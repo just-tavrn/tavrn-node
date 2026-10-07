@@ -22,6 +22,9 @@
 //!   that decision once in the audit log of each such room (`room.bots_in_encrypted_channels`, `meta.reason =
 //!   existing_room`), so room managers can see why their encrypted channels stay open to bots, and sets the marker
 //!   [`BOTS_IN_ENCRYPTED_MARKER`].
+//! - `manage_threads` (bit 36) is added once to every role that holds `manage_messages` (marker
+//!   [`MANAGE_THREADS_MARKER`]), so moderators keep moderating threads; rooms narrow it later. `create_threads`
+//!   (bit 6) has been part of `@everyone`'s defaults since the first release and needs no fixup.
 
 use sqlx::Row;
 
@@ -40,6 +43,8 @@ pub struct FixupReport {
     pub manage_applications_roles: u64,
     /// Existing rooms whose `bots_in_encrypted_channels = allowed` was recorded.
     pub bots_encrypted_rooms: u64,
+    /// Roles holding `manage_messages` that got `manage_threads`.
+    pub manage_threads_roles: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -50,6 +55,9 @@ pub const READ_HISTORY_MARKER: &str = "fixup.everyone_read_history";
 
 /// `node_settings` key: the one-time grant of `manage_applications` to roles holding `manage_room` has run.
 pub const MANAGE_APPLICATIONS_MARKER: &str = "fixup.manage_applications";
+
+/// `node_settings` key: the one-time grant of `manage_threads` to roles holding `manage_messages` has run.
+pub const MANAGE_THREADS_MARKER: &str = "fixup.manage_threads";
 
 /// `node_settings` key: the `allowed` default of existing rooms for `bots_in_encrypted_channels` was recorded.
 pub const BOTS_IN_ENCRYPTED_MARKER: &str = "fixup.bots_in_encrypted_channels";
@@ -120,6 +128,7 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.read_history_roles = grant_read_history(db).await?;
     report.manage_applications_roles = grant_manage_applications(db).await?;
     report.bots_encrypted_rooms = record_bots_in_encrypted(db).await?;
+    report.manage_threads_roles = grant_manage_threads(db).await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }
@@ -218,10 +227,19 @@ async fn marker_set(db: &Pool, key: &str) -> anyhow::Result<bool> {
 
 /// Adds `manage_applications` to every role holding `manage_room`, once per node (see the module docs).
 async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
-    if marker_set(db, MANAGE_APPLICATIONS_MARKER).await? {
+    grant_to_holders(db, MANAGE_APPLICATIONS_MARKER, permissions::MANAGE_ROOM, permissions::MANAGE_APPLICATIONS).await
+}
+
+/// Adds `manage_threads` to every role holding `manage_messages`, once per node (see the module docs).
+async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
+    grant_to_holders(db, MANAGE_THREADS_MARKER, permissions::MANAGE_MESSAGES, permissions::MANAGE_THREADS).await
+}
+
+/// Adds `add` to every role (not `@everyone`) holding `have`, once per node (`marker` in `node_settings`).
+async fn grant_to_holders(db: &Pool, marker: &str, have: u64, add: u64) -> anyhow::Result<u64> {
+    if marker_set(db, marker).await? {
         return Ok(0);
     }
-    let (have, add) = (permissions::MANAGE_ROOM, permissions::MANAGE_APPLICATIONS);
     let mut tx = db.begin().await?;
     let roles = sqlx::query("SELECT id, permissions FROM roles WHERE is_everyone = 0 AND (permissions & $1) <> 0")
         .bind(have as i64)
@@ -241,7 +259,7 @@ async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
         changed += 1;
     }
     sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
-        .bind(MANAGE_APPLICATIONS_MARKER)
+        .bind(marker)
         .bind("done")
         .bind(util::now())
         .execute(&mut *tx)

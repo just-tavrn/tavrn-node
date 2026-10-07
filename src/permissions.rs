@@ -52,6 +52,7 @@ perms! {
     MANAGE_FILES = 33, "manage_files";
     READ_HISTORY = 34, "read_history";
     MANAGE_APPLICATIONS = 35, "manage_applications";
+    MANAGE_THREADS = 36, "manage_threads";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -103,6 +104,7 @@ pub const EVERYONE_RESTRICTED: Perms = ADMINISTRATOR
     | MANAGE_MESSAGES
     | MANAGE_NICKNAMES
     | MANAGE_APPLICATIONS
+    | MANAGE_THREADS
     | PURGE;
 
 /// Permissions a member keeps while timed out.
@@ -147,7 +149,8 @@ pub const SCOPES: &[(&str, Perms)] = &[
             | VIEW_AUDIT_LOG
             | MANAGE_NICKNAMES
             | MUTE_MEMBERS
-            | MOVE_MEMBERS,
+            | MOVE_MEMBERS
+            | MANAGE_THREADS,
     ),
     (
         "rooms:manage",
@@ -422,7 +425,7 @@ mod tests {
     fn everyone_defaults_contain_nothing_restricted() {
         assert_eq!(DEFAULT_EVERYONE & EVERYONE_RESTRICTED, 0);
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_062_204_976_004);
+        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_130_924_452_740);
         assert!(has(DEFAULT_EVERYONE, USE_WHITEBOARD));
         assert!(!has(DEFAULT_EVERYONE, MANAGE_WHITEBOARD));
         assert_eq!(names(USE_WHITEBOARD | MANAGE_WHITEBOARD), vec!["use_whiteboard", "manage_whiteboard"]);
@@ -468,6 +471,21 @@ mod tests {
         assert!(!has(scope_mask(&["moderation".to_string(), "commands".to_string()]), MANAGE_APPLICATIONS));
         assert_eq!(names(MANAGE_APPLICATIONS), vec!["manage_applications"]);
         assert_eq!(parse(&MANAGE_APPLICATIONS.to_string()), Some(MANAGE_APPLICATIONS));
+    }
+
+    #[test]
+    fn manage_threads_is_management_class_and_covered_by_moderation() {
+        assert_eq!(MANAGE_THREADS, 1 << 36);
+        assert_eq!(CREATE_THREADS, 1 << 6);
+        assert!(has(DEFAULT_EVERYONE, CREATE_THREADS), "everybody starts threads by default");
+        assert!(has(EVERYONE_RESTRICTED, MANAGE_THREADS), "never on @everyone");
+        assert!(!has(EVERYONE_RESTRICTED, CREATE_THREADS));
+        assert!(!has(DEFAULT_EVERYONE, MANAGE_THREADS));
+        assert!(has(scope_mask(&["moderation".to_string()]), MANAGE_THREADS));
+        assert!(!has(scope_mask(&["messages:write".to_string()]), MANAGE_THREADS));
+        assert!(has(scope_mask(&["messages:write".to_string()]), CREATE_THREADS));
+        assert_eq!(names(MANAGE_THREADS), vec!["manage_threads"]);
+        assert_eq!(parse(&MANAGE_THREADS.to_string()), Some(MANAGE_THREADS));
     }
 
     #[derive(Deserialize)]
