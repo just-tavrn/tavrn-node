@@ -239,6 +239,14 @@ async fn text_channel_thread_round_trip() {
     assert_eq!(bodies(&page), vec!["Then Friday", "Friday works"]);
     let (s, j) = r.node.get_auth(&format!("{}?thread={}", r.messages(&r.channel), tavrn_node::util::ulid()), &r.carol.token).await;
     assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"));
+    // `threads=all` (local search index sync): the channel with its threads.
+    let (s, all) = r.node.get_auth(&format!("{}?threads=all", r.messages(&r.channel)), &r.carol.token).await;
+    assert_eq!(s, StatusCode::OK, "{all}");
+    assert_eq!(bodies(&all), vec!["unrelated", "Then Friday", "Friday works", "Release on Friday?"]);
+    for bad in [format!("threads=some"), format!("threads=all&thread={thread_id}")] {
+        let (s, j) = r.node.get_auth(&format!("{}?{bad}", r.messages(&r.channel)), &r.carol.token).await;
+        assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.filter_invalid"), "{bad}");
+    }
 
     // One thread per root; thread messages are no roots; messages of other channels are no roots.
     let (s, j) = r.create_thread(&r.carol.token, &r.channel, json!({ "title": "again", "root_message_id": root_id })).await;

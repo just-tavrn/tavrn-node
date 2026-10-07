@@ -42,6 +42,8 @@ pub struct ListQuery {
     pub epoch: Option<i64>,
     /// Page this thread of the channel (PROTOCOL.md §7e); without it the channel's list leaves thread messages out.
     pub thread: Option<String>,
+    /// `all`: the channel's messages including those of its threads (clients syncing their local search index).
+    pub threads: Option<String>,
 }
 
 /// Adds attachments, reactions and pin status for the requester to messages.
@@ -150,10 +152,15 @@ async fn list_in(state: &AppState, auth: &AuthUser, conv: &Conv, q: ListQuery) -
         Some(t) => Some(crate::threads::of_conversation(state, conv, t).await?.id),
         None => None,
     };
-    let filter = match (&thread, q.epoch) {
+    let all = match q.threads.as_deref() {
+        None => false,
+        Some("all") if thread.is_none() => true,
+        Some(_) => return Err(bad("thread.filter_invalid", "threads: only `all`, and not together with thread")),
+    };
+    let filter = match (&thread, q.epoch.is_some() || all) {
         (Some(t), _) => store::messages::ThreadFilter::Thread(t),
-        (None, Some(_)) => store::messages::ThreadFilter::Any,
-        (None, None) => store::messages::ThreadFilter::Channel,
+        (None, true) => store::messages::ThreadFilter::Any,
+        (None, false) => store::messages::ThreadFilter::Channel,
     };
     // Encrypted history from before the join only as far as the channel's policy allows (§7b).
     let cut = crate::history::list_cutoff(state, conv, &auth.user).await?;
