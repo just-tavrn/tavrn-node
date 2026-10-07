@@ -23,6 +23,7 @@ jobs:
     if: ${{ vars.CI_ENABLED == 'true' }}
     uses: just-tavrn/.github/.github/workflows/rust-ci.yml@main
     with:
+      runner: tavrn-heavy
       # rustfmt, clippy (node and load generator), the tests on PostgreSQL (incl. the protocol test vectors and
       # the comparison with protocol/openapi.json from the submodule) with a Valkey for the cluster tests,
       # cargo deny with deny.toml.
@@ -81,6 +82,7 @@ jobs:
       contents: read
       packages: write
     with:
+      runner: tavrn-heavy
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
       build-args: |
