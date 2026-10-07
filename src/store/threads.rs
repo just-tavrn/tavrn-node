@@ -193,14 +193,16 @@ pub struct Update<'a> {
 pub async fn update(db: &Pool, id: &str, u: Update<'_>) -> Result<(), ApiError> {
     let mut tx = db.begin().await?;
     if let Some(t) = &u.title {
-        sqlx::query("UPDATE threads SET title = $1, title_epoch = $2, title_author_id = $3, title_device_id = $4 WHERE id = $5")
-            .bind(t.text)
-            .bind(t.epoch)
-            .bind(t.author_id)
-            .bind(t.device_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE threads SET title = $1, title_epoch = $2, title_author_id = $3, title_device_id = $4 WHERE id = $5",
+        )
+        .bind(t.text)
+        .bind(t.epoch)
+        .bind(t.author_id)
+        .bind(t.device_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(tags) = u.tags {
         sqlx::query("UPDATE threads SET tags = $1 WHERE id = $2")
@@ -210,10 +212,18 @@ pub async fn update(db: &Pool, id: &str, u: Update<'_>) -> Result<(), ApiError> 
             .await?;
     }
     if let Some(archived_at) = u.archived_at {
-        sqlx::query("UPDATE threads SET archived_at = $1 WHERE id = $2").bind(archived_at).bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE threads SET archived_at = $1 WHERE id = $2")
+            .bind(archived_at)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(locked) = u.locked {
-        sqlx::query("UPDATE threads SET locked = $1 WHERE id = $2").bind(locked as i64).bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE threads SET locked = $1 WHERE id = $2")
+            .bind(locked as i64)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -275,7 +285,8 @@ pub async fn foreign_messages(db: &Pool, id: &str, user_id: &str) -> Result<i64,
 /// Returns the number of deleted messages; the caller deletes the upload files.
 pub async fn delete(db: &Pool, id: &str) -> Result<i64, ApiError> {
     let mut tx = db.begin().await?;
-    let deleted = sqlx::query("DELETE FROM messages WHERE thread_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
+    let deleted =
+        sqlx::query("DELETE FROM messages WHERE thread_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
     sqlx::query("DELETE FROM threads WHERE id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(deleted as i64)
@@ -390,11 +401,12 @@ pub async fn follow(db: &Pool, id: &str, user_id: &str, read_up_to: Option<&str>
 
 /// Stops following. Returns `true` when the user followed before.
 pub async fn unfollow(db: &Pool, id: &str, user_id: &str) -> Result<bool, ApiError> {
-    let r = sqlx::query("UPDATE thread_members SET following = 0 WHERE thread_id = $1 AND user_id = $2 AND following = 1")
-        .bind(id)
-        .bind(user_id)
-        .execute(db)
-        .await?;
+    let r =
+        sqlx::query("UPDATE thread_members SET following = 0 WHERE thread_id = $1 AND user_id = $2 AND following = 1")
+            .bind(id)
+            .bind(user_id)
+            .execute(db)
+            .await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -475,8 +487,11 @@ pub async fn followed_counts(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let roles: Vec<String> =
-        role_ids.iter().take(100).map(|r| super::messages::mention_pattern(&super::messages::role_mention(r))).collect();
+    let roles: Vec<String> = role_ids
+        .iter()
+        .take(100)
+        .map(|r| super::messages::mention_pattern(&super::messages::role_mention(r)))
+        .collect();
     let direct = std::iter::once("m.mentions LIKE $2 ESCAPE '\\'".to_string())
         .chain((0..roles.len()).map(|i| format!("m.mentions LIKE ${} ESCAPE '\\'", i + 3)))
         .collect::<Vec<_>>()
@@ -519,12 +534,20 @@ pub async fn followed_counts(
 // ---------------------------------------------------------------- channel settings and housekeeping
 
 pub async fn set_auto_archive(db: &Pool, channel_id: &str, minutes: i64) -> Result<(), ApiError> {
-    sqlx::query("UPDATE channels SET auto_archive_minutes = $1 WHERE id = $2").bind(minutes).bind(channel_id).execute(db).await?;
+    sqlx::query("UPDATE channels SET auto_archive_minutes = $1 WHERE id = $2")
+        .bind(minutes)
+        .bind(channel_id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
 pub async fn set_forum_tags(db: &Pool, channel_id: &str, tags_json: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE channels SET forum_tags = $1 WHERE id = $2").bind(tags_json).bind(channel_id).execute(db).await?;
+    sqlx::query("UPDATE channels SET forum_tags = $1 WHERE id = $2")
+        .bind(tags_json)
+        .bind(channel_id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -558,24 +581,28 @@ mod tests {
         let pool = crate::db::connect("sqlite::memory:").await.unwrap();
         let t = now();
         for (id, name) in [("u1", "alice"), ("u2", "bob")] {
-            sqlx::query("INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $2, 'd', $2, $3)")
-                .bind(id)
-                .bind(name)
-                .bind(&t)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $2, 'd', $2, $3)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(&t)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         sqlx::query("INSERT INTO rooms (id, name, owner_id, created_at) VALUES ('r', 'r', 'u1', $1)")
             .bind(&t)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO conversations (id, kind, room_id, encrypted, created_at) VALUES ('c', 'channel', 'r', 0, $1)")
-            .bind(&t)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, kind, room_id, encrypted, created_at) VALUES ('c', 'channel', 'r', 0, $1)",
+        )
+        .bind(&t)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO channels (id, room_id, kind, name) VALUES ('c', 'r', 'text', 'general')")
             .execute(&pool)
             .await
@@ -621,7 +648,12 @@ mod tests {
         assert!(insert(&db, new("T3", None, &[])).await.unwrap(), "several standalone threads");
         assert_eq!(id_by_root(&db, "M1").await.unwrap().as_deref(), Some("T1"));
         message(&db, "MA", "T1", "u2", "[]").await;
-        fn page<'a>(before: Option<&'a ThreadRow>, sort: Sort, archived: Archived, tag: Option<&'a str>) -> ListFilter<'a> {
+        fn page<'a>(
+            before: Option<&'a ThreadRow>,
+            sort: Sort,
+            archived: Archived,
+            tag: Option<&'a str>,
+        ) -> ListFilter<'a> {
             ListFilter { channel_id: "c", archived, tag, sort, before, limit: 2 }
         }
         let ids = |rows: Vec<ThreadRow>| rows.into_iter().map(|t| t.id).collect::<Vec<_>>();
@@ -669,7 +701,9 @@ mod tests {
         let counts = followed_counts(&db, "u1", "alice@d", &[], CountScope::Threads(&["T1".into()])).await.unwrap();
         assert_eq!(counts[0].unread, 1);
         assert!(unfollow(&db, "T1", "u1").await.unwrap());
-        assert!(followed_counts(&db, "u1", "alice@d", &[], CountScope::Threads(&["T1".into()])).await.unwrap().is_empty());
+        assert!(
+            followed_counts(&db, "u1", "alice@d", &[], CountScope::Threads(&["T1".into()])).await.unwrap().is_empty()
+        );
         assert!(follower_ids(&db, "T1").await.unwrap().is_empty());
         let m = members(&db, "u1", &["T1".into()]).await.unwrap();
         assert_eq!(m["T1"].last_read_message_id.as_deref(), Some("M2"));

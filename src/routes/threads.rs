@@ -45,7 +45,17 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_thread, list_threads, get_thread, update_thread, delete_thread, mark_read, follow, unfollow, followed_threads),
+    paths(
+        create_thread,
+        list_threads,
+        get_thread,
+        update_thread,
+        delete_thread,
+        mark_read,
+        follow,
+        unfollow,
+        followed_threads
+    ),
     components(schemas(
         Thread,
         th::ThreadUserState,
@@ -112,7 +122,8 @@ pub async fn create_thread(
     let tags = th::check_post_tags(&channel, &req.tags)?;
     let root = match &req.root_message_id {
         Some(r) => {
-            let invalid = || bad("thread.root_invalid", "The root must be a message of this channel outside any thread");
+            let invalid =
+                || bad("thread.root_invalid", "The root must be a message of this channel outside any thread");
             let r = r.to_ascii_uppercase();
             if !util::is_ulid(&r) {
                 return Err(invalid());
@@ -149,7 +160,8 @@ pub async fn create_thread(
     .await?;
     if !inserted {
         // Another request started a thread on the same root in between.
-        let existing = store::threads::id_by_root(&state.db, root.as_deref().unwrap_or_default()).await?.unwrap_or_default();
+        let existing =
+            store::threads::id_by_root(&state.db, root.as_deref().unwrap_or_default()).await?.unwrap_or_default();
         return Err(exists(&existing));
     }
     store::threads::follow(&state.db, &id, &auth.user.id, None).await?;
@@ -244,7 +256,14 @@ pub async fn list_threads(
     let limit = validate::limit(q.limit, 25, 50);
     let mut rows = store::threads::list(
         &state.db,
-        ListFilter { channel_id: &conv.id, archived, tag: tag.as_deref(), sort, before: before.as_ref(), limit: limit + 1 },
+        ListFilter {
+            channel_id: &conv.id,
+            archived,
+            tag: tag.as_deref(),
+            sort,
+            before: before.as_ref(),
+            limit: limit + 1,
+        },
     )
     .await?;
     let more = rows.len() as i64 > limit;

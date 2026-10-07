@@ -227,17 +227,32 @@ async fn text_channel_thread_round_trip() {
     assert_eq!(listed_root["thread"]["id"], thread_id.as_str(), "{listed_root}");
     assert_eq!(listed_root["thread"]["message_count"], 2);
     assert_eq!(listed_root["thread"]["participant_ids"], json!([r.alice.user_id, r.bob.user_id]));
-    assert!(channel.as_array().unwrap().iter().find(|m| m["content"]["body"] == "unrelated").unwrap().get("thread").is_none());
+    assert!(
+        channel
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["content"]["body"] == "unrelated")
+            .unwrap()
+            .get("thread")
+            .is_none()
+    );
     let (s, page) = r.node.get_auth(&format!("{}?thread={thread_id}", r.messages(&r.channel)), &r.carol.token).await;
     assert_eq!(s, StatusCode::OK, "{page}");
     assert_eq!(bodies(&page), vec!["Then Friday", "Friday works"]);
     let (s, page) = r
         .node
-        .get_auth(&format!("{}?thread={thread_id}&around={}", r.messages(&r.channel), reply["id"].as_str().unwrap()), &r.carol.token)
+        .get_auth(
+            &format!("{}?thread={thread_id}&around={}", r.messages(&r.channel), reply["id"].as_str().unwrap()),
+            &r.carol.token,
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{page}");
     assert_eq!(bodies(&page), vec!["Then Friday", "Friday works"]);
-    let (s, j) = r.node.get_auth(&format!("{}?thread={}", r.messages(&r.channel), tavrn_node::util::ulid()), &r.carol.token).await;
+    let (s, j) = r
+        .node
+        .get_auth(&format!("{}?thread={}", r.messages(&r.channel), tavrn_node::util::ulid()), &r.carol.token)
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"));
     // `threads=all` (local search index sync): the channel with its threads.
     let (s, all) = r.node.get_auth(&format!("{}?threads=all", r.messages(&r.channel)), &r.carol.token).await;
@@ -249,12 +264,12 @@ async fn text_channel_thread_round_trip() {
     }
 
     // One thread per root; thread messages are no roots; messages of other channels are no roots.
-    let (s, j) = r.create_thread(&r.carol.token, &r.channel, json!({ "title": "again", "root_message_id": root_id })).await;
+    let (s, j) =
+        r.create_thread(&r.carol.token, &r.channel, json!({ "title": "again", "root_message_id": root_id })).await;
     assert_eq!((s, code(&j)), (StatusCode::CONFLICT, "thread.exists"), "{j}");
     assert_eq!(j["meta"]["thread_id"], thread_id.as_str());
-    let (s, j) = r
-        .create_thread(&r.carol.token, &r.channel, json!({ "title": "nested", "root_message_id": reply["id"] }))
-        .await;
+    let (s, j) =
+        r.create_thread(&r.carol.token, &r.channel, json!({ "title": "nested", "root_message_id": reply["id"] })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.root_invalid"));
     let other = r.channel("text", "other").await;
     let (s, j) = r.create_thread(&r.carol.token, &other, json!({ "title": "moved", "root_message_id": root_id })).await;
@@ -271,7 +286,9 @@ async fn text_channel_thread_round_trip() {
     let solo = r.thread_ok(&r.carol.token, &r.channel, json!({ "title": "Standalone" })).await;
     assert!(solo["root_message_id"].is_null());
     assert_eq!(solo["message_count"], 0);
-    let (s, j) = r.create_thread(&r.carol.token, &r.channel, json!({ "title": "tagged", "tags": [tavrn_node::util::ulid()] })).await;
+    let (s, j) = r
+        .create_thread(&r.carol.token, &r.channel, json!({ "title": "tagged", "tags": [tavrn_node::util::ulid()] }))
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.tags_invalid"));
 
     // GET by id; strangers and members without view_channel get 404/403.
@@ -290,7 +307,11 @@ async fn text_channel_thread_round_trip() {
 
     // Edits keep the thread; slash-command style content (`action`) works in threads too.
     let me = r
-        .send_ok(&r.alice.token, &r.channel, json!({ "content": { "type": "action", "body": "waves" }, "thread_id": thread_id }))
+        .send_ok(
+            &r.alice.token,
+            &r.channel,
+            json!({ "content": { "type": "action", "body": "waves" }, "thread_id": thread_id }),
+        )
         .await;
     assert_eq!(me["thread_id"], thread_id.as_str());
     let (s, edited) = r
@@ -332,10 +353,15 @@ async fn permissions_per_channel_kind() {
     let (s, j) = r.create_thread(&r.bob.token, &forum, json!({ "title": "Empty post" })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.message_required"));
     let (s, j) = r
-        .create_thread(&r.bob.token, &forum, json!({ "title": "Rooted", "root_message_id": root["id"], "message": text("x") }))
+        .create_thread(
+            &r.bob.token,
+            &forum,
+            json!({ "title": "Rooted", "root_message_id": root["id"], "message": text("x") }),
+        )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.root_invalid"));
-    let post = r.thread_ok(&r.bob.token, &forum, json!({ "title": "How do I…", "message": text("…set this up?") })).await;
+    let post =
+        r.thread_ok(&r.bob.token, &forum, json!({ "title": "How do I…", "message": text("…set this up?") })).await;
     assert_eq!(post["message_count"], 1);
     assert_eq!(post["first_message"]["content"]["body"], "…set this up?");
     assert!(post["root_message"].is_null());
@@ -350,7 +376,11 @@ async fn permissions_per_channel_kind() {
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "message.announcement_forbidden"));
     let announcement = r.send_ok(&r.alice.token, &news, text("v1.0 is out")).await;
     let discussion = r
-        .thread_ok(&r.bob.token, &news, json!({ "title": "v1.0", "root_message_id": announcement["id"], "message": text("Congrats") }))
+        .thread_ok(
+            &r.bob.token,
+            &news,
+            json!({ "title": "v1.0", "root_message_id": announcement["id"], "message": text("Congrats") }),
+        )
         .await;
     r.send_ok(&r.carol.token, &news, in_thread("Thanks", discussion["id"].as_str().unwrap())).await;
     r.give_role(&r.carol.user_id, "Herald", &[p::MANAGE_MESSAGES]).await;
@@ -358,7 +388,11 @@ async fn permissions_per_channel_kind() {
     let (s, j) = r
         .node
         .put(
-            &format!("/api/v1/rooms/{}/channels/{news}/messages/{}/reactions/%F0%9F%8E%89", r.room_id, announcement["id"].as_str().unwrap()),
+            &format!(
+                "/api/v1/rooms/{}/channels/{news}/messages/{}/reactions/%F0%9F%8E%89",
+                r.room_id,
+                announcement["id"].as_str().unwrap()
+            ),
             &r.bob.token,
             json!({}),
         )
@@ -367,10 +401,16 @@ async fn permissions_per_channel_kind() {
 
     // Voice and files channels and the welcome channel have no threads; DMs have no threads either.
     let (_, room) = r.node.get_auth(&format!("/api/v1/rooms/{}", r.room_id), &r.alice.token).await;
-    let voice = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "voice").unwrap()["id"].as_str().unwrap().to_string();
+    let voice = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "voice").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (s, j) = r.create_thread(&r.alice.token, &voice, json!({ "title": "x" })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.unsupported_channel"));
-    let welcome = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "system").unwrap()["id"].as_str().unwrap().to_string();
+    let welcome = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "system").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (s, j) = r.create_thread(&r.alice.token, &welcome, json!({ "title": "x" })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.unsupported_channel"));
 }
@@ -406,7 +446,14 @@ async fn listing_paging_filters_and_tags() {
     }
     let (s, j) = r.node.patch(&path, &r.bob.token, json!({ "tags": [] })).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "channel.manage_forbidden"));
-    let (s, j) = r.node.patch(&format!("/api/v1/rooms/{}/channels/{}", r.room_id, r.channel), &r.alice.token, json!({ "tags": [{ "name": "x" }] })).await;
+    let (s, j) = r
+        .node
+        .patch(
+            &format!("/api/v1/rooms/{}/channels/{}", r.room_id, r.channel),
+            &r.alice.token,
+            json!({ "tags": [{ "name": "x" }] }),
+        )
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "channel.tags_invalid"), "only forums have tags");
 
     // Posts with tags (at most 5, of this channel).
@@ -419,7 +466,13 @@ async fn listing_paging_filters_and_tags() {
     assert_eq!(a["tags"], json!([bug]));
     let (s, j) = r.create_thread(&r.bob.token, &forum, post("bad", vec!["01J00000000000000000000000"])).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.tags_invalid"));
-    let (s, j) = r.create_thread(&r.bob.token, &forum, json!({ "title": "x", "tags": [bug, bug, bug, bug, bug, bug], "message": text("x") })).await;
+    let (s, j) = r
+        .create_thread(
+            &r.bob.token,
+            &forum,
+            json!({ "title": "x", "tags": [bug, bug, bug, bug, bug, bug], "message": text("x") }),
+        )
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.tags_invalid"));
     let (a, b, c) = (a["id"].as_str().unwrap(), b["id"].as_str().unwrap(), c["id"].as_str().unwrap());
 
@@ -443,7 +496,9 @@ async fn listing_paging_filters_and_tags() {
     assert!(page2["next"].is_null());
     let page1 = r.list(&r.carol.token, &forum, "limit=2&sort=created").await;
     assert_eq!(ids(&page1), vec![c, b]);
-    let page2 = r.list(&r.carol.token, &forum, &format!("limit=2&sort=created&before={}", page1["next"].as_str().unwrap())).await;
+    let page2 = r
+        .list(&r.carol.token, &forum, &format!("limit=2&sort=created&before={}", page1["next"].as_str().unwrap()))
+        .await;
     assert_eq!(ids(&page2), vec![a]);
 
     // Archived threads are left out by default.
@@ -478,7 +533,8 @@ async fn listing_paging_filters_and_tags() {
     let (_, got) = r.get_thread(&r.carol.token, b).await;
     assert_eq!(got["tags"], json!([feature]));
     let (_, audit) = r.node.get_auth(&format!("/api/v1/rooms/{}/audit-log", r.room_id), &r.alice.token).await;
-    let actions: Vec<&str> = audit["items"].as_array().or(audit.as_array()).unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
+    let actions: Vec<&str> =
+        audit["items"].as_array().or(audit.as_array()).unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
     assert!(actions.contains(&"channel.tags"), "{actions:?}");
     assert!(actions.contains(&"thread.update"), "{actions:?}");
 }
@@ -505,9 +561,17 @@ async fn follow_unread_and_read_markers() {
     r.send_ok(&r.alice.token, &r.channel, json!({ "content": { "type": "text", "body": "@bob two" }, "thread_id": thread_id, "mentions": [format!("bob@{D}")] })).await;
 
     let (_, t) = r.get_thread(&r.bob.token, &thread_id).await;
-    assert_eq!(t["me"], json!({ "following": true, "last_read_message_id": bobs["id"], "unread_count": 2, "mention_count": 1 }), "{t}");
+    assert_eq!(
+        t["me"],
+        json!({ "following": true, "last_read_message_id": bobs["id"], "unread_count": 2, "mention_count": 1 }),
+        "{t}"
+    );
     let bob_channel = r.read_state(&r.bob.token, &r.channel).await;
-    assert_eq!((bob_channel["unread_count"].as_i64(), bob_channel["mention_count"].as_i64()), (Some(2), Some(1)), "{bob_channel}");
+    assert_eq!(
+        (bob_channel["unread_count"].as_i64(), bob_channel["mention_count"].as_i64()),
+        (Some(2), Some(1)),
+        "{bob_channel}"
+    );
     let carol_channel = r.read_state(&r.carol.token, &r.channel).await;
     assert_eq!(carol_channel["unread_count"], 0, "thread messages count for followers only: {carol_channel}");
     assert_eq!(carol_channel["last_message_id"], root["id"], "the channel's newest message ignores threads");
@@ -537,7 +601,10 @@ async fn follow_unread_and_read_markers() {
         .put(&format!("/api/v1/threads/{thread_id}/read"), &r.bob.token, json!({ "last_read_message_id": root["id"] }))
         .await;
     assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "message.not_found"));
-    let (s, j) = r.node.put(&format!("/api/v1/threads/{thread_id}/read"), &r.bob.token, json!({ "last_read_message_id": "x" })).await;
+    let (s, j) = r
+        .node
+        .put(&format!("/api/v1/threads/{thread_id}/read"), &r.bob.token, json!({ "last_read_message_id": "x" }))
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "validation.id"));
 
     // Followed threads of the room.
@@ -657,13 +724,18 @@ async fn deleting_threads_and_roots() {
     let id = thread["id"].as_str().unwrap().to_string();
     let blob = upload(&r, &r.carol.token, &r.channel, b"\x89PNGfake").await;
     let with_file = r
-        .send_ok(&r.carol.token, &r.channel, json!({ "content": { "type": "text", "body": "file" }, "attachments": [blob], "thread_id": id }))
+        .send_ok(
+            &r.carol.token,
+            &r.channel,
+            json!({ "content": { "type": "text", "body": "file" }, "attachments": [blob], "thread_id": id }),
+        )
         .await;
     r.send_ok(&r.bob.token, &r.channel, in_thread("mine", &id)).await;
 
     // Deleting a single thread message updates the counters.
     let own = r.send_ok(&r.bob.token, &r.channel, in_thread("oops", &id)).await;
-    let (s, _) = r.node.delete(&format!("{}/{}", r.messages(&r.channel), own["id"].as_str().unwrap()), &r.bob.token).await;
+    let (s, _) =
+        r.node.delete(&format!("{}/{}", r.messages(&r.channel), own["id"].as_str().unwrap()), &r.bob.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, t) = r.get_thread(&r.bob.token, &id).await;
     assert_eq!(t["message_count"], 2, "{t}");
@@ -686,14 +758,24 @@ async fn deleting_threads_and_roots() {
         .unwrap();
     assert_eq!(gone, 0);
     assert!(r.node.state.storage.read(&blob).await.unwrap().is_none(), "the upload's file is deleted");
-    let (s, _) = r.node.get_auth(&format!("{}/{}", r.messages(&r.channel), with_file["id"].as_str().unwrap()), &r.alice.token).await;
+    let (s, _) = r
+        .node
+        .get_auth(&format!("{}/{}", r.messages(&r.channel), with_file["id"].as_str().unwrap()), &r.alice.token)
+        .await;
     assert_ne!(s, StatusCode::OK);
     // The root stays, without a summary.
     let (_, channel) = r.node.get_auth(&r.messages(&r.channel), &r.alice.token).await;
     let listed = channel.as_array().unwrap().iter().find(|m| m["id"] == root_id.as_str()).unwrap();
     assert!(listed.get("thread").is_none_or(Value::is_null), "{listed}");
     let (_, audit) = r.node.get_auth(&format!("/api/v1/rooms/{}/audit-log", r.room_id), &r.alice.token).await;
-    let entry = audit["items"].as_array().or(audit.as_array()).unwrap().iter().find(|e| e["action"] == "thread.delete").cloned().unwrap();
+    let entry = audit["items"]
+        .as_array()
+        .or(audit.as_array())
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "thread.delete")
+        .cloned()
+        .unwrap();
     assert_eq!(entry["meta"]["deleted"], 2, "{entry}");
 
     // A creator deletes a thread holding only their own messages.
@@ -703,8 +785,15 @@ async fn deleting_threads_and_roots() {
 
     // Deleting the root keeps the thread.
     let root2 = r.send_ok(&r.alice.token, &r.channel, text("root 2")).await;
-    let t2 = r.thread_ok(&r.carol.token, &r.channel, json!({ "title": "T2", "root_message_id": root2["id"], "message": text("reply") })).await;
-    let (s, _) = r.node.delete(&format!("{}/{}", r.messages(&r.channel), root2["id"].as_str().unwrap()), &r.alice.token).await;
+    let t2 = r
+        .thread_ok(
+            &r.carol.token,
+            &r.channel,
+            json!({ "title": "T2", "root_message_id": root2["id"], "message": text("reply") }),
+        )
+        .await;
+    let (s, _) =
+        r.node.delete(&format!("{}/{}", r.messages(&r.channel), root2["id"].as_str().unwrap()), &r.alice.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, j) = r.get_thread(&r.carol.token, t2["id"].as_str().unwrap()).await;
     assert_eq!(j["root_deleted"], true, "{j}");
@@ -745,7 +834,10 @@ async fn encrypted_channel_threads_are_ciphertext() {
     let room = node.create_room(alice.token(), "Secret").await;
     let room_id = room["id"].as_str().unwrap().to_string();
     let channel = TestNode::text_channel(&room);
-    assert_eq!(room["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap()["encrypted"], true);
+    assert_eq!(
+        room["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap()["encrypted"],
+        true
+    );
     join(&node, &alice.session, &room_id, &bob.session).await;
     node.create_group(&mut alice, &channel).await;
     node.add_user(&mut alice, &channel, "bob").await;
@@ -757,16 +849,27 @@ async fn encrypted_channel_threads_are_ciphertext() {
 
     let (root_ct, epoch) = seal(&alice, json!({ "type": "text", "body": "the root" }));
     let (s, root) = node
-        .post(&format!("/api/v1/conversations/{channel}/messages"), alice.token(), json!({ "content": root_ct, "epoch": epoch }))
+        .post(
+            &format!("/api/v1/conversations/{channel}/messages"),
+            alice.token(),
+            json!({ "content": root_ct, "epoch": epoch }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{root}");
     let threads = format!("/api/v1/rooms/{room_id}/channels/{channel}/threads");
 
     // Plaintext titles and messages are refused here.
-    let (s, j) = node.post(&threads, bob.token(), json!({ "title": "visible title", "root_message_id": root["id"] })).await;
+    let (s, j) =
+        node.post(&threads, bob.token(), json!({ "title": "visible title", "root_message_id": root["id"] })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "thread.title_invalid"), "{j}");
     let (title_ct, title_epoch) = seal(&bob, json!({ "type": "thread.title", "body": "Secret plans" }));
-    let (s, j) = node.post(&threads, bob.token(), json!({ "title": title_ct, "title_epoch": title_epoch + 5, "root_message_id": root["id"] })).await;
+    let (s, j) = node
+        .post(
+            &threads,
+            bob.token(),
+            json!({ "title": title_ct, "title_epoch": title_epoch + 5, "root_message_id": root["id"] }),
+        )
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.epoch_mismatch"), "{j}");
     let (msg_ct, msg_epoch) = seal(&bob, json!({ "type": "text", "body": "first secret reply" }));
     let (s, thread) = node
@@ -783,7 +886,11 @@ async fn encrypted_channel_threads_are_ciphertext() {
     assert_eq!(thread["title_device_id"], bob.session.device_id.as_str());
     let thread_id = thread["id"].as_str().unwrap().to_string();
     let (s, j) = node
-        .post(&format!("/api/v1/conversations/{channel}/messages"), alice.token(), json!({ "content": { "type": "text", "body": "plain" }, "thread_id": thread_id }))
+        .post(
+            &format!("/api/v1/conversations/{channel}/messages"),
+            alice.token(),
+            json!({ "content": { "type": "text", "body": "plain" }, "thread_id": thread_id }),
+        )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.encryption_mismatch"));
 
@@ -791,7 +898,8 @@ async fn encrypted_channel_threads_are_ciphertext() {
     let opened = open(&alice, &conv, thread["title"].as_str().unwrap(), &format!("bob@{D}"), &bob.session.device_id);
     assert_eq!(opened["type"], "thread.title");
     assert_eq!(opened["body"], "Secret plans");
-    let (s, page) = node.get_auth(&format!("/api/v1/conversations/{channel}/messages?thread={thread_id}"), alice.token()).await;
+    let (s, page) =
+        node.get_auth(&format!("/api/v1/conversations/{channel}/messages?thread={thread_id}"), alice.token()).await;
     assert_eq!(s, StatusCode::OK, "{page}");
     let first = &page[0];
     assert_eq!(first["encrypted"], true);
@@ -803,16 +911,22 @@ async fn encrypted_channel_threads_are_ciphertext() {
 
     // A rename by Alice is her ciphertext under the current epoch.
     let (renamed_ct, renamed_epoch) = seal(&alice, json!({ "type": "thread.title", "body": "Renamed plans" }));
-    node.post(&format!("/api/v1/rooms/{room_id}/roles"), alice.token(), json!({ "name": "x", "permissions": "0" })).await;
+    node.post(&format!("/api/v1/rooms/{room_id}/roles"), alice.token(), json!({ "name": "x", "permissions": "0" }))
+        .await;
     let (s, j) = node
-        .patch(&format!("/api/v1/threads/{thread_id}"), alice.token(), json!({ "title": renamed_ct, "title_epoch": renamed_epoch }))
+        .patch(
+            &format!("/api/v1/threads/{thread_id}"),
+            alice.token(),
+            json!({ "title": renamed_ct, "title_epoch": renamed_epoch }),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "owners manage every thread: {j}");
     assert_eq!(j["title_author"], format!("alice@{D}"));
 
     // Nothing the node stores contains the plaintext.
     let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM threads").fetch_all(&node.state.db).await.unwrap();
-    let contents: Vec<String> = sqlx::query_scalar("SELECT content FROM messages").fetch_all(&node.state.db).await.unwrap();
+    let contents: Vec<String> =
+        sqlx::query_scalar("SELECT content FROM messages").fetch_all(&node.state.db).await.unwrap();
     for stored in titles.iter().chain(&contents) {
         for secret in ["Secret plans", "Renamed plans", "first secret reply", "the root"] {
             assert!(!stored.contains(secret), "plaintext {secret:?} stored");
@@ -829,7 +943,8 @@ fn open(dev: &Dev, conv: &str, content: &str, author: &str, device: &str) -> Val
 #[tokio::test]
 async fn app_tokens_use_the_messages_scopes() {
     let r = setup().await;
-    let thread = r.thread_ok(&r.alice.token, &r.channel, json!({ "title": "Bots welcome", "message": text("hi") })).await;
+    let thread =
+        r.thread_ok(&r.alice.token, &r.channel, json!({ "title": "Bots welcome", "message": text("hi") })).await;
     let id = thread["id"].as_str().unwrap();
     let token = |scopes: Value, name: &'static str| {
         let r = &r;
@@ -837,13 +952,21 @@ async fn app_tokens_use_the_messages_scopes() {
             let wanted = mask(&[p::SEND_MESSAGES, p::CREATE_THREADS, p::READ_HISTORY]);
             let (s, app) = r
                 .node
-                .post("/api/v1/applications", &r.alice.token, json!({ "name": name, "public": true, "requested_permissions": wanted }))
+                .post(
+                    "/api/v1/applications",
+                    &r.alice.token,
+                    json!({ "name": name, "public": true, "requested_permissions": wanted }),
+                )
                 .await;
             assert_eq!(s, StatusCode::CREATED, "{app}");
             let app_id = app["id"].as_str().unwrap().to_string();
             let (s, t) = r
                 .node
-                .post(&format!("/api/v1/applications/{app_id}/tokens"), &r.alice.token, json!({ "name": "main", "scopes": scopes }))
+                .post(
+                    &format!("/api/v1/applications/{app_id}/tokens"),
+                    &r.alice.token,
+                    json!({ "name": "main", "scopes": scopes }),
+                )
                 .await;
             assert_eq!(s, StatusCode::CREATED, "{t}");
             let (s, j) = r
@@ -866,13 +989,26 @@ async fn app_tokens_use_the_messages_scopes() {
     let reply = r.send_ok(&writer, &r.channel, in_thread("Beep", id)).await;
     assert_eq!(reply["thread_id"], id);
     let own = r.thread_ok(&writer, &r.channel, json!({ "title": "Bot thread", "message": text("boop") })).await;
-    let (s, j) = r.node.patch(&format!("/api/v1/threads/{}", own["id"].as_str().unwrap()), &writer, json!({ "archived": true })).await;
+    let (s, j) = r
+        .node
+        .patch(&format!("/api/v1/threads/{}", own["id"].as_str().unwrap()), &writer, json!({ "archived": true }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     let (s, j) = r.node.patch(&format!("/api/v1/threads/{id}"), &writer, json!({ "locked": true })).await;
-    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "thread.manage_forbidden"), "manage_threads needs the moderation scope");
-    let (s, _) = r.node.put(&format!("/api/v1/threads/{id}/read"), &writer, json!({ "last_read_message_id": reply["id"] })).await;
+    assert_eq!(
+        (s, code(&j)),
+        (StatusCode::FORBIDDEN, "thread.manage_forbidden"),
+        "manage_threads needs the moderation scope"
+    );
+    let (s, _) = r
+        .node
+        .put(&format!("/api/v1/threads/{id}/read"), &writer, json!({ "last_read_message_id": reply["id"] }))
+        .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, j) = r.node.put(&format!("/api/v1/threads/{id}/read"), &reader, json!({ "last_read_message_id": reply["id"] })).await;
+    let (s, j) = r
+        .node
+        .put(&format!("/api/v1/threads/{id}/read"), &reader, json!({ "last_read_message_id": reply["id"] }))
+        .await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "app.scope_missing"));
     let (s, _) = r.node.get_auth(&format!("/api/v1/rooms/{}/followed-threads", r.room_id), &reader).await;
     assert_eq!(s, StatusCode::OK);
@@ -883,16 +1019,27 @@ async fn manage_threads_is_restricted_and_granted_to_moderators_once() {
     let r = setup().await;
     // @everyone can never hold it.
     let (_, room) = r.node.get_auth(&format!("/api/v1/rooms/{}", r.room_id), &r.alice.token).await;
-    let everyone = room["roles"].as_array().unwrap().iter().find(|x| x["is_everyone"] == true).unwrap()["id"].as_str().unwrap().to_string();
+    let everyone = room["roles"].as_array().unwrap().iter().find(|x| x["is_everyone"] == true).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (s, j) = r
         .node
-        .patch(&format!("/api/v1/rooms/{}/roles/{everyone}", r.room_id), &r.alice.token, json!({ "permissions": mask(&[p::VIEW_CHANNEL, p::MANAGE_THREADS]) }))
+        .patch(
+            &format!("/api/v1/rooms/{}/roles/{everyone}", r.room_id),
+            &r.alice.token,
+            json!({ "permissions": mask(&[p::VIEW_CHANNEL, p::MANAGE_THREADS]) }),
+        )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "role.everyone_restricted"));
     // The startup fixup grants it to roles holding manage_messages, once.
     let (s, role) = r
         .node
-        .post(&format!("/api/v1/rooms/{}/roles", r.room_id), &r.alice.token, json!({ "name": "Mods", "permissions": mask(&[p::MANAGE_MESSAGES]) }))
+        .post(
+            &format!("/api/v1/rooms/{}/roles", r.room_id),
+            &r.alice.token,
+            json!({ "name": "Mods", "permissions": mask(&[p::MANAGE_MESSAGES]) }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{role}");
     sqlx::query("DELETE FROM node_settings WHERE key = $1")
@@ -949,7 +1096,11 @@ async fn notify_hints_for_remote_followers() {
     assert!(!entry.body.contains("@everyone in a thread"), "hints carry no content");
     a.deliver().await;
     let (st, j) = a
-        .post(&messages, &alice.token, json!({ "content": { "type": "text", "body": "carol?" }, "mentions": ["carol@b.test"], "thread_id": id }))
+        .post(
+            &messages,
+            &alice.token,
+            json!({ "content": { "type": "text", "body": "carol?" }, "mentions": ["carol@b.test"], "thread_id": id }),
+        )
         .await;
     assert_eq!(st, StatusCode::CREATED, "{j}");
     assert_eq!(notified(&a).await, vec!["carol@b.test"], "direct mentions reach non-followers");
