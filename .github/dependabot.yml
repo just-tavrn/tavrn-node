@@ -13,6 +13,10 @@ updates:
     groups:
       docker:
         patterns: ["*"]
+    ignore:
+      # The build toolchain stays on the Node LTS the runner image uses; Node 26's alpine image has no corepack.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
