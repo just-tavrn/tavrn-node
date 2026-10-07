@@ -274,7 +274,11 @@ pub async fn check_title(
 pub fn check_post_tags(channel: &ChannelRow, tags: &[String]) -> Result<Vec<String>, ApiError> {
     let invalid = || bad("thread.tags_invalid", "tags: at most 5 tags of this forum channel");
     if channel.kind != "forum" {
-        return if tags.is_empty() { Ok(Vec::new()) } else { Err(bad("thread.tags_invalid", "Only forum posts have tags")) };
+        return if tags.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(bad("thread.tags_invalid", "Only forum posts have tags"))
+        };
     }
     let known = tag_set(channel);
     let mut out: Vec<String> = Vec::new();
@@ -399,7 +403,12 @@ async fn read_counts(
 }
 
 /// The API objects of threads of one channel for `user` (state, root and first messages through the history cut).
-pub async fn to_api(state: &AppState, user: &UserRow, conv: &Conv, rows: Vec<ThreadRow>) -> Result<Vec<Thread>, ApiError> {
+pub async fn to_api(
+    state: &AppState,
+    user: &UserRow,
+    conv: &Conv,
+    rows: Vec<ThreadRow>,
+) -> Result<Vec<Thread>, ApiError> {
     let Some(channel) = channel_of(conv) else { return Ok(Vec::new()) };
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -412,8 +421,10 @@ pub async fn to_api(state: &AppState, user: &UserRow, conv: &Conv, rows: Vec<Thr
 
     // Root messages (text threads) and first messages (forum posts), as the requester may see them.
     let roots: Vec<String> = rows.iter().filter_map(|t| t.root_message_id.clone()).collect();
-    let existing = if roots.is_empty() { HashSet::new() } else { store::blobs::existing_messages(&state.db, &roots).await? };
-    let firsts = if channel.kind == "forum" { store::threads::first_messages(&state.db, &ids).await? } else { HashMap::new() };
+    let existing =
+        if roots.is_empty() { HashSet::new() } else { store::blobs::existing_messages(&state.db, &roots).await? };
+    let firsts =
+        if channel.kind == "forum" { store::threads::first_messages(&state.db, &ids).await? } else { HashMap::new() };
     let wanted: Vec<String> = roots.iter().chain(firsts.values()).cloned().collect();
     let cut = crate::history::list_cutoff(state, conv, user).await?;
     let mut messages: HashMap<String, Message> = HashMap::new();
@@ -421,7 +432,9 @@ pub async fn to_api(state: &AppState, user: &UserRow, conv: &Conv, rows: Vec<Thr
         let visible: Vec<MessageRow> = store::messages::by_ids(&state.db, &wanted)
             .await?
             .into_iter()
-            .filter(|m| m.conversation_id == conv.id && (m.encrypted == 0 || cut.as_deref().is_none_or(|c| m.id.as_str() >= c)))
+            .filter(|m| {
+                m.conversation_id == conv.id && (m.encrypted == 0 || cut.as_deref().is_none_or(|c| m.id.as_str() >= c))
+            })
             .collect();
         for m in crate::routes::messages::enrich(state, &user.id, &visible).await? {
             messages.insert(m.id.clone(), m);
@@ -461,8 +474,10 @@ pub async fn for_event(state: &AppState, id: &str) -> Result<Option<Thread>, Api
         Some(c) => tag_set(&c),
         None => return Ok(None),
     };
-    let participants =
-        store::threads::participants(&state.db, std::slice::from_ref(&row.id)).await?.remove(&row.id).unwrap_or_default();
+    let participants = store::threads::participants(&state.db, std::slice::from_ref(&row.id))
+        .await?
+        .remove(&row.id)
+        .unwrap_or_default();
     Ok(Some(row.to_base(&tags, participants)))
 }
 
@@ -496,7 +511,11 @@ pub async fn read_state(state: &AppState, user: &UserRow, t: &ThreadAccess) -> R
 }
 
 /// The followed threads of `user` in a room, in channels they can view (`GET /rooms/{id}/followed-threads`).
-pub async fn followed(state: &AppState, user: &UserRow, room: &access::RoomAccess) -> Result<Vec<ThreadReadState>, ApiError> {
+pub async fn followed(
+    state: &AppState,
+    user: &UserRow,
+    room: &access::RoomAccess,
+) -> Result<Vec<ThreadReadState>, ApiError> {
     if room.member.is_none() {
         return Ok(Vec::new());
     }
@@ -599,7 +618,6 @@ pub async fn auto_archive(state: &AppState, now: DateTime<Utc>) -> Result<u64, A
     Ok(archived)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,7 +656,9 @@ mod tests {
     fn channel_tags_are_validated() {
         let id = util::ulid();
         let ch = forum(&json!([{ "id": id, "name": "Old", "emoji": null }]).to_string());
-        let tags = check_channel_tags(&ch, &[input(Some(&id.to_lowercase()), " Kept ", None), input(None, "New", Some("🐛"))]).unwrap();
+        let tags =
+            check_channel_tags(&ch, &[input(Some(&id.to_lowercase()), " Kept ", None), input(None, "New", Some("🐛"))])
+                .unwrap();
         assert_eq!(tags[0], ForumTag { id: id.clone(), name: "Kept".into(), emoji: None });
         assert_eq!(tags[1].emoji.as_deref(), Some("🐛"));
         assert!(util::is_ulid(&tags[1].id));
