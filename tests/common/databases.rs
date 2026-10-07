@@ -5,7 +5,7 @@
 //! its creation time (the first ten characters of a ULID are the milliseconds since the epoch), so leftovers can
 //! be recognized without bookkeeping:
 //! - a test node drops its database when it is dropped ([`TestDatabase`]);
-//! - before a database is created, the databases `t_*` older than `TAVRN_TEST_DB_MAX_AGE_SECS` (default 30
+//! - before a database is created, the databases `t_*` older than `TAVRN_TEST_DB_MAX_AGE_SECS` (default 20
 //!   minutes) are dropped: what a killed or crashed run left behind ([`sweep`], at most once a minute per
 //!   test binary).
 
@@ -20,7 +20,7 @@ use sqlx::{AnyConnection, Connection};
 pub const PREFIX: &str = "t_";
 
 /// Age after which a leftover test database is dropped, unless `TAVRN_TEST_DB_MAX_AGE_SECS` says otherwise.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(20 * 60);
 
 /// Milliseconds since the epoch.
 pub fn now_ms() -> u64 {
@@ -98,8 +98,8 @@ pub fn max_age() -> Duration {
 fn sweep_due() -> bool {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = now_ms();
-    LAST.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| (now.saturating_sub(last) >= 60_000).then_some(now))
-        .is_ok()
+    let last = LAST.load(Ordering::Relaxed);
+    now.saturating_sub(last) >= 60_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
 /// Creates a fresh test database on the server of `base_url` (the URL of `TAVRN_TEST_DATABASE_URL`), after

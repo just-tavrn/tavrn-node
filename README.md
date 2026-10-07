@@ -145,7 +145,7 @@ With `TAVRN_TEST_DATABASE_URL` (what `just test-pg` sets: the container of `just
 gets its own database `t_<ulid>` on that PostgreSQL server and drops it again when the node goes away
 (`tests/common/databases.rs`). A run that is killed or crashes leaves its databases behind; the name carries the
 creation time, and before creating a database the tests drop the `t_*` databases older than
-`TAVRN_TEST_DB_MAX_AGE_SECS` (default 1800, 30 minutes; at most once a minute per test binary). Nothing else on
+`TAVRN_TEST_DB_MAX_AGE_SECS` (default 1200, 20 minutes; at most once a minute per test binary). Nothing else on
 the server is touched. `just test-pg-clean` drops every `t_*` database at once (only while no tests run).
 
 ### Container image
