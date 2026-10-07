@@ -40,26 +40,35 @@ and one TCP port must be reachable from the internet.
    ```
 
 4. Point the reverse proxy at `127.0.0.1:8080` with WebSocket support:
-   [`deploy/REVERSE-PROXY.md`](deploy/REVERSE-PROXY.md) (examples for nginx and Caddy in `deploy/`).
+   [Reverse proxy and TLS](docs/HANDBOOK.md#reverse-proxy-and-tls) (examples for nginx and Caddy in `deploy/`).
 5. Open the firewall for voice: the UDP range `TAVRN_RTC_UDP_PORT_RANGE` (default `61000-61100`) and
    `TAVRN_RTC_TCP_PORT` (default 7881), published 1:1 and forwarded by the router.
 6. Open `https://<your domain>` and register: the first account becomes node admin.
 
 The compose file runs PostgreSQL next to the node; an external database works too (`TAVRN_DATABASE_URL`).
 `docker compose exec tavrn tavrn-node check-config` prints the effective configuration and checks LiveKit and
-the SSO provider.
+the SSO provider. Everything after the quick start is in the [operator handbook](docs/HANDBOOK.md).
 
 ## Configuration
 
-Everything is configured through environment variables; **all of them are documented in
-[`deploy/.env.example`](deploy/.env.example)**. Further reading:
+Everything is configured through environment variables; [`deploy/.env.example`](deploy/.env.example) is the
+annotated template, and the [operator handbook](docs/HANDBOOK.md) lists **every variable** with its default and
+range in [Configuration](docs/HANDBOOK.md#configuration). The handbook also covers:
 
-- [docs/OPERATING.md](docs/OPERATING.md): keys and the storage key, node administration, voice and video,
-  media, the peer directory, conformance checks of other nodes, SSO (Authentik, Keycloak), legal setup.
-- [deploy/REVERSE-PROXY.md](deploy/REVERSE-PROXY.md): TLS, WebSockets, TURN over TLS, delegating an identity
-  domain to another host.
-- [docs/SCALING.md](docs/SCALING.md): several instances of one node with Valkey behind a load balancer.
-- [docs/WEBHOOKS.md](docs/WEBHOOKS.md): incoming webhooks for integrations, including encrypted channels.
+- [Reverse proxy and TLS](docs/HANDBOOK.md#reverse-proxy-and-tls): WebSockets, nginx and Caddy, TURN over TLS,
+  delegating an identity domain to another host.
+- [Keys and backups](docs/HANDBOOK.md#keys-and-backups), [Database](docs/HANDBOOK.md#database) and
+  [Storage and media](docs/HANDBOOK.md#storage-and-media): the key files, encryption at rest and the storage key.
+- [Federation](docs/HANDBOOK.md#federation): the peer directory and conformance checks of other nodes;
+  [Voice and video](docs/HANDBOOK.md#voice-and-video): ports, addresses, TURN.
+- [Web push](docs/HANDBOOK.md#web-push) and [Metrics and health](docs/HANDBOOK.md#metrics-and-health).
+- [Scaling with Valkey](docs/HANDBOOK.md#scaling-with-valkey): several instances of one node behind a load balancer.
+- [Webhooks and applications](docs/HANDBOOK.md#webhooks-and-applications): bots and incoming webhooks, including
+  encrypted channels.
+- [SSO with OpenID Connect](docs/HANDBOOK.md#single-sign-on-openid-connect), [legal pages and GDPR](docs/HANDBOOK.md#legal-pages-and-gdpr),
+  [moderation](docs/HANDBOOK.md#moderation-and-auto-moderation), the [CLI commands](docs/HANDBOOK.md#the-doctor-and-other-cli-commands),
+  [troubleshooting](docs/HANDBOOK.md#logs-and-troubleshooting) and a
+  [security hardening checklist](docs/HANDBOOK.md#security-hardening-checklist).
 
 ## Backups
 
@@ -73,9 +82,11 @@ created at the first start:
 | `keys/secrets.key` | encrypts data at rest such as the users' TOTP secrets | every TOTP enrollment becomes unusable |
 | `keys/storage.key` | wraps the keys of every stored file (attachments, avatars, emojis, …) | **every stored file is unreadable**; the node refuses to start |
 | `keys/livekit.key` | LiveKit's API key | regenerated, nothing lost |
+| `keys/vapid.key` | the key that signs web push requests (VAPID) | every push subscription becomes invalid; users re-enable push on each device |
 
-Never replace or delete these files; restore them from the same backup as the database. Rotating the storage
-key: [docs/OPERATING.md](docs/OPERATING.md#keys-backups-and-the-storage-key).
+Never replace or delete these files; restore them from the same backup as the database. Backup and restore
+procedure: [Keys and backups](docs/HANDBOOK.md#keys-and-backups); rotating the storage key:
+[Rotating the storage key](docs/HANDBOOK.md#rotating-the-storage-key).
 
 ## Upgrading
 
@@ -88,7 +99,8 @@ docker compose pull && docker compose up -d
 - Pin a release line with `IMAGE_TAG` in `.env` (for example `0.1`) to get fixes without surprises; the
   default `latest` follows every release. Read the [release notes](https://github.com/just-tavrn/tavrn-node/releases)
   before moving to a new minor version.
-- Several instances behind a load balancer: update one instance at a time ([docs/SCALING.md](docs/SCALING.md)).
+- Several instances behind a load balancer: update one instance at a time
+  ([Upgrade and rollback](docs/HANDBOOK.md#upgrade-and-rollback)).
 - Watch the releases of this repository for security fixes.
 
 Versions before 1.0 may still change configuration or behavior between minor versions; the release notes say

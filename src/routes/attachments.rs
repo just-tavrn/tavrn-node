@@ -188,6 +188,7 @@ async fn upload_in(
         store::blobs::delete_rows(&state.db, std::slice::from_ref(&blob.id)).await?;
         return Err(ApiError::Internal(e));
     }
+    state.metrics.upload_bytes.inc_by(body.len() as u64);
     Ok((StatusCode::CREATED, Json(blob.to_api())))
 }
 

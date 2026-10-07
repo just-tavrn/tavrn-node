@@ -18,3 +18,8 @@ paths = ['''^protocol/testvectors/[^/]+\.json$''', '''^Cargo\.lock$''']
 description = "Fixed test identifiers and fake keys in the tests"
 regexTarget = "secret"
 regexes = ['''^01J9ZK3G5M8Q2W4E6R8T0Y2V[0-9A-Z]{2}$''', '''^0123456789abcdef0123456789abcdef$''']
+
+[[allowlists]]
+description = "The published example of RFC 8291 Appendix A (web push encryption test in src/push/crypto.rs)"
+regexTarget = "secret"
+regexes = ['''^BTBZMqHH6r4Tts7J_aSIgg$''']

@@ -53,6 +53,9 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     if config.search_enabled {
         caps.push("search.v1");
     }
+    if config.push.on() {
+        caps.push(crate::push::CAPABILITY);
+    }
     if config.voice_enabled {
         caps.push("voice");
         caps.push("soundboard");
@@ -197,6 +200,10 @@ pub struct AppState {
     /// Access tokens issued before this Unix time are expired. Only development nodes move it
     /// (`POST /dev/expire-access-tokens`, e2e tests of the refresh paths); 0 otherwise.
     pub access_not_before: Arc<std::sync::atomic::AtomicI64>,
+    /// Web push (`push.rs`): VAPID key, subscriptions' sender, limits.
+    pub push: Arc<crate::push::Push>,
+    /// Counters and gauges of `GET /metrics` (`metrics.rs`).
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl AppState {
@@ -243,10 +250,13 @@ impl AppState {
         let webauthn = Arc::new(crate::second_factor::build_webauthn(&config)?);
         // Application URLs share the injected DNS lookup with the federation client (tests).
         let hooks = Arc::new(crate::hooks::HookClient::new(&config, options.lookup.clone())?);
+        let options_lookup = options.lookup.clone();
         let federation = Arc::new(crate::federation::client::FederationClient::with_options(&config, options)?);
-        let mut state = Self::assemble(config, keys, secret_key, db, storage, federation, webauthn, cluster)?;
+        let push = Arc::new(crate::push::Push::new(&config, &cluster, options_lookup)?);
+        let mut state = Self::assemble(config, keys, secret_key, db, storage, federation, webauthn, cluster, push)?;
         state.hooks = hooks;
         crate::cache::start(&state);
+        crate::push::start(&state);
         Ok(state)
     }
 
@@ -260,6 +270,7 @@ impl AppState {
         federation: Arc<crate::federation::client::FederationClient>,
         webauthn: Arc<webauthn_rs::prelude::Webauthn>,
         cluster: Arc<crate::cache::Cluster>,
+        push: Arc<crate::push::Push>,
     ) -> anyhow::Result<Self> {
         let mailer = Mailer::from_config(&config);
         let captcha = CaptchaVerifier::from_config(&config);
@@ -332,6 +343,8 @@ impl AppState {
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            push,
+            metrics: Arc::new(crate::metrics::Metrics::new(SOFTWARE_VERSION, cluster.is_shared())),
             app_connections: Arc::new(crate::applications::Connections::new(&cluster)),
             connect_codes: Arc::new(routes::connect::ConnectCodes::new(&cluster)),
             cluster: cluster.clone(),
@@ -875,6 +888,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(routes::health::healthz))
         .route("/readyz", get(routes::health::readyz))
+        .route("/metrics", get(crate::metrics::endpoint))
         .route("/.well-known/tavrn", get(routes::wellknown::get_well_known))
         // LiveKit signaling (token-checked proxy to 127.0.0.1, routes/rtc.rs).
         .route("/rtc", get(routes::rtc::proxy))
@@ -889,7 +903,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::installations::routes())
                 .merge(routes::search::routes())
                 .merge(routes::commands::routes())
-                .merge(routes::legal::routes()),
+                .merge(routes::legal::routes())
+                .merge(routes::push::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
         .merge(routes::legal::page_routes())
@@ -917,5 +932,7 @@ pub fn router(state: AppState) -> Router {
         .layer(cors())
         // Several instances: voice, call and whiteboard requests go to the leader (`cache::relay`).
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::cache::relay::middleware))
+        // Request counts and latency by route template (`metrics.rs`); a no-op while `TAVRN_METRICS` is off.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::metrics::track))
         .with_state(state)
 }

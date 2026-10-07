@@ -496,6 +496,13 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 }
                 Err(e) => tracing::warn!(error = %e, "Legal housekeeping failed"),
             }
+            // Web push: expired subscriptions and those of signed-out devices.
+            match crate::store::push::prune(&db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(subscriptions = n, "Stale push subscriptions deleted"),
+                Err(e) => tracing::warn!(error = %e, "Push subscription housekeeping failed"),
+            }
+            state.metrics.housekeeping_last_run.set(Utc::now().timestamp());
         }
     })
 }

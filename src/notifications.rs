@@ -52,6 +52,10 @@ pub struct GlobalSettings {
     /// Browser notifications while the tab is in the background (client side).
     #[serde(default)]
     pub browser: bool,
+    /// Web push (PROTOCOL.md §6d): include a preview of unencrypted messages (default off; never for encrypted
+    /// conversations). Left out of the document while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub push_text: bool,
 }
 
 fn yes() -> bool {
@@ -60,7 +64,7 @@ fn yes() -> bool {
 
 impl Default for GlobalSettings {
     fn default() -> Self {
-        Self { mode: Mode::All, sound: true, browser: false }
+        Self { mode: Mode::All, sound: true, browser: false, push_text: false }
     }
 }
 
@@ -162,6 +166,41 @@ impl NotificationSettings {
     }
 }
 
+impl NotificationSettings {
+    /// Should a new message notify the user by web push? The rules clients apply to their own notifications
+    /// (PROTOCOL.md §6d): nothing while muted or under `nothing`; DMs and group DMs (`room_id` = `None`) follow
+    /// their own mode, else every message unless the global mode is `nothing`, and always count as mentions;
+    /// in channels `mentions` lets through direct mentions (`direct`: the user or one of their roles) and
+    /// `@everyone` (`everyone`) unless the room suppresses it. `Some(true)` for a mention or DM, `Some(false)` for
+    /// another message, `None` for no push.
+    pub fn push_decision(
+        &self,
+        room_id: Option<&str>,
+        conversation_id: &str,
+        now: &str,
+        direct: bool,
+        everyone: bool,
+    ) -> Option<bool> {
+        let effective = self.effective(room_id, conversation_id, now);
+        if effective.muted {
+            return None;
+        }
+        let mode = match room_id {
+            Some(_) => effective.mode,
+            None => self.channels.get(conversation_id).and_then(|c| c.mode).unwrap_or(match self.global.mode {
+                Mode::Nothing => Mode::Nothing,
+                _ => Mode::All,
+            }),
+        };
+        let mentioned = room_id.is_none() || direct || (everyone && !effective.suppress_everyone);
+        match mode {
+            Mode::Nothing => None,
+            Mode::Mentions if !mentioned => None,
+            _ => Some(mentioned),
+        }
+    }
+}
+
 /// Settings as they apply to one conversation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Effective {
@@ -238,7 +277,7 @@ mod tests {
             "channels": { CHAN: { "muted_until": "forever" } }
         }))
         .unwrap();
-        assert_eq!(s.global, GlobalSettings { mode: Mode::Mentions, sound: true, browser: false });
+        assert_eq!(s.global, GlobalSettings { mode: Mode::Mentions, sound: true, browser: false, push_text: false });
         assert_eq!(s.rooms.len(), 1, "empty entries are dropped");
         assert_eq!(s.rooms[ROOM].muted_until.as_deref(), Some("2029-12-31T23:00:00.000Z"));
         assert_eq!(s.channels[CHAN].muted_until.as_deref(), Some(FOREVER));
@@ -275,9 +314,28 @@ mod tests {
         assert_eq!(dm, Effective::default());
         assert_eq!(dm.mentions(1, 1), 2);
 
+        // Push: DMs notify unless the global mode is `nothing`; channels follow the mode.
+        assert_eq!(s.push_decision(None, "01JEEEEEEEEEEEEEEEEEEEEEEE", now, false, false), Some(true));
+        assert_eq!(s.push_decision(Some(ROOM), "01JDDDDDDDDDDDDDDDDDDDDDDD", now, false, false), None);
+        assert_eq!(s.push_decision(Some(ROOM), "01JDDDDDDDDDDDDDDDDDDDDDDD", now, true, false), Some(true));
+        assert_eq!(s.push_decision(Some(ROOM), "01JDDDDDDDDDDDDDDDDDDDDDDD", now, false, true), None, "suppressed");
+        assert_eq!(s.push_decision(Some(ROOM), CHAN, now, true, false), None, "channel mode nothing");
+        let all = parse(serde_json::json!({})).unwrap();
+        assert_eq!(all.push_decision(Some(ROOM), CHAN, now, false, false), Some(false), "default: every message");
+        assert_eq!(all.push_decision(Some(ROOM), CHAN, now, false, true), Some(true), "@everyone is a mention");
+        let quiet =
+            parse(serde_json::json!({ "global": { "mode": "nothing" }, "channels": { CHAN: { "mode": "all" } } }))
+                .unwrap();
+        assert_eq!(quiet.push_decision(None, "01JEEEEEEEEEEEEEEEEEEEEEEE", now, false, false), None);
+        assert_eq!(quiet.push_decision(None, CHAN, now, false, false), Some(true), "a DM's own mode wins");
+        let text = parse(serde_json::json!({ "global": { "push_text": true } })).unwrap();
+        assert!(text.global.push_text);
+        assert!(!serde_json::to_string(&all).unwrap().contains("push_text"), "left out while off");
+
         let muted = parse(serde_json::json!({ "rooms": { ROOM: { "muted_until": "2026-10-06T00:00:00Z" } } })).unwrap();
         assert!(muted.effective(Some(ROOM), CHAN, now).muted, "a muted room mutes its channels");
         assert!(!muted.effective(Some(ROOM), CHAN, "2026-10-07T00:00:00.000Z").muted, "until the time passed");
         assert!(!muted.effective(Some(ROOM), CHAN, now).wants_hint(true, false));
+        assert_eq!(muted.push_decision(Some(ROOM), CHAN, now, true, false), None, "muted: no push");
     }
 }
