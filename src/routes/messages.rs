@@ -584,6 +584,21 @@ async fn create_in(
         return Err(bad("message.spoiler_invalid", "Encrypted messages carry spoilers inside the encrypted content"));
     }
     let signature = validate_signature(encrypted, req.signature.as_deref(), &req.mentions, &v.mentions)?;
+    // Content rules of unencrypted conversations (MODERATION.md §2.2): text and the attachments' file names.
+    let hit = if encrypted {
+        None
+    } else {
+        let mut names = Vec::new();
+        for a in &req.attachments {
+            if let Some(b) = store::blobs::by_id(&state.db, a).await?.filter(|b| b.conversation_id == conv.id) {
+                names.push(b.name);
+            }
+        }
+        crate::automod::evaluate(state, conv, &req.content, &names).await?
+    };
+    if let Some(h) = hit.as_ref().filter(|h| h.blocks()) {
+        return Err(crate::automod::blocked(state, conv, &auth.user, h).await);
+    }
     let epoch =
         if encrypted { Some(check_ciphertext(state, auth, &conv.id, &v.content, req.epoch).await?) } else { None };
     let id = util::ulid();
@@ -620,6 +635,11 @@ async fn create_in(
         }
     }
     let message = enrich_one(state, &auth.user.id, &id).await?;
+    // `delete` and `timeout` rules: accepted, but never shown to anyone else.
+    if let Some(h) = &hit {
+        crate::automod::remove(state, conv, &auth.user, h, &id).await?;
+        return Ok((StatusCode::CREATED, Json(message)));
+    }
     // Plaintext channel messages go into the node's search index (with their file names, bound above).
     if !encrypted {
         crate::search::index_message(state, &id).await;
@@ -755,6 +775,16 @@ async fn edit_in(
         check_body_emojis(state, conv, &req.content).await?;
     }
     let signature = validate_signature(conv.encrypted, req.signature.as_deref(), &req.mentions, &v.mentions)?;
+    let hit = if conv.encrypted {
+        None
+    } else {
+        let names: Vec<String> =
+            store::blobs::by_message(&state.db, message_id).await?.into_iter().map(|b| b.name).collect();
+        crate::automod::evaluate(state, conv, &req.content, &names).await?
+    };
+    if let Some(h) = hit.as_ref().filter(|h| h.blocks()) {
+        return Err(crate::automod::blocked(state, conv, &auth.user, h).await);
+    }
     let epoch =
         if conv.encrypted { Some(check_ciphertext(state, auth, &conv.id, &v.content, req.epoch).await?) } else { None };
     store::messages::update_content(
@@ -771,6 +801,10 @@ async fn edit_in(
     )
     .await?;
     let message = enrich_one(state, &auth.user.id, message_id).await?;
+    if let Some(h) = &hit {
+        crate::automod::remove(state, conv, &auth.user, h, message_id).await?;
+        return Ok(Json(message));
+    }
     if !conv.encrypted {
         crate::search::index_message(state, message_id).await;
     }
@@ -806,6 +840,15 @@ async fn delete_in(state: &AppState, auth: &AuthUser, conv: &Conv, message_id: &
         .await?
         .filter(|m| m.conversation_id == conv.id)
         .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+    // The welcome channel is the room's security log: nobody deletes its entries (MODERATION.md §3).
+    if let ConvKind::Channel { channel, .. } = &conv.kind
+        && channel.kind == "system"
+    {
+        return Err(ApiError::Forbidden {
+            code: "message.system_protected",
+            detail: "Entries of the welcome channel cannot be deleted".into(),
+        });
+    }
     let own = existing.author_id == auth.user.id;
     if !own {
         conv.require(p::MANAGE_MESSAGES, "message.delete_forbidden", "Manage messages")?;
