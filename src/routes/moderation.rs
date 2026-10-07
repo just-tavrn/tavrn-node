@@ -441,7 +441,7 @@ pub async fn admin_rooms(
             .filter(|role| role.is_everyone == 0)
             .map(|role| AdminRoomRole { id: role.id, name: role.name, position: role.position })
             .collect();
-        roles.sort_by(|a, b| b.position.cmp(&a.position));
+        roles.sort_by_key(|r| std::cmp::Reverse(r.position));
         out.push(AdminRoom {
             owner: r.owner_username.zip(r.owner_domain).map(|(u, d)| format!("{u}@{d}")),
             id: r.id,
