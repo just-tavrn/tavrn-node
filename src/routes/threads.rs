@@ -76,12 +76,12 @@ pub struct CreateThreadRequest {
     pub message: Option<CreateMessageRequest>,
 }
 
-/// Start a thread (`create_threads`) or, in a forum channel, a post (`send_messages`).
+/// Start a thread (`send_messages` and `create_threads`) or, in a forum channel, a post (`send_messages`).
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/threads", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = CreateThreadRequest,
     responses((status = 201, body = Thread), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
               (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)),
-    description = "Starts a thread inside a text or announcement channel (from a root message of the channel or standalone, `create_threads`) or a post in a forum channel (title, tags and the first message in one request, `send_messages`). In encrypted channels the title is ciphertext. The creator follows the thread; `thread.create` and then `message.create` for the first message are sent to the room.")]
+    description = "Starts a thread inside a text or announcement channel (from a root message of the channel or standalone, `send_messages` and `create_threads`) or a post in a forum channel (title, tags and the first message in one request, `send_messages`). In encrypted channels the title is ciphertext. The creator follows the thread; `thread.create` and then `message.create` for the first message are sent to the room.")]
 pub async fn create_thread(
     State(state): State<AppState>,
     auth: AuthUser,
