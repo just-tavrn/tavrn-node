@@ -47,12 +47,14 @@ mod suite {
     mod identity_rotation_flow;
     mod legal_flow;
     mod messages_flow;
+    mod metrics_flow;
     mod mls_flow;
     mod notifications_flow;
     mod pending_removals_flow;
     mod permissions_flow;
     mod presence_flow;
     mod profiles_flow;
+    mod push_flow;
     mod reauth_flow;
     mod room_invites_flow;
     mod room_profiles_flow;
