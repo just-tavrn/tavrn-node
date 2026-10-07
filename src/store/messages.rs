@@ -110,6 +110,36 @@ pub async fn by_ids(db: &Pool, ids: &[String]) -> Result<Vec<MessageRow>, ApiErr
     Ok(out)
 }
 
+/// Which messages of a conversation a page lists (PROTOCOL.md §7e).
+#[derive(Debug, Clone, Copy)]
+pub enum ThreadFilter<'a> {
+    /// The channel itself: messages outside threads.
+    Channel,
+    /// One thread.
+    Thread(&'a str),
+    /// Every message (key checks by epoch).
+    Any,
+}
+
+impl ThreadFilter<'_> {
+    /// SQL condition with the thread id bound as `$n` (an empty string for the other variants, so every
+    /// variant uses the same numbering).
+    fn sql(&self, n: usize) -> String {
+        match self {
+            ThreadFilter::Channel => format!("m.thread_id IS NULL AND ${n} = ''"),
+            ThreadFilter::Thread(_) => format!("m.thread_id = ${n}"),
+            ThreadFilter::Any => format!("${n} = ''"),
+        }
+    }
+    /// The value bound for the condition.
+    fn bind(&self) -> &str {
+        match self {
+            ThreadFilter::Thread(id) => id,
+            _ => "",
+        }
+    }
+}
+
 /// The page around `target` (PROTOCOL.md §7, `around`): up to `limit / 2` newer messages, the target and older
 /// ones up to `limit` in total, newest first. Same `cut` as [`list`]; the caller has checked that the target is
 /// visible.
@@ -119,25 +149,29 @@ pub async fn list_around(
     target: &str,
     limit: i64,
     cut: Option<&str>,
+    thread: ThreadFilter<'_>,
 ) -> Result<Vec<MessageRow>, ApiError> {
-    const FILTER: &str = "(m.encrypted = 0 OR m.id >= $4)";
+    let filter = format!("(m.encrypted = 0 OR m.id >= $4) AND {}", thread.sql(5));
+    let filter = filter.as_str();
     let newer_limit = limit / 2;
     let mut newer: Vec<MessageRow> = sqlx::query_as(&format!(
-        "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id > $2 AND {FILTER} ORDER BY m.id ASC LIMIT $3"
+        "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id > $2 AND {filter} ORDER BY m.id ASC LIMIT $3"
     ))
     .bind(conversation_id)
     .bind(target)
     .bind(newer_limit)
     .bind(cut.unwrap_or(""))
+    .bind(thread.bind())
     .fetch_all(db)
     .await?;
     let older: Vec<MessageRow> = sqlx::query_as(&format!(
-        "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id <= $2 AND {FILTER} ORDER BY m.id DESC LIMIT $3"
+        "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id <= $2 AND {filter} ORDER BY m.id DESC LIMIT $3"
     ))
     .bind(conversation_id)
     .bind(target)
     .bind(limit - newer.len() as i64)
     .bind(cut.unwrap_or(""))
+    .bind(thread.bind())
     .fetch_all(db)
     .await?;
     newer.reverse();
@@ -148,6 +182,7 @@ pub async fn list_around(
 /// Newest first, `before`/`after` as ID bounds (exclusive).
 /// A page of a conversation's messages. `cut` (a ULID floor, ENCRYPTION.md §7b) hides encrypted messages
 /// older than it; `epoch` limits the page to encrypted messages of one epoch (key checks of history shares).
+#[allow(clippy::too_many_arguments)]
 pub async fn list(
     db: &Pool,
     conversation_id: &str,
@@ -156,30 +191,37 @@ pub async fn list(
     after: Option<&str>,
     cut: Option<&str>,
     epoch: Option<i64>,
+    thread: ThreadFilter<'_>,
 ) -> Result<Vec<MessageRow>, ApiError> {
-    const FILTER: &str = "(m.encrypted = 0 OR m.id >= $4) AND ($5 < 0 OR (m.encrypted = 1 AND m.epoch = $5))";
+    let filter = format!(
+        "(m.encrypted = 0 OR m.id >= $4) AND ($5 < 0 OR (m.encrypted = 1 AND m.epoch = $5)) AND {}",
+        thread.sql(6)
+    );
+    let filter = filter.as_str();
     let rows: Vec<MessageRow> = match after {
         Some(after) => {
             sqlx::query_as(&format!(
-                "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id > $2 AND {FILTER} ORDER BY m.id ASC LIMIT $3"
+                "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id > $2 AND {filter} ORDER BY m.id ASC LIMIT $3"
             ))
             .bind(conversation_id)
             .bind(after)
             .bind(limit)
             .bind(cut.unwrap_or(""))
             .bind(epoch.unwrap_or(-1))
+            .bind(thread.bind())
             .fetch_all(db)
             .await?
         }
         None => {
             sqlx::query_as(&format!(
-                "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id < $2 AND {FILTER} ORDER BY m.id DESC LIMIT $3"
+                "SELECT {COLS} FROM messages m JOIN users u ON u.id = m.author_id WHERE m.conversation_id = $1 AND m.id < $2 AND {filter} ORDER BY m.id DESC LIMIT $3"
             ))
             .bind(conversation_id)
             .bind(before.unwrap_or("~"))
             .bind(limit)
             .bind(cut.unwrap_or(""))
             .bind(epoch.unwrap_or(-1))
+            .bind(thread.bind())
             .fetch_all(db)
             .await?
         }
@@ -371,7 +413,7 @@ pub async fn read_states(
         .join(" OR ");
     let (last_sql, last_binds) = query(
         format!(
-            "SELECT conversation_id, MAX(id) AS last_id FROM messages WHERE conversation_id IN ({}) GROUP BY conversation_id",
+            "SELECT conversation_id, MAX(id) AS last_id FROM messages WHERE conversation_id IN ({}) AND thread_id IS NULL GROUP BY conversation_id",
             ids(0)
         ),
         vec![],
@@ -391,7 +433,7 @@ pub async fn read_states(
                     CAST(SUM(CASE WHEN m.mentions_everyone <> 0 AND NOT ({direct}) THEN 1 ELSE 0 END) AS BIGINT) AS everyone
              FROM messages m
              LEFT JOIN read_markers r ON r.conversation_id = m.conversation_id AND r.user_id = $1
-             WHERE m.conversation_id IN ({}) AND m.author_id <> $1
+             WHERE m.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
                AND (m.id > r.last_read_message_id
                     OR (r.last_read_message_id IS NULL AND m.created_at > COALESCE(
                           (SELECT cm.joined_at FROM conversation_members cm WHERE cm.conversation_id = m.conversation_id AND cm.user_id = $1),
@@ -419,21 +461,45 @@ pub async fn read_states(
         }
     }
     let now = crate::util::now();
+    // (unread, direct mentions, @everyone mentions) per conversation: the channel's own messages …
+    let mut raw: std::collections::HashMap<usize, (i64, i64, i64)> = std::collections::HashMap::new();
     for row in fetch(count_sql, count_binds).await? {
         if let Some(&i) = index.get(&row.try_get::<String, _>("conversation_id")?) {
-            let unread = row.try_get::<i64, _>("unread")?;
-            let direct = row.try_get::<Option<i64>, _>("direct")?.unwrap_or(0);
-            let everyone = row.try_get::<Option<i64>, _>("everyone")?.unwrap_or(0);
-            let id = &states[i].conversation_id;
-            let effective = ctx.settings.map(|s| s.effective(ctx.room_id, id, &now)).unwrap_or_default();
-            let (unread, mentions) = if ctx.system_channels.contains(id) {
-                (unread.min(1), 0)
-            } else {
-                (unread, effective.mentions(direct, everyone))
-            };
-            states[i].unread_count = if effective.muted { 0 } else { unread.min(UNREAD_CAP) };
-            states[i].mention_count = mentions.min(UNREAD_CAP);
+            raw.insert(
+                i,
+                (
+                    row.try_get::<i64, _>("unread")?,
+                    row.try_get::<Option<i64>, _>("direct")?.unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("everyone")?.unwrap_or(0),
+                ),
+            );
         }
+    }
+    // … and the messages of the threads the user follows (PROTOCOL.md §7e).
+    let threads = super::threads::followed_counts(
+        db,
+        user_id,
+        address,
+        ctx.role_ids,
+        super::threads::CountScope::Channels(conversation_ids),
+    )
+    .await?;
+    for c in threads {
+        if let Some(&i) = index.get(&c.channel_id) {
+            let e = raw.entry(i).or_default();
+            *e = (e.0 + c.unread, e.1 + c.direct, e.2 + c.everyone);
+        }
+    }
+    for (i, (unread, direct, everyone)) in raw {
+        let id = &states[i].conversation_id;
+        let effective = ctx.settings.map(|s| s.effective(ctx.room_id, id, &now)).unwrap_or_default();
+        let (unread, mentions) = if ctx.system_channels.contains(id) {
+            (unread.min(1), 0)
+        } else {
+            (unread, effective.mentions(direct, everyone))
+        };
+        states[i].unread_count = if effective.muted { 0 } else { unread.min(UNREAD_CAP) };
+        states[i].mention_count = mentions.min(UNREAD_CAP);
     }
     if let Some(settings) = ctx.settings {
         for s in &mut states {

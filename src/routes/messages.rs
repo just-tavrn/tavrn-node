@@ -37,8 +37,13 @@ pub struct ListQuery {
     /// itself and older ones, newest first. Not combinable with `before`, `after` or `epoch`; `404
     /// message.not_found` if the message is not in this conversation or not visible to the caller.
     pub around: Option<String>,
-    /// Only encrypted messages of this MLS epoch (used to check shared history keys, ENCRYPTION.md §7b).
+    /// Only encrypted messages of this MLS epoch (used to check shared history keys, ENCRYPTION.md §7b). Lists
+    /// the messages of the whole channel, threads included.
     pub epoch: Option<i64>,
+    /// Page this thread of the channel (PROTOCOL.md §7e); without it the channel's list leaves thread messages out.
+    pub thread: Option<String>,
+    /// `all`: the channel's messages including those of its threads (clients syncing their local search index).
+    pub threads: Option<String>,
 }
 
 /// Adds attachments, reactions and pin status for the requester to messages.
@@ -72,9 +77,12 @@ pub async fn enrich(state: &AppState, user_id: &str, rows: &[MessageRow]) -> Res
     } else {
         store::blobs::existing_messages(&state.db, &replies).await?
     };
+    // Messages that started a thread carry its summary (PROTOCOL.md §7e).
+    let mut threads = crate::threads::summaries(state, rows).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut m = row.to_api();
+        m.thread = threads.remove(&row.id);
         m.reply_deleted = row.reply_to_id.as_ref().is_some_and(|r| !originals.contains(r));
         m.author_room_profile = profiles.get(&(row.conversation_id.clone(), row.author_id.clone())).cloned();
         m.attachments = attachments.remove(&row.id).unwrap_or_default().iter().map(|b| b.to_api()).collect();
@@ -139,12 +147,29 @@ async fn list_in(state: &AppState, auth: &AuthUser, conv: &Conv, q: ListQuery) -
     if q.epoch.is_some_and(|e| e < 0) {
         return Err(bad("message.epoch_invalid", "epoch must not be negative"));
     }
+    // The channel's own messages, one thread, or (key checks by epoch) everything.
+    let thread = match &q.thread {
+        Some(t) => Some(crate::threads::of_conversation(state, conv, t).await?.id),
+        None => None,
+    };
+    let all = match q.threads.as_deref() {
+        None => false,
+        Some("all") if thread.is_none() => true,
+        Some(_) => return Err(bad("thread.filter_invalid", "threads: only `all`, and not together with thread")),
+    };
+    let filter = match (&thread, q.epoch.is_some() || all) {
+        (Some(t), _) => store::messages::ThreadFilter::Thread(t),
+        (None, true) => store::messages::ThreadFilter::Any,
+        (None, false) => store::messages::ThreadFilter::Channel,
+    };
     // Encrypted history from before the join only as far as the channel's policy allows (§7b).
     let cut = crate::history::list_cutoff(state, conv, &auth.user).await?;
     if let Some(target) = &q.around {
         let target = target.to_ascii_uppercase();
         let visible = store::messages::by_id(&state.db, &target).await?.is_some_and(|m| {
-            m.conversation_id == conv.id && (m.encrypted == 0 || cut.as_deref().is_none_or(|c| m.id.as_str() >= c))
+            m.conversation_id == conv.id
+                && m.thread_id == thread
+                && (m.encrypted == 0 || cut.as_deref().is_none_or(|c| m.id.as_str() >= c))
         });
         if !visible {
             return Err(access::not_found("Message", "message.not_found"));
@@ -155,6 +180,7 @@ async fn list_in(state: &AppState, auth: &AuthUser, conv: &Conv, q: ListQuery) -
             &target,
             validate::limit(q.limit, 50, 100),
             cut.as_deref(),
+            filter,
         )
         .await?;
         return Ok(Json(enrich(state, &auth.user.id, &rows).await?));
@@ -167,6 +193,7 @@ async fn list_in(state: &AppState, auth: &AuthUser, conv: &Conv, q: ListQuery) -
         q.after.as_deref(),
         cut.as_deref(),
         q.epoch,
+        filter,
     )
     .await?;
     Ok(Json(enrich(state, &auth.user.id, &rows).await?))
@@ -195,6 +222,9 @@ pub struct CreateMessageRequest {
     /// §10.3). Rejected in encrypted conversations; mentions must then be sent normalized (lowercase,
     /// without duplicates) because the node stores them as signed.
     pub signature: Option<String>,
+    /// Write into this thread of the channel (PROTOCOL.md §7e): needs `create_threads` in text and announcement
+    /// channels, `manage_threads` in a locked thread; an archived thread reopens.
+    pub thread_id: Option<String>,
 }
 
 pub(crate) struct Validated {
@@ -502,7 +532,8 @@ pub(crate) async fn check_not_blocked(state: &AppState, auth: &AuthUser, conv: &
     Ok(())
 }
 
-async fn create_in(
+/// Writes a message into `conv` or one of its threads.
+pub(crate) async fn create_in(
     state: &AppState,
     auth: &AuthUser,
     conv: &Conv,
@@ -538,6 +569,12 @@ async fn create_in(
     }
     let perms = conv.perms;
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    // Threads, forum and announcement channels (PROTOCOL.md §7e).
+    let thread = match &req.thread_id {
+        Some(t) => Some(crate::threads::of_conversation(state, conv, t).await?),
+        None => None,
+    };
+    crate::threads::check_write(conv, thread.as_ref())?;
     if req.mentions_everyone {
         conv.require(p::MENTION_EVERYONE, "message.mention_everyone_forbidden", "Mention @everyone")?;
     }
@@ -614,7 +651,7 @@ async fn create_in(
             epoch,
             content: &v.content,
             reply_to_id: req.reply_to_id.as_deref(),
-            thread_id: None,
+            thread_id: thread.as_ref().map(|t| t.id.as_str()),
             mentions: &v.mentions,
             mentions_everyone: req.mentions_everyone,
             signature: signature.as_deref(),
@@ -649,6 +686,9 @@ async fn create_in(
         && let Some(alert) = automod_check(state, access, channel, &auth.user).await?
     {
         return Err(alert);
+    }
+    if let Some(t) = &thread {
+        crate::threads::after_message(state, &t.id, &message).await?;
     }
     conv.publish_recorded(state, "message.create", &message).await;
     crate::federation::social::notify_members(state, conv, &message, &auth.user.id).await;
@@ -858,6 +898,10 @@ async fn delete_in(state: &AppState, auth: &AuthUser, conv: &Conv, message_id: &
     for b in &blobs {
         state.storage.delete(&b.id).await;
     }
+    if let Some(thread_id) = &existing.thread_id {
+        store::threads::recount(&state.db, std::slice::from_ref(thread_id)).await?;
+        crate::threads::publish(state, "thread.update", thread_id).await?;
+    }
     if !own && let Some(room_id) = conv.room_id() {
         store::rooms::audit(
             &state.db,
@@ -882,14 +926,22 @@ async fn delete_in(state: &AppState, auth: &AuthUser, conv: &Conv, message_id: &
 /// Bulk deletion including the files of the affected messages.
 pub async fn purge_with_blobs(state: &AppState, filter: &store::messages::PurgeFilter) -> Result<i64, ApiError> {
     let (where_sql, binds) = store::messages::purge_where(filter);
-    let blob_ids = if where_sql.is_empty() {
-        Vec::new()
+    let (blob_ids, threads) = if where_sql.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        store::blobs::ids_for_messages(&state.db, &where_sql, &binds).await?
+        (
+            store::blobs::ids_for_messages(&state.db, &where_sql, &binds).await?,
+            store::threads::ids_for_messages(&state.db, &where_sql, &binds).await?,
+        )
     };
     let deleted = store::messages::purge(&state.db, filter).await?;
     for id in &blob_ids {
         state.storage.delete(id).await;
+    }
+    // The threads the purge touched count their messages again (PROTOCOL.md §7e).
+    store::threads::recount(&state.db, &threads).await?;
+    for id in &threads {
+        crate::threads::publish(state, "thread.update", id).await?;
     }
     Ok(deleted)
 }

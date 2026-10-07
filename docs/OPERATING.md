@@ -15,4 +15,5 @@ in the [README](../README.md) in one document. The former sections of this page 
 - Conformance checks of other nodes: [Conformance checks of other nodes](HANDBOOK.md#conformance-checks-of-other-nodes)
 - SSO with Authentik/Keycloak: [Single sign-on (OpenID Connect)](HANDBOOK.md#single-sign-on-openid-connect)
 - Legal setup: [Legal pages and GDPR](HANDBOOK.md#legal-pages-and-gdpr)
+- Threads, forum and announcement channels: [Threads and forum channels](HANDBOOK.md#threads-and-forum-channels)
 - Moderation, reports and auto-moderation: [Moderation and auto-moderation](HANDBOOK.md#moderation-and-auto-moderation)
