@@ -4,7 +4,7 @@
 #
 # Reverse proxy: tavrn speaks HTTP only on port 8080. The proxy must pass WebSockets through
 # (Upgrade/Connection headers) and set X-Forwarded-For. Examples: deploy/nginx.conf.example,
-# deploy/Caddyfile.example, deploy/REVERSE-PROXY.md (also covers Nginx Proxy Manager).
+# deploy/Caddyfile.example, docs/HANDBOOK.md "Reverse proxy and TLS" (also covers Nginx Proxy Manager).
 services:
   tavrn:
     # IMAGE_TAG in .env pins a release line, e.g. 0.1 (README.md "Upgrading"); default: the newest release.
@@ -24,13 +24,13 @@ services:
       - "${TAVRN_RTC_UDP_PORT_RANGE:-61000-61100}:${TAVRN_RTC_UDP_PORT_RANGE:-61000-61100}/udp"
       # ICE over TCP, the fallback when UDP is blocked (TAVRN_RTC_TCP_PORT; forward it like the UDP range).
       - "${TAVRN_RTC_TCP_PORT:-7881}:${TAVRN_RTC_TCP_PORT:-7881}/tcp"
-      # Optional embedded TURN server (TAVRN_RTC_TURN_ENABLED=true, deploy/REVERSE-PROXY.md):
+      # Optional embedded TURN server (TAVRN_RTC_TURN_ENABLED=true, docs/HANDBOOK.md "Voice and video"):
       # - "3478:3478/udp"            # TURN over UDP (TAVRN_RTC_TURN_UDP_PORT), forwarded by the router
       # - "127.0.0.1:5349:5349"      # TURN/TLS backend (TAVRN_RTC_TURN_TLS_PORT), only the proxy connects
     env_file: .env
     environment:
       TAVRN_DATABASE_URL: ${TAVRN_DATABASE_URL:-postgres://tavrn:${POSTGRES_PASSWORD}@db:5432/tavrn}
-      # Peer directory (docs/OPERATING.md "Getting listed in the directory"): the example default is the project owner's
+      # Peer directory (docs/HANDBOOK.md "Getting listed in the directory"): the example default is the project owner's
       # public test node; set TAVRN_REFERENCE_NODES in .env to replace it (an empty value means none).
       TAVRN_REFERENCE_NODES: ${TAVRN_REFERENCE_NODES-tavrn.swsp.eu}
     volumes:
@@ -56,7 +56,7 @@ services:
       timeout: 3s
       retries: 20
 
-  # Optional: Valkey for several tavrn instances of one node (docs/SCALING.md). Not needed for a single instance.
+  # Optional: Valkey for several tavrn instances of one node (docs/HANDBOOK.md "Scaling with Valkey"). Not needed for a single instance.
   # Uncomment, set VALKEY_PASSWORD and TAVRN_CACHE_URL (same password) in .env, and add
   # `valkey: { condition: service_healthy }` to the depends_on of every tavrn service. No host port: only the
   # tavrn containers on this network reach it.
