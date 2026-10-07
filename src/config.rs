@@ -498,7 +498,7 @@ pub struct Config {
     /// `TAVRN_METRICS`: `GET /metrics` in the Prometheus text format; off by default.
     pub metrics: Switch,
     /// `TAVRN_METRICS_TOKEN`: bearer token scrapers must send (at least 16 characters). Empty: `/metrics` answers
-    /// only to loopback and `TAVRN_TRUSTED_PROXIES` peers. Never printed by `check-config`.
+    /// only to loopback and `TAVRN_TRUSTED_PROXIES` clients. Never printed by `check-config`.
     #[serde(skip_serializing)]
     pub metrics_token: Option<String>,
 
@@ -1625,7 +1625,13 @@ mod tests {
             Config { metrics_token: Some("short".into()), ..prod() },
             Config { metrics_token: Some("with space 0123456789".into()), ..prod() },
         ] {
-            assert!(bad.validate().is_err(), "{:?} {:?} {:?}", bad.push_max_per_minute, bad.push_contact, bad.metrics_token);
+            assert!(
+                bad.validate().is_err(),
+                "{:?} {:?} {:?}",
+                bad.push_max_per_minute,
+                bad.push_contact,
+                bad.metrics_token
+            );
         }
         let c = Config { push_contact: Some(" mailto:ops@example.org ".into()), ..prod() };
         assert_eq!(c.push_contact(), "mailto:ops@example.org");

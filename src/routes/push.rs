@@ -90,7 +90,8 @@ pub struct PushRegistration {
 
 impl PushRegistration {
     fn of(row: SubscriptionRow, device_id: &str) -> Self {
-        let push_service = reqwest::Url::parse(&row.endpoint).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+        let push_service =
+            reqwest::Url::parse(&row.endpoint).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
         Self {
             current_device: row.device_id == device_id,
             id: row.id,
@@ -156,7 +157,7 @@ pub async fn register(
     {
         return Err(bad("push.device_invalid", "device_id must be the requesting device"));
     }
-    state.push.register_limiter.check_all(&[auth.user.id.clone()]).await?;
+    state.push.register_limiter.check_all(std::slice::from_ref(&auth.user.id)).await?;
     let endpoint = state.push.check_endpoint(req.endpoint.trim())?;
     check_keys(&req.keys.p256dh, &req.keys.auth).map_err(|e| {
         bad(
@@ -234,7 +235,7 @@ pub async fn test(State(state): State<AppState>, auth: AuthUser) -> Result<Statu
     if !state.push.enabled() {
         return Err(disabled());
     }
-    state.push.test_limiter.check_all(&[auth.user.id.clone()]).await?;
+    state.push.test_limiter.check_all(std::slice::from_ref(&auth.user.id)).await?;
     crate::push::test(&state, &auth.user.id);
     Ok(StatusCode::ACCEPTED)
 }

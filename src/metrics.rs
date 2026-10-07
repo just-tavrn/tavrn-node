@@ -3,8 +3,9 @@
 //! and health").
 //!
 //! Off by default (`TAVRN_METRICS=on`). With `TAVRN_METRICS_TOKEN` scrapers send `Authorization: Bearer <token>`;
-//! without a token only peers on loopback or in `TAVRN_TRUSTED_PROXIES` are answered (the TCP peer address, never
-//! `X-Forwarded-For`). Everything else gets the same `404` as an unknown path, so the route does not reveal itself.
+//! without a token only clients on loopback or in `TAVRN_TRUSTED_PROXIES` are answered (the client address as for
+//! rate limits: a request forwarded by a trusted proxy counts as its original client, so a public request through a
+//! reverse proxy on the same host is refused). Everything else gets the same `404` as an unknown path.
 //!
 //! Every instance keeps its own registry (counters since its start); gauges are read at scrape time. Labels are
 //! bounded: HTTP routes are route templates (`/api/v1/rooms/{room_id}`), never ids; unmatched paths count as
@@ -20,8 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use subtle::ConstantTimeEq;
 
@@ -192,11 +192,17 @@ pub async fn endpoint(State(state): State<AppState>, request: Request) -> Respon
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .is_some_and(|t| bool::from(t.trim().as_bytes().ct_eq(token.as_bytes()))),
-        // Without a token: the TCP peer must be loopback or a trusted proxy. Requests without a peer address (an
-        // in-process router) are refused.
+        // Without a token: the client must be loopback or a trusted proxy address: the TCP peer, or, for a request a
+        // trusted proxy forwarded, the client it names (so a public request through a reverse proxy on the same
+        // host is refused). Requests without a peer address (an in-process router) are refused.
         None => connect.is_some_and(|ConnectInfo(addr)| {
-            let ip = addr.ip().to_canonical();
-            ip.is_loopback() || state.config.is_trusted_proxy(ip)
+            let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+            crate::auth::resolve_client_ip(&state.config, Some(addr.ip()), forwarded)
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| {
+                    let ip = ip.to_canonical();
+                    ip.is_loopback() || state.config.is_trusted_proxy(ip)
+                })
         }),
     };
     if !allowed {
@@ -225,7 +231,9 @@ mod tests {
         TextEncoder::new().encode(&m.registry.gather(), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#"tavrn_build_info{version="1.2.3"} 1"#), "{text}");
-        assert!(text.contains(r#"tavrn_http_requests_total{method="GET",route="/api/v1/rooms/{room_id}",status="200"} 1"#));
+        assert!(
+            text.contains(r#"tavrn_http_requests_total{method="GET",route="/api/v1/rooms/{room_id}",status="200"} 1"#)
+        );
         assert!(text.contains(r#"tavrn_messages_total{encrypted="false"} 2"#));
         assert!(text.contains(r#"tavrn_federation_deliveries_total{result="failure"} 1"#));
         assert!(text.contains("tavrn_push_sent_total 1"));

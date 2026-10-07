@@ -29,7 +29,8 @@ pub struct SubscriptionRow {
     pub retry_at: Option<String>,
 }
 
-const COLS: &str = "id, user_id, device_id, endpoint, p256dh, auth, expires_at, created_at, last_used_at, failures, retry_at";
+const COLS: &str =
+    "id, user_id, device_id, endpoint, p256dh, auth, expires_at, created_at, last_used_at, failures, retry_at";
 
 pub struct NewSubscription<'a> {
     pub user_id: &'a str,
@@ -242,13 +243,15 @@ mod tests {
             .unwrap();
             for d in ["1", "2"] {
                 let device = format!("{u}-d{d}");
-                sqlx::query("INSERT INTO devices (id, user_id, name, created_at, last_seen_at) VALUES ($1, $2, 'x', $3, $3)")
-                    .bind(&device)
-                    .bind(*u)
-                    .bind(now())
-                    .execute(&db)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO devices (id, user_id, name, created_at, last_seen_at) VALUES ($1, $2, 'x', $3, $3)",
+                )
+                .bind(&device)
+                .bind(*u)
+                .bind(now())
+                .execute(&db)
+                .await
+                .unwrap();
                 sqlx::query(
                     "INSERT INTO sessions (id, user_id, device_id, refresh_token_hash, created_at, expires_at)
                      VALUES ($1, $2, $3, $1, $4, $5)",
@@ -305,7 +308,10 @@ mod tests {
         let db = db_with_user(&["u1"]).await;
         let (a, _) = upsert(&db, sub("u1", "u1-d1", "https://push.example/a")).await.unwrap().unwrap();
         let (b, _) = upsert(&db, sub("u1", "u1-d2", "https://push.example/b")).await.unwrap().unwrap();
-        let expired = NewSubscription { expires_at: Some("2000-01-01T00:00:00.000Z"), ..sub("u1", "u1-d1", "https://push.example/c") };
+        let expired = NewSubscription {
+            expires_at: Some("2000-01-01T00:00:00.000Z"),
+            ..sub("u1", "u1-d1", "https://push.example/c")
+        };
         upsert(&db, expired).await.unwrap().unwrap();
         let ids = |rows: Vec<SubscriptionRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!(ids(deliverable(&db, "u1").await.unwrap()), vec![a.id.clone(), b.id.clone()]);
@@ -324,7 +330,11 @@ mod tests {
             .unwrap();
         assert!(mark_failed(&db, &a.id, &now()).await.unwrap());
         // Revoked sessions: not deliverable, pruned by housekeeping (with the expired one).
-        sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = 'u1-d2'").bind(now()).execute(&db).await.unwrap();
+        sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = 'u1-d2'")
+            .bind(now())
+            .execute(&db)
+            .await
+            .unwrap();
         assert!(deliverable(&db, "u1").await.unwrap().is_empty());
         assert_eq!(prune(&db).await.unwrap(), 2);
         assert!(list(&db, "u1").await.unwrap().is_empty());

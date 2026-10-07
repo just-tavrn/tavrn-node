@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Web push (PROTOCOL.md §6d): subscriptions (validation, takeover, the cascade with devices and sign-out), which
 //! events push (notification rules, only without a connection), what an encrypted conversation's payload contains,
 //! coalescing, the handling of push service answers, forwarded hints and the test push. A fake push service (an
@@ -42,7 +42,12 @@ struct FakePushService {
     base: String,
 }
 
-async fn receive(State(fake): State<FakePushService>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+async fn receive(
+    State(fake): State<FakePushService>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
     fake.received.lock().unwrap().push(Received { path: path.clone(), headers, body });
     if path.starts_with("gone/") {
         StatusCode::GONE.into_response()
@@ -120,7 +125,8 @@ impl Browser {
     /// Decrypts a received push as the service worker gets it.
     fn open(&self, r: &Received) -> Value {
         assert_eq!(r.headers["content-encoding"], "aes128gcm");
-        let plain = crypto::decrypt(&self.secret, &self.auth, &r.body).expect("the push decrypts with the browser's keys");
+        let plain =
+            crypto::decrypt(&self.secret, &self.auth, &r.body).expect("the push decrypts with the browser's keys");
         serde_json::from_slice(&plain).unwrap()
     }
 }
@@ -161,7 +167,11 @@ async fn plaintext_channel(s: &Setup, name: &str) -> String {
         .await;
     assert_eq!(st, StatusCode::CREATED, "{c}");
     let id = c["id"].as_str().unwrap().to_string();
-    sqlx::query("UPDATE conversations SET encrypted = 0 WHERE id = $1").bind(&id).execute(&s.node.state.db).await.unwrap();
+    sqlx::query("UPDATE conversations SET encrypted = 0 WHERE id = $1")
+        .bind(&id)
+        .execute(&s.node.state.db)
+        .await
+        .unwrap();
     id
 }
 
@@ -195,7 +205,10 @@ async fn vapid_key_and_subscriptions_are_validated() {
     for (body, code) in [
         (with(&|b| b["endpoint"] = json!("ftp://push.example/x")), "push.endpoint_invalid"),
         (with(&|b| b["endpoint"] = json!("https://user:pw@push.example/x")), "push.endpoint_invalid"),
-        (with(&|b| b["endpoint"] = json!(format!("https://push.example/{}", "a".repeat(2100)))), "push.endpoint_invalid"),
+        (
+            with(&|b| b["endpoint"] = json!(format!("https://push.example/{}", "a".repeat(2100)))),
+            "push.endpoint_invalid",
+        ),
         (with(&|b| b["keys"]["p256dh"] = json!("AAAA")), "push.keys_invalid"),
         (with(&|b| b["keys"]["auth"] = json!("c2hvcnQ")), "push.keys_invalid"),
         (with(&|b| b["device_id"] = json!("01JAAAAAAAAAAAAAAAAAAAAAAA")), "push.device_invalid"),
@@ -277,7 +290,8 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     assert!(!serde_json::to_string(&p).unwrap().contains(m["id"].as_str().unwrap()), "no message id");
     // RFC 8030/8292 headers.
     let vapid = s.node.state.push.public_key().unwrap().to_string();
-    let claims = crypto::verify_authorization(r.headers["authorization"].to_str().unwrap(), &vapid, &s.fake.base).unwrap();
+    let claims =
+        crypto::verify_authorization(r.headers["authorization"].to_str().unwrap(), &vapid, &s.fake.base).unwrap();
     assert_eq!(claims["sub"], format!("http://{DOMAIN}:8080"), "default contact: the public URL");
     assert_eq!(r.headers["ttl"], "21600");
     assert_eq!(r.headers["urgency"], "normal");
@@ -312,8 +326,12 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     let quiet = plaintext_channel(&s, "quiet").await;
     send(&s, &quiet, text("nothing for bob")).await;
     s.fake.settle(&browser.path, 2).await;
-    send(&s, &quiet, json!({ "content": { "type": "text", "body": "@bob look" }, "mentions": [format!("bob@{DOMAIN}")] }))
-        .await;
+    send(
+        &s,
+        &quiet,
+        json!({ "content": { "type": "text", "body": "@bob look" }, "mentions": [format!("bob@{DOMAIN}")] }),
+    )
+    .await;
     let got = s.fake.wait(&browser.path, 3).await;
     let p = browser.open(&got[2]);
     assert_eq!(p["type"], "mention");
@@ -322,9 +340,14 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     // A muted channel never pushes, not even mentions.
     let muted = plaintext_channel(&s, "muted").await;
     s.node
-        .put(settings, &s.bob.token, json!({ "global": { "mode": "all" }, "channels": { muted.clone(): { "muted_until": "forever" } } }))
+        .put(
+            settings,
+            &s.bob.token,
+            json!({ "global": { "mode": "all" }, "channels": { muted.clone(): { "muted_until": "forever" } } }),
+        )
         .await;
-    send(&s, &muted, json!({ "content": { "type": "text", "body": "@bob" }, "mentions": [format!("bob@{DOMAIN}")] })).await;
+    send(&s, &muted, json!({ "content": { "type": "text", "body": "@bob" }, "mentions": [format!("bob@{DOMAIN}")] }))
+        .await;
     s.fake.settle(&browser.path, 3).await;
 
     // Own messages never push the author.
@@ -343,8 +366,12 @@ async fn encrypted_conversations_push_no_content() {
     node.befriend(&alice.session, &bob.session).await;
     let dm = node.create_dm(&alice.session, &bob.session).await;
     node.create_group(&mut alice, &dm).await;
-    node.put("/api/v1/users/me/notification-settings", bob.token(), json!({ "global": { "mode": "mentions", "push_text": true } }))
-        .await;
+    node.put(
+        "/api/v1/users/me/notification-settings",
+        bob.token(),
+        json!({ "global": { "mode": "mentions", "push_text": true } }),
+    )
+    .await;
     let browser = Browser::new(&fake, "ok/bob");
     subscribe(&node, &bob.session, &browser).await;
     let (st, m) = node.send_encrypted(&alice, &dm, "secret plans for the heist").await;
@@ -362,7 +389,8 @@ async fn encrypted_conversations_push_no_content() {
     let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
     for k in &keys {
         assert!(
-            ["v", "type", "node", "local", "conversation_id", "conversation_kind", "sender", "encrypted"].contains(&k.as_str()),
+            ["v", "type", "node", "local", "conversation_id", "conversation_kind", "sender", "encrypted"]
+                .contains(&k.as_str()),
             "unexpected field {k} in {raw}"
         );
     }
@@ -393,7 +421,10 @@ async fn push_service_answers_remove_or_hold_back_subscriptions() {
     assert_eq!(left[0].failures, 1, "429: held back");
     let retry_at = tavrn_node::util::parse_time(left[0].retry_at.as_deref().unwrap()).unwrap();
     let wait = retry_at - chrono::Utc::now();
-    assert!(wait > chrono::Duration::seconds(100) && wait <= chrono::Duration::seconds(121), "Retry-After honored: {wait}");
+    assert!(
+        wait > chrono::Duration::seconds(100) && wait <= chrono::Duration::seconds(121),
+        "Retry-After honored: {wait}"
+    );
     // Held back: the next push skips it.
     send(&s, &plaintext_channel(&s, "later").await, text("hello again")).await;
     s.fake.settle(&busy.path, 1).await;
@@ -417,7 +448,13 @@ async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     };
     let room = tavrn_node::util::ulid();
     let conv = tavrn_node::util::ulid();
-    let hint = Incoming::Notify { conversation_id: conv.clone(), room_id: Some(room.clone()), mention: true, everyone: false, call: None };
+    let hint = Incoming::Notify {
+        conversation_id: conv.clone(),
+        room_id: Some(room.clone()),
+        mention: true,
+        everyone: false,
+        call: None,
+    };
     assert_eq!(handle(hint).await, "stored");
     let got = fake.wait(&browser.path, 1).await;
     let p = browser.open(&got[0]);
@@ -444,7 +481,13 @@ async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     assert_eq!((p["type"].as_str(), p["sender"].as_str()), (Some("call"), Some("carol@b.test")));
     assert_eq!(got[1].headers["ttl"], "45");
     // TAVRN_PUSH_MAX_PER_MINUTE=2: a third push of another conversation within the minute is dropped.
-    let third = Incoming::Notify { conversation_id: tavrn_node::util::ulid(), room_id: None, mention: false, everyone: false, call: None };
+    let third = Incoming::Notify {
+        conversation_id: tavrn_node::util::ulid(),
+        room_id: None,
+        mention: false,
+        everyone: false,
+        call: None,
+    };
     assert_eq!(handle(third).await, "stored");
     fake.settle(&browser.path, 2).await;
 }

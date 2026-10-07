@@ -1022,7 +1022,8 @@ Access:
 - `TAVRN_METRICS_TOKEN` set (16–256 printable ASCII characters without spaces): scrapers must send
   `Authorization: Bearer <token>`.
 - `TAVRN_METRICS_TOKEN` empty: `/metrics` answers only to requests from loopback and from the addresses in
-  `TAVRN_TRUSTED_PROXIES`, decided by the direct peer address (`X-Forwarded-For` is not used for this decision);
+  `TAVRN_TRUSTED_PROXIES`, decided by the client address as for rate limits (a request forwarded by a trusted
+  proxy counts as its original client, so public requests through a reverse proxy on the same host are refused);
   everything else gets the same `404` as an unknown path. The default `TAVRN_TRUSTED_PROXIES` contains all private
   networks, so set a token when untrusted hosts share a private network with the node.
 - Block `/metrics` at the reverse proxy for the public anyway (nginx: `location = /metrics { return 404; }`) and
