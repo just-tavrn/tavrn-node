@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
-//! Test helpers: in-memory nodes. With `TAVRN_TEST_DATABASE_URL` (PostgreSQL) every test gets its own
-//! fresh database, otherwise SQLite in-memory.
+//! Test helpers: in-memory nodes. With `TAVRN_TEST_DATABASE_URL` (PostgreSQL) every test node gets its own
+//! fresh database, dropped with the node (`databases`), otherwise SQLite in-memory.
 
 use axum::{
     Router,
@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 pub mod cluster;
 pub mod crossnode;
+pub mod databases;
 pub mod e2ee;
 pub mod federation;
 pub mod oidc;
@@ -32,6 +33,8 @@ pub struct TestNode {
     /// a client does right after signing in (PROTOCOL.md §5c). Tokens from a refresh have none.
     pub reauth: std::sync::Mutex<std::collections::HashMap<String, String>>,
     _tmp: tempfile::TempDir,
+    /// The node's PostgreSQL database, dropped with the node (after everything else).
+    _db: Option<databases::TestDatabase>,
 }
 
 /// TOTP secret and unused recovery codes of a test user.
@@ -68,14 +71,12 @@ pub fn totp_secret(base32: &str) -> Vec<u8> {
     totp_rs::Secret::try_from_base32(base32).unwrap().as_bytes().to_vec()
 }
 
-async fn test_database_url() -> String {
-    let Ok(base) = std::env::var("TAVRN_TEST_DATABASE_URL") else { return "sqlite::memory:".into() };
-    sqlx::any::install_default_drivers();
-    let name = format!("t_{}", tavrn_node::util::ulid().to_lowercase());
-    let admin = sqlx::AnyPool::connect(&base).await.expect("test PostgreSQL reachable");
-    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
-    let (prefix, _) = base.rsplit_once('/').unwrap();
-    format!("{prefix}/{name}")
+/// The database of a test node: a fresh PostgreSQL database with `TAVRN_TEST_DATABASE_URL` (dropped with the
+/// returned guard, see [`databases`]), else SQLite in memory.
+async fn test_database_url() -> (String, Option<databases::TestDatabase>) {
+    let Ok(base) = std::env::var("TAVRN_TEST_DATABASE_URL") else { return ("sqlite::memory:".into(), None) };
+    let (url, database) = databases::create(&base).await;
+    (url, Some(database))
 }
 
 pub fn dev_config(domain: &str, data_dir: &str, database_url: &str) -> Config {
@@ -97,7 +98,7 @@ pub async fn test_node(domain: &str) -> TestNode {
 
 pub async fn test_node_with(domain: &str, tweak: impl FnOnce(&mut Config)) -> TestNode {
     let tmp = tempfile::tempdir().unwrap();
-    let url = test_database_url().await;
+    let (url, db) = test_database_url().await;
     let mut config = dev_config(domain, &tmp.path().to_string_lossy(), &url);
     tweak(&mut config);
     config.validate().unwrap();
@@ -108,6 +109,7 @@ pub async fn test_node_with(domain: &str, tweak: impl FnOnce(&mut Config)) -> Te
         factors: Default::default(),
         reauth: Default::default(),
         _tmp: tmp,
+        _db: db,
     }
 }
 

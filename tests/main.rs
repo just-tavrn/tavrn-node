@@ -72,6 +72,7 @@ mod suite {
     mod sso_flow;
     mod storage_encryption_flow;
     mod subscriptions_flow;
+    mod test_databases_flow;
     mod threads_flow;
     mod unfurl_flow;
     mod unread_flow;
