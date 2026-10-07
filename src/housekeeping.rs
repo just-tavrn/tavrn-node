@@ -94,7 +94,8 @@ const REMOTE_USER_UNUSED: &str = "u.domain <> $1
     AND NOT EXISTS (SELECT 1 FROM rooms x WHERE x.owner_id = u.id)
     AND NOT EXISTS (SELECT 1 FROM bans x WHERE x.actor_id = u.id OR x.subject = u.username || '@' || u.domain)
     AND NOT EXISTS (SELECT 1 FROM users x WHERE x.owner_id = u.id)
-    AND NOT EXISTS (SELECT 1 FROM invites x WHERE x.creator_id = u.id)";
+    AND NOT EXISTS (SELECT 1 FROM invites x WHERE x.creator_id = u.id)
+    AND NOT EXISTS (SELECT 1 FROM threads x WHERE x.created_by = u.id OR x.title_author_id = u.id)";
 
 /// Deletes remote users that had no federated login for `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`
 /// (default 90) and that nothing ties to this node any more (see [`REMOTE_USER_UNUSED`]), with their
@@ -439,6 +440,11 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             let grants_cutoff = util::format_time(Utc::now() - chrono::Duration::days(GRANT_KEEP_DAYS));
             if let Err(e) = crate::store::entitlements::prune_grants(&db, &grants_cutoff).await {
                 tracing::warn!(error = %e, "Entitlement housekeeping failed");
+            }
+            match crate::threads::auto_archive(&state, Utc::now()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(threads = n, "Idle threads archived"),
+                Err(e) => tracing::warn!(error = %e, "Thread auto-archive failed"),
             }
             match crate::emoji_cache::evict_unused(&state, Utc::now()).await {
                 Ok(0) => {}

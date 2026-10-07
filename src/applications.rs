@@ -136,6 +136,16 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/conversations/{conversation_id}", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis/{emoji_id}/image", Scope("messages:read")),
+    // threads (PROTOCOL.md §7e): reading under messages:read, writing under messages:write
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/threads", Scope("messages:read")),
+    ("GET", "/api/v1/threads/{thread_id}", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/followed-threads", Scope("messages:read")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/threads", Scope("messages:write")),
+    ("PATCH", "/api/v1/threads/{thread_id}", Scope("messages:write")),
+    ("DELETE", "/api/v1/threads/{thread_id}", Scope("messages:write")),
+    ("PUT", "/api/v1/threads/{thread_id}/read", Scope("messages:write")),
+    ("POST", "/api/v1/threads/{thread_id}/follow", Scope("messages:write")),
+    ("DELETE", "/api/v1/threads/{thread_id}/follow", Scope("messages:write")),
     // messages:write
     ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/messages", Scope("messages:write")),
     ("PATCH", "/api/v1/rooms/{room_id}/channels/{channel_id}/messages/{message_id}", Scope("messages:write")),
@@ -288,7 +298,7 @@ pub fn event_allowed(kind: &str, data: &Value, scopes: &[String]) -> bool {
         ("room" | "channel" | "category" | "role" | "mls" | "application", _)
         | (_, "override.update" | "identity.changed" | "identity.rotated" | "devices.changed")
         | (_, crate::federation::inbox::SESSION_REVOKED_EVENT) => !matches!(kind, "room.invite"),
-        ("message" | "reaction" | "pin" | "emoji" | "conversation", _) | (_, "typing" | "read.update") => {
+        ("message" | "reaction" | "pin" | "emoji" | "conversation" | "thread", _) | (_, "typing" | "read.update") => {
             kind != "conversation.invite" && has("messages:read")
         }
         ("member" | "presence", _) | (_, "user.update") => has("members:read"),
@@ -816,6 +826,9 @@ mod tests {
         assert!(event_allowed("session.revoked", &d, &none));
         assert!(!event_allowed("message.create", &d, &none));
         assert!(event_allowed("message.create", &d, &s(&["messages:read"])));
+        assert!(!event_allowed("thread.update", &d, &none));
+        assert!(event_allowed("thread.update", &d, &s(&["messages:read"])));
+        assert!(!event_allowed("thread.read", &d, &s(&["messages:write"])));
         assert!(!event_allowed("member.join", &d, &s(&["messages:read"])));
         assert!(event_allowed("member.join", &d, &s(&["members:read"])));
         assert!(!event_allowed("friend.request", &d, &permissions::all_scopes()), "unknown to bots: dropped");

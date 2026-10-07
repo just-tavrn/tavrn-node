@@ -175,6 +175,8 @@ pub fn spec() -> utoipa::openapi::OpenApi {
     // Message search (PROTOCOL.md §7d).
     doc.merge(crate::routes::search::SearchApi::openapi());
     doc.merge(crate::routes::commands::CommandsApi::openapi());
+    // Threads, forum and announcement channels (PROTOCOL.md §7e).
+    doc.merge(crate::routes::threads::ThreadsApi::openapi());
     // Legal pages, notices, data export and account deletion (protocol/LEGAL.md).
     doc.merge(crate::routes::legal::LegalApi::openapi());
     doc

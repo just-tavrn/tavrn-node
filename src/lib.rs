@@ -51,6 +51,7 @@ pub mod storage;
 pub mod store;
 pub mod subscriptions;
 pub mod telemetry;
+pub mod threads;
 pub mod unfurl;
 pub mod uploads;
 pub mod util;

@@ -371,6 +371,12 @@ pub struct ChannelRow {
     /// The channel has incoming webhooks (computed by the query; APPLICATIONS.md §6.1a).
     #[sqlx(default)]
     pub has_webhooks: i64,
+    /// Threads without a message for this long are archived (PROTOCOL.md §7e).
+    #[sqlx(default)]
+    pub auto_archive_minutes: i64,
+    /// Forum channels: the tag list as JSON `[{ id, name, emoji }]`.
+    #[sqlx(default)]
+    pub forum_tags: String,
 }
 
 impl ChannelRow {
@@ -406,8 +412,29 @@ impl ChannelRow {
             bots_allowed: b(self.bots_allowed),
             history_for_new_members: crate::history::Policy::of(self.history_for_new_members.as_deref()).to_string(),
             has_webhooks: b(self.has_webhooks),
+            auto_archive_minutes: self.auto_archive_minutes,
+            tags: self.tags(),
         }
     }
+
+    /// The forum tags of the channel (empty for other kinds and unreadable values).
+    pub fn tags(&self) -> Vec<ForumTag> {
+        if self.kind != "forum" {
+            return Vec::new();
+        }
+        serde_json::from_str(&self.forum_tags).unwrap_or_default()
+    }
+}
+
+/// A tag of a forum channel (PROTOCOL.md §7e).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ForumTag {
+    pub id: String,
+    /// 1–32 characters, unique in the channel ignoring case.
+    pub name: String,
+    /// A Unicode emoji or a custom emoji token, null without.
+    #[serde(default)]
+    pub emoji: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -446,6 +473,17 @@ pub struct Channel {
     /// epoch's inbox key (APPLICATIONS.md §6.1a, ENCRYPTION.md §5b); channels without webhooks skip that.
     #[serde(default)]
     pub has_webhooks: bool,
+    /// Threads without a message for this many minutes are archived (60–43200, default 10080 = 7 days;
+    /// PROTOCOL.md §7e).
+    #[serde(default = "default_auto_archive")]
+    pub auto_archive_minutes: i64,
+    /// Forum channels: the tags posts can carry (at most 20); empty for other kinds.
+    #[serde(default)]
+    pub tags: Vec<ForumTag>,
+}
+
+fn default_auto_archive() -> i64 {
+    10080
 }
 
 /// Kinds a client can create. The node itself creates one channel of kind `system` per room: the welcome
@@ -726,8 +764,22 @@ impl MessageRow {
                 .clone()
                 .map(|id| WebhookRef { id, name: self.webhook_name.clone().unwrap_or_default() }),
             interaction: self.interaction.as_deref().and_then(|j| serde_json::from_str(j).ok()),
+            thread: None,
         }
     }
+}
+
+/// The summary of the thread a message started (PROTOCOL.md §7e), on the root message only.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub message_count: i64,
+    pub last_message_id: Option<String>,
+    pub last_message_at: String,
+    /// Up to three users who wrote in the thread most recently, newest first.
+    pub participant_ids: Vec<String>,
+    pub archived_at: Option<String>,
+    pub locked: bool,
 }
 
 /// The node-set envelope field of a webhook message (APPLICATIONS.md §6.1).
@@ -790,6 +842,9 @@ pub struct Message {
     /// Set by the node on a message an application posted as the answer to a command (APPLICATIONS.md §5.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction: Option<InteractionRef>,
+    /// On a message that started a thread: the thread's summary (PROTOCOL.md §7e). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadSummary>,
 }
 
 /// The node-set envelope field of a command answer (APPLICATIONS.md §5.7).

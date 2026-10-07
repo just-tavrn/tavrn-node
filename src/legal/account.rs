@@ -198,6 +198,8 @@ async fn move_references(db: &Pool, from: &UserRow, to: &UserRow) -> Result<(), 
         ("legal_counter_notices", "user_id"),
         ("file_entries", "created_by"),
         ("conversations", "creator_id"),
+        ("threads", "created_by"),
+        ("threads", "title_author_id"),
     ] {
         sqlx::query(&format!("UPDATE {table} SET {column} = $1 WHERE {column} = $2"))
             .bind(&to.id)
@@ -389,6 +391,10 @@ async fn check_owned_rooms(db: &Pool, user: &UserRow) -> Result<(), ApiError> {
 /// account's devices.
 async fn strip_envelopes(db: &Pool, tombstone_id: &str) -> Result<(), ApiError> {
     sqlx::query("UPDATE messages SET device_id = NULL, signature = NULL WHERE author_id = $1")
+        .bind(tombstone_id)
+        .execute(db)
+        .await?;
+    sqlx::query("UPDATE threads SET title_device_id = NULL WHERE title_author_id = $1")
         .bind(tombstone_id)
         .execute(db)
         .await?;

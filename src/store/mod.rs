@@ -25,6 +25,7 @@ pub mod pending_removals;
 pub mod rooms;
 pub mod social;
 pub mod subscriptions;
+pub mod threads;
 pub mod users;
 pub mod voice;
 pub mod webhooks;

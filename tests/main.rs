@@ -67,6 +67,7 @@ mod suite {
     mod sso_flow;
     mod storage_encryption_flow;
     mod subscriptions_flow;
+    mod threads_flow;
     mod unfurl_flow;
     mod unread_flow;
     mod upload_categories_flow;

@@ -41,6 +41,7 @@ pub mod search;
 pub mod second_factor;
 pub mod secret_storage;
 pub mod subscriptions;
+pub mod threads;
 pub mod unfurl;
 pub mod voice;
 pub mod webhooks;

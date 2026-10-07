@@ -272,6 +272,10 @@ pub struct UpdateChannelRequest {
     /// History for new members (`since_join`, `days:<n>`, `all`; ENCRYPTION.md §7b). Audit-logged; a narrower
     /// value does not revoke keys already shared.
     pub history_for_new_members: Option<String>,
+    /// Threads without a message for this many minutes are archived (60–43200; PROTOCOL.md §7e).
+    pub auto_archive_minutes: Option<i64>,
+    /// Forum channels: the complete new tag list (at most 20; entries without `id` are new tags). Audit-logged.
+    pub tags: Option<Vec<crate::threads::TagInput>>,
 }
 
 /// Update a channel (`manage_channels`).
@@ -295,10 +299,24 @@ pub async fn update_channel(
             || req.user_limit.is_some()
             || req.encrypted.is_some()
             || req.bots_allowed.is_some()
-            || req.history_for_new_members.is_some())
+            || req.history_for_new_members.is_some()
+            || req.auto_archive_minutes.is_some()
+            || req.tags.is_some())
     {
         return Err(system_protected());
     }
+    let auto_archive = req
+        .auto_archive_minutes
+        .map(|m| {
+            validate::range(
+                "auto_archive_minutes",
+                m,
+                crate::threads::MIN_AUTO_ARCHIVE_MINUTES,
+                crate::threads::MAX_AUTO_ARCHIVE_MINUTES,
+            )
+        })
+        .transpose()?;
+    let tags = req.tags.as_deref().map(|t| crate::threads::check_channel_tags(&current, t)).transpose()?;
     let history_policy = req.history_for_new_members.as_deref().map(crate::history::validate).transpose()?;
     let name = req.name.as_deref().map(|n| channel_name(&current.kind, n)).transpose()?;
     let topic = req.topic.as_deref().map(|t| validate::text("topic", t, 0, 1024)).transpose()?;
@@ -355,6 +373,23 @@ pub async fn update_channel(
     }
     if let Some(value) = req.bots_allowed {
         crate::bot_channels::set_channel_setting(&state, &room_id, &auth.user, &current, value).await?;
+    }
+    if let Some(minutes) = auto_archive {
+        store::threads::set_auto_archive(&state.db, &channel_id, minutes).await?;
+    }
+    if let Some(tags) = &tags {
+        let json = serde_json::to_string(tags).map_err(|e| ApiError::Internal(e.into()))?;
+        store::threads::set_forum_tags(&state.db, &channel_id, &json).await?;
+        store::rooms::audit(
+            &state.db,
+            Some(&room_id),
+            Some(&auth.user.id),
+            "channel.tags",
+            &channel_id,
+            "",
+            serde_json::json!({ "tags": tags }),
+        )
+        .await?;
     }
     if let Some(policy) = history_policy {
         let before = crate::history::Policy::of(current.history_for_new_members.as_deref());

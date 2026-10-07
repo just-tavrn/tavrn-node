@@ -53,6 +53,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     if config.search_enabled {
         caps.push("search.v1");
     }
+    // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
+    caps.extend(["threads", "forum", "announcement"]);
     if config.voice_enabled {
         caps.push("voice");
         caps.push("soundboard");
@@ -101,6 +103,8 @@ pub struct AppState {
     pub secret_storage_limiter: Arc<RateLimiter>,
     /// Read marker updates per user (`read:<user id>`).
     pub read_limiter: Arc<RateLimiter>,
+    /// New threads per user (`thread:<user id>`, 10 per minute; PROTOCOL.md §7e).
+    pub thread_limiter: Arc<RateLimiter>,
     /// WebAuthn relying party.
     pub webauthn: Arc<webauthn_rs::prelude::Webauthn>,
     /// Outbound HTTP client for every request to other nodes (FEDERATION.md §1.3).
@@ -272,6 +276,7 @@ impl AppState {
         // (second factor per account, per IP, secret storage writes)
         let factors = if config.dev { (1000, 1000, 1000) } else { (5, 20, 30) };
         let read_max = if config.dev { 1000 } else { 120 };
+        let thread_max = if config.dev { 1000 } else { 10 };
         let token_max = if config.dev { 1000 } else { 30 };
         // (claim pair, direct invites, received room invites) per hour
         let invites = if config.dev { (1000, 1000, 1000) } else { (10, 20, 10) };
@@ -358,6 +363,7 @@ impl AppState {
             secret_storage_limiter: limiter(factors.2, 3600),
             // Clients debounce markers; 120 per minute leave room for many open tabs.
             read_limiter: limiter(read_max, 60),
+            thread_limiter: limiter(thread_max, 60),
             webauthn,
         })
     }
@@ -888,6 +894,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::subscriptions::routes())
                 .merge(routes::installations::routes())
                 .merge(routes::search::routes())
+                .merge(routes::threads::routes())
                 .merge(routes::commands::routes())
                 .merge(routes::legal::routes()),
         )
