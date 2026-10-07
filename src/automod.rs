@@ -122,41 +122,83 @@ pub fn parts(term: &str) -> Vec<String> {
     raw.iter().enumerate().filter(|(i, p)| !p.is_empty() || *i == 0 || *i == last).map(|(_, p)| p.to_string()).collect()
 }
 
-/// Does the term (its [`parts`]) occur in the normalized `text`?
-pub fn term_matches(text: &str, parts: &[String], whole_word: bool) -> bool {
-    let Some(k) = parts.iter().position(|p| !p.is_empty()) else { return false };
-    let leading_star = k > 0;
-    let first = &parts[k];
-    for (pos, _) in text.match_indices(first.as_str()) {
-        // A leading star extends the match back to the start of its non-space run, which is a boundary.
-        if whole_word && !leading_star && !boundary_before(text, pos) {
-            continue;
-        }
-        if match_rest(text, pos + first.len(), &parts[k + 1..], whole_word) {
-            return true;
-        }
+/// Start positions (bytes) of every occurrence of `part` in `text`, overlapping ones included.
+fn occurrences(text: &str, part: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(off) = text[from..].find(part) {
+        let at = from + off;
+        out.push(at);
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
     }
-    false
+    out
 }
 
-fn match_rest(text: &str, pos: usize, rest: &[String], whole_word: bool) -> bool {
-    let Some((next, tail)) = rest.split_first() else {
-        return !whole_word || boundary_after(text, pos);
-    };
-    // A trailing star extends the match to the end of its non-space run, which is a boundary.
-    if next.is_empty() {
+/// For every byte position, the position of the next whitespace character at or after it (or the text's end).
+fn next_whitespace(text: &str) -> Vec<usize> {
+    let mut out = vec![text.len(); text.len() + 1];
+    let mut next = text.len();
+    for (i, c) in text.char_indices().rev() {
+        if c.is_whitespace() {
+            next = i;
+        }
+        for slot in out.iter_mut().skip(i).take(c.len_utf8()) {
+            *slot = next;
+        }
+    }
+    out
+}
+
+/// The earliest position in the sorted `list` that is at least `from` and at most `until`.
+fn earliest(list: &[usize], from: usize, until: usize) -> Option<usize> {
+    let i = list.partition_point(|&p| p < from);
+    list.get(i).copied().filter(|&p| p <= until)
+}
+
+/// Does the term (its [`parts`]) occur in the normalized `text`?
+///
+/// Every literal after the first must follow the previous one with only non-space characters in between (what a
+/// `*` matches). Each start of the first literal is tried; the following literals take their earliest possible
+/// occurrence, which never loses a match because literals after a `*` contain no spaces ([`validate_rules`]). The
+/// cost is linear in the text per literal plus a binary search per start: no backtracking a crafted text could
+/// blow up.
+pub fn term_matches(text: &str, parts: &[String], whole_word: bool) -> bool {
+    let literals: Vec<&str> = parts.iter().map(String::as_str).filter(|p| !p.is_empty()).collect();
+    let Some(first) = literals.first() else { return false };
+    // A leading (trailing) star extends the match to the start (end) of its non-space run, which is a boundary.
+    let leading_star = parts.first().is_some_and(String::is_empty);
+    let trailing_star = parts.len() > 1 && parts.last().is_some_and(String::is_empty);
+    let last = literals.len() - 1;
+    let lists: Vec<Vec<usize>> = literals
+        .iter()
+        .enumerate()
+        .map(|(j, lit)| {
+            let mut list = occurrences(text, lit);
+            if whole_word && j == 0 && !leading_star {
+                list.retain(|&p| boundary_before(text, p));
+            }
+            if whole_word && j == last && !trailing_star {
+                list.retain(|&p| boundary_after(text, p + lit.len()));
+            }
+            list
+        })
+        .collect();
+    if lists.iter().any(Vec::is_empty) {
+        return false;
+    }
+    if literals.len() == 1 {
         return true;
     }
-    let mut from = pos;
-    while let Some(off) = text[from..].find(next.as_str()) {
-        let at = from + off;
-        if text[pos..at].chars().any(char::is_whitespace) {
-            return false;
+    let ws = next_whitespace(text);
+    'starts: for &start in &lists[0] {
+        let mut pos = start + first.len();
+        for j in 1..literals.len() {
+            match earliest(&lists[j], pos, ws[pos]) {
+                Some(at) => pos = at + literals[j].len(),
+                None => continue 'starts,
+            }
         }
-        if match_rest(text, at + next.len(), tail, whole_word) {
-            return true;
-        }
-        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+        return true;
     }
     false
 }
@@ -375,6 +417,9 @@ pub fn validate_rules(
             if term.chars().all(|c| c == '*') {
                 return Err(invalid(&name, "a term needs more than wildcards"));
             }
+            if !star_placement_ok(&term) {
+                return Err(invalid(&name, "in a phrase with spaces, * may only stand at its start or end"));
+            }
             if !terms.contains(&term) {
                 terms.push(term);
             }
@@ -446,6 +491,22 @@ pub struct NodeFilter {
     domains: Vec<String>,
 }
 
+/// Phrases with spaces take `*` only at their ends (the matcher's greedy search relies on it).
+pub fn star_placement_ok(term: &str) -> bool {
+    !term.contains(' ') || !term.trim_matches('*').contains('*')
+}
+
+/// Reads the node's word list ([`read_list`]) and checks every term like a room rule's.
+pub fn read_terms(path: &str) -> Result<Vec<String>, String> {
+    let terms = read_list(path)?;
+    if let Some(bad) = terms.iter().find(|t| !star_placement_ok(t) || t.matches('*').count() > MAX_STARS) {
+        return Err(format!(
+            "{path}: \"{bad}\": at most {MAX_STARS} wildcards, in phrases with spaces only at the start or end"
+        ));
+    }
+    Ok(terms)
+}
+
 /// Reads a node list: one entry per line, empty lines and `#` comments ignored.
 pub fn read_list(path: &str) -> Result<Vec<String>, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -469,7 +530,7 @@ pub fn read_list(path: &str) -> Result<Vec<String>, String> {
 impl NodeFilter {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let terms = match config.automod_words_file.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(path) => read_list(path).map_err(|e| anyhow::anyhow!("TAVRN_AUTOMOD_WORDS_FILE: {e}"))?,
+            Some(path) => read_terms(path).map_err(|e| anyhow::anyhow!("TAVRN_AUTOMOD_WORDS_FILE: {e}"))?,
             None => Vec::new(),
         };
         let domains = match config.automod_links.trim() {
@@ -732,6 +793,28 @@ mod tests {
         assert!(m("abxbc", "a*b", false));
         assert!(m("a.b.c.d", "a*b*c*d", true));
         assert!(!m("nothing", "spam*", true));
+    }
+
+    #[test]
+    fn crafted_text_cannot_make_matching_slow() {
+        let text = "a".repeat(4000);
+        let started = std::time::Instant::now();
+        for term in ["a*a*a*a*a*b", "*a*a*a*b", "a*b"] {
+            assert!(!m(&text, term, true));
+            assert!(!m(&text, term, false));
+        }
+        assert!(m(&format!("{text}b"), "a*a*a*a*a*b", true));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn stars_in_phrases_only_at_their_ends() {
+        assert!(star_placement_ok("forbidden phrase*"));
+        assert!(star_placement_ok("*coin scam"));
+        assert!(star_placement_ok("fr*e"));
+        assert!(!star_placement_ok("buy * now"));
+        assert!(m("buy now!", "buy now*", true));
+        assert!(m("so buy nowadays", "buy now*", true));
     }
 
     #[test]
