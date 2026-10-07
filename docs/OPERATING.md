@@ -46,7 +46,35 @@ re-encrypted, an old key together with an old database backup still opens the fi
 The first account registered on a node becomes node admin (plus anyone listed in `TAVRN_ADMIN_USERS`).
 Node admins get a "Node administration" page in the client: overview and effective configuration, users
 (disable, promote, room-creation grants, delete all content, reset a locked-out user's second factor), account invites for `TAVRN_REGISTRATION=invite`,
-node-wide bans, other nodes with their conformance results (block, unblock, check) and the node audit log.
+node-wide bans, reports (see "Moderation" below), other nodes with their conformance results (block, unblock, check)
+and the node audit log.
+
+## Moderation: reports and auto-moderation
+
+What the node does is specified in [MODERATION.md](https://github.com/just-tavrn/tavrn-protocol/blob/main/MODERATION.md).
+
+- **Reports.** Members report messages, members and rooms from the context menus. Reports about room content land
+  in the room's "Reports" settings tab (moderators with `moderate_members`); reports about direct messages, about
+  users without a room, about rooms and about a room's owner land in Admin → Reports, where node admins also see
+  every room report. Reporters are visible to moderators; the reported user is never told. For end-to-end encrypted
+  messages the reporter can release the plaintext of the reported message and up to ten messages before it: the
+  inbox shows it labelled "released by the reporter", the node cannot verify it. Plaintext messages are linked and
+  snapshotted instead. The inbox offers shortcuts (delete the message, time out, kick, ban, delete the user's
+  content) that run the normal moderation actions and note the report in the audit log.
+  `TAVRN_REPORTS_RATE_PER_HOUR` (default 10) limits reports per user, `TAVRN_REPORTS_RETENTION_DAYS` (default 90)
+  deletes resolved and dismissed reports with their evidence; admins can delete a report at any time.
+- **Flood detection** (`TAVRN_AUTOMOD_BURST_LIMIT`, `TAVRN_AUTOMOD_TIMEOUT_MINUTES`) works everywhere, encrypted
+  or not.
+- **Content rules** only work where the node can read: unencrypted channels. Rooms define their own rules
+  (room settings → Auto-moderation: word lists with `*` wildcards, link allow and block lists, exempt roles and
+  channels, block, delete or timeout). As operator you can add node-wide lists that block in every unencrypted
+  conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt` (one term per line, whole words, `#` comments)
+  and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per line, subdomains included). Both files are
+  read at start (at most 1 MiB and 10000 entries; `check-config` names problems); restart the node after a change.
+  Matches are audited with the matched term, never the message text, and show up in the moderators' inbox.
+- **The welcome channel** is the room's security log: its entries cannot be deleted or purged by anyone.
+- **Room ownership** moves with room settings → Overview → "Transfer ownership" (the owner confirms with their
+  password or passkey). Accounts that own rooms must transfer or delete them before they can be deleted.
 
 ## Voice and video
 
@@ -219,7 +247,8 @@ Notes: the issuer must match the provider's `issuer` exactly; provider requests 
 no redirects and may target LAN addresses. SSO logins need no tavrn second factor (the provider is
 responsible), but end-to-end encryption still asks for the recovery key on the first login. Existing password
 accounts link their provider identity themselves in Settings → Security (the node never links by email or
-username). Without `TAVRN_OIDC_GROUP_MAP` admins edit the mapping through `PUT /api/v1/admin/sso/group-map`;
+username). Without `TAVRN_OIDC_GROUP_MAP` admins edit the mapping in Admin → SSO (rooms and roles are picked by
+name; `PUT /api/v1/admin/sso/group-map` underneath);
 group changes take effect at the next SSO login, at the latest after `TAVRN_OIDC_SESSION_DAYS` (default 7).
 With `TAVRN_OIDC_ONLY=true` keep at least one account in `TAVRN_ADMIN_USERS`, so an outage of the provider
 cannot lock you out; those names are never given to accounts created by SSO.
