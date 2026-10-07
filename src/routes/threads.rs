@@ -104,6 +104,8 @@ pub async fn create_thread(
             return Err(bad("thread.root_invalid", "Forum posts start without a root message"));
         }
     } else {
+        // Like replies: a thread needs what writing in the channel needs, plus create_threads.
+        conv.require(p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
         conv.require(p::CREATE_THREADS, "thread.create_forbidden", "Create threads")?;
     }
     state.thread_limiter.check_all(&[format!("thread:{}", auth.user.id)])?;
