@@ -53,6 +53,9 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     if config.search_enabled {
         caps.push("search.v1");
     }
+    // Reports and content auto-moderation (MODERATION.md).
+    caps.push("reports.v1");
+    caps.push("automod.v1");
     if config.voice_enabled {
         caps.push("voice");
         caps.push("soundboard");
@@ -188,6 +191,8 @@ pub struct AppState {
     pub subscription_wakeup: Arc<tokio::sync::Notify>,
     /// Search requests per user (`search:<user id>`, `TAVRN_SEARCH_RATE_PER_MINUTE` per minute).
     pub search_limiter: Arc<RateLimiter>,
+    /// The operator's auto-moderation lists (`TAVRN_AUTOMOD_WORDS_FILE`, `TAVRN_AUTOMOD_LINKS`, MODERATION.md §2.3).
+    pub node_automod: Arc<crate::automod::NodeFilter>,
     /// Admin API calls per node admin session (`admin:<user id>`) and per admin token (`admin-token:<id>`).
     pub admin_limiter: Arc<RateLimiter>,
     /// Takedown notices per client IP (`notice-ip:<ip>`, `TAVRN_LEGAL_NOTICE_RATE_PER_HOUR` per hour).
@@ -331,6 +336,7 @@ impl AppState {
             legal_notice_limiter: shared("legal-notice", config.legal_notice_rate_per_hour, 3600),
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
+            node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             app_connections: Arc::new(crate::applications::Connections::new(&cluster)),
             connect_codes: Arc::new(routes::connect::ConnectCodes::new(&cluster)),
@@ -889,7 +895,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::installations::routes())
                 .merge(routes::search::routes())
                 .merge(routes::commands::routes())
-                .merge(routes::legal::routes()),
+                .merge(routes::legal::routes())
+                .merge(routes::moderation::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
         .merge(routes::legal::page_routes())

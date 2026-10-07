@@ -177,6 +177,8 @@ pub fn spec() -> utoipa::openapi::OpenApi {
     doc.merge(crate::routes::commands::CommandsApi::openapi());
     // Legal pages, notices, data export and account deletion (protocol/LEGAL.md).
     doc.merge(crate::routes::legal::LegalApi::openapi());
+    // Reports, auto-moderation and ownership transfer (protocol/MODERATION.md).
+    doc.merge(crate::routes::moderation::ModerationApi::openapi());
     doc
 }
 

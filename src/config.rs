@@ -400,6 +400,14 @@ pub struct Config {
     pub automod_burst_limit: u32,
     /// Timeout in minutes after a spam burst.
     pub automod_timeout_minutes: u32,
+    /// The operator's word list for every unencrypted conversation (one term per line, protocol MODERATION.md §2.3).
+    pub automod_words_file: Option<String>,
+    /// `off` (default) or the path of a domain blocklist for every unencrypted conversation (one domain per line).
+    pub automod_links: String,
+    /// Reports a user may send per hour (1–1000, default 10, MODERATION.md §1.3).
+    pub reports_rate_per_hour: u32,
+    /// Days resolved and dismissed reports are kept (1–36500, default 90, MODERATION.md §1.5).
+    pub reports_retention_days: u32,
 
     // ---- Single sign-on via OpenID Connect (protocol/APPLICATIONS.md §8)
     /// Issuer URL of the OpenID provider; SSO is enabled when set. Discovery at
@@ -598,6 +606,10 @@ impl Default for Config {
             dev_misbehave: String::new(),
             automod_burst_limit: 10,
             automod_timeout_minutes: 10,
+            automod_words_file: None,
+            automod_links: "off".into(),
+            reports_rate_per_hour: 10,
+            reports_retention_days: 90,
             oidc_issuer: None,
             oidc_client_id: None,
             oidc_client_secret: None,
@@ -718,6 +730,29 @@ impl Config {
             c.legal_notice_rate_per_hour = 1000;
         }
         c
+    }
+
+    /// Reports and the auto-moderation node lists (MODERATION.md §1.3, §1.5, §2.3).
+    fn validate_moderation(&self, problems: &mut Vec<String>) {
+        if !(1..=1000).contains(&self.reports_rate_per_hour) {
+            problems.push("TAVRN_REPORTS_RATE_PER_HOUR must be between 1 and 1000".into());
+        }
+        if !(1..=36_500).contains(&self.reports_retention_days) {
+            problems.push("TAVRN_REPORTS_RETENTION_DAYS must be between 1 and 36500".into());
+        }
+        if let Some(path) = self.automod_words_file.as_deref().filter(|p| !p.trim().is_empty())
+            && let Err(e) = crate::automod::read_list(path)
+        {
+            problems.push(format!("TAVRN_AUTOMOD_WORDS_FILE: {e}"));
+        }
+        match self.automod_links.trim() {
+            "" | "off" => {}
+            path => {
+                if let Err(e) = crate::automod::read_list(path) {
+                    problems.push(format!("TAVRN_AUTOMOD_LINKS: {e} (off or the path of a domain list)"));
+                }
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -921,6 +956,7 @@ impl Config {
     }
 
     fn validate_legal(&self, problems: &mut Vec<String>) {
+        self.validate_moderation(problems);
         if !(1..=1000).contains(&self.legal_notice_rate_per_hour) {
             problems.push("TAVRN_LEGAL_NOTICE_RATE_PER_HOUR must be between 1 and 1000".into());
         }
@@ -2514,6 +2550,41 @@ mod tests {
             let printed = serde_json::to_string(&c).unwrap();
             assert!(!printed.contains("very-secret"), "{printed}");
             assert_eq!(c.oidc_client_secret.as_deref(), Some("very-secret"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn moderation_settings_load_and_validate() {
+        let c = Config::default();
+        assert_eq!((c.reports_rate_per_hour, c.reports_retention_days), (10, 90));
+        assert_eq!((c.automod_words_file.as_deref(), c.automod_links.as_str()), (None, "off"));
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            jail.create_file("words.txt", "spam*\n# comment\n")?;
+            jail.create_file("links.txt", "evil.test\n")?;
+            jail.set_env("TAVRN_AUTOMOD_WORDS_FILE", "words.txt");
+            jail.set_env("TAVRN_AUTOMOD_LINKS", "links.txt");
+            jail.set_env("TAVRN_REPORTS_RATE_PER_HOUR", "20");
+            jail.set_env("TAVRN_REPORTS_RETENTION_DAYS", "30");
+            let c = Config::load(false).unwrap();
+            assert_eq!((c.reports_rate_per_hour, c.reports_retention_days), (20, 30));
+            assert_eq!((c.automod_words_file.as_deref(), c.automod_links.as_str()), (Some("words.txt"), "links.txt"));
+            for (var, bad) in [
+                ("TAVRN_REPORTS_RATE_PER_HOUR", "0"),
+                ("TAVRN_REPORTS_RETENTION_DAYS", "0"),
+                ("TAVRN_AUTOMOD_WORDS_FILE", "missing.txt"),
+                ("TAVRN_AUTOMOD_LINKS", "missing.txt"),
+            ] {
+                let keep = std::env::var(var).unwrap_or_default();
+                jail.set_env(var, bad);
+                let err = Config::load(false).unwrap_err();
+                assert!(err.problems.iter().any(|p| p.contains(var)), "{err}");
+                jail.set_env(var, keep);
+            }
+            jail.set_env("TAVRN_AUTOMOD_LINKS", "off");
+            assert!(Config::load(false).is_ok());
             Ok(())
         });
     }

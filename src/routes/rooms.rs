@@ -51,7 +51,7 @@ pub struct RoomDetail {
     pub read_states: Vec<crate::store::messages::ReadState>,
 }
 
-async fn detail(state: &AppState, access: &RoomAccess) -> Result<RoomDetail, ApiError> {
+pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<RoomDetail, ApiError> {
     let db = &state.db;
     let id = &access.room.id;
     let mut channels = store::rooms::channels(db, id).await?;
