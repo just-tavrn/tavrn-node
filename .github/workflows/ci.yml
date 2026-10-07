@@ -31,6 +31,14 @@ jobs:
       test-args: --workspace --locked
       postgres: true
       pre-test: |
+        if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then
+          # The runner image ships livekit-server, ffmpeg and a private Valkey on 127.0.0.1:6379 (the
+          # organization's runner/README.md); a container started on the stack's DinD would not be reachable
+          # from this runner at 127.0.0.1 anyway.
+          echo "TAVRN_TEST_CACHE_URL=redis://127.0.0.1:6379" >> "$GITHUB_ENV"
+          livekit-server --version && ffmpeg -version | head -1 && valkey-cli -p 6379 ping
+          exit 0
+        fi
         # Voice (protocol/VOICE.md): the node supervises livekit-server; the voice tests need the binary.
         mkdir -p "$HOME/.local/bin"
         curl -fsSL "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz" | tar -xz -C "$HOME/.local/bin" livekit-server
