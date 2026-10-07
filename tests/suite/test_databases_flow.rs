@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+#![allow(clippy::unwrap_used)]
 //! The tests' own PostgreSQL databases (tests/common/databases.rs): leftovers are swept, a test node drops its
 //! database when it goes away. PostgreSQL only: skipped without `TAVRN_TEST_DATABASE_URL`.
-
-use std::time::Duration;
 
 use crate::common::{databases, test_node};
 
@@ -25,7 +24,7 @@ async fn stale_test_databases_are_swept_and_fresh_ones_stay() {
         sqlx::query(&format!("CREATE DATABASE {name}")).execute(&mut admin).await.unwrap();
     }
 
-    databases::sweep(&mut admin, &base, Duration::from_secs(30 * 60)).await;
+    databases::sweep(&mut admin, &base, databases::DEFAULT_MAX_AGE).await;
     assert!(!databases::exists(&mut admin, &old).await, "the database of an hour ago is swept");
     assert!(databases::exists(&mut admin, &fresh).await, "a fresh database stays");
 
