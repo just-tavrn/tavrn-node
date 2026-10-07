@@ -120,6 +120,11 @@ impl Hub {
         Presence { online: self.online.clone(), user_id: user_id.to_string() }
     }
 
+    /// Open WebSocket connections of users on this instance (metrics).
+    pub fn connections(&self) -> usize {
+        self.online.lock().unwrap_or_else(|e| e.into_inner()).values().sum()
+    }
+
     /// `true` while the user has at least one open WebSocket on this node.
     pub fn is_online(&self, user_id: &str) -> bool {
         self.online.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).is_some_and(|n| *n > 0)

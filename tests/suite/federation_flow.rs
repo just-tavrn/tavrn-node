@@ -644,6 +644,12 @@ const LOCAL_ONLY_REQUESTS: &[(&str, &str, &str)] = &[
     ),
     ("*", "/api/v1/users/me/blocks/{username}", "DELETE /api/v1/users/me/blocks/bob"),
     ("*", "/api/v1/users/me/invites", "GET /api/v1/users/me/invites"),
+    ("*", "/api/v1/users/me/push-subscriptions", "GET /api/v1/users/me/push-subscriptions"),
+    (
+        "*",
+        "/api/v1/users/me/push-subscriptions/*",
+        "DELETE /api/v1/users/me/push-subscriptions/01J00000000000000000000000",
+    ),
     ("*", "/api/v1/users/me/invites/{invite_id}", "DELETE /api/v1/users/me/invites/01J00000000000000000000000"),
     ("POST", "/api/v1/conversations", "POST /api/v1/conversations"),
     ("POST", "/api/v1/directory/reports", "POST /api/v1/directory/reports"),

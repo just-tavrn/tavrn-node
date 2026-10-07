@@ -339,6 +339,8 @@ pub async fn revoke_device_sessions(db: &Pool, device_id: &str) -> Result<(), Ap
         .bind(device_id)
         .execute(db)
         .await?;
+    // A signed-out device gets no more pushes (PROTOCOL.md §6d).
+    crate::store::push::delete_for_device(db, device_id).await?;
     Ok(())
 }
 

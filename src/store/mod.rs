@@ -22,6 +22,7 @@ pub mod media;
 pub mod messages;
 pub mod oidc;
 pub mod pending_removals;
+pub mod push;
 pub mod rooms;
 pub mod social;
 pub mod subscriptions;

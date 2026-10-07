@@ -182,7 +182,12 @@ pub const MAX_SHARED_ROOMS: usize = 10;
 /// `notify` hints (§5.2) for a new message: to the home nodes of remote members without an open
 /// WebSocket on this node, for DMs and group DMs and for mentions in channels, coalesced to one per
 /// conversation and member per minute. Never carries content, author or message id. Failures are logged.
+///
+/// Every path that creates a message calls this, so it also counts the message (`metrics.rs`) and queues the web
+/// pushes of local members (`push.rs`, never blocks).
 pub async fn notify_members(state: &AppState, conv: &Conv, message: &Message, author_id: &str) {
+    state.metrics.message(message.encrypted);
+    crate::push::message(state, message, author_id);
     if !state.config.federation_enabled {
         return;
     }
@@ -561,6 +566,12 @@ pub async fn handle(
                         json!({ "conversation_id": conversation_id, "node": iss, "from": from,
                                 "started_at": started_at, "group": group }),
                     );
+                    // A user without a connection here rings by web push (PROTOCOL.md §6d).
+                    let settings = crate::notifications::load(&state.db, &to.id).await?;
+                    let effective = settings.effective(None, &conversation_id, &util::now());
+                    if !effective.muted && effective.mode != crate::notifications::Mode::Nothing {
+                        crate::push::hint(state, &to.id, iss, &conversation_id, None, false, Some(&from));
+                    }
                 }
                 CallHint::End => {
                     state.hub.users(
@@ -582,6 +593,9 @@ pub async fn handle(
             }
             let mention = mention && (!everyone || !effective.suppress_everyone);
             store::invites::add_hint(&state.db, &to.id, iss, &conversation_id, room_id.as_deref(), mention).await?;
+            // Without a connection here the user gets a web push (PROTOCOL.md §6d; the hint is already coalesced
+            // per conversation by the sending node, the push limits apply on top).
+            crate::push::hint(state, &to.id, iss, &conversation_id, room_id.as_deref(), mention, None);
             state.hub.users(
                 vec![to.id.clone()],
                 "notify",

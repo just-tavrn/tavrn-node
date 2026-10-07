@@ -60,6 +60,9 @@ pub const LOCAL_ONLY: &[(&str, &str)] = &[
     ("*", "/api/v1/users/me/whiteboards/{scene_id}/thumbnail"),
     // Notification settings
     ("*", "/api/v1/users/me/notification-settings"),
+    // Web push subscriptions (PROTOCOL.md §6d): pushes come from the home node only
+    ("*", "/api/v1/users/me/push-subscriptions"),
+    ("*", "/api/v1/users/me/push-subscriptions/*"),
     // Personal emojis and soundboard clips
     ("*", "/api/v1/users/me/emojis"),
     ("*", "/api/v1/users/me/emojis/{emoji_id}"),
@@ -145,6 +148,8 @@ mod tests {
         assert!(!local(Method::GET, "/api/v1/users/me/devices"));
         assert!(local(Method::POST, "/api/v1/conversations"));
         assert!(!local(Method::GET, "/api/v1/conversations"), "listing conversations on this node is fine");
+        assert!(local(Method::PUT, "/api/v1/users/me/push-subscriptions"));
+        assert!(local(Method::DELETE, "/api/v1/users/me/push-subscriptions/{subscription_id}"));
         assert!(local(Method::GET, "/api/v1/admin/users"));
         assert!(local(Method::POST, "/api/v1/admin/users/{user_id}/second-factor/reset"));
         assert!(!local(Method::GET, "/api/v1/administrator"), "prefix rules end at a path segment");
