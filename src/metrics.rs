@@ -3,9 +3,9 @@
 //! and health").
 //!
 //! Off by default (`TAVRN_METRICS=on`). With `TAVRN_METRICS_TOKEN` scrapers send `Authorization: Bearer <token>`;
-//! without a token only clients on loopback or in `TAVRN_TRUSTED_PROXIES` are answered (the client address as for
-//! rate limits: a request forwarded by a trusted proxy counts as its original client, so a public request through a
-//! reverse proxy on the same host is refused). Everything else gets the same `404` as an unknown path.
+//! without a token only requests whose TCP peer and forwarded addresses (`X-Forwarded-For`) are all on loopback or in
+//! `TAVRN_TRUSTED_PROXIES` are answered, so a public request through a reverse proxy on the same host is refused.
+//! Everything else gets the same `404` as an unknown path.
 //!
 //! Every instance keeps its own registry (counters since its start); gauges are read at scrape time. Labels are
 //! bounded: HTTP routes are route templates (`/api/v1/rooms/{room_id}`), never ids; unmatched paths count as
@@ -192,17 +192,18 @@ pub async fn endpoint(State(state): State<AppState>, request: Request) -> Respon
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .is_some_and(|t| bool::from(t.trim().as_bytes().ct_eq(token.as_bytes()))),
-        // Without a token: the client must be loopback or a trusted proxy address: the TCP peer, or, for a request a
-        // trusted proxy forwarded, the client it names (so a public request through a reverse proxy on the same
-        // host is refused). Requests without a peer address (an in-process router) are refused.
+        // Without a token: the TCP peer and every address a proxy forwarded (`X-Forwarded-For`) must be loopback or
+        // trusted proxies, so a public request through a reverse proxy on the same host is refused (a forged header
+        // can only lead to a refusal). Requests without a peer address (an in-process router) are refused.
         None => connect.is_some_and(|ConnectInfo(addr)| {
-            let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-            crate::auth::resolve_client_ip(&state.config, Some(addr.ip()), forwarded)
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| {
-                    let ip = ip.to_canonical();
-                    ip.is_loopback() || state.config.is_trusted_proxy(ip)
-                })
+            let internal = |ip: std::net::IpAddr| {
+                let ip = ip.to_canonical();
+                ip.is_loopback() || state.config.is_trusted_proxy(ip)
+            };
+            let forwarded = headers.get_all("x-forwarded-for").iter().all(|v| {
+                v.to_str().is_ok_and(|v| v.split(',').all(|a| a.trim().parse::<std::net::IpAddr>().is_ok_and(internal)))
+            });
+            internal(addr.ip()) && forwarded
         }),
     };
     if !allowed {
