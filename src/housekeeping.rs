@@ -483,6 +483,11 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             if let Err(e) = crate::store::directory::prune_reports(&db, &reports_cutoff).await {
                 tracing::warn!(error = %e, "Report housekeeping failed");
             }
+            match crate::reports::prune(&state, Utc::now()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(reports = n, "Closed reports past their retention deleted"),
+                Err(e) => tracing::warn!(error = %e, "Report retention failed"),
+            }
             // Legal: notice retention, interrupted content deletions, accounts past their grace period.
             match crate::legal::housekeeping(&state, Utc::now()).await {
                 Ok((0, 0, 0)) => {}

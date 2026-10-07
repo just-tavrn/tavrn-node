@@ -369,7 +369,7 @@ async fn delete_system_entries(db: &Pool, user_id: &str) -> Result<(), ApiError>
     Ok(())
 }
 
-/// The account `user` owns rooms: they must be deleted first (there is no ownership transfer yet).
+/// The account `user` owns rooms: they must be transferred (`POST /rooms/{id}/transfer`) or deleted first.
 async fn check_owned_rooms(db: &Pool, user: &UserRow) -> Result<(), ApiError> {
     let rooms: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM rooms WHERE owner_id = $1 ORDER BY id")
         .bind(&user.id)
@@ -380,7 +380,7 @@ async fn check_owned_rooms(db: &Pool, user: &UserRow) -> Result<(), ApiError> {
     }
     Err(ApiError::Conflict {
         code: "account.owns_rooms",
-        detail: "Delete the rooms this account owns first".into(),
+        detail: "Transfer or delete the rooms this account owns first".into(),
         meta: json!({ "rooms": rooms.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>() }),
     })
 }

@@ -179,6 +179,8 @@ pub fn spec() -> utoipa::openapi::OpenApi {
     doc.merge(crate::routes::legal::LegalApi::openapi());
     // Web push (PROTOCOL.md §6d).
     doc.merge(crate::routes::push::PushApi::openapi());
+    // Reports, auto-moderation and ownership transfer (protocol/MODERATION.md).
+    doc.merge(crate::routes::moderation::ModerationApi::openapi());
     doc
 }
 
