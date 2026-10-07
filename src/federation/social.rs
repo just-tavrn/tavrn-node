@@ -212,11 +212,24 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
         }
         ConvKind::Channel { access, .. } => {
             let mut users = Vec::new();
-            if message.mentions_everyone || !message.mentions.is_empty() {
+            // Thread messages (PROTOCOL.md §7e) reach the thread's followers (every message; their home node applies
+            // their settings) and the users they mention directly; `@everyone` inside a thread reaches followers only.
+            let followers: Option<Vec<String>> = match &message.thread_id {
+                Some(t) => Some(store::threads::follower_ids(&state.db, t).await?),
+                None => None,
+            };
+            if followers.as_ref().is_some_and(|f| !f.is_empty())
+                || message.mentions_everyone
+                || !message.mentions.is_empty()
+            {
                 for id in store::rooms::remote_member_ids(&state.db, &access.room.id, own).await? {
                     if let Some(u) = store::users::by_id(&state.db, &id).await? {
                         let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &u.id).await?;
-                        if message.mentions_everyone || direct_mention(message, &u, &roles) {
+                        let wanted = match &followers {
+                            Some(f) => f.contains(&u.id) || direct_mention(message, &u, &roles),
+                            None => message.mentions_everyone || direct_mention(message, &u, &roles),
+                        };
+                        if wanted {
                             users.push((u, roles));
                         }
                     }

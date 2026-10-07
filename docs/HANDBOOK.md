@@ -1640,9 +1640,16 @@ accounts that own rooms must transfer or delete them before they can be deleted.
 
 ## Threads and forum channels
 
-<!-- TODO(merge): complete after the threads/moderation merge -->
-Threads are archived automatically after a period of inactivity set per channel (default 7 days); the hourly
-housekeeping does the archiving. There is no node setting besides that.
+Every text and announcement channel has threads: "Create thread" on a message (or the "Threads" list of the
+channel) starts a sub-conversation whose messages stay messages of the channel, so threads of encrypted channels
+are end-to-end encrypted with the channel's keys, titles included. Forum channels hold posts only (title, first
+message, tags the channel's managers define); announcement channels let only members with *Manage messages* post,
+everyone else reacts and replies in threads. Members follow the threads they start or write in; only followed
+threads count towards their unread badges and notifications. The node archives threads without a message for a
+channel's "Auto-archive" time (default 7 days) in its hourly housekeeping; a new message reopens them unless a
+moderator locked them. Permission bits: *Create threads* (everyone by default) and *Manage threads* (rename,
+archive, lock, delete others' threads; granted once at the upgrade to every role that could manage messages).
+Nothing needs configuring ([PROTOCOL.md §7e](https://github.com/just-tavrn/tavrn-protocol/blob/main/PROTOCOL.md)).
 
 ## The `doctor` and other CLI commands
 

@@ -29,6 +29,7 @@ pub mod room_admin;
 pub mod rooms;
 pub mod social;
 pub mod subscriptions;
+pub mod threads;
 pub mod users;
 pub mod voice;
 pub mod webhooks;
