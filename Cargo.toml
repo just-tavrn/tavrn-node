@@ -1,0 +1,137 @@
+[workspace]
+resolver = "3"
+# The node is the root package; the load generator of the performance budgets (perf/README.md) is the
+# second member.
+members = [".", "perf/loadgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# tavrn-crypto (OpenMLS 0.9) requires Rust 1.91.
+rust-version = "1.91"
+repository = "https://github.com/just-tavrn/tavrn-node"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tavrn-crypto = { git = "https://github.com/just-tavrn/tavrn-crypto", tag = "v0.1.0" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+
+[package]
+name = "tavrn-node"
+description = "tavrn node server: API, federation, media signaling, web client"
+license = "AGPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+# The image is published to ghcr.io; the crate is not published to crates.io.
+publish = false
+
+[[bin]]
+name = "tavrn-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+argon2 = { version = "0.5", features = ["std"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
+figment = { version = "0.10", features = ["env", "toml"] }
+futures = "0.3"
+# SRV lookups for the server-to-server DNS fallback `_tavrn._tcp.<domain>`; the system resolver
+# (getaddrinfo) cannot query SRV records.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+ipnet = "2"
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "pool"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+# Legal pages: the admin's Markdown is rendered once at publish time; raw HTML is escaped.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# Decodes animated WebP uploads for the media pipeline (ffmpeg cannot decode them); pure Rust, small.
+image-webp = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+# Files channels: NFC-normalised entry names and SigV4 signatures for S3-compatible stores.
+unicode-normalization = "0.1"
+hmac = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "any", "migrate"] }
+thiserror.workspace = true
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "request-id", "set-header"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ulid = "1"
+subtle = "2"
+# The encryption core, consumed by tag while the repositories are private (workspace dependency: a git
+# dependency; set CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo uses your git credentials, README.md "Building").
+tavrn-crypto.workspace = true
+utoipa = { version = "5", features = ["axum_extras"] }
+# Second factor: TOTP (RFC 6238) and WebAuthn. webauthn-rs needs OpenSSL; it is
+# vendored (built from source) so neither developers nor the image need system OpenSSL headers.
+totp-rs = { version = "6", features = ["otpauth"] }
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+openssl = { version = "0.10", features = ["vendored"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["serde"] }
+tokio-tungstenite = "0.29"
+# LiveKit tokens, webhook verification and the room service (voice); HTTP to 127.0.0.1 only, no TLS.
+livekit-api = { version = "0.8", default-features = false, features = ["services", "webhooks", "access-token"] }
+livekit-protocol = "0.8"
+# Single sign-on (APPLICATIONS.md §8): JWK parsing and RS256/PS256/ES256/EdDSA verification of the identity
+# provider's ID tokens. Only the RustCrypto verifiers are used, called explicitly (never jsonwebtoken's
+# process-global provider, which livekit-token installs HMAC-only). The small OIDC code flow itself is
+# implemented in `oidc.rs` on reqwest (no `openidconnect`/`oauth2` stack).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+
+# Optional Valkey/Redis for several instances of one node (`TAVRN_CACHE_URL`, docs/SCALING.md): pub/sub, counters,
+# leases. redis-rs over fred: the reference Rust client (also covers Valkey), small with default features off, the
+# connection manager reconnects by itself; TLS through the rustls stack already in the tree.
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+# Graceful stop of the livekit-server child (SIGTERM).
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["test"] }
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+# Software passkey that plays the browser/authenticator in the WebAuthn tests.
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
+
+[lints]
+workspace = true
+
+# Optimize the crypto crates in the dev profile too: Argon2id with 64 MiB would otherwise take seconds.
+# Debug builds keep only line tables (backtraces still show file:line) and are not re-linked per codegen
+# unit: full DWARF made the test binaries so large that one day of builds filled 430 GB of caches.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3

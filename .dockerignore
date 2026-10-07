@@ -1,0 +1,12 @@
+# Build context of deploy/Dockerfile: sources, manifests, the optional prebuilt web/dist.
+.git
+**/.git
+target
+**/node_modules
+data
+data-dev
+pgdata
+.env
+perf/results
+test-results
+.claude

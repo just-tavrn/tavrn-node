@@ -1,0 +1,83 @@
+# Standard setup: one tavrn container + PostgreSQL behind a reverse proxy that terminates TLS.
+# Values live in .env (see .env.example). External database: remove the "db" service and set
+# TAVRN_DATABASE_URL in .env.
+#
+# Reverse proxy: tavrn speaks HTTP only on port 8080. The proxy must pass WebSockets through
+# (Upgrade/Connection headers) and set X-Forwarded-For. Examples: deploy/nginx.conf.example,
+# deploy/Caddyfile.example, deploy/REVERSE-PROXY.md (also covers Nginx Proxy Manager).
+services:
+  tavrn:
+    # IMAGE_TAG in .env pins a release line, e.g. 0.1 (README.md "Upgrading"); default: the newest release.
+    image: ghcr.io/just-tavrn/tavrn-node:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      # Published on localhost only; the reverse proxy on the same host connects here.
+      # If the proxy runs as a container on the same Docker network, drop this line
+      # and use "tavrn:8080" as the target.
+      - "127.0.0.1:${TAVRN_HOST_PORT:-8080}:8080"
+      # Voice and video: UDP straight to the container, bypassing the proxy. The range must be the same
+      # outside and inside (LiveKit announces these ports to clients), open in the firewall and forwarded by
+      # the router to this host. Signaling runs through the proxy (/rtc on port 8080); LiveKit's own port
+      # 7880 is never published. Many ports make Docker's userland proxy slow; with large ranges consider
+      # `network_mode: host`. Without a host address Docker publishes on IPv4 and, if the network has IPv6
+      # (see "networks" below), on the host's IPv6 too (protocol/VOICE.md §10.2).
+      - "${TAVRN_RTC_UDP_PORT_RANGE:-61000-61100}:${TAVRN_RTC_UDP_PORT_RANGE:-61000-61100}/udp"
+      # ICE over TCP, the fallback when UDP is blocked (TAVRN_RTC_TCP_PORT; forward it like the UDP range).
+      - "${TAVRN_RTC_TCP_PORT:-7881}:${TAVRN_RTC_TCP_PORT:-7881}/tcp"
+      # Optional embedded TURN server (TAVRN_RTC_TURN_ENABLED=true, deploy/REVERSE-PROXY.md):
+      # - "3478:3478/udp"            # TURN over UDP (TAVRN_RTC_TURN_UDP_PORT), forwarded by the router
+      # - "127.0.0.1:5349:5349"      # TURN/TLS backend (TAVRN_RTC_TURN_TLS_PORT), only the proxy connects
+    env_file: .env
+    environment:
+      TAVRN_DATABASE_URL: ${TAVRN_DATABASE_URL:-postgres://tavrn:${POSTGRES_PASSWORD}@db:5432/tavrn}
+      # Peer directory (docs/OPERATING.md "Getting listed in the directory"): the example default is the project owner's
+      # public test node; set TAVRN_REFERENCE_NODES in .env to replace it (an empty value means none).
+      TAVRN_REFERENCE_NODES: ${TAVRN_REFERENCE_NODES-tavrn.swsp.eu}
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp"]
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tavrn
+      POSTGRES_DB: tavrn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tavrn -d tavrn"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Optional: Valkey for several tavrn instances of one node (docs/SCALING.md). Not needed for a single instance.
+  # Uncomment, set VALKEY_PASSWORD and TAVRN_CACHE_URL (same password) in .env, and add
+  # `valkey: { condition: service_healthy }` to the depends_on of every tavrn service. No host port: only the
+  # tavrn containers on this network reach it.
+  # valkey:
+  #   image: valkey/valkey:8
+  #   restart: unless-stopped
+  #   command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:?set VALKEY_PASSWORD in .env}", "--save", "", "--appendonly", "no"]
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "valkey-cli -a \"$$VALKEY_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 20
+  #   environment:
+  #     VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+
+# IPv6 for voice (optional, Docker 27+): give the default network an IPv6 subnet (a ULA is fine: Docker forwards
+# the host's global IPv6 to it for published ports); LiveKit learns the global address via STUN or
+# TAVRN_RTC_ADVERTISE_IPS (protocol/VOICE.md §10.2).
+# networks:
+#   default:
+#     enable_ipv6: true
+#     ipam:
+#       config:
+#         - subnet: fd00:7a76:726e::/64

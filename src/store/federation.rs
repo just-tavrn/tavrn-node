@@ -1,0 +1,827 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Federation tables (migration 0010): peers and their keys, replay store, federation targets, remote
+//! users and devices, federated sessions, inbox dedupe and outbox.
+
+use sqlx::{FromRow, Row};
+
+use crate::{
+    db::Pool,
+    error::ApiError,
+    models::UserRow,
+    util::{now, ulid},
+};
+
+use super::{is_unique_violation, users::USER_COLS};
+
+// ---------------------------------------------------------------- domain policy
+
+/// Node-wide ban of a whole domain (`POST /admin/bans` with a domain subject).
+pub async fn domain_banned(db: &Pool, domain: &str) -> Result<bool, ApiError> {
+    let row = sqlx::query("SELECT 1 AS x FROM bans WHERE room_id IS NULL AND subject = $1 LIMIT 1")
+        .bind(domain)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.is_some())
+}
+
+// ---------------------------------------------------------------- peers
+
+#[derive(Debug, Clone, FromRow)]
+pub struct PeerRow {
+    pub domain: String,
+    pub document: String,
+    pub fetched_at: String,
+    pub expires_at: String,
+    pub status: String,
+    pub kid_refresh_at: Option<String>,
+}
+
+pub async fn peer(db: &Pool, domain: &str) -> Result<Option<PeerRow>, ApiError> {
+    Ok(sqlx::query_as(
+        "SELECT domain, document, fetched_at, expires_at, status, kid_refresh_at FROM federation_peers WHERE domain = $1",
+    )
+    .bind(domain)
+    .fetch_optional(db)
+    .await?)
+}
+
+pub async fn peer_status(db: &Pool, domain: &str) -> Result<Option<String>, ApiError> {
+    let row =
+        sqlx::query("SELECT status FROM federation_peers WHERE domain = $1").bind(domain).fetch_optional(db).await?;
+    Ok(row.map(|r| r.try_get::<String, _>("status")).transpose()?)
+}
+
+/// Stores a freshly fetched, valid document (status stays as it is).
+pub async fn upsert_peer(
+    db: &Pool,
+    domain: &str,
+    document: &str,
+    fetched_at: &str,
+    expires_at: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4",
+    )
+    .bind(domain)
+    .bind(document)
+    .bind(fetched_at)
+    .bind(expires_at)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Marks a peer (creating a row if needed, with an empty, expired document).
+pub async fn set_peer_status(db: &Pool, domain: &str, status: &str) -> Result<(), ApiError> {
+    let ts = now();
+    sqlx::query(
+        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, status) VALUES ($1, '{}', $2, $2, $3)
+         ON CONFLICT (domain) DO UPDATE SET status = $3",
+    )
+    .bind(domain)
+    .bind(&ts)
+    .bind(status)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Claims the unknown-`kid` refetch of a peer: `true` if none happened since `cutoff`.
+pub async fn claim_kid_refresh(db: &Pool, domain: &str, now: &str, cutoff: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query(
+        "UPDATE federation_peers SET kid_refresh_at = $1 WHERE domain = $2 AND (kid_refresh_at IS NULL OR kid_refresh_at < $3)",
+    )
+    .bind(now)
+    .bind(domain)
+    .bind(cutoff)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Every `(kid, x)` ever seen for a peer.
+pub async fn peer_keys(db: &Pool, domain: &str) -> Result<Vec<(String, String)>, ApiError> {
+    let rows =
+        sqlx::query("SELECT kid, x FROM federation_peer_keys WHERE domain = $1").bind(domain).fetch_all(db).await?;
+    rows.iter().map(|r| Ok((r.try_get("kid")?, r.try_get("x")?))).collect()
+}
+
+pub async fn add_peer_key(db: &Pool, domain: &str, kid: &str, x: &str) -> Result<(), ApiError> {
+    let r = sqlx::query("INSERT INTO federation_peer_keys (domain, kid, x, first_seen_at) VALUES ($1, $2, $3, $4)")
+        .bind(domain)
+        .bind(kid)
+        .bind(x)
+        .bind(now())
+        .execute(db)
+        .await;
+    match r {
+        Ok(_) => Ok(()),
+        Err(e) if is_unique_violation(&e) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ---------------------------------------------------------------- replay store
+
+/// Records a `jti` of `iss`; `false` if it was seen before (replay).
+pub async fn spend_jti(db: &Pool, iss: &str, jti: &str, expires_at: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query("INSERT INTO federation_replay (iss, jti, expires_at) VALUES ($1, $2, $3)")
+        .bind(iss)
+        .bind(jti)
+        .bind(expires_at)
+        .execute(db)
+        .await;
+    match r {
+        Ok(_) => Ok(true),
+        Err(e) if is_unique_violation(&e) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ---------------------------------------------------------------- federation targets (home node)
+
+pub async fn touch_target(db: &Pool, user_id: &str, device_id: &str, target: &str) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO federation_targets (user_id, device_id, target, last_issued_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, device_id, target) DO UPDATE SET last_issued_at = $4",
+    )
+    .bind(user_id)
+    .bind(device_id)
+    .bind(target)
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Distinct target domains a user requested federation tokens for (any device).
+pub async fn target_domains(db: &Pool, user_id: &str) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query("SELECT DISTINCT target FROM federation_targets WHERE user_id = $1 ORDER BY target")
+        .bind(user_id)
+        .fetch_all(db)
+        .await?;
+    rows.iter().map(|r| Ok(r.try_get("target")?)).collect()
+}
+
+// ---------------------------------------------------------------- profiles (home node)
+
+/// `(profile_version, avatar_sha256, avatar media id, avatar mime)` of a user (the still image).
+pub async fn profile_info(
+    db: &Pool,
+    user_id: &str,
+) -> Result<(i64, Option<String>, Option<String>, Option<String>), ApiError> {
+    let row = sqlx::query(
+        "SELECT u.profile_version AS pv, m.still_sha256 AS sha, m.id AS blob_id, m.mime AS mime
+         FROM users u LEFT JOIN media m ON m.id = u.avatar_blob_id WHERE u.id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    Ok((row.try_get("pv")?, row.try_get("sha")?, row.try_get("blob_id")?, row.try_get("mime")?))
+}
+
+// ---------------------------------------------------------------- remote users (target node)
+
+#[derive(Debug, Clone, FromRow)]
+pub struct RemoteMeta {
+    pub user_id: String,
+    pub profile_version: i64,
+    pub profile_fetched_at: Option<String>,
+    pub avatar_sha256: Option<String>,
+    pub avatar_mime: Option<String>,
+    pub keys_fetched_at: Option<String>,
+    pub last_login_at: Option<String>,
+}
+
+pub async fn remote_meta(db: &Pool, user_id: &str) -> Result<Option<RemoteMeta>, ApiError> {
+    Ok(sqlx::query_as(
+        "SELECT user_id, profile_version, profile_fetched_at, avatar_sha256, avatar_mime, keys_fetched_at, last_login_at
+         FROM remote_users WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Number of remote users (all domains other than `local_domain`, or exactly `domain`).
+pub async fn count_remote_users(db: &Pool, local_domain: &str) -> Result<i64, ApiError> {
+    let row = sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM users WHERE domain <> $1")
+        .bind(local_domain)
+        .fetch_one(db)
+        .await?;
+    Ok(row.try_get("n")?)
+}
+
+pub async fn count_users_of_domain(db: &Pool, domain: &str) -> Result<i64, ApiError> {
+    let row = sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM users WHERE domain = $1")
+        .bind(domain)
+        .fetch_one(db)
+        .await?;
+    Ok(row.try_get("n")?)
+}
+
+/// Creates the users row of a remote user (no password, email or factors) and its mirror state.
+/// Returns the existing row if another request created it concurrently.
+pub async fn create_remote_user(
+    db: &Pool,
+    username: &str,
+    domain: &str,
+    display_name: &str,
+    kind: &str,
+    owner_id: Option<&str>,
+) -> Result<UserRow, ApiError> {
+    let id = ulid();
+    let ts = now();
+    let mut tx = db.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO users (id, username, domain, display_name, kind, owner_id, is_node_admin, created_at, profile_version)
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 0)",
+    )
+    .bind(&id)
+    .bind(username)
+    .bind(domain)
+    .bind(display_name)
+    .bind(kind)
+    .bind(owner_id)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await;
+    match inserted {
+        Ok(_) => {
+            sqlx::query("INSERT INTO remote_users (user_id, profile_version) VALUES ($1, 0)")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Err(e) if is_unique_violation(&e) => drop(tx),
+        Err(e) => return Err(e.into()),
+    }
+    super::users::by_username(db, username, domain)
+        .await?
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("remote user missing after insert")))
+}
+
+/// Mirrors a fetched profile: display name, version and fetch time.
+pub async fn store_profile(db: &Pool, user_id: &str, display_name: &str, version: i64) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+        .bind(display_name)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "INSERT INTO remote_users (user_id, profile_version, profile_fetched_at) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE SET profile_version = $2, profile_fetched_at = $3",
+    )
+    .bind(user_id)
+    .bind(version)
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Mirrors bio, linked accounts (JSON) and the DM setting of a remote user.
+pub async fn store_remote_profile_fields(
+    db: &Pool,
+    user_id: &str,
+    bio: &str,
+    links: &str,
+    dm_policy: &str,
+) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET bio = $1, links = $2, dm_policy = $3 WHERE id = $4")
+        .bind(bio)
+        .bind(links)
+        .bind(dm_policy)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Hashes of the mirrored images of a remote user (what the home node announced when they were copied).
+#[derive(Debug, Default, Clone)]
+pub struct RemoteImageHashes {
+    pub avatar: Option<String>,
+    pub avatar_animated: Option<String>,
+    pub header: Option<String>,
+    pub header_animated: Option<String>,
+}
+
+pub async fn remote_image_hashes(db: &Pool, user_id: &str) -> Result<RemoteImageHashes, ApiError> {
+    let row = sqlx::query(
+        "SELECT avatar_sha256, avatar_animated_sha256, header_sha256, header_animated_sha256 FROM remote_users WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else { return Ok(RemoteImageHashes::default()) };
+    Ok(RemoteImageHashes {
+        avatar: row.try_get("avatar_sha256")?,
+        avatar_animated: row.try_get("avatar_animated_sha256")?,
+        header: row.try_get("header_sha256")?,
+        header_animated: row.try_get("header_animated_sha256")?,
+    })
+}
+
+/// Records the hashes of a mirrored avatar or header (`kind`), NULL when it was removed.
+pub async fn set_remote_image_hashes(
+    db: &Pool,
+    user_id: &str,
+    kind: &str,
+    still: Option<&str>,
+    animated: Option<&str>,
+    mime: Option<&str>,
+) -> Result<(), ApiError> {
+    let sql = if kind == "header" {
+        "UPDATE remote_users SET header_sha256 = $1, header_animated_sha256 = $2 WHERE user_id = $3"
+    } else {
+        "UPDATE remote_users SET avatar_sha256 = $1, avatar_animated_sha256 = $2, avatar_mime = $4 WHERE user_id = $3"
+    };
+    let q = sqlx::query(sql).bind(still).bind(animated).bind(user_id);
+    let q = if kind == "header" { q } else { q.bind(mime) };
+    q.execute(db).await?;
+    Ok(())
+}
+
+pub async fn touch_login(db: &Pool, user_id: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE remote_users SET last_login_at = $1 WHERE user_id = $2")
+        .bind(now())
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// An attested device of a remote user as published by the home node (signature verified).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeviceKey {
+    pub home_device_id: String,
+    pub public_key: String,
+    pub identity_signature: String,
+}
+
+/// Stores the key view of a remote user's home node: identity key, attested devices (device rows
+/// keyed by `(user, home device id)`, created when missing) and the fetch time. Devices that were
+/// attested under the previous identity key and are no longer published lose their attestation.
+/// Returns the home device ids of those vanished devices.
+pub async fn store_remote_keys(
+    db: &Pool,
+    user_id: &str,
+    home_domain: &str,
+    identity: Option<&str>,
+    identity_reset_at: Option<&str>,
+    devices: &[RemoteDeviceKey],
+) -> Result<Vec<String>, ApiError> {
+    let ts = now();
+    let mut tx = db.begin().await?;
+    let before = sqlx::query(
+        "SELECT d.home_device_id AS home FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE d.user_id = $1 AND d.home_device_id IS NOT NULL AND d.identity_signature IS NOT NULL
+           AND d.attested_identity_key = u.identity_pubkey",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let before: Vec<String> = before.iter().map(|r| r.try_get("home")).collect::<Result<_, _>>()?;
+    sqlx::query("UPDATE users SET identity_pubkey = $1, identity_reset_at = $2 WHERE id = $3")
+        .bind(identity)
+        .bind(identity_reset_at)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE devices SET identity_signature = NULL, attested_identity_key = NULL, attested_at = NULL
+         WHERE user_id = $1 AND home_device_id IS NOT NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    for d in devices {
+        let updated = sqlx::query(
+            "UPDATE devices SET public_key = $1, identity_signature = $2, attested_identity_key = $3, attested_at = $4
+             WHERE user_id = $5 AND home_device_id = $6",
+        )
+        .bind(&d.public_key)
+        .bind(&d.identity_signature)
+        .bind(identity)
+        .bind(&ts)
+        .bind(user_id)
+        .bind(&d.home_device_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO devices (id, user_id, name, client, created_at, last_seen_at, home_device_id, home_domain,
+                                      public_key, identity_signature, attested_identity_key, attested_at)
+                 VALUES ($1, $2, '', '', $3, $3, $4, $5, $6, $7, $8, $3)",
+            )
+            .bind(ulid())
+            .bind(user_id)
+            .bind(&ts)
+            .bind(&d.home_device_id)
+            .bind(home_domain)
+            .bind(&d.public_key)
+            .bind(&d.identity_signature)
+            .bind(identity)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO remote_users (user_id, profile_version, keys_fetched_at) VALUES ($1, 0, $2)
+         ON CONFLICT (user_id) DO UPDATE SET keys_fetched_at = $2",
+    )
+    .bind(user_id)
+    .bind(&ts)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let still: Vec<&str> = devices.iter().filter(|_| identity.is_some()).map(|d| d.home_device_id.as_str()).collect();
+    Ok(before.into_iter().filter(|h| !still.contains(&h.as_str())).collect())
+}
+
+/// Attested devices of a remote user from the key cache: `(home device id, public key, signature,
+/// created_at)`.
+pub async fn remote_attested_devices(
+    db: &Pool,
+    user_id: &str,
+) -> Result<Vec<(String, String, String, String)>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT d.home_device_id AS home, d.public_key AS pk, d.identity_signature AS sig, d.created_at AS created
+         FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE d.user_id = $1 AND d.home_device_id IS NOT NULL AND d.public_key IS NOT NULL
+           AND d.identity_signature IS NOT NULL AND d.attested_identity_key = u.identity_pubkey
+         ORDER BY d.created_at, d.id",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    rows.iter().map(|r| Ok((r.try_get("home")?, r.try_get("pk")?, r.try_get("sig")?, r.try_get("created")?))).collect()
+}
+
+/// Local row id of a remote user's device by its home device id.
+pub async fn remote_device_row(db: &Pool, user_id: &str, home_device_id: &str) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query("SELECT id FROM devices WHERE user_id = $1 AND home_device_id = $2")
+        .bind(user_id)
+        .bind(home_device_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(|r| r.try_get::<String, _>("id")).transpose()?)
+}
+
+/// Marks the key cache of a remote user as stale (`identity.changed`, `devices.changed`).
+pub async fn invalidate_keys(db: &Pool, user_id: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE remote_users SET keys_fetched_at = NULL WHERE user_id = $1").bind(user_id).execute(db).await?;
+    Ok(())
+}
+
+/// Mirrors the identity key announced by the user's home node.
+pub async fn set_remote_identity(db: &Pool, user_id: &str, key: &str, reset_at: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET identity_pubkey = $1, identity_reset_at = $2 WHERE id = $3")
+        .bind(key)
+        .bind(reset_at)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Replaces the cached identity key of a remote user if it is still `old` (compare and swap): `true` for the one
+/// caller that observed the change (it writes the `system.key_changed` entries).
+pub async fn swap_remote_identity(db: &Pool, user_id: &str, old: &str, new: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query("UPDATE users SET identity_pubkey = $1 WHERE id = $2 AND identity_pubkey = $3")
+        .bind(new)
+        .bind(user_id)
+        .bind(old)
+        .execute(db)
+        .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------- remote devices and sessions
+
+/// Local row id of a remote device, created if missing (keyed by `(user, home device id)`).
+pub async fn ensure_remote_device(
+    db: &Pool,
+    user_id: &str,
+    home_device_id: &str,
+    home_domain: &str,
+    name: &str,
+    client: &str,
+) -> Result<String, ApiError> {
+    let find = || async {
+        let row = sqlx::query("SELECT id FROM devices WHERE user_id = $1 AND home_device_id = $2")
+            .bind(user_id)
+            .bind(home_device_id)
+            .fetch_optional(db)
+            .await?;
+        Ok::<_, ApiError>(row.map(|r| r.try_get::<String, _>("id")).transpose()?)
+    };
+    if let Some(id) = find().await? {
+        sqlx::query("UPDATE devices SET name = $1, client = $2, last_seen_at = $3 WHERE id = $4")
+            .bind(name)
+            .bind(client)
+            .bind(now())
+            .bind(&id)
+            .execute(db)
+            .await?;
+        return Ok(id);
+    }
+    let id = ulid();
+    let ts = now();
+    let r = sqlx::query(
+        "INSERT INTO devices (id, user_id, name, client, created_at, last_seen_at, home_device_id, home_domain)
+         VALUES ($1, $2, $3, $4, $5, $5, $6, $7)",
+    )
+    .bind(&id)
+    .bind(user_id)
+    .bind(name)
+    .bind(client)
+    .bind(&ts)
+    .bind(home_device_id)
+    .bind(home_domain)
+    .execute(db)
+    .await;
+    match r {
+        Ok(_) => Ok(id),
+        Err(e) if is_unique_violation(&e) => {
+            find().await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("remote device missing after conflict")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Home device id of a device row (remote devices only).
+pub async fn home_device_id(db: &Pool, device_id: &str) -> Result<Option<String>, ApiError> {
+    let row =
+        sqlx::query("SELECT home_device_id FROM devices WHERE id = $1").bind(device_id).fetch_optional(db).await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("home_device_id").ok().flatten()))
+}
+
+/// Revokes every session of a device and creates the single federated session, ending at
+/// `max_expires_at` whatever the refreshes.
+pub async fn replace_federated_session(
+    db: &Pool,
+    user_id: &str,
+    device_id: &str,
+    refresh_hash: &str,
+    max_expires_at: &str,
+) -> Result<(), ApiError> {
+    let ts = now();
+    let mut tx = db.begin().await?;
+    sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND revoked_at IS NULL")
+        .bind(&ts)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, device_id, refresh_token_hash, created_at, expires_at, max_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)",
+    )
+    .bind(ulid())
+    .bind(user_id)
+    .bind(device_id)
+    .bind(refresh_hash)
+    .bind(&ts)
+    .bind(max_expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `Some(home device id)` if the remote device has a live (not revoked, not expired) session.
+pub async fn live_remote_session(db: &Pool, user_id: &str, device_id: &str) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query(
+        "SELECT d.home_device_id AS home FROM sessions s JOIN devices d ON d.id = s.device_id
+         WHERE s.device_id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > $3 LIMIT 1",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .bind(now())
+    .fetch_optional(db)
+    .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("home").ok().flatten()))
+}
+
+/// Revokes the sessions of a remote user: of one home device, or all. Returns the affected device rows.
+pub async fn revoke_remote_sessions(
+    db: &Pool,
+    user_id: &str,
+    home_device_id: Option<&str>,
+) -> Result<Vec<String>, ApiError> {
+    let rows = match home_device_id {
+        Some(home) => {
+            sqlx::query("SELECT id FROM devices WHERE user_id = $1 AND home_device_id = $2")
+                .bind(user_id)
+                .bind(home)
+                .fetch_all(db)
+                .await?
+        }
+        None => sqlx::query("SELECT id FROM devices WHERE user_id = $1").bind(user_id).fetch_all(db).await?,
+    };
+    let ids: Vec<String> = rows.iter().map(|r| r.try_get("id")).collect::<Result<_, _>>()?;
+    let ts = now();
+    for id in &ids {
+        sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND revoked_at IS NULL")
+            .bind(&ts)
+            .bind(id)
+            .execute(db)
+            .await?;
+    }
+    Ok(ids)
+}
+
+/// Users whose home domain is `domain`, and bots whose owner's home domain is `domain`.
+pub async fn users_of_domain(db: &Pool, domain: &str) -> Result<Vec<UserRow>, ApiError> {
+    let cols: Vec<String> = USER_COLS.split(',').map(|c| format!("u.{}", c.trim())).collect();
+    Ok(sqlx::query_as(&format!(
+        "SELECT {} FROM users u LEFT JOIN users o ON o.id = u.owner_id WHERE u.domain = $1 OR o.domain = $1",
+        cols.join(", ")
+    ))
+    .bind(domain)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Remote user row by address parts.
+pub async fn user_by_address(db: &Pool, username: &str, domain: &str) -> Result<Option<UserRow>, ApiError> {
+    Ok(sqlx::query_as(&format!("SELECT {USER_COLS} FROM users WHERE username = $1 AND domain = $2"))
+        .bind(username)
+        .bind(domain)
+        .fetch_optional(db)
+        .await?)
+}
+
+// ---------------------------------------------------------------- inbox
+
+/// Records an inbox message id of `iss`; `false` if it was seen before (duplicate).
+pub async fn mark_seen(db: &Pool, iss: &str, id: &str, kind: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query("INSERT INTO federation_inbox_seen (iss, id, type, seen_at) VALUES ($1, $2, $3, $4)")
+        .bind(iss)
+        .bind(id)
+        .bind(kind)
+        .bind(now())
+        .execute(db)
+        .await;
+    match r {
+        Ok(_) => Ok(true),
+        Err(e) if is_unique_violation(&e) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ---------------------------------------------------------------- outbox
+
+#[derive(Debug, Clone, FromRow)]
+pub struct OutboxRow {
+    pub id: String,
+    pub target: String,
+    #[sqlx(rename = "type")]
+    pub kind: String,
+    pub body: String,
+    pub attempts: i64,
+    pub next_at: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub last_status: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+const OUTBOX_COLS: &str = "id, target, type, body, attempts, next_at, created_at, expires_at, last_status, last_error";
+
+pub struct NewOutbox<'a> {
+    pub id: &'a str,
+    pub target: &'a str,
+    pub kind: &'a str,
+    pub body: &'a str,
+    pub created_at: &'a str,
+    pub expires_at: &'a str,
+}
+
+pub async fn enqueue(db: &Pool, e: NewOutbox<'_>) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO federation_outbox (id, target, type, body, attempts, next_at, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, 0, $5, $5, $6)",
+    )
+    .bind(e.id)
+    .bind(e.target)
+    .bind(e.kind)
+    .bind(e.body)
+    .bind(e.created_at)
+    .bind(e.expires_at)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Entries due at `now`, oldest first.
+pub async fn due(db: &Pool, now: &str, limit: i64) -> Result<Vec<OutboxRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {OUTBOX_COLS} FROM federation_outbox WHERE next_at <= $1 ORDER BY next_at, id LIMIT $2"
+    ))
+    .bind(now)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+pub async fn outbox_entries(db: &Pool) -> Result<Vec<OutboxRow>, ApiError> {
+    Ok(sqlx::query_as(&format!("SELECT {OUTBOX_COLS} FROM federation_outbox ORDER BY id")).fetch_all(db).await?)
+}
+
+pub async fn delete_outbox(db: &Pool, id: &str) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM federation_outbox WHERE id = $1").bind(id).execute(db).await?;
+    Ok(())
+}
+
+pub async fn reschedule(
+    db: &Pool,
+    id: &str,
+    attempts: i64,
+    next_at: &str,
+    last_status: Option<i64>,
+    last_error: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE federation_outbox SET attempts = $1, next_at = $2, last_status = $3, last_error = $4 WHERE id = $5",
+    )
+    .bind(attempts)
+    .bind(next_at)
+    .bind(last_status)
+    .bind(last_error)
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Delays every queued entry of a target that is due before `next_at` (a failed target is not hammered).
+pub async fn delay_target(db: &Pool, target: &str, next_at: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE federation_outbox SET next_at = $1 WHERE target = $2 AND next_at < $1")
+        .bind(next_at)
+        .bind(target)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+const UNDELIVERABLE_KEY: &str = "federation.undeliverable";
+
+/// Counts a given-up outbox entry (admin overview).
+pub async fn count_undeliverable(db: &Pool) -> Result<(), ApiError> {
+    let current = undeliverable_count(db).await?;
+    sqlx::query(
+        "INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3",
+    )
+    .bind(UNDELIVERABLE_KEY)
+    .bind((current + 1).to_string())
+    .bind(now())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Number of outbox entries given up so far.
+pub async fn undeliverable_count(db: &Pool) -> Result<i64, ApiError> {
+    let row = sqlx::query("SELECT value FROM node_settings WHERE key = $1")
+        .bind(UNDELIVERABLE_KEY)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("value").ok()).and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+// ---------------------------------------------------------------- housekeeping
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FederationPrune {
+    pub replay: u64,
+    pub inbox_seen: u64,
+    pub targets: u64,
+    /// Push hints older than the inbox window and expired invitations.
+    pub hints_and_invites: u64,
+}
+
+/// Drops spent `jti`s after their expiry, inbox ids and push hints after 7 days, expired invitations and
+/// federation targets after 30 days.
+pub async fn prune(db: &Pool, now: &str, seen_cutoff: &str, targets_cutoff: &str) -> Result<FederationPrune, ApiError> {
+    let replay =
+        sqlx::query("DELETE FROM federation_replay WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
+    let inbox_seen = sqlx::query("DELETE FROM federation_inbox_seen WHERE seen_at < $1")
+        .bind(seen_cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let targets = sqlx::query("DELETE FROM federation_targets WHERE last_issued_at < $1")
+        .bind(targets_cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let hints = super::invites::prune_hints(db, seen_cutoff).await?;
+    let invites =
+        sqlx::query("DELETE FROM user_invites WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
+    Ok(FederationPrune { replay, inbox_seen, targets, hints_and_invites: hints + invites })
+}

@@ -1,0 +1,53 @@
+name: Bug report
+description: The node, the container image or the deployment files do not work as described
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems (anything that could leak data, bypass permissions or weaken the encryption) are
+        reported privately through "Report a vulnerability" on the Security tab, not here. Problems of the web
+        client belong in [tavrn-web](https://github.com/just-tavrn/tavrn-web).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what happened instead? Error codes from API responses help.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, requests or configuration needed to see the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant part of the node's log (`docker compose logs tavrn`). Remove tokens, addresses and user data first.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`tavrn-node --version`, the image tag or the commit."
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How the node runs
+      options:
+        - Container image with the compose file
+        - Container image, other orchestration
+        - Binary built from source
+        - Development mode (--dev)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Database (PostgreSQL version or SQLite), reverse proxy, Valkey (if several instances), operating system.

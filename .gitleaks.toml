@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# gitleaks configuration: the default rules, minus known false positives. The protocol's test vectors
+# (submodule protocol/) contain keys derived from fixed, published seeds so that every implementation can
+# reproduce them; Cargo.lock lists crate names such as "libcrux-secrets"; the tests use fixed ULIDs and an
+# obviously fake LiveKit key line. None of them protect anything. Every other file is scanned with the
+# default rules.
+title = "tavrn-node"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic test vectors (fixed published seeds) and the lockfile"
+paths = ['''^protocol/testvectors/[^/]+\.json$''', '''^Cargo\.lock$''']
+
+[[allowlists]]
+description = "Fixed test identifiers and fake keys in the tests"
+regexTarget = "secret"
+regexes = ['''^01J9ZK3G5M8Q2W4E6R8T0Y2V[0-9A-Z]{2}$''', '''^0123456789abcdef0123456789abcdef$''']
