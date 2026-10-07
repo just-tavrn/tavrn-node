@@ -182,6 +182,7 @@ pub async fn list_around(
 /// Newest first, `before`/`after` as ID bounds (exclusive).
 /// A page of a conversation's messages. `cut` (a ULID floor, ENCRYPTION.md §7b) hides encrypted messages
 /// older than it; `epoch` limits the page to encrypted messages of one epoch (key checks of history shares).
+#[allow(clippy::too_many_arguments)]
 pub async fn list(
     db: &Pool,
     conversation_id: &str,

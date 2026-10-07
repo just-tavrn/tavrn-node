@@ -574,19 +574,19 @@ pub fn publish_read(state: &AppState, user_id: &str, read: &ThreadReadState) {
 /// message), and `thread.update`.
 pub async fn after_message(state: &AppState, thread_id: &str, message: &Message) -> Result<(), ApiError> {
     store::threads::record_message(&state.db, thread_id, &message.id, &message.created_at).await?;
-    if store::threads::follow(&state.db, thread_id, &message.author_id, Some(&message.id)).await? {
-        if let Some(t) = store::threads::by_id(&state.db, thread_id).await? {
-            let read = ThreadReadState {
-                thread_id: t.id.clone(),
-                channel_id: t.channel_id.clone(),
-                room_id: t.room_id.clone(),
-                following: true,
-                last_read_message_id: Some(message.id.clone()),
-                unread_count: 0,
-                mention_count: 0,
-            };
-            publish_read(state, &message.author_id, &read);
-        }
+    if store::threads::follow(&state.db, thread_id, &message.author_id, Some(&message.id)).await?
+        && let Some(t) = store::threads::by_id(&state.db, thread_id).await?
+    {
+        let read = ThreadReadState {
+            thread_id: t.id.clone(),
+            channel_id: t.channel_id.clone(),
+            room_id: t.room_id.clone(),
+            following: true,
+            last_read_message_id: Some(message.id.clone()),
+            unread_count: 0,
+            mention_count: 0,
+        };
+        publish_read(state, &message.author_id, &read);
     }
     publish(state, "thread.update", thread_id).await
 }
@@ -620,6 +620,7 @@ pub async fn auto_archive(state: &AppState, now: DateTime<Utc>) -> Result<u64, A
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     fn forum(tags: &str) -> ChannelRow {
