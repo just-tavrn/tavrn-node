@@ -553,14 +553,19 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
     let browser = Browser::new(&s.fake, "ok/bob");
     subscribe(&s.node, &s.bob, &browser).await;
     let threads = |channel: &str| format!("/api/v1/rooms/{}/channels/{channel}/threads", s.room_id);
-    let in_thread = |body: &str, thread_id: &str| json!({ "content": { "type": "text", "body": body }, "thread_id": thread_id });
+    let in_thread =
+        |body: &str, thread_id: &str| json!({ "content": { "type": "text", "body": body }, "thread_id": thread_id });
 
     // Alice's thread: Bob does not follow it, so its first message does not push (mode "all" would otherwise).
     let channel = plaintext_channel(&s, "threads").await;
     let root = send(&s, &channel, text("plan the raid")).await;
     let (st, thread) = s
         .node
-        .post(&threads(&channel), &s.alice.token, json!({ "title": "raid", "root_message_id": root["id"], "message": text("who is in?") }))
+        .post(
+            &threads(&channel),
+            &s.alice.token,
+            json!({ "title": "raid", "root_message_id": root["id"], "message": text("who is in?") }),
+        )
         .await;
     assert_eq!(st, StatusCode::CREATED, "{thread}");
     let thread_id = thread["id"].as_str().unwrap().to_string();
@@ -568,7 +573,8 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
 
     // A direct mention inside the thread reaches him anyway (another conversation: no coalescing in the way).
     let mention = plaintext_channel(&s, "mention").await;
-    let (st, t2) = s.node.post(&threads(&mention), &s.alice.token, json!({ "title": "loot", "message": text("rules") })).await;
+    let (st, t2) =
+        s.node.post(&threads(&mention), &s.alice.token, json!({ "title": "loot", "message": text("rules") })).await;
     assert_eq!(st, StatusCode::CREATED, "{t2}");
     s.fake.settle(&browser.path, 1).await;
     let mut m = in_thread("<@bob> you too", t2["id"].as_str().unwrap());
@@ -581,7 +587,8 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
 
     // A thread Bob follows (he started it) pushes its plain messages.
     let own = plaintext_channel(&s, "own").await;
-    let (st, t3) = s.node.post(&threads(&own), &s.bob.token, json!({ "title": "mine", "message": text("hello") })).await;
+    let (st, t3) =
+        s.node.post(&threads(&own), &s.bob.token, json!({ "title": "mine", "message": text("hello") })).await;
     assert_eq!(st, StatusCode::CREATED, "{t3}");
     send(&s, &own, in_thread("we start at nine", t3["id"].as_str().unwrap())).await;
     let got = s.fake.wait(&browser.path, 3).await;
