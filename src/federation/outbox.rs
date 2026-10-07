@@ -157,6 +157,7 @@ async fn deliver_target(
         }
         match attempt(state, &row).await {
             Ok(status) => {
+                state.metrics.federation_delivery(true);
                 store::federation::delete_outbox(&state.db, &row.id).await?;
                 tracing::info!(
                     target,
@@ -169,6 +170,7 @@ async fn deliver_target(
                 report.delivered += 1;
             }
             Err(e) => {
+                state.metrics.federation_delivery(false);
                 let status = e.status();
                 let retry_in = if status == Some(401) {
                     (row.last_status != Some(401)).then_some(UNAUTHORIZED_RETRY_SECS)

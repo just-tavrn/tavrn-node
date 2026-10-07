@@ -301,6 +301,11 @@ impl Registry {
         }
     }
 
+    /// Devices with at least one open connection on this instance (metrics).
+    pub fn connected_devices(&self) -> usize {
+        self.lock().values().map(|u| u.devices.values().filter(|d| d.connections > 0).count()).sum()
+    }
+
     /// Users with at least one open connection (on any instance).
     pub fn online_ids(&self) -> Vec<String> {
         let mut ids: std::collections::HashSet<String> = self

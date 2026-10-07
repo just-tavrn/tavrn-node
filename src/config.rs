@@ -486,6 +486,22 @@ pub struct Config {
     /// (1–365, default 30). After that the account row is erased and the username is free again.
     pub account_delete_grace_days: u32,
 
+    /// `TAVRN_PUSH`: web push notifications to browsers and installed web apps (PROTOCOL.md §6d, capability
+    /// `push.webpush`); on by default. The VAPID key is `<data_dir>/keys/vapid.key`.
+    pub push: Switch,
+    /// `TAVRN_PUSH_CONTACT`: the VAPID `sub` push services may use to reach the operator (`mailto:` or `https:`);
+    /// default: the public URL.
+    pub push_contact: Option<String>,
+    /// `TAVRN_PUSH_MAX_PER_MINUTE`: pushes per user and minute (1–1000, default 10); in addition at most one per
+    /// conversation and user every 30 seconds.
+    pub push_max_per_minute: u32,
+    /// `TAVRN_METRICS`: `GET /metrics` in the Prometheus text format; off by default.
+    pub metrics: Switch,
+    /// `TAVRN_METRICS_TOKEN`: bearer token scrapers must send (at least 16 characters). Empty: `/metrics` answers
+    /// only to loopback and `TAVRN_TRUSTED_PROXIES` peers. Never printed by `check-config`.
+    #[serde(skip_serializing)]
+    pub metrics_token: Option<String>,
+
     /// Comma-separated usernames with node admin permissions.
     pub admin_users: String,
     pub log_level: String,
@@ -634,6 +650,11 @@ impl Default for Config {
             legal_counter_notice_days: 14,
             legal_terms_mode: TermsMode::Notice,
             account_delete_grace_days: 30,
+            push: Switch::On,
+            push_contact: None,
+            push_max_per_minute: 10,
+            metrics: Switch::Off,
+            metrics_token: None,
             admin_users: String::new(),
             log_level: "info".into(),
             log_format: LogFormat::Text,
@@ -864,6 +885,7 @@ impl Config {
             problems.push("TAVRN_SEARCH_RATE_PER_MINUTE must be between 1 and 10000".into());
         }
         self.validate_legal(&mut problems);
+        self.validate_push_metrics(&mut problems);
         if !(1..=crate::webhooks::MAX_PER_ROOM as u32).contains(&self.webhooks_per_channel) {
             problems.push("TAVRN_WEBHOOKS_PER_CHANNEL must be between 1 and 50".into());
         }
@@ -918,6 +940,42 @@ impl Config {
                 "TAVRN_WEBAUTHN_RP_ID='{rp_id}' (default: TAVRN_DOMAIN) is not a registrable suffix of the host '{host}' of {source}: set TAVRN_WEBAUTHN_RP_ID to '{host}' or a parent domain of it, or serve the web client under the relying party domain"
             ));
         }
+    }
+
+    /// `TAVRN_PUSH_*` and `TAVRN_METRICS_*`.
+    fn validate_push_metrics(&self, problems: &mut Vec<String>) {
+        if !(1..=1000).contains(&self.push_max_per_minute) {
+            problems.push("TAVRN_PUSH_MAX_PER_MINUTE must be between 1 and 1000".into());
+        }
+        if let Some(contact) = self.push_contact.as_deref().map(str::trim).filter(|c| !c.is_empty())
+            && !valid_push_contact(contact)
+        {
+            problems.push(format!(
+                "TAVRN_PUSH_CONTACT='{contact}' is invalid: a mailto: address or an https:// URL (at most 256 characters)"
+            ));
+        }
+        if let Some(token) = self.metrics_token.as_deref().filter(|t| !t.is_empty())
+            && (token.chars().count() < 16 || token.len() > 256 || !token.chars().all(|c| c.is_ascii_graphic()))
+        {
+            problems.push(
+                "TAVRN_METRICS_TOKEN must be 16 to 256 printable ASCII characters without spaces (or empty)".into(),
+            );
+        }
+    }
+
+    /// The VAPID contact (`TAVRN_PUSH_CONTACT`, else the public URL).
+    pub fn push_contact(&self) -> String {
+        self.push_contact
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| self.public_url())
+    }
+
+    /// The bearer token of `/metrics`, `None` when empty.
+    pub fn metrics_token(&self) -> Option<&str> {
+        self.metrics_token.as_deref().map(str::trim).filter(|t| !t.is_empty())
     }
 
     fn validate_legal(&self, problems: &mut Vec<String>) {
@@ -1445,6 +1503,17 @@ fn rp_id_covers(rp_id: &str, host: &str) -> bool {
 /// `TAVRN_PUBLIC_URL`: `https://<host>[:port]` without path, query, fragment or user info. The host may be
 /// any domain (delegation: the identity domain `tavrn.org` served at `app.tavrn.org` or `chat.example.net`);
 /// `http://` and IP addresses only in development mode.
+/// A VAPID contact (RFC 8292 §2.1): `mailto:<address>` or an `https://` URL.
+pub fn valid_push_contact(contact: &str) -> bool {
+    if contact.len() > 256 || contact.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if let Some(address) = contact.strip_prefix("mailto:") {
+        return address.split_once('@').is_some_and(|(l, d)| !l.is_empty() && d.contains('.') && !d.contains('@'));
+    }
+    reqwest::Url::parse(contact).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
+}
+
 pub fn valid_public_url(url: &str, dev: bool) -> bool {
     let Ok(u) = reqwest::Url::parse(url) else { return false };
     let Some(host) = u.host_str() else { return false };
@@ -1533,6 +1602,35 @@ mod tests {
     #[test]
     fn valid_production_config_passes() {
         prod().validate().unwrap();
+    }
+
+    #[test]
+    fn push_and_metrics_settings_are_validated() {
+        let c = prod();
+        assert!(c.push.on() && !c.metrics.on(), "push on, metrics off by default");
+        assert_eq!(c.push_max_per_minute, 10);
+        assert_eq!(c.push_contact(), "https://chat.example.org", "default contact: the public URL");
+        assert_eq!(c.metrics_token(), None);
+        let ok = |c: Config| c.validate().is_ok();
+        assert!(ok(Config { push_contact: Some("mailto:ops@example.org".into()), ..prod() }));
+        assert!(ok(Config { push_contact: Some("https://example.org/contact".into()), ..prod() }));
+        assert!(ok(Config { metrics_token: Some(String::new()), ..prod() }), "empty token: loopback rule");
+        assert!(ok(Config { metrics_token: Some("0123456789abcdef".into()), ..prod() }));
+        for bad in [
+            Config { push_max_per_minute: 0, ..prod() },
+            Config { push_max_per_minute: 1001, ..prod() },
+            Config { push_contact: Some("ops@example.org".into()), ..prod() },
+            Config { push_contact: Some("http://example.org".into()), ..prod() },
+            Config { push_contact: Some("mailto:nobody".into()), ..prod() },
+            Config { metrics_token: Some("short".into()), ..prod() },
+            Config { metrics_token: Some("with space 0123456789".into()), ..prod() },
+        ] {
+            assert!(bad.validate().is_err(), "{:?} {:?} {:?}", bad.push_max_per_minute, bad.push_contact, bad.metrics_token);
+        }
+        let c = Config { push_contact: Some(" mailto:ops@example.org ".into()), ..prod() };
+        assert_eq!(c.push_contact(), "mailto:ops@example.org");
+        let json = serde_json::to_string(&Config { metrics_token: Some("0123456789abcdef".into()), ..prod() }).unwrap();
+        assert!(!json.contains("0123456789abcdef"), "check-config never prints the token");
     }
 
     #[test]
