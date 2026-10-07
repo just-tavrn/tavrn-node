@@ -741,7 +741,7 @@ impl Config {
             problems.push("TAVRN_REPORTS_RETENTION_DAYS must be between 1 and 36500".into());
         }
         if let Some(path) = self.automod_words_file.as_deref().filter(|p| !p.trim().is_empty())
-            && let Err(e) = crate::automod::read_list(path)
+            && let Err(e) = crate::automod::read_terms(path)
         {
             problems.push(format!("TAVRN_AUTOMOD_WORDS_FILE: {e}"));
         }
