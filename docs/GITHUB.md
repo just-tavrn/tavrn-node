@@ -48,6 +48,7 @@ building tavrn-web). The token never ends up in a layer: the Dockerfile reads it
 ## Settings applied through the API
 
 Default branch `main`, delete branches on merge, squash merges allowed, issues on, wiki off, projects off.
+The labels of `scripts/github-labels.sh` were created at setup (run it again after changing the list).
 
 ## Settings the owner flips by hand
 
@@ -61,7 +62,6 @@ Default branch `main`, delete branches on merge, squash merges allowed, issues o
       "Grant Dependabot access to private repositories" at the organization).
 - [ ] Discussions: questions are routed to the Discussions of the umbrella repository `just-tavrn/tavrn`
       (`ISSUE_TEMPLATE/config.yml`).
-- [ ] Labels: `scripts/github-labels.sh` (needs `gh` with write access).
 - [ ] The container package `ghcr.io/just-tavrn/tavrn-node`: repository access and visibility (see above).
 - [ ] Once public: branch protection or a ruleset for `main` (require pull requests, the CI checks `Rust`,
       `SPDX headers, publication hygiene, perf report`, `gitleaks`, `Dependency review`, `CLA`, linear
