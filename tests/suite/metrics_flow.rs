@@ -91,6 +91,8 @@ async fn without_a_token_only_loopback_and_trusted_proxies() {
     let forwarded = |f: &'static str| scrape_forwarded(&node, Some("127.0.0.1:5000"), None, Some(f));
     assert_eq!(forwarded("198.51.100.7").await.0, StatusCode::NOT_FOUND, "public client via the proxy");
     assert_eq!(forwarded("10.9.8.7").await.0, StatusCode::OK, "internal scraper via the proxy");
+    assert_eq!(forwarded("10.9.8.7, 198.51.100.7").await.0, StatusCode::NOT_FOUND, "any public hop refuses");
+    assert_eq!(forwarded("not-an-address").await.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
