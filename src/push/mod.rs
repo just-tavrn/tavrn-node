@@ -138,7 +138,14 @@ pub enum Job {
     /// A call in a DM or group DM hosted here rings `user_id`.
     Call { conversation_id: String, user_id: String, caller_id: String, group: bool },
     /// A received `notify` hint for a conversation on `node` (already filtered by the user's settings).
-    Hint { user_id: String, node: String, conversation_id: String, room_id: Option<String>, mention: bool, call: Option<String> },
+    Hint {
+        user_id: String,
+        node: String,
+        conversation_id: String,
+        room_id: Option<String>,
+        mention: bool,
+        call: Option<String>,
+    },
     /// A notice of another feature for one user, coalesced per `conversation_id` when given.
     Notice { user_id: String, payload: PushPayload },
     /// The test push of one user (every deliverable subscription).
@@ -186,8 +193,7 @@ impl Push {
             .no_proxy()
             .build()?;
         let (tx, rx) = mpsc::channel(QUEUE);
-        let shared =
-            |name: &'static str, max: u32, window: Duration| SharedLimiter::new(name, max, window, cluster);
+        let shared = |name: &'static str, max: u32, window: Duration| SharedLimiter::new(name, max, window, cluster);
         Ok(Self {
             enabled,
             vapid,
@@ -553,7 +559,9 @@ pub enum Outcome {
     /// The push service no longer knows the subscription (404, 410): it is deleted.
     Gone,
     /// Try again later (429, 5xx, network, timeouts); `retry_after` seconds when the service said so.
-    Retry { retry_after: Option<i64> },
+    Retry {
+        retry_after: Option<i64>,
+    },
     /// Any other answer, or a refused address.
     Failed,
 }
@@ -699,7 +707,12 @@ mod tests {
     }
 
     fn config(dev: bool, dir: &tempfile::TempDir) -> Config {
-        Config { dev, domain: "n.test".into(), data_dir: dir.path().to_string_lossy().into(), ..Config::defaults_for(dev) }
+        Config {
+            dev,
+            domain: "n.test".into(),
+            data_dir: dir.path().to_string_lossy().into(),
+            ..Config::defaults_for(dev)
+        }
     }
 
     #[test]
@@ -734,7 +747,8 @@ mod tests {
         assert!(prod.check_endpoint(&format!("https://push.example.net/{}", "a".repeat(MAX_ENDPOINT))).is_err());
         let dev = Push::new(&config(true, &dir), &cluster, lookup.clone()).unwrap();
         assert!(dev.check_endpoint("http://127.0.0.1:9/x").is_ok(), "development nodes reach local fakes");
-        let off = Push::new(&Config { push: crate::config::Switch::Off, ..config(false, &dir) }, &cluster, lookup).unwrap();
+        let off =
+            Push::new(&Config { push: crate::config::Switch::Off, ..config(false, &dir) }, &cluster, lookup).unwrap();
         assert!(!off.enabled() && off.public_key().is_none());
     }
 }

@@ -17,7 +17,19 @@ use tower::ServiceExt;
 const TOKEN: &str = "scrape-token-0123456789";
 
 async fn scrape(node: &common::TestNode, peer: Option<&str>, bearer: Option<&str>) -> (StatusCode, String) {
+    scrape_forwarded(node, peer, bearer, None).await
+}
+
+async fn scrape_forwarded(
+    node: &common::TestNode,
+    peer: Option<&str>,
+    bearer: Option<&str>,
+    forwarded_for: Option<&str>,
+) -> (StatusCode, String) {
     let mut request = Request::get("/metrics");
+    if let Some(f) = forwarded_for {
+        request = request.header("x-forwarded-for", f);
+    }
     if let Some(b) = bearer {
         request = request.header(header::AUTHORIZATION, format!("Bearer {b}"));
     }
@@ -56,7 +68,10 @@ async fn token_protects_the_endpoint() {
     assert_eq!(scrape(&node, None, Some("wrong-token-0123456789")).await.0, StatusCode::NOT_FOUND);
     let (st, body) = scrape(&node, Some("198.51.100.7:443"), Some(TOKEN)).await;
     assert_eq!(st, StatusCode::OK);
-    assert!(body.contains(&format!("tavrn_build_info{{version=\"{}\"}} 1", tavrn_node::app::SOFTWARE_VERSION)), "{body}");
+    assert!(
+        body.contains(&format!("tavrn_build_info{{version=\"{}\"}} 1", tavrn_node::app::SOFTWARE_VERSION)),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -72,6 +87,10 @@ async fn without_a_token_only_loopback_and_trusted_proxies() {
     assert_eq!(scrape(&node, Some("198.51.100.7:5000"), None).await.0, StatusCode::NOT_FOUND, "public peer");
     assert_eq!(scrape(&node, None, None).await.0, StatusCode::NOT_FOUND, "no peer address");
     assert_eq!(scrape(&node, Some("198.51.100.7:5000"), Some(TOKEN)).await.0, StatusCode::NOT_FOUND, "no token set");
+    // A public request through a reverse proxy on the same host is refused; an internal scraper behind it is not.
+    let forwarded = |f: &'static str| scrape_forwarded(&node, Some("127.0.0.1:5000"), None, Some(f));
+    assert_eq!(forwarded("198.51.100.7").await.0, StatusCode::NOT_FOUND, "public client via the proxy");
+    assert_eq!(forwarded("10.9.8.7").await.0, StatusCode::OK, "internal scraper via the proxy");
 }
 
 #[tokio::test]
@@ -95,7 +114,9 @@ async fn counters_move() {
     let room_get = r#"tavrn_http_requests_total{method="GET",route="/api/v1/rooms/{room_id}",status="200"}"#;
     assert_eq!(value(&after, room_get), 1.0, "route templates, never ids: {after}");
     assert!(!after.contains(room_id), "no ids in labels");
-    assert!(value(&after, r#"tavrn_http_requests_total{method="POST",route="/api/v1/auth/register",status="201"}"#) >= 1.0);
+    assert!(
+        value(&after, r#"tavrn_http_requests_total{method="POST",route="/api/v1/auth/register",status="201"}"#) >= 1.0
+    );
     assert!(after.contains(r#"route="unmatched""#) || after.contains("status=\"404\""), "unknown paths are bounded");
     assert_eq!(value(&after, "tavrn_websocket_connections"), 1.0);
     assert!(after.contains("tavrn_http_request_duration_seconds_bucket"));

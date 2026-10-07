@@ -323,7 +323,9 @@ mod tests {
         let all = parse(serde_json::json!({})).unwrap();
         assert_eq!(all.push_decision(Some(ROOM), CHAN, now, false, false), Some(false), "default: every message");
         assert_eq!(all.push_decision(Some(ROOM), CHAN, now, false, true), Some(true), "@everyone is a mention");
-        let quiet = parse(serde_json::json!({ "global": { "mode": "nothing" }, "channels": { CHAN: { "mode": "all" } } })).unwrap();
+        let quiet =
+            parse(serde_json::json!({ "global": { "mode": "nothing" }, "channels": { CHAN: { "mode": "all" } } }))
+                .unwrap();
         assert_eq!(quiet.push_decision(None, "01JEEEEEEEEEEEEEEEEEEEEEEE", now, false, false), None);
         assert_eq!(quiet.push_decision(None, CHAN, now, false, false), Some(true), "a DM's own mode wins");
         let text = parse(serde_json::json!({ "global": { "push_text": true } })).unwrap();
