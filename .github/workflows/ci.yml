@@ -83,8 +83,10 @@ jobs:
         run: node --test perf/report.test.ts
 
   image:
-    name: Container image (build only)
-    if: ${{ vars.CI_ENABLED == 'true' && github.event_name == 'pull_request' }}
+    # Pull requests only build the image; pushes to main publish it as ghcr.io/just-tavrn/tavrn-node:edge (plus a
+    # short sha tag), the image tavrn-web's end-to-end suite runs against by default. Releases are tagged by release.yml.
+    name: Container image
+    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     uses: just-tavrn/.github/.github/workflows/docker-publish.yml@main
     permissions:
       contents: read
@@ -95,7 +97,7 @@ jobs:
       image-name: tavrn-node
       build-args: |
         TAVRN_WEB_REF=${{ vars.TAVRN_WEB_REF || 'main' }}
-      push: false
+      push: ${{ github.event_name == 'push' }}
     secrets:
       # Read access to tavrn-crypto (cargo) and tavrn-web (the web stage), passed as the build secret read_token.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
