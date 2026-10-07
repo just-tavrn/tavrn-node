@@ -26,6 +26,7 @@ pub mod keys;
 pub mod legal;
 pub mod messages;
 pub mod mls;
+pub mod moderation;
 pub mod node;
 pub mod notifications;
 pub mod oidc;

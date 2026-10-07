@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod applications;
+pub mod automod;
 pub mod blobs;
 pub mod commands;
 pub mod conformance;
@@ -23,6 +24,8 @@ pub mod messages;
 pub mod oidc;
 pub mod pending_removals;
 pub mod push;
+pub mod reports;
+pub mod room_admin;
 pub mod rooms;
 pub mod social;
 pub mod subscriptions;

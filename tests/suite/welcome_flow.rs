@@ -172,3 +172,61 @@ async fn old_rooms_get_a_welcome_channel_at_start() {
     assert_eq!(welcome(&detail)["system_name"], "welcome");
     assert_eq!(tavrn_node::fixups::run(&node.state.db).await.unwrap().welcome_channels, 0);
 }
+
+#[tokio::test]
+async fn welcome_entries_cannot_be_deleted_or_purged_by_anyone() {
+    let node = test_node(DOMAIN).await;
+    let admin = node.register("admin").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let room = node.create_room(&alice.token, "Guild").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let wid = welcome(&room)["id"].as_str().unwrap().to_string();
+    join(&node, &alice, &room_id, &bob).await;
+    let (_, msgs) = node.get_auth(&format!("/api/v1/conversations/{wid}/messages"), &alice.token).await;
+    let entry = msgs[0]["id"].as_str().unwrap().to_string();
+    // Owner, node admin and the member the entry is about: nobody deletes it.
+    for token in [&alice.token, &admin.token, &bob.token] {
+        for path in [
+            format!("/api/v1/conversations/{wid}/messages/{entry}"),
+            format!("/api/v1/rooms/{room_id}/channels/{wid}/messages/{entry}"),
+        ] {
+            let (s, j) = node.delete(&path, token).await;
+            assert_eq!(
+                (s, j["code"].as_str()),
+                (StatusCode::FORBIDDEN, Some("message.system_protected")),
+                "{path}: {j}"
+            );
+        }
+    }
+    // Purges skip the welcome channel even when it is named, and the node admin's purge of a user too.
+    let (s, preview) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/moderation/purge"),
+            &alice.token,
+            json!({ "channel_ids": [wid], "author_id": bob.user_id }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{preview}");
+    assert_eq!(preview["messages"], 0, "{preview}");
+    let token = preview["confirm_token"].as_str().unwrap();
+    let (s, done) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/moderation/purge"),
+            &alice.token,
+            json!({ "channel_ids": [wid], "author_id": bob.user_id, "confirm_token": token }),
+        )
+        .await;
+    assert_eq!((s, done["messages"].as_i64()), (StatusCode::OK, Some(0)), "{done}");
+    let (_, preview) = node.post(&format!("/api/v1/admin/users/{}/purge", bob.user_id), &admin.token, json!({})).await;
+    let (s, _) = node
+        .post(
+            &format!("/api/v1/admin/users/{}/purge", bob.user_id),
+            &admin.token,
+            json!({ "confirm_token": preview["confirm_token"] }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let list = entries(&node, &alice.token, &wid).await;
+    assert!(list.iter().any(|e| e["type"] == "system.join" && e["user"] == "bob@t.local"), "{list:?}");
+}

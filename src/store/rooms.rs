@@ -1012,8 +1012,12 @@ pub async fn audit(
     action: &str,
     target: &str,
     reason: &str,
-    meta: serde_json::Value,
+    mut meta: serde_json::Value,
 ) -> Result<(), ApiError> {
+    // Action shortcuts of the moderation inbox record the report they act on (MODERATION.md §1.4).
+    if let (Some(report_id), Some(obj)) = (crate::reports::acting_on(), meta.as_object_mut()) {
+        obj.insert("report_id".into(), report_id.into());
+    }
     sqlx::query("INSERT INTO audit_log (id, room_id, actor_id, action, target, reason, meta, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
         .bind(ulid())
         .bind(room_id)

@@ -349,7 +349,6 @@ Bot tokens are a single factor: rooms, categories and channels can be declared "
 | `TAVRN_AUTOMOD_BURST_LIMIT` | `10` | More than this many messages of a user per channel within 5 seconds count as spam (`0` = off). |
 | `TAVRN_AUTOMOD_TIMEOUT_MINUTES` | `10` | Timeout in minutes after a spam burst. |
 
-<!-- TODO(merge): complete after the threads/moderation merge -->
 Reports and content auto-moderation add `TAVRN_REPORTS_RETENTION_DAYS`, `TAVRN_REPORTS_RATE_PER_HOUR`,
 `TAVRN_AUTOMOD_WORDS_FILE` and `TAVRN_AUTOMOD_LINKS`; see [Moderation and auto-moderation](#moderation-and-auto-moderation).
 
@@ -1609,18 +1608,35 @@ detection off. It works on message metadata only, so it applies to encrypted cha
 
 ### Reports
 
-<!-- TODO(merge): complete after the threads/moderation merge -->
-Users report messages and members to the moderators of a room. `TAVRN_REPORTS_RETENTION_DAYS` (default 90):
-resolved and dismissed reports and their evidence are deleted after that. `TAVRN_REPORTS_RATE_PER_HOUR` (default
-10): reports per user and hour. Reporters of encrypted messages may deliberately release the plaintext as evidence;
-otherwise the node never sees it.
+What the node does is specified in [MODERATION.md](https://github.com/just-tavrn/tavrn-protocol/blob/main/MODERATION.md).
+Members report messages, members and rooms from the context menus. Reports about room content land in the room's
+"Reports" settings tab (moderators with `moderate_members`); reports about direct messages, about users without a
+room, about rooms and about a room's owner land in Admin → Reports, where node admins also see every room report.
+Reporters are visible to moderators; the reported user is never told. For end-to-end encrypted messages the reporter
+can release the plaintext of the reported message and up to ten messages before it: the inbox shows it labelled
+"released by the reporter", the node cannot verify it. Plaintext messages are linked and snapshotted instead. The
+inbox offers shortcuts (delete the message, time out, kick, ban, delete the user's content) that run the normal
+moderation actions and note the report in the audit log. Every moderator of a room sees the room's reports,
+including those about channels hidden from them.
+
+`TAVRN_REPORTS_RATE_PER_HOUR` (default 10) limits reports per user, `TAVRN_REPORTS_RETENTION_DAYS` (default 90)
+deletes resolved and dismissed reports with their evidence; admins can delete a report at any time. Reports are
+announced in the client (bell and toast), not by web push.
 
 ### Content auto-moderation
 
-<!-- TODO(merge): complete after the threads/moderation merge -->
-`TAVRN_AUTOMOD_WORDS_FILE`: a file with one blocked term per line. `TAVRN_AUTOMOD_LINKS`: `off` or the path of a
-link blocklist file. Both apply to unencrypted conversations only, never to ciphertext. Room moderators configure
-their own rules in the room settings.
+Content rules only work where the node can read: unencrypted channels (never ciphertext). Rooms define their own
+rules (room settings → Auto-moderation: word lists with `*` wildcards, link allow and block lists, exempt roles and
+channels; actions block, delete or timeout), checked on send and edit, including attachment file names. As operator
+you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
+(one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
+line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;
+`check-config` names problems); restart the node after a change. Matches are audited with the matched term, never
+the message text, and show up in the moderators' inbox.
+
+The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
+moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
+accounts that own rooms must transfer or delete them before they can be deleted.
 
 ## Threads and forum channels
 

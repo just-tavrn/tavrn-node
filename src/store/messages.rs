@@ -478,6 +478,10 @@ pub fn purge_where(f: &PurgeFilter) -> (String, Vec<String>) {
         binds.push(t.clone());
         clauses.push(format!("created_at <= ${}", binds.len()));
     }
+    // The welcome channel's entries are never purged (MODERATION.md §3).
+    if !clauses.is_empty() {
+        clauses.push("conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')".into());
+    }
     (clauses.join(" AND "), binds)
 }
 
@@ -520,7 +524,11 @@ mod tests {
             to: None,
         };
         let (sql, binds) = purge_where(&f);
-        assert_eq!(sql, "conversation_id IN ($1, $2) AND author_id = $3 AND created_at >= $4");
+        assert_eq!(
+            sql,
+            "conversation_id IN ($1, $2) AND author_id = $3 AND created_at >= $4 \
+             AND conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')"
+        );
         assert_eq!(binds, vec!["c1", "c2", "u1", "2026"]);
         assert_eq!(purge_where(&PurgeFilter::default()).0, "");
     }

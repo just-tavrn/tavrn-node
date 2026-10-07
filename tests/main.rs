@@ -16,6 +16,7 @@ mod suite {
     mod attachment_retention_flow;
     mod attachments_flow;
     mod auth_flow;
+    mod automod_content_flow;
     mod backups_flow;
     mod blob_deletion_flow;
     mod bots_encrypted_flow;
@@ -56,8 +57,10 @@ mod suite {
     mod profiles_flow;
     mod push_flow;
     mod reauth_flow;
+    mod reports_flow;
     mod room_invites_flow;
     mod room_profiles_flow;
+    mod room_transfer_flow;
     mod rooms_flow;
     mod sealed_webhooks_flow;
     mod search_flow;
