@@ -15,7 +15,8 @@ permissions:
 jobs:
   dependency-review:
     name: Dependency review
-    if: ${{ vars.CI_ENABLED == 'true' }}
+    # Private repositories get the dependency graph only with Advanced Security: the job waits for publication.
+    if: ${{ vars.CI_ENABLED == 'true' && !github.event.repository.private }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
