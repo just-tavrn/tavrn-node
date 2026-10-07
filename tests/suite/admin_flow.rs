@@ -117,8 +117,8 @@ async fn admin_manages_users_bans_and_purges() {
 
     // Delete everything of Bob's: preview + confirmation
     let (_, preview) = node.post(&format!("/api/v1/admin/users/{}/purge", bob.user_id), &admin.token, json!({})).await;
-    // His message and his join entry in the welcome channel.
-    assert_eq!(preview["messages"], 2);
+    // His message; his join entry in the welcome channel stays (protocol MODERATION.md §3).
+    assert_eq!(preview["messages"], 1);
     let (s, done) = node
         .post(
             &format!("/api/v1/admin/users/{}/purge", bob.user_id),
@@ -127,7 +127,7 @@ async fn admin_manages_users_bans_and_purges() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{done}");
-    assert_eq!(done["messages"], 2);
+    assert_eq!(done["messages"], 1);
 
     // Node ban: the local account is locked; a domain ban blocks joins from foreign domains (later)
     let (s, j) =
