@@ -33,7 +33,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(OpenApi)]
 #[openapi(
     paths(vapid, list, register, remove, test),
-    components(schemas(VapidInfo, PushSubscriptionRequest, PushSubscriptionKeys, PushSubscription))
+    components(schemas(VapidInfo, PushSubscriptionRequest, PushSubscriptionKeys, PushRegistration))
 )]
 pub struct PushApi;
 
@@ -71,9 +71,10 @@ pub struct PushSubscriptionRequest {
     pub expiration_time: Option<f64>,
 }
 
-/// A registered subscription (the keys are never returned).
+/// A registered push subscription (the keys and the endpoint are never returned). Named apart from the browser's
+/// `PushSubscription`.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PushSubscription {
+pub struct PushRegistration {
     pub id: String,
     pub device_id: String,
     /// Origin of the push service (`https://host`), to tell the subscriptions apart.
@@ -87,7 +88,7 @@ pub struct PushSubscription {
     pub failures: i64,
 }
 
-impl PushSubscription {
+impl PushRegistration {
     fn of(row: SubscriptionRow, device_id: &str) -> Self {
         let push_service = reqwest::Url::parse(&row.endpoint).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
         Self {
@@ -122,10 +123,10 @@ pub async fn vapid(State(state): State<AppState>) -> Json<VapidInfo> {
 /// Every registered push subscription of the account's devices, oldest first; `current_device` marks those of the
 /// requesting device. Keys and endpoints are not returned, only the push service's origin.
 #[utoipa::path(get, path = "/api/v1/users/me/push-subscriptions", security(("bearer" = [])),
-    responses((status = 200, body = [PushSubscription]), (status = 403, body = ProblemDetails)))]
-pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Vec<PushSubscription>>, ApiError> {
+    responses((status = 200, body = [PushRegistration]), (status = 403, body = ProblemDetails)))]
+pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Vec<PushRegistration>>, ApiError> {
     let rows = store::push::list(&state.db, &auth.user.id).await?;
-    Ok(Json(rows.into_iter().map(|r| PushSubscription::of(r, &auth.device_id)).collect()))
+    Ok(Json(rows.into_iter().map(|r| PushRegistration::of(r, &auth.device_id)).collect()))
 }
 
 /// Register a push subscription.
@@ -139,14 +140,14 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<
 /// sessions are revoked (sign-out).
 #[utoipa::path(put, path = "/api/v1/users/me/push-subscriptions", security(("bearer" = [])),
     request_body = PushSubscriptionRequest,
-    responses((status = 200, body = PushSubscription), (status = 201, body = PushSubscription),
+    responses((status = 200, body = PushRegistration), (status = 201, body = PushRegistration),
         (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails),
         (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn register(
     State(state): State<AppState>,
     auth: AuthUser,
     ApiJson(req): ApiJson<PushSubscriptionRequest>,
-) -> Result<(StatusCode, Json<PushSubscription>), ApiError> {
+) -> Result<(StatusCode, Json<PushRegistration>), ApiError> {
     if !state.push.enabled() {
         return Err(disabled());
     }
@@ -200,7 +201,7 @@ pub async fn register(
         });
     };
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
-    Ok((status, Json(PushSubscription::of(row, &auth.device_id))))
+    Ok((status, Json(PushRegistration::of(row, &auth.device_id))))
 }
 
 /// Delete a push subscription.
