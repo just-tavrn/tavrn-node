@@ -898,3 +898,59 @@ async fn manage_threads_is_restricted_and_granted_to_moderators_once() {
     let report = tavrn_node::fixups::run(&r.node.state.db).await.unwrap();
     assert_eq!(report.manage_threads_roles, 0, "runs once");
 }
+
+/// Remote members get `notify` hints for thread messages as followers (every message) or when mentioned
+/// directly; `@everyone` inside a thread reaches followers only.
+#[tokio::test]
+async fn notify_hints_for_remote_followers() {
+    use common::federation::{A, two_nodes};
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    let room = a.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = TestNode::text_channel(&room);
+    a.patch(&format!("/api/v1/rooms/{room_id}"), &alice.token, json!({ "join_mode": "public" })).await;
+    let bob = b.register("bob").await;
+    let carol = b.register("carol").await;
+    let bob_on_a = a.sign_in_from(&b, &bob).await;
+    let carol_on_a = a.sign_in_from(&b, &carol).await;
+    for s in [&bob_on_a, &carol_on_a] {
+        let (st, j) = a.post(&format!("/api/v1/rooms/{room_id}/join"), &s.token, json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{j}");
+    }
+    let threads = format!("/api/v1/rooms/{room_id}/channels/{channel}/threads");
+    let messages = format!("/api/v1/rooms/{room_id}/channels/{channel}/messages");
+    let (st, thread) = a.post(&threads, &bob_on_a.token, json!({ "title": "Bob's", "message": text("mine") })).await;
+    assert_eq!(st, StatusCode::CREATED, "{thread}");
+    let id = thread["id"].as_str().unwrap();
+    a.deliver().await;
+    let (st, j) = a
+        .post(&messages, &alice.token, json!({ "content": { "type": "text", "body": "@everyone in a thread" }, "mentions_everyone": true, "thread_id": id }))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    assert_eq!(notified(&a).await, vec!["bob@b.test"], "followers only");
+    let entry = a.outbox().await.into_iter().find(|e| e.kind == "notify").unwrap();
+    let payload: Value = serde_json::from_str(&entry.body).unwrap();
+    assert_eq!(payload["payload"]["conversation_id"], channel.as_str());
+    assert_eq!(payload["payload"]["node"], A);
+    assert!(!entry.body.contains("@everyone in a thread"), "hints carry no content");
+    a.deliver().await;
+    let (st, j) = a
+        .post(&messages, &alice.token, json!({ "content": { "type": "text", "body": "carol?" }, "mentions": ["carol@b.test"], "thread_id": id }))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    assert_eq!(notified(&a).await, vec!["carol@b.test"], "direct mentions reach non-followers");
+}
+
+/// The recipients of the queued `notify` hints.
+async fn notified(node: &common::federation::FedNode) -> Vec<String> {
+    let mut to: Vec<String> = node
+        .outbox()
+        .await
+        .into_iter()
+        .filter(|e| e.kind == "notify")
+        .map(|e| serde_json::from_str::<Value>(&e.body).unwrap()["to"].as_str().unwrap().to_string())
+        .collect();
+    to.sort();
+    to
+}
