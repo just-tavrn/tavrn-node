@@ -5,7 +5,7 @@ resolver = "3"
 members = [".", "perf/loadgen"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # tavrn-crypto (OpenMLS 0.9) requires Rust 1.91.
 rust-version = "1.91"
