@@ -32,6 +32,7 @@ pub mod oidc;
 pub mod peer_resolve;
 pub mod presence;
 pub mod profile;
+pub mod push;
 pub mod read;
 pub mod roles;
 pub mod room_profiles;

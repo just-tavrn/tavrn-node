@@ -99,6 +99,12 @@ livekit-protocol = "0.8"
 # implemented in `oidc.rs` on reqwest (no `openidconnect`/`oauth2` stack).
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
+# Web push (protocol PROTOCOL.md §6d): RFC 8291 payload encryption and RFC 8292 VAPID need P-256 ECDH and ES256;
+# the RustCrypto crate is already in the tree (jsonwebtoken), AES-128-GCM and HKDF come from aes-gcm and hkdf.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8", "pem"] }
+# `GET /metrics` in the Prometheus text exposition format (docs/HANDBOOK.md): the plain client without protobuf.
+prometheus = { version = "0.14", default-features = false }
+
 # Optional Valkey/Redis for several instances of one node (`TAVRN_CACHE_URL`, docs/SCALING.md): pub/sub, counters,
 # leases. redis-rs over fred: the reference Rust client (also covers Valkey), small with default features off, the
 # connection manager reconnects by itself; TLS through the rustls stack already in the tree.

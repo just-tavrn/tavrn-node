@@ -304,6 +304,10 @@ pub async fn start(state: &AppState, conversation_id: &str, caller: &UserRow, gr
         "started_at": call.started_at, "group": group,
     });
     state.hub.users(ring.iter().map(|(id, _)| id.clone()).collect(), "call.ring", &ring_event);
+    // Local members without a connection ring by web push (PROTOCOL.md §6d; the sender checks the connection).
+    for m in members.iter().filter(|m| m.id != caller.id && m.domain == state.config.domain) {
+        crate::push::call(state, conversation_id, &m.id, &caller.id, group);
+    }
     // Members of other nodes without a connection here ring through their home node.
     let mut rung = Vec::new();
     for m in members.iter().filter(|m| m.id != caller.id && m.domain != state.config.domain) {
