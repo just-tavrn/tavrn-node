@@ -134,7 +134,7 @@ VOLUME ["/data"]
 # 8080: HTTP for the reverse proxy (API, web client, /rtc signaling). The UDP range carries voice and
 # video and must be published 1:1 (same ports outside and inside, TAVRN_RTC_UDP_PORT_RANGE). LiveKit's own
 # signaling port (7880) stays on 127.0.0.1 inside the container and is never published.
-EXPOSE 8080 50000-50100/udp
+EXPOSE 8080 7881 61000-61100/udp
 ENV TAVRN_DATA_DIR=/data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD ["tavrn-node", "check-config"]
 ENTRYPOINT ["tini", "--", "tavrn-node"]
