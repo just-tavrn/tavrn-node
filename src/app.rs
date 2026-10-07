@@ -910,7 +910,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::search::routes())
                 .merge(routes::commands::routes())
                 .merge(routes::legal::routes())
-                .merge(routes::push::routes()),
+                .merge(routes::push::routes())
                 .merge(routes::moderation::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
