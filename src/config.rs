@@ -335,7 +335,7 @@ pub struct Config {
     /// LiveKit's embedded TURN server (relays media for clients behind strict NATs or firewalls).
     pub rtc_turn_enabled: bool,
     /// Domain of TURN over TLS (`turns:<domain>:443`, TLS terminated by the reverse proxy). Default
-    /// `turn.<TAVRN_DOMAIN>`.
+    /// `turn.<host of TAVRN_PUBLIC_URL>` (`turn.<TAVRN_DOMAIN>` when that host is an IP address).
     pub rtc_turn_domain: Option<String>,
     /// TURN over UDP (published like the media ports); 0 = off.
     pub rtc_turn_udp_port: u16,
@@ -364,8 +364,9 @@ pub struct Config {
     pub federation_allow_private: bool,
     /// `--dev` only: `domain=http://host:port` mapping for local multi-node setups and tests.
     pub federation_dev_peers: String,
-    /// Server-to-server only: when a peer's `/.well-known/tavrn` fails with a network error (not a 404),
-    /// look up `_tavrn._tcp.<domain>` SRV and fetch the document from its target (FEDERATION.md §1.4).
+    /// When a peer's identity domain serves no `/.well-known/tavrn` (404, or no HTTPS server at all), look up
+    /// `_tavrn._tcp.<domain>` SRV and fetch the document from its target (FEDERATION.md §1.4); also used by
+    /// `GET /federation/resolve/{domain}` for clients.
     pub federation_srv_fallback: bool,
     /// Accept bots of other nodes (APPLICATIONS.md §2.8; whether this node's own bots may federate is
     /// `apps_federate`).
