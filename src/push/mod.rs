@@ -418,6 +418,11 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         .and_then(|p| p.nick.clone())
         .or_else(|| author.as_ref().map(|a| a.display_name.clone()));
     let now = util::now();
+    // Thread messages (PROTOCOL.md §7e) reach the thread's followers; others only when mentioned directly.
+    let followers: HashSet<String> = match &message.thread_id {
+        Some(thread_id) => store::threads::follower_ids(&state.db, thread_id).await?.into_iter().collect(),
+        None => HashSet::new(),
+    };
     for user_id in candidates {
         if user_id == author_id || crate::presence::is_online(state, &user_id) {
             continue;
@@ -453,6 +458,9 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         }
         let settings = crate::notifications::load(&state.db, &user.id).await?;
         let direct = direct_mention(message, &user, &role_ids);
+        if message.thread_id.is_some() && !direct && !followers.contains(&user.id) {
+            continue;
+        }
         let Some(important) =
             settings.push_decision(room_id.as_deref(), &row.id, &now, direct, message.mentions_everyone)
         else {
