@@ -1,0 +1,33 @@
+[package]
+name = "tavrn-perf-loadgen"
+description = "Load generator for the tavrn node performance budgets (perf/README.md, `just perf-node`)"
+license = "AGPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+# Uses tavrn-crypto (OpenMLS 0.9 requires Rust 1.91).
+rust-version = "1.91"
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "tavrn-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+tavrn-crypto.workspace = true
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+totp-rs = "6"
+ulid = "1"
+
+[lints]
+workspace = true

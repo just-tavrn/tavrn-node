@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Release of tavrn-node: a tag vX.Y.Z builds the container image with the web client of tavrn-web
+# (TAVRN_WEB_REF, repository variable, default main) and pushes it to ghcr.io/just-tavrn/tavrn-node
+# (tags X.Y.Z, X.Y and sha-…, with SLSA provenance and an SBOM), then creates the GitHub release with the
+# image digest. Gated by CI_ENABLED (docs/GITHUB.md); the private repositories are read with TAVRN_READ_PAT.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version check
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: The tag matches Cargo.toml
+        run: |
+          crate=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $crate in Cargo.toml" >&2
+            exit 1
+          fi
+
+  image:
+    name: Container image
+    needs: version
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      dockerfile: deploy/Dockerfile
+      image-name: tavrn-node
+      build-args: |
+        TAVRN_WEB_REF=${{ vars.TAVRN_WEB_REF || 'main' }}
+      push: true
+    secrets:
+      # Read access to tavrn-crypto (cargo) and tavrn-web (the web stage), passed as the build secret read_token.
+      READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
+
+  release:
+    name: GitHub release
+    needs: image
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          WEB_REF: ${{ vars.TAVRN_WEB_REF || 'main' }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(mktemp)"
+          {
+            echo "Container image: \`ghcr.io/just-tavrn/tavrn-node:${version}\` (\`${DIGEST}\`)"
+            echo
+            echo "Web client: tavrn-web \`${WEB_REF}\`. Upgrade notes: README.md (\"Upgrading\")."
+          } > "$notes"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes-file "$notes" --generate-notes --verify-tag

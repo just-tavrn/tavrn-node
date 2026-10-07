@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Node performance budgets (perf/README.md): nightly and by hand, never on pull requests. Release builds, the
+# load generator against a release node with PostgreSQL, then the report (fails when a metric is over budget).
+# Gated by CI_ENABLED (docs/GITHUB.md).
+name: Performance
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  perf:
+    name: Node performance budgets
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: tavrn, POSTGRES_PASSWORD: tavrn, POSTGRES_DB: tavrn_test }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U tavrn" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - name: Access to private organization repositories
+        env:
+          READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
+        run: |
+          if [ -n "$READ_TOKEN" ]; then
+            git config --global url."https://x-access-token:${READ_TOKEN}@github.com/just-tavrn/".insteadOf "https://github.com/just-tavrn/"
+          fi
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          token: ${{ secrets.TAVRN_READ_PAT || github.token }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release --locked -p tavrn-node -p tavrn-perf-loadgen
+      - name: Node benchmarks
+        run: target/release/tavrn-loadgen
+        env:
+          TAVRN_TEST_DATABASE_URL: postgres://tavrn:tavrn@localhost:5432/tavrn_test
+      - name: Report (fails when a metric is over budget)
+        if: success() || failure()
+        run: node perf/report.ts perf/results/raw/node.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: perf-results
+          path: perf/results
+          if-no-files-found: ignore

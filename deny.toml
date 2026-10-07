@@ -1,0 +1,69 @@
+# cargo deny configuration (docs/LICENSES.md). `cargo deny check` runs in the CI;
+# `just license-check` runs the license part locally.
+
+[graph]
+all-features = true
+
+[licenses]
+# Explicit allow-list: permissive licenses and MPL-2.0 (file-level copyleft, compatible with all our
+# licenses). No (A)GPL/LGPL: the crypto core (MPL-2.0) and everything the web client or the SDK could pull in
+# must stay free of it. The node itself (AGPL-3.0-only) may use GPL-compatible copyleft crates, but only
+# through a crate-specific exception below that names the node crate's dependency, never globally, and only
+# after checking with `cargo tree -i <crate>` that tavrn-crypto does not depend on it.
+allow = [
+    "MIT",
+    "MIT-0",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.93
+# The list is the project-wide allow-list (also for future dependencies); entries nobody uses today are fine.
+unused-allowed-license = "allow"
+
+# Our own crates carry the licenses of LICENSE.md.
+[[licenses.exceptions]]
+crate = "tavrn-node"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+crate = "tavrn-perf-loadgen"
+allow = ["AGPL-3.0-only"]
+
+# Mozilla's CA certificate bundle compiled into the TLS stacks (rustls via reqwest, lettre, sqlx): data
+# under the permissive Community Data License Agreement, not code.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[advisories]
+yanked = "deny"
+# Accepted until upstream moves (docs/LICENSES.md, section 2). Review on every dependency update.
+ignore = [
+    # rsa 0.9 (Marvin timing attack) via jsonwebtoken and livekit-api: no fixed version exists. The node uses
+    # RSA only to verify ID-token signatures of SSO providers with their public keys; the timing side channel
+    # concerns private-key operations, which never happen here.
+    { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification with public keys only; no fix upstream" },
+    # proc-macro-error2 is unmaintained: a build-time macro crate via tavrn-crypto -> openmls_rust_crypto ->
+    # hpke-rs -> libcrux, not part of the binary's runtime code.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate deep in the OpenMLS stack" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The encryption core is consumed by tag from its repository until it is published on crates.io.
+allow-git = ["https://github.com/just-tavrn/tavrn-crypto"]

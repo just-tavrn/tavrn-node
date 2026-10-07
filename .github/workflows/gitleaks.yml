@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# gitleaks over the full history (the organization's reusable workflow). Gated by CI_ENABLED (docs/GITHUB.md).
+name: Secret scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    uses: just-tavrn/.github/.github/workflows/gitleaks.yml@main

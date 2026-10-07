@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Contributor license agreement (CLA.md), checked by the organization's reusable workflow; signatures are
+# kept in just-tavrn/cla-signatures. Gated by CI_ENABLED (docs/GITHUB.md).
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    uses: just-tavrn/.github/.github/workflows/cla.yml@main
+    secrets:
+      CLA_PAT: ${{ secrets.CLA_PAT }}

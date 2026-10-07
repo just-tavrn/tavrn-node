@@ -1,0 +1,43 @@
+# Rust (build output goes to target/ or $CARGO_TARGET_DIR)
+/target
+target/
+**/*.rs.bk
+
+# The web client bundle embedded at compile time (README.md "Building"): only the placeholder is tracked,
+# so `cargo build` works without a bundle.
+/web/dist/*
+!/web/dist/.gitkeep
+
+# Node.js (perf/report.ts runs without dependencies)
+node_modules/
+
+# Local data and secrets: never part of the repository
+/data
+data/
+data-dev/
+pgdata/
+*.db
+*.sqlite
+.env
+!.env.example
+*.pem
+*.key
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Agent settings, memory files and planning notes: never part of the repository
+.claude/
+CLAUDE.md
+docs/PLAN.md
+
+# Test and benchmark output
+test-results/
+playwright-report/
+coverage/
+perf/results/
+
+# Private pattern list of the pre-publication check
+.publish-check.private

@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an improvement to the node, its administration or its deployment
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Changes to the API, federation or wire formats start as a proposal in
+        [tavrn-protocol](https://github.com/just-tavrn/tavrn-protocol). Ideas that need discussion first are
+        welcome in the [Discussions](https://github.com/just-tavrn/tavrn/discussions).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do as an operator or user, and what is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How could it work? Configuration, API or behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/just-tavrn/tavrn-node/security/advisories/new
+    about: Please report vulnerabilities privately, never as a public issue.
+  - name: Ask a question or get help running a node
+    url: https://github.com/just-tavrn/tavrn/discussions
+    about: Questions, setup help and ideas belong in the Discussions.
