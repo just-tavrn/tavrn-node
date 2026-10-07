@@ -318,6 +318,11 @@ async fn permissions_per_channel_kind() {
     let (s, j) = r.send(&r.bob.token, &r.channel, in_thread("no", thread_id)).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "thread.reply_forbidden"));
     r.send_ok(&r.bob.token, &r.channel, text("top level is fine")).await;
+    // A read-only channel has no new threads either.
+    let quiet = r.channel("text", "quiet").await;
+    r.deny_everyone(&quiet, &[p::SEND_MESSAGES]).await;
+    let (s, j) = r.create_thread(&r.bob.token, &quiet, json!({ "title": "no" })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "message.send_forbidden"));
 
     // Forum: posts only; send_messages is enough, create_threads is not needed.
     let forum = r.channel("forum", "help").await;
