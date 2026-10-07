@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Reports with evidence (protocol MODERATION.md §1): targets and routing, evidence for encrypted messages and
 //! snapshots of plaintext ones, the inbox of room moderators and node admins, merging, limits, action shortcuts,
 //! events and retention.
@@ -617,6 +617,10 @@ async fn retention_removes_closed_reports() {
 #[tokio::test]
 async fn the_report_routes_need_a_session() {
     let w = world().await;
+    // Clients offer reports and the rules editor only where the node announces them.
+    let (_, info) = w.node.req(Method::GET, "/api/v1/node", None, None).await;
+    let caps = info["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&json!("reports.v1")) && caps.contains(&json!("automod.v1")), "{info}");
     let (s, _) = w
         .node
         .req(
@@ -629,4 +633,45 @@ async fn the_report_routes_need_a_session() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = w.node.req(Method::GET, &format!("/api/v1/rooms/{}/reports", w.room_id), None, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn users_of_other_nodes_report_with_their_session_here() {
+    let (a, b) = common::federation::two_nodes().await;
+    let carol = b.register("carol").await;
+    let mallory = b.register("mallory").await;
+    let room = b.plaintext_room(&carol.token, "Meeting point").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = TestNode::text_channel(&room);
+    b.patch(&format!("/api/v1/rooms/{room_id}"), &carol.token, json!({ "join_mode": "public" })).await;
+    let (s, _) = b.post(&format!("/api/v1/rooms/{room_id}/join"), &mallory.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, msg) = b.send(&mallory.token, &room_id, &channel, "scam link").await;
+
+    // Alice of a.test reports through her federated session on b.test: the room's moderators see her address.
+    let alice = a.register("alice").await;
+    let remote = b.sign_in_from(&a, &alice).await;
+    let (s, _) = b.post(&format!("/api/v1/rooms/{room_id}/join"), &remote.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, created) = b
+        .post(
+            "/api/v1/reports",
+            &remote.token,
+            json!({ "kind": "message", "conversation_id": channel, "message_id": msg["id"], "category": "spam" }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{created}");
+    let (_, list) = b.get_auth(&format!("/api/v1/rooms/{room_id}/reports"), &carol.token).await;
+    assert_eq!(list["reports"][0]["reporter"]["address"], "alice@a.test");
+    assert_eq!(list["reports"][0]["scope"], "room");
+
+    // Conversations of a third node are reported to the home node, never through a federated session.
+    let (s, j) = b
+        .post(
+            "/api/v1/reports",
+            &remote.token,
+            json!({ "kind": "message", "conversation_id": channel, "message_id": msg["id"], "node": "c.test", "user": "x@c.test", "category": "spam" }),
+        )
+        .await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("report.target_invalid")), "{j}");
 }
