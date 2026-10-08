@@ -132,7 +132,8 @@ async fn join_inner(state: &AppState, auth: &AuthUser, conversation_id: &str) ->
         conversation_id: conversation_id.to_string(),
         epoch,
         limits: VoiceLimits {
-            audio_bitrate_kbps: i64::from(config.voice_max_bitrate_kbps),
+            audio_bitrate_kbps: i64::from(config.call_audio_bitrate_kbps()),
+            audio_fec: crate::routes::voice::AUDIO_FEC,
             screenshare: VideoLimits {
                 enabled: s.screen,
                 max_resolution: config.screenshare_max_resolution.clone(),

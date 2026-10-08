@@ -298,6 +298,9 @@ pub struct Config {
     pub gif_api_key: Option<String>,
 
     pub voice_enabled: bool,
+    /// Audio bitrate cap of every voice channel (8–512 kbps). The default 192 makes every client preset up to
+    /// "Music" (stereo Opus, VOICE.md §4a) reachable; new channels still start at
+    /// [`DEFAULT_CHANNEL_BITRATE_KBPS`].
     pub voice_max_bitrate_kbps: u32,
     pub screenshare_enabled: bool,
     pub screenshare_max_resolution: String,
@@ -578,7 +581,7 @@ impl Default for Config {
             gif_provider: GifProvider::None,
             gif_api_key: None,
             voice_enabled: true,
-            voice_max_bitrate_kbps: 96,
+            voice_max_bitrate_kbps: 192,
             screenshare_enabled: true,
             screenshare_max_resolution: "1080p".into(),
             screenshare_max_fps: 30,
@@ -712,6 +715,9 @@ impl std::error::Error for ConfigError {}
 /// Flags of `TAVRN_DEV_MISBEHAVE` (development nodes that break the protocol on purpose, FEDERATION.md §13.1).
 pub const MISBEHAVIORS: &[&str] = &["accept_bad_signatures", "replay_ok", "plaintext_ok", "no_rate_limit"];
 
+/// Bitrate of a new voice channel without an explicit `bitrate_kbps` (kbps, lowered to the node's cap): the
+/// "High" preset of the clients (VOICE.md §4a).
+pub const DEFAULT_CHANNEL_BITRATE_KBPS: u32 = 64;
 pub const SCREENSHARE_RESOLUTIONS: &[&str] = &["720p", "1080p", "1440p", "4k"];
 pub const CAMERA_RESOLUTIONS: &[&str] = &["360p", "720p", "1080p"];
 
@@ -1213,6 +1219,12 @@ impl Config {
     /// `TAVRN_RTC_STUN_SERVERS`.
     pub fn rtc_stun_servers(&self) -> Vec<String> {
         split_list(&self.rtc_stun_servers)
+    }
+
+    /// Audio bitrate of calls in DMs (VOICE.md §11): speech, so the bitrate of a new voice channel, lowered to
+    /// the node's cap.
+    pub fn call_audio_bitrate_kbps(&self) -> u32 {
+        DEFAULT_CHANNEL_BITRATE_KBPS.min(self.voice_max_bitrate_kbps)
     }
 
     /// `TAVRN_RTC_EXTERNAL_IP`, if set.
@@ -1796,6 +1808,10 @@ mod tests {
         assert_eq!((c.camera_max_resolution.as_str(), c.camera_max_fps), ("720p", 30));
         assert_eq!(c.voice_max_participants, 50);
         assert_eq!(c.voice_reconnect_grace_secs, 45);
+        // The cap leaves room for every client preset up to "Music" (stereo, 192 kbps); calls are speech and
+        // get the default channel bitrate below it.
+        assert_eq!((c.voice_max_bitrate_kbps, c.call_audio_bitrate_kbps()), (192, 64));
+        assert_eq!(Config { voice_max_bitrate_kbps: 32, ..prod() }.call_audio_bitrate_kbps(), 32);
         assert_eq!(c.rtc_external_ip(), None);
         let bad = Config {
             camera_max_resolution: "4k".into(),
