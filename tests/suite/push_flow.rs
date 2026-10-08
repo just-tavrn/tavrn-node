@@ -296,8 +296,16 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     assert_eq!(r.headers["ttl"], "21600");
     assert_eq!(r.headers["urgency"], "normal");
     assert_eq!(r.headers["topic"].len(), 22);
-    let row = &store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0];
-    assert!(row.last_used_at.is_some());
+    // The sender records the delivery after the push service answered: wait for it (tavrn-node #21).
+    let mut used = None;
+    for _ in 0..100 {
+        used = store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0].last_used_at.clone();
+        if used.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(used.is_some(), "a delivered push sets last_used_at");
 
     // Coalescing: the next message of the same conversation within 30 seconds does not push.
     send(&s, &s.channel, text("again")).await;
