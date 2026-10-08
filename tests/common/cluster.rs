@@ -68,10 +68,10 @@ pub fn in_process() -> Arc<dyn Cache> {
 }
 
 /// A fresh database for the instances: PostgreSQL with `TAVRN_TEST_DATABASE_URL`, else an SQLite file.
-async fn shared_database(dir: &std::path::Path) -> String {
+async fn shared_database(dir: &std::path::Path) -> (String, Option<super::databases::TestDatabase>) {
     match std::env::var("TAVRN_TEST_DATABASE_URL") {
         Ok(_) => super::test_database_url().await,
-        Err(_) => format!("sqlite://{}/tavrn.db?mode=rwc", dir.display()),
+        Err(_) => (format!("sqlite://{}/tavrn.db?mode=rwc", dir.display()), None),
     }
 }
 
@@ -94,9 +94,9 @@ pub async fn instances_with(
 ) -> Vec<Instance> {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_string_lossy().to_string();
-    let url = shared_database(tmp.path()).await;
+    let (url, db) = shared_database(tmp.path()).await;
     let mut out = Vec::new();
-    let mut tmp = Some(tmp);
+    let (mut tmp, mut db) = (Some(tmp), db);
     for i in 0..n {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -121,6 +121,8 @@ pub async fn instances_with(
                 reauth: Default::default(),
                 // The first instance owns the shared directory; the others get an unused one.
                 _tmp: tmp.take().unwrap_or_else(|| tempfile::tempdir().unwrap()),
+                // ... and the shared database.
+                _db: db.take(),
             },
             base,
         });

@@ -89,17 +89,20 @@ mod tests {
     /// Binary columns (BYTEA) round-trip through the `Any` driver on SQLite (and PostgreSQL in test-pg).
     #[tokio::test]
     async fn binary_columns_roundtrip() {
-        let url = match std::env::var("TAVRN_TEST_DATABASE_URL") {
+        // On PostgreSQL a database `t_<ulid>` like the integration tests' (tests/common/databases.rs), dropped at
+        // the end; if the test fails, their sweep drops it later.
+        let postgres = match std::env::var("TAVRN_TEST_DATABASE_URL") {
             Ok(base) => {
                 sqlx::any::install_default_drivers();
                 let name = format!("t_{}", crate::util::ulid().to_lowercase());
                 let admin = sqlx::AnyPool::connect(&base).await.unwrap();
                 sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
-                format!("{}/{name}", base.rsplit_once('/').unwrap().0)
+                Some((admin, format!("{}/{name}", base.rsplit_once('/').unwrap().0), name))
             }
-            Err(_) => "sqlite::memory:".into(),
+            Err(_) => None,
         };
-        let pool = connect(&url).await.unwrap();
+        let url = postgres.as_ref().map_or("sqlite::memory:", |(_, url, _)| url.as_str());
+        let pool = connect(url).await.unwrap();
         let ts = crate::util::now();
         sqlx::query(
             "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ('u', 'u', 'd', 'u', $1)",
@@ -120,6 +123,10 @@ mod tests {
         let back: Vec<u8> =
             sqlx::query_scalar("SELECT blob FROM key_backups WHERE user_id = 'u'").fetch_one(&pool).await.unwrap();
         assert_eq!(back, blob);
+        pool.close().await;
+        if let Some((admin, _, name)) = postgres {
+            sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        }
     }
 
     #[tokio::test]
