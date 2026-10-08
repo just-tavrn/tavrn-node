@@ -82,11 +82,39 @@ jobs:
       - name: Unit tests of the performance report
         run: node --test perf/report.test.ts
 
+  web-ref:
+    # The commit of tavrn-web that goes into the image. The build cache keys the web stage by its build arguments:
+    # with the branch name alone ("main") a rebuilt image would keep the cached, stale bundle of an earlier main.
+    # Resolving the branch to its current commit here makes every change of the web client a cache miss.
+    name: Web client commit
+    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - id: resolve
+        env:
+          WEB_REF: ${{ vars.TAVRN_WEB_REF || 'main' }}
+          READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
+        run: |
+          if printf '%s' "$WEB_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            sha="$WEB_REF"
+          else
+            url="https://github.com/just-tavrn/tavrn-web"
+            [ -n "$READ_TOKEN" ] && url="https://x-access-token:${READ_TOKEN}@github.com/just-tavrn/tavrn-web"
+            sha="$(git ls-remote "$url" "refs/heads/$WEB_REF" "refs/tags/$WEB_REF^{}" "refs/tags/$WEB_REF" | head -1 | cut -f1)"
+          fi
+          [ -n "$sha" ] || { echo "::error::tavrn-web ref '$WEB_REF' not found"; exit 1; }
+          echo "tavrn-web $WEB_REF = $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   image:
-    # Pull requests only build the image; pushes to main publish it as ghcr.io/just-tavrn/tavrn-node:edge (plus a
-    # short sha tag), the image tavrn-web's end-to-end suite runs against by default. Releases are tagged by release.yml.
+    # Pull requests only build the image; pushes to main (and manual runs on main) publish it as
+    # ghcr.io/just-tavrn/tavrn-node:edge (plus a short sha tag), the image tavrn-web's end-to-end suite runs
+    # against by default. Releases are tagged by release.yml.
     name: Container image
-    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    needs: web-ref
+    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
     uses: just-tavrn/.github/.github/workflows/docker-publish.yml@main
     permissions:
       contents: read
@@ -96,8 +124,8 @@ jobs:
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
       build-args: |
-        TAVRN_WEB_REF=${{ vars.TAVRN_WEB_REF || 'main' }}
-      push: ${{ github.event_name == 'push' }}
+        TAVRN_WEB_REF=${{ needs.web-ref.outputs.sha }}
+      push: ${{ github.event_name != 'pull_request' }}
     secrets:
       # Read access to tavrn-crypto (cargo) and tavrn-web (the web stage), passed as the build secret read_token.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
