@@ -42,6 +42,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     // Applications and installations, commands (APPLICATIONS.md §10.1).
     caps.push(crate::installations::CAPABILITY);
     caps.push(crate::commands::CAPABILITY);
+    // App sessions of the connect flow for native apps (FEDERATION.md §8 step 3).
+    caps.push(crate::connect_sessions::CAPABILITY);
     if config.oidc_issuer().is_some() {
         caps.push(crate::oidc::CAPABILITY);
     }
@@ -143,6 +145,13 @@ pub struct AppState {
     pub outbox_wakeup: Arc<tokio::sync::Notify>,
     /// Pending one-time codes of the connect flow (FEDERATION.md §8).
     pub connect_codes: Arc<routes::connect::ConnectCodes>,
+    /// App sessions of the connect flow (FEDERATION.md §8 step 3) and their limits: creations per IP and for the
+    /// whole node, polls per session and per IP.
+    pub connect_sessions: Arc<crate::connect_sessions::ConnectSessions>,
+    pub connect_session_limiter: Arc<SharedLimiter>,
+    pub connect_session_node_limiter: Arc<SharedLimiter>,
+    pub connect_poll_limiter: Arc<SharedLimiter>,
+    pub connect_poll_ip_limiter: Arc<SharedLimiter>,
     /// Conformance check runs in progress (FEDERATION.md §9).
     pub conformance: Arc<crate::federation::conformance::Runner>,
     /// Voice: LiveKit credentials and client, process status, participants (`protocol/VOICE.md`).
@@ -358,6 +367,15 @@ impl AppState {
             metrics: Arc::new(crate::metrics::Metrics::new(SOFTWARE_VERSION, cluster.is_shared())),
             app_connections: Arc::new(crate::applications::Connections::new(&cluster)),
             connect_codes: Arc::new(routes::connect::ConnectCodes::new(&cluster)),
+            connect_sessions: Arc::new(crate::connect_sessions::ConnectSessions::new(&cluster)),
+            connect_session_limiter: shared("connect-session", crate::connect_sessions::create_limit(config.dev), 60),
+            connect_session_node_limiter: shared(
+                "connect-session-node",
+                crate::connect_sessions::create_limit_node(config.dev),
+                60,
+            ),
+            connect_poll_limiter: shared("connect-poll", crate::connect_sessions::POLLS_PER_SESSION, 60),
+            connect_poll_ip_limiter: shared("connect-poll-ip", crate::connect_sessions::poll_limit_ip(config.dev), 60),
             cluster: cluster.clone(),
             config: Arc::new(config),
             keys: Arc::new(keys),
@@ -821,6 +839,8 @@ pub fn router(state: AppState) -> Router {
         .route("/federation/resolve/{domain}", get(routes::peer_resolve::resolve_peer))
         .route("/auth/connect/code", post(routes::connect::connect_code).layer(small()))
         .route("/auth/connect/token", post(routes::connect::connect_token).layer(small()))
+        .route("/auth/connect/session", post(routes::connect::create_session).layer(small()))
+        .route("/auth/connect/session/{session_id}", get(routes::connect::poll_session))
         // The handler reads the body itself with the 512 KiB cap of §4 (`index.too_large`).
         .route(
             "/users/me/conversations-index",
