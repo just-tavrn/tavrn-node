@@ -214,7 +214,8 @@ pub async fn create_channel(
         });
     }
     // 64 kbit/s by default, never more than the node allows.
-    let default_bitrate = 64.min(i64::from(state.config.voice_max_bitrate_kbps));
+    let default_bitrate =
+        i64::from(crate::config::DEFAULT_CHANNEL_BITRATE_KBPS.min(state.config.voice_max_bitrate_kbps));
     let (bitrate_kbps, user_limit) =
         check_voice_limits(&state, req.bitrate_kbps.unwrap_or(default_bitrate), req.user_limit.unwrap_or(0))?;
     let position = req.position.unwrap_or(store::rooms::channels(&state.db, &room_id).await?.len() as i64);
