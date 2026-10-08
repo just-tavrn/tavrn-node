@@ -418,6 +418,15 @@ async fn a_lowered_cap_limits_existing_channels_at_join() {
     let (s, j) = v.join(&v.alice).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["limits"]["audio_bitrate_kbps"], 128);
+    // Other settings of such a channel stay editable; only a new bitrate above the cap is refused.
+    let channel = format!("/api/v1/rooms/{}/channels/{}", v.room_id, v.voice_id);
+    let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "user_limit": 5 })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!((j["user_limit"].as_i64(), j["bitrate_kbps"].as_i64()), (Some(5), Some(192)));
+    let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "bitrate_kbps": 192 })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.bitrate_too_high")), "{j}");
+    let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "bitrate_kbps": 128 })).await;
+    assert_eq!((s, j["bitrate_kbps"].as_i64()), (StatusCode::OK, Some(128)), "{j}");
     // Calls stay at the default channel bitrate below the cap, and follow a cap below it.
     let low = setup_with(|c| c.voice_max_bitrate_kbps = 48).await;
     assert_eq!(low.node.state.config.call_audio_bitrate_kbps(), 48);

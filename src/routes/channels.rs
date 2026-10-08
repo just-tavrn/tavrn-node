@@ -164,9 +164,16 @@ fn channel_name(kind: &str, name: &str) -> Result<String, ApiError> {
     if kind == "voice" { Ok(name) } else { Ok(name.to_lowercase().replace(' ', "-")) }
 }
 
-fn check_voice_limits(state: &AppState, bitrate: i64, user_limit: i64) -> Result<(i64, i64), ApiError> {
+/// Validates a voice channel's bitrate and user limit. `new_bitrate`: the bitrate is being set, so the node's
+/// cap applies; a stored bitrate above a cap the operator lowered later stays (the join caps it).
+fn check_voice_limits(
+    state: &AppState,
+    bitrate: i64,
+    new_bitrate: bool,
+    user_limit: i64,
+) -> Result<(i64, i64), ApiError> {
     let max = i64::from(state.config.voice_max_bitrate_kbps);
-    if bitrate > max {
+    if new_bitrate && bitrate > max {
         return Err(bad("channel.bitrate_too_high", format!("This node allows at most {max} kbit/s")));
     }
     Ok((validate::range("bitrate_kbps", bitrate, 8, 512)?, validate::range("user_limit", user_limit, 0, 99)?))
@@ -217,7 +224,7 @@ pub async fn create_channel(
     let default_bitrate =
         i64::from(crate::config::DEFAULT_CHANNEL_BITRATE_KBPS.min(state.config.voice_max_bitrate_kbps));
     let (bitrate_kbps, user_limit) =
-        check_voice_limits(&state, req.bitrate_kbps.unwrap_or(default_bitrate), req.user_limit.unwrap_or(0))?;
+        check_voice_limits(&state, req.bitrate_kbps.unwrap_or(default_bitrate), true, req.user_limit.unwrap_or(0))?;
     let position = req.position.unwrap_or(store::rooms::channels(&state.db, &room_id).await?.len() as i64);
     let id = store::rooms::create_channel(
         &state.db,
@@ -330,8 +337,12 @@ pub async fn update_channel(
     let (bitrate, user_limit) = match (req.bitrate_kbps, req.user_limit) {
         (None, None) => (None, None),
         (b, u) => {
-            let (b2, u2) =
-                check_voice_limits(&state, b.unwrap_or(current.bitrate_kbps), u.unwrap_or(current.user_limit))?;
+            let (b2, u2) = check_voice_limits(
+                &state,
+                b.unwrap_or(current.bitrate_kbps),
+                b.is_some(),
+                u.unwrap_or(current.user_limit),
+            )?;
             (Some(b2), Some(u2))
         }
     };
