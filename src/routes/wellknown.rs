@@ -80,6 +80,22 @@ pub struct WellKnown {
     /// Present while federation is enabled (FEDERATION.md §1.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub federation: Option<FederationInfo>,
+    /// WebAuthn relying party of this node's passkeys (PROTOCOL.md §5a.4).
+    pub webauthn: WebauthnInfo,
+}
+
+/// The WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain). It may be a parent
+/// domain of the web client's host (delegation); clients pass it as `rpId` on assertions they build
+/// themselves (the secret storage PRF, PROTOCOL.md §5a.4).
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WebauthnInfo {
+    pub rp_id: String,
+}
+
+impl WebauthnInfo {
+    pub fn of(c: &crate::config::Config) -> Self {
+        Self { rp_id: c.webauthn_rp_id() }
+    }
 }
 
 /// Per-domain limits this node applies to peers, so they can pace themselves (FEDERATION.md §1.1).
@@ -135,6 +151,7 @@ pub fn build_from(c: &crate::config::Config, keys: &[crate::keys::NodeKey]) -> W
                 max_remote_users: c.federation_max_remote_users,
             },
         }),
+        webauthn: WebauthnInfo::of(c),
     }
 }
 
