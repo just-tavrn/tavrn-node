@@ -45,8 +45,8 @@ pub const MAX_PER_ROOM: usize = 50;
 pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const SECRET_BYTES: usize = 32;
 pub const MAX_NAME: usize = 32;
-/// Channel kinds webhooks can post in.
-pub const CHANNEL_KINDS: &[&str] = &["text", "announcement"];
+/// Channel kinds webhooks can post in (forum channels only into posts, with `thread_id`).
+pub const CHANNEL_KINDS: &[&str] = &["text", "announcement", "forum"];
 
 pub fn not_found() -> ApiError {
     ApiError::NotFound { code: "webhook.not_found", what: "Webhook".into() }
@@ -233,6 +233,8 @@ pub struct WebhookPayload {
     pub mentions_everyone: bool,
     /// A message of the same channel this one replies to.
     pub reply_to: Option<String>,
+    /// A thread of the channel to post into; required in forum channels (a post), which show no loose messages.
+    pub thread_id: Option<String>,
 }
 
 /// A `Conv` for publishing into the webhook's channel: no member, no permissions (webhooks cannot read).
@@ -285,6 +287,8 @@ pub struct SealedPayload {
     pub sealed: String,
     /// The epoch of the inbox key (from `GET …/inbox-key`).
     pub epoch: i64,
+    /// A thread of the channel to post into (routing metadata outside the box); required in forum channels.
+    pub thread_id: Option<String>,
 }
 
 /// The inner payload a sealed box carries (validated by readers, never by the node in `sender` mode).
@@ -303,6 +307,7 @@ struct Prepared {
     mentions: Vec<String>,
     mentions_everyone: bool,
     reply_to: Option<String>,
+    thread_id: Option<String>,
     name: String,
 }
 
@@ -324,6 +329,7 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
             Sealing::Node => prepare_node_sealed(state, webhook, &channel, &inbox, body).await.map_err(opaque)?,
         }
     };
+    let thread = target_thread(state, &channel, prepared.thread_id.as_deref()).await?;
     let id = util::ulid();
     store::messages::insert_webhook(
         &state.db,
@@ -337,7 +343,7 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
             epoch: prepared.epoch,
             content: &prepared.content,
             reply_to_id: prepared.reply_to.as_deref(),
-            thread_id: None,
+            thread_id: thread.as_ref().map(|t| t.id.as_str()),
             mentions: &prepared.mentions,
             mentions_everyone: prepared.mentions_everyone,
             signature: None,
@@ -348,12 +354,44 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
     store::webhooks::touch(&state.db, &webhook.id).await?;
     crate::search::index_message(state, &id).await;
     let message = crate::routes::messages::enrich_one(state, &webhook.user_id, &id).await?;
+    if let Some(t) = &thread {
+        // Like a member's reply (an archived thread reopens), without following: the pseudo user reads nothing.
+        store::threads::record_message(&state.db, &t.id, &message.id, &message.created_at).await?;
+        crate::threads::publish(state, "thread.update", &t.id).await?;
+    }
     let conv = channel_conv(state, channel).await?;
     let event_id = state.hub.room(&webhook.room_id, "message.create", &message);
     crate::subscriptions::record(state, &webhook.room_id, "message.create", &event_id, &message).await;
     crate::federation::social::notify_members(state, &conv, &message, &webhook.user_id).await;
     tracing::info!(webhook = webhook.id, message = id, "webhook executed");
     Ok(message)
+}
+
+/// The thread a post goes into (PROTOCOL.md §7e): a thread of the webhook's channel (`404 thread.not_found`), not
+/// locked (`403 thread.locked`); forum channels take posts only (`400 message.thread_required` without one).
+async fn target_thread(
+    state: &AppState,
+    channel: &ChannelRow,
+    thread_id: Option<&str>,
+) -> Result<Option<store::threads::ThreadRow>, ApiError> {
+    let Some(thread_id) = thread_id else {
+        if channel.kind == "forum" {
+            return Err(bad("message.thread_required", "Forum channels take posts only: name the post in thread_id"));
+        }
+        return Ok(None);
+    };
+    if !util::is_ulid(thread_id) {
+        return Err(crate::threads::not_found());
+    }
+    match store::threads::by_id(&state.db, &thread_id.to_ascii_uppercase()).await? {
+        Some(t) if t.channel_id == channel.id => {
+            if t.is_locked() {
+                return Err(ApiError::Forbidden { code: "thread.locked", detail: "This thread is locked".into() });
+            }
+            Ok(Some(t))
+        }
+        _ => Err(crate::threads::not_found()),
+    }
 }
 
 /// The checks of a plaintext payload shared by unencrypted channels and `node` sealing: content, username,
@@ -402,6 +440,7 @@ async fn prepare_plain(
         mentions,
         mentions_everyone: payload.mentions_everyone,
         reply_to: payload.reply_to,
+        thread_id: payload.thread_id,
         name: username.unwrap_or_else(|| webhook.name.clone()),
     })
 }
@@ -438,6 +477,7 @@ fn prepare_sender_sealed(
         mentions: Vec::new(),
         mentions_everyone: false,
         reply_to: None,
+        thread_id: payload.thread_id,
         name: webhook.name.clone(),
     })
 }
@@ -472,6 +512,7 @@ async fn prepare_node_sealed(
         mentions,
         mentions_everyone: payload.mentions_everyone,
         reply_to: payload.reply_to,
+        thread_id: payload.thread_id,
         name: webhook.name.clone(),
     })
 }

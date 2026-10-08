@@ -408,13 +408,13 @@ async fn tampered_expired_revoked_reset_and_rotated_tokens() {
         &b.token_id,
     )
     .await;
-    assert_eq!(me(fresh).await.0, StatusCode::UNAUTHORIZED, "rotated secret after 24 h");
+    assert_eq!(me(fresh.clone()).await.0, StatusCode::UNAUTHORIZED, "rotated secret after 24 h");
     assert_eq!(me(rotated.clone()).await.0, StatusCode::OK);
 
     // Revoked: the token and its device are gone.
     let (s, _) = node.delete(&format!("/api/v1/applications/{}/tokens/{}", b.app_id, b.token_id), &alice.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    assert_eq!(me(rotated).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(rotated.clone()).await.0, StatusCode::UNAUTHORIZED);
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE id = $1")
         .bind(&b.device_id)
         .fetch_one(&node.state.db)
@@ -428,11 +428,16 @@ async fn tampered_expired_revoked_reset_and_rotated_tokens() {
     .await
     .unwrap();
     assert_eq!(audit, 3);
-    let leaked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE meta LIKE '%eyJ%'")
-        .fetch_one(&node.state.db)
-        .await
-        .unwrap();
-    assert_eq!(leaked, 0, "secrets never reach the audit log");
+    // Look for the exact secrets the test handed out (and their signatures), compared in Rust: a pattern like
+    // LIKE '%eyJ%' is case-insensitive on SQLite and matched random ULIDs in the rows (tavrn-node #18).
+    let metas: Vec<String> = sqlx::query_scalar("SELECT meta FROM audit_log").fetch_all(&node.state.db).await.unwrap();
+    for secret in [&b.secret, &fresh, &rotated] {
+        let signature = secret.rsplit('.').next().unwrap();
+        for meta in &metas {
+            assert!(!meta.contains(secret.as_str()), "secrets never reach the audit log: {meta}");
+            assert!(!meta.contains(signature), "token signatures never reach the audit log: {meta}");
+        }
+    }
 }
 
 fn base64_url(bytes: &[u8]) -> String {

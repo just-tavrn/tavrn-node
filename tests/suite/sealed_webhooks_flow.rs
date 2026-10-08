@@ -387,3 +387,44 @@ async fn the_encryption_switch_resets_the_key_and_sealed_messages_are_moderated(
     let (st, j) = exec(&s.node, &path, json!({ "content": { "type": "text", "body": "x" } })).await;
     assert_eq!((st, code(&j)), (StatusCode::CONFLICT, "webhook.pending_key"));
 }
+
+/// A sealed post names its thread outside the box (`thread_id`, routing metadata like `epoch`; tavrn-node #8).
+#[tokio::test]
+async fn sealed_posts_go_into_threads() {
+    let s = setup().await;
+    let (_, path) = s.webhook(json!({ "name": "CI" })).await;
+    assert_eq!(
+        publish(&s.node, s.alice.token(), &s.channel, inbox_body(&s.alice, &s.channel, 0)).await.0,
+        StatusCode::OK
+    );
+    // A thread of the channel (its encrypted title does not matter here).
+    let thread_id = tavrn_node::util::ulid();
+    let inserted = tavrn_node::store::threads::insert(
+        &s.node.state.db,
+        tavrn_node::store::threads::NewThread {
+            id: &thread_id,
+            channel_id: &s.channel,
+            root_message_id: None,
+            title: tavrn_node::store::threads::Title {
+                text: "AAAA",
+                epoch: Some(0),
+                author_id: &s.alice.session.user_id,
+                device_id: None,
+            },
+            tags: &[],
+            created_by: &s.alice.session.user_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(inserted);
+    let (_, key) = s.node.req(Method::GET, &format!("{path}/inbox-key"), None, None).await;
+    let pk: [u8; 32] = unb64(&key["public_key"]).try_into().unwrap();
+    let inner = json!({ "content": { "type": "text", "body": "threaded" } }).to_string();
+    let sealed = b64(&tavrn_crypto::sealed::seal(&pk, inner.as_bytes()).unwrap());
+    let (st, m) = exec(&s.node, &path, json!({ "sealed": sealed, "epoch": 0, "thread_id": thread_id })).await;
+    assert_eq!((st, m["thread_id"].as_str()), (StatusCode::OK, Some(thread_id.as_str())), "{m}");
+    let (st, j) =
+        exec(&s.node, &path, json!({ "sealed": sealed, "epoch": 0, "thread_id": tavrn_node::util::ulid() })).await;
+    assert_eq!((st, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"));
+}

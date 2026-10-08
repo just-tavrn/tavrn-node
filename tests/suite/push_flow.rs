@@ -224,9 +224,26 @@ async fn vapid_key_and_subscriptions_are_validated() {
     assert!(created.get("keys").is_none() && created.get("endpoint").is_none(), "keys and endpoint stay private");
     let (st, again) = s.node.put(SUBS, &s.bob.token, good.clone()).await;
     assert_eq!((st, &again["id"]), (StatusCode::OK, &created["id"]), "same endpoint: updated");
-    // Another account on the same browser takes the endpoint over.
+    // Another account cannot take over the endpoint of a live subscription (tavrn-node #9).
+    let (st, j) = s.node.put(SUBS, &s.alice.token, good.clone()).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::CONFLICT, Some("push.endpoint_taken")), "{j}");
+    let (_, mine) = s.node.get_auth(SUBS, &s.bob.token).await;
+    assert_eq!(mine.as_array().unwrap().len(), 1, "the owner keeps it: {mine}");
+    // The same account moves it to another of its devices.
+    let laptop = s.node.login("bob").await;
+    let (st, moved) = s.node.put(SUBS, &laptop.token, good.clone()).await;
+    assert_eq!(
+        (st, &moved["id"], moved["device_id"].as_str()),
+        (StatusCode::OK, &created["id"], Some(laptop.device_id.as_str()))
+    );
+    // Once the owner's device has no live session, the endpoint is stale and another account takes it over.
+    sqlx::query("UPDATE sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE device_id = $1")
+        .bind(&laptop.device_id)
+        .execute(&s.node.state.db)
+        .await
+        .unwrap();
     let (st, taken) = s.node.put(SUBS, &s.alice.token, good.clone()).await;
-    assert_eq!((st, &taken["id"]), (StatusCode::OK, &created["id"]));
+    assert_eq!((st, &taken["id"]), (StatusCode::OK, &created["id"]), "{taken}");
     let (_, mine) = s.node.get_auth(SUBS, &s.bob.token).await;
     assert_eq!(mine, json!([]));
     let (_, theirs) = s.node.get_auth(SUBS, &s.alice.token).await;
@@ -296,8 +313,16 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     assert_eq!(r.headers["ttl"], "21600");
     assert_eq!(r.headers["urgency"], "normal");
     assert_eq!(r.headers["topic"].len(), 22);
-    let row = &store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0];
-    assert!(row.last_used_at.is_some());
+    // The sender records the delivery after the push service answered: wait for it (tavrn-node #21).
+    let mut used = None;
+    for _ in 0..100 {
+        used = store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0].last_used_at.clone();
+        if used.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(used.is_some(), "a delivered push sets last_used_at");
 
     // Coalescing: the next message of the same conversation within 30 seconds does not push.
     send(&s, &s.channel, text("again")).await;

@@ -33,7 +33,7 @@ pub struct WebhookAuthor<'a> {
 pub async fn insert_webhook(db: &Pool, m: NewMessage<'_>, webhook: WebhookAuthor<'_>) -> Result<MessageRow, ApiError> {
     sqlx::query(
         "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature, webhook_id, webhook_name)
-         VALUES ($1, $2, $3, NULL, $12, 1, $13, $4, $5, $6, NULL, $7, $8, $9, NULL, $10, $11)",
+         VALUES ($1, $2, $3, NULL, $12, 1, $13, $4, $5, $6, $14, $7, $8, $9, NULL, $10, $11)",
     )
     .bind(m.id)
     .bind(m.conversation_id)
@@ -48,6 +48,7 @@ pub async fn insert_webhook(db: &Pool, m: NewMessage<'_>, webhook: WebhookAuthor
     .bind(webhook.name)
     .bind(m.encrypted as i64)
     .bind(m.epoch)
+    .bind(m.thread_id)
     .execute(db)
     .await?;
     by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))

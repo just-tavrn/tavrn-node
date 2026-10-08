@@ -62,7 +62,7 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.push("reports.v1");
     caps.push("automod.v1");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
-    caps.extend(["threads", "forum", "announcement"]);
+    caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
         caps.push("voice");
         caps.push("soundboard");
