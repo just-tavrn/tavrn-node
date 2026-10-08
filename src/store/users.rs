@@ -152,6 +152,20 @@ pub async fn update_profile_fields(db: &Pool, user_id: &str, u: ProfileUpdate<'_
     Ok(())
 }
 
+/// The language of a user's mails (`mail_templates.rs`), `None` = English.
+pub async fn locale(db: &Pool, user_id: &str) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_scalar::<_, Option<String>>("SELECT locale FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?
+        .flatten())
+}
+
+pub async fn set_locale(db: &Pool, user_id: &str, locale: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET locale = $1 WHERE id = $2").bind(locale).bind(user_id).execute(db).await?;
+    Ok(())
+}
+
 /// The `auto_preview` privacy setting of a user.
 pub async fn auto_preview(db: &Pool, user_id: &str) -> Result<String, ApiError> {
     let v: Option<String> =

@@ -47,6 +47,8 @@ mod suite {
     mod housekeeping_flow;
     mod identity_rotation_flow;
     mod legal_flow;
+    mod mail_locale_flow;
+    mod message_retention_flow;
     mod messages_flow;
     mod metrics_flow;
     mod mls_flow;
@@ -57,6 +59,7 @@ mod suite {
     mod profiles_flow;
     mod push_flow;
     mod reauth_flow;
+    mod report_push_flow;
     mod reports_flow;
     mod room_invites_flow;
     mod room_profiles_flow;

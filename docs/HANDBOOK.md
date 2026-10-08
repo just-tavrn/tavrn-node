@@ -143,6 +143,7 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_EMAIL` | `optional` | `none`, `optional` or `required` (`required` needs `TAVRN_SMTP_URL`). |
 | `TAVRN_SMTP_URL` | unset | `smtp://host:port` (plain, internal relay), `smtps://host:port` (TLS) or `smtp+starttls://host:port`, optionally `user:pass@`. Test it with `tavrn-node send-test-mail you@example.org`. |
 | `TAVRN_SMTP_FROM` | `noreply@<TAVRN_DOMAIN>` | Sender address. |
+| `TAVRN_MAIL_TEMPLATES_DIR` | `<TAVRN_DATA_DIR>/templates/mail` | Your own texts for the node's mails, per language: `<dir>/<language>/<name>.txt`. See [Mail languages and templates](#mail-languages-and-templates). |
 | `TAVRN_CAPTCHA_PROVIDER` | `none` | `none` or `turnstile` (Cloudflare Turnstile). |
 | `TAVRN_TURNSTILE_SITE_KEY`, `TAVRN_TURNSTILE_SECRET_KEY` | unset | Required with `TAVRN_CAPTCHA_PROVIDER=turnstile`. |
 | `TAVRN_CAPTCHA_REGISTER` | `true` | Require the captcha at registration (only with a provider). |
@@ -162,6 +163,33 @@ and the captcha, and the app picks up the session. A passkey used there also unl
 page seals the passkey's unlock secret to a key only the app holds, and the node keeps that sealed box (at most
 1 KiB, never logged, handed out once) until the app picks it up. There is nothing to configure; `/connect` must be
 served like every other page of the web client.
+
+#### Mail languages and templates
+
+The node's mails (email confirmation, password reset, account deleted and restored, takedown notices and statements
+of reasons, app token expiry) are written in the recipient's language: the language the user picked in the client
+(the client stores it on the node; a new account starts with the browser's language), for reporters of takedown
+notices the browser language of the notice form. The node has English and German texts; any other language falls
+back to English. The texts are the templates in `templates/mail/<language>/<name>.txt` of this repository:
+
+```text
+Subject: Reset your password
+
+Hello {name},
+
+you can set a new password via this link:
+{link}
+```
+
+The first line is the subject (the node puts its name in front), the second is empty, the rest is the plain-text
+body. `{name}`-style variables are filled in; every template knows `{node}` (`TAVRN_NAME`), `{domain}` and
+`{public_url}` plus its own (`check-config` names them when one is wrong). To change a text, copy the file to
+`TAVRN_MAIL_TEMPLATES_DIR` (default `/data/templates/mail`) under the same language and name, for example
+`/data/templates/mail/de/password_reset.txt`, and edit it; you can also add a language the node has no texts for
+(`/data/templates/mail/fr/…`, used for users whose language is `fr` or `fr-ca`). The files are read when a mail is
+sent, so changes apply without a restart. `tavrn-node check-config` validates the directory (unknown names, a
+missing subject line, unknown variables, files over 64 KiB); a file that is broken when a mail goes out is skipped
+with a warning and the built-in text is sent instead.
 
 ### Single sign-on (OpenID Connect)
 
@@ -234,7 +262,7 @@ you out; those names are never given to accounts created by SSO. `TAVRN_OIDC_CLI
 | `TAVRN_UPLOAD_DM_CATEGORIES` | `images,audio,video,documents,archives,other` | Upload categories in DMs and group DMs hosted here. |
 | `TAVRN_STORAGE_QUOTA_PER_ROOM_BYTES` | `10737418240` (10 GiB) | Storage per room (entitlement `storage.max_bytes_per_room`). |
 | `TAVRN_STORAGE_ENCRYPTION` | `on` | Encryption at rest of every stored file; `off` stores new files unencrypted (debugging only; encrypted files stay readable). See [Storage and media](#storage-and-media). |
-| `TAVRN_RETENTION_DAYS` | `0` | Accepted for compatibility; this version does not use it. File retention is `TAVRN_ATTACHMENT_RETENTION_DAYS`. |
+| `TAVRN_RETENTION_DAYS` | `0` | Message retention: messages of channels, DMs and group DMs hosted here are deleted this many days after they were sent by the hourly housekeeping, with their attachments, reactions and pins. Pinned messages and the welcome channel's entries are kept. Rooms may only shorten it (room setting). 0–36500, `0` = keep forever. See [Message retention](#message-retention). |
 | `TAVRN_EMOJI_MAX_PER_ROOM` | `100` | Custom emojis per room (entitlement `emoji.max_per_room`). |
 | `TAVRN_EMOJI_MAX_BYTES` | `262144` (256 KiB) | Largest custom emoji file. |
 | `TAVRN_PREVIEW_AUTO_MAX_BYTES` | `5242880` (5 MiB) | Images up to this size load as previews by themselves where the user's setting allows it (always / friends and shared rooms / never); larger ones show a placeholder with a "Load" button. `0` = never automatically. |
@@ -688,7 +716,7 @@ still opens the files of that time.
   PostgreSQL version on an empty data directory, restore, then start the node. Do not just change the image tag of
   the `db` service on an existing `./pgdata`.
 - The node cleans up after itself through the hourly **housekeeping** (handshake log, federation state, orphaned
-  files, attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
+  files, message and attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
   PostgreSQL's own autovacuum is needed.
 
 ## Storage and media
@@ -743,6 +771,21 @@ Upload size, types, the executable rule, per-room quotas and attachment retentio
 hourly housekeeping deletes expired attachments (messages keep listing them as "file expired"; pinned messages keep
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
 Files channels can use external WebDAV/S3 stores only with `TAVRN_FILES_EXTERNAL=on`.
+
+### Message retention
+
+`TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
+sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
+together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
+again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
+and the entries of a room's **welcome channel** (the room's security log). A room owner or a member with "Manage
+room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
+node's value); a longer room value has no effect, a room can only shorten. Each run that deleted something writes one
+entry `retention.messages` to the node's audit log (`deleted`, `node_days`, `rooms` with an own shorter value,
+`incomplete` when the run's time budget of one minute ran out; the rest follows an hour later). Clients are not told:
+an open client keeps showing what it already loaded until it reloads, and messages users saved themselves (exports,
+the local search index of encrypted conversations) are outside the node's reach. `tavrn-node check-config` refuses
+values above 36500. Tell your users in the privacy policy.
 
 ### Profiles, presence and message requests
 
@@ -1005,7 +1048,13 @@ How it behaves:
   endpoints are chosen by the browsers (hosts of Google, Mozilla, Apple, Microsoft and others), so egress HTTPS to
   the internet must be allowed. Endpoints on private or loopback addresses are refused.
 - **Remote conversations**: notifications for rooms on other nodes arrive through the federation `notify` hint at
-  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations).
+  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations). A
+  channel set to "all messages" in a room on another node therefore does not push for ordinary messages; the client
+  says so in the notification settings. This is a design decision: subscriptions stay with the home node, which holds
+  the settings (PROTOCOL.md §6d).
+- **Reports**: room moderators and node admins without an open connection get a push for every new report (its kind
+  and room only, at most one per room every 30 seconds); each of them can turn it off ("Reports" in the notification
+  settings).
 - **Several instances**: any instance sends; the rate counters live in Valkey.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
@@ -1367,7 +1416,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 | Job | Decision |
 |---|---|
-| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
+| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **message and attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
 | Federation outbox delivery | leader only (any instance queues and wakes it) |
 | Event subscription delivery | leader only (any instance queues and wakes it) |
 | Directory announce and pruning | leader only |
@@ -1392,7 +1441,10 @@ are in [tavrn-js](https://github.com/just-tavrn/tavrn-js). What the operator dec
 - **How many**: `TAVRN_APPS_PER_USER` (default 5 per owner, node admins included), `TAVRN_APPS_PER_ROOM` (default 25
   installed per room).
 - **Tokens and load**: `TAVRN_APP_TOKEN_MAX_DAYS` (default 365) caps the token lifetime; `TAVRN_APP_RATE_REQUESTS`
-  (default 1200 per application and minute) caps REST and WebSocket operations.
+  (default 1200 per application and minute) caps REST and WebSocket operations. Seven days and one day before a token
+  expires, the hourly housekeeping tells the owner in the client and, with SMTP and a confirmed address, by e-mail
+  (once per token and step, in the owner's language; templates `app_token_expiring_week` and `app_token_expiring_day`,
+  see [Mail languages and templates](#mail-languages-and-templates)).
 - **Command review**: `TAVRN_APP_COMMANDS_REQUIRE_APPROVAL=true` makes node admins approve every command definition
   (and every change of one) before it is offered in this node's rooms.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and
@@ -1596,8 +1648,8 @@ the node and remain responsible for it. Settings: [Legal settings](#legal-settin
 What the node can and cannot see, for the privacy policy: the content of encrypted conversations (messages, voice,
 whiteboards) is end-to-end encrypted and never readable by the node; metadata (who is in which room, when messages
 are sent, IP addresses in logs) and unencrypted channels are. Link previews show the node which URLs users preview.
-Web push payloads carry no content of encrypted conversations. Retention you control: attachments
-(`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
+Web push payloads carry no content of encrypted conversations. Retention you control: messages
+(`TAVRN_RETENTION_DAYS`), attachments (`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
@@ -1631,11 +1683,13 @@ can release the plaintext of the reported message and up to ten messages before 
 "released by the reporter", the node cannot verify it. Plaintext messages are linked and snapshotted instead. The
 inbox offers shortcuts (delete the message, time out, kick, ban, delete the user's content) that run the normal
 moderation actions and note the report in the audit log. Every moderator of a room sees the room's reports,
-including those about channels hidden from them.
+including those about channels hidden from them: moderation needs the context, and the reporter addressed the
+room's moderators as a whole (MODERATION.md §1.1). Give a private area that needs its own moderators its own room.
 
 `TAVRN_REPORTS_RATE_PER_HOUR` (default 10) limits reports per user, `TAVRN_REPORTS_RETENTION_DAYS` (default 90)
 deletes resolved and dismissed reports with their evidence; admins can delete a report at any time. Reports are
-announced in the client (bell and toast), not by web push.
+announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
+only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
 ### Content auto-moderation
 
@@ -1645,8 +1699,13 @@ channels; actions block, delete or timeout), checked on send and edit, including
 you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
 (one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
 line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;
-`check-config` names problems); restart the node after a change. Matches are audited with the matched term, never
-the message text, and show up in the moderators' inbox.
+`check-config` names problems) and read again, without a restart, by the hourly housekeeping and when the node gets
+`SIGHUP` (`docker compose kill -s HUP tavrn`; with several instances every instance reads its own copy, so signal
+each one or wait for the hour). A reload validates both files like `check-config`: when one of them is invalid or
+unreadable, the node keeps **both** previous lists and logs a warning naming the problem; otherwise it logs how many
+terms and domains were added and removed ("Auto-moderation node lists reloaded"). Point the variables at a file, not
+at a path that does not exist yet: the paths themselves are read from the configuration at start. Matches are
+audited with the matched term, never the message text, and show up in the moderators' inbox.
 
 The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);

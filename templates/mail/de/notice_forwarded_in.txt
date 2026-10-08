@@ -1,0 +1,5 @@
+Subject: Meldung erhalten ({case})
+
+Der Node {origin} hat Ihre Meldung an {domain} weitergeleitet, wo die gemeldeten Inhalte liegen. Vorgang auf diesem Node: {case}
+
+Der Betreiber von {domain} prüft sie und teilt Ihnen die Entscheidung mit.

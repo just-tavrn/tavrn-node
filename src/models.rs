@@ -118,6 +118,7 @@ impl UserRow {
             has_password: self.password_hash.is_some(),
             notification_settings: None,
             auto_preview: None,
+            locale: None,
         }
     }
 }
@@ -178,6 +179,10 @@ pub struct UserPrivate {
     /// (`always`, `friends_and_shared` or `never`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_preview: Option<String>,
+    /// `GET /users/me` and `PATCH /users/me` of local users: the language of the node's mails (a lowercase language
+    /// tag such as `de`; null = English). Clients send theirs when it changes.
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -245,6 +250,9 @@ pub struct Room {
     /// Attachments of the room's channels are deleted after this many days (null = the node's value; a room
     /// can only shorten it).
     pub attachment_retention_days: Option<i64>,
+    /// Messages of the room's channels are deleted after this many days (null = the node's value; a room can only
+    /// shorten it; pinned messages and the welcome channel are exempt, PROTOCOL.md §7f).
+    pub message_retention_days: Option<i64>,
 }
 
 impl Room {

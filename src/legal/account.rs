@@ -467,13 +467,11 @@ pub async fn delete_local(
     )
     .await?;
     if let Some(email) = user.email.as_deref() {
-        let body = format!(
-            "The account {} on {} was deleted{}.\n\nA node admin can undo the deletion until {purge_after}; after that the account is erased and the username becomes free.",
-            user.address(),
-            state.config.domain,
-            if admin.is_some() { " by a node admin" } else { "" }
-        );
-        state.mailer.send(email, "Account deleted", &body).await;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        let template = if admin.is_some() { "account_deleted_by_admin" } else { "account_deleted" };
+        let address = user.address();
+        let vars = [("address", address.as_str()), ("purge_after", purge_after.as_str())];
+        state.mailer.send_template(email, locale.as_deref(), template, &vars).await;
     }
     let row = by_id(&state.db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("deletion missing")))?;
     if delete_messages {
@@ -663,14 +661,9 @@ pub async fn undelete(state: &AppState, admin: &UserRow, user_id: &str) -> Resul
     )
     .await?;
     if let Some(email) = user.email.as_deref() {
-        state
-            .mailer
-            .send(
-                email,
-                "Account restored",
-                &format!("A node admin restored the account {}. Sign in again to use it.", user.address()),
-            )
-            .await;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        let address = user.address();
+        state.mailer.send_template(email, locale.as_deref(), "account_restored", &[("address", &address)]).await;
     }
     Ok(by_id(&state.db, &row.id).await?.unwrap_or(row).to_api(true))
 }

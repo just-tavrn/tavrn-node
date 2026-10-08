@@ -216,6 +216,9 @@ pub struct Config {
     pub smtp_url: Option<String>,
     /// Sender address; default `noreply@<domain>`.
     pub smtp_from: Option<String>,
+    /// Operator overrides of the mail templates, `<dir>/<language>/<name>.txt` (`mail_templates.rs`); default
+    /// `<TAVRN_DATA_DIR>/templates/mail`.
+    pub mail_templates_dir: Option<String>,
     /// Optional captcha: `none` or `turnstile` (Cloudflare).
     pub captcha_provider: CaptchaProvider,
     pub turnstile_site_key: Option<String>,
@@ -255,6 +258,9 @@ pub struct Config {
     pub preview_auto_max_bytes: u64,
     /// Sender-generated link previews (`GET /api/v1/unfurl`): `on` (default) or `off`.
     pub unfurl: crate::unfurl::UnfurlSetting,
+    /// Message retention (PROTOCOL.md §7f): messages are deleted this many days after they were sent by the hourly
+    /// housekeeping (`0` = keep forever, at most 36500); rooms may only shorten it. Pinned messages and the welcome
+    /// channel are exempt.
     pub retention_days: u32,
     /// Custom emojis per room: maximum count and maximum file size.
     pub emoji_max_per_room: u32,
@@ -541,6 +547,7 @@ impl Default for Config {
             email: EmailMode::Optional,
             smtp_url: None,
             smtp_from: None,
+            mail_templates_dir: None,
             captcha_provider: CaptchaProvider::None,
             turnstile_site_key: None,
             turnstile_secret_key: None,
@@ -840,6 +847,15 @@ impl Config {
         {
             problems.push(format!("TAVRN_SMTP_FROM='{from}' is not a valid sender address"));
         }
+        let templates = crate::mail_templates::dir_of(self);
+        let explicit = self.mail_templates_dir.as_deref().is_some_and(|d| !d.trim().is_empty());
+        if explicit && !templates.is_dir() {
+            problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR='{}' is not a directory", templates.display()));
+        } else if templates.is_dir() {
+            for p in crate::mail_templates::check_dir(&templates) {
+                problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR: {p}"));
+            }
+        }
 
         if self.gif_provider != GifProvider::None && self.gif_api_key.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("TAVRN_GIF_API_KEY is missing (needed with TAVRN_GIF_PROVIDER=giphy|tenor)".into());
@@ -1043,7 +1059,7 @@ impl Config {
         if self.upload_max_bytes_ceiling != 0 && self.upload_max_bytes_ceiling < self.upload_max_bytes {
             problems.push("TAVRN_UPLOAD_MAX_BYTES_CEILING must be 0 or at least TAVRN_UPLOAD_MAX_BYTES".into());
         }
-        let ranges: [(&str, u64, u64); 9] = [
+        let ranges: [(&str, u64, u64); 10] = [
             ("TAVRN_VOICE_CHANNEL_MAX_PARTICIPANTS", self.voice_channel_max_participants.into(), 1000),
             ("TAVRN_STREAM_MAX_HEIGHT", self.stream_max_height.into(), 4320),
             ("TAVRN_STREAM_MAX_FPS", self.stream_max_fps.into(), 240),
@@ -1052,6 +1068,7 @@ impl Config {
             ("TAVRN_SOUNDS_MAX_PER_ROOM", self.sounds_max_per_room.into(), 100_000),
             ("TAVRN_SOUNDS_MAX_PERSONAL", self.sounds_max_personal.into(), 100_000),
             ("TAVRN_ATTACHMENT_RETENTION_DAYS", self.attachment_retention_days.into(), 36_500),
+            ("TAVRN_RETENTION_DAYS", self.retention_days.into(), 36_500),
             ("TAVRN_MAX_ROOMS_PER_USER", self.max_rooms_per_user.into(), 1_000_000),
         ];
         for (name, value, max) in ranges {
@@ -2255,6 +2272,21 @@ mod tests {
             Ok(())
         });
         assert_eq!(Config::default().upload_ceiling(), Config::default().upload_max_bytes);
+    }
+
+    #[test]
+    fn message_retention_is_validated() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            assert_eq!(Config::load(false).unwrap().retention_days, 0, "keep forever by default");
+            jail.set_env("TAVRN_RETENTION_DAYS", "365");
+            assert_eq!(Config::load(false).unwrap().retention_days, 365);
+            jail.set_env("TAVRN_RETENTION_DAYS", "36501");
+            let err = Config::load(false).unwrap_err().to_string();
+            assert!(err.contains("TAVRN_RETENTION_DAYS must be between 0 and 36500"), "{err}");
+            Ok(())
+        });
     }
 
     #[test]

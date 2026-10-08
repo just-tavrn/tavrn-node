@@ -484,11 +484,45 @@ pub async fn room_rules(state: &AppState, room_id: &str) -> Result<Vec<AutomodRu
 
 // ---------------------------------------------------------------- node lists
 
-/// The operator's lists (MODERATION.md §2.3), loaded once at start.
+/// The operator's lists (MODERATION.md §2.3): read at start, read again by the hourly housekeeping and on SIGHUP
+/// ([`reload_node_lists`]); an invalid file keeps the lists in force.
 #[derive(Debug, Default)]
 pub struct NodeFilter {
+    lists: std::sync::RwLock<NodeLists>,
+}
+
+#[derive(Debug, Default)]
+struct NodeLists {
+    words: Vec<String>,
     terms: Terms,
     domains: Vec<String>,
+}
+
+impl NodeLists {
+    fn new(words: Vec<String>, domains: Vec<String>) -> Self {
+        Self { terms: Terms::new(&words, true), words, domains }
+    }
+}
+
+/// What a reload changed: entries added to and removed from each list.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ListChanges {
+    pub words_added: usize,
+    pub words_removed: usize,
+    pub domains_added: usize,
+    pub domains_removed: usize,
+}
+
+impl ListChanges {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Entries of `new` missing in `old`, and of `old` missing in `new`.
+fn diff(old: &[String], new: &[String]) -> (usize, usize) {
+    let (o, n): (HashSet<&String>, HashSet<&String>) = (old.iter().collect(), new.iter().collect());
+    (n.difference(&o).count(), o.difference(&n).count())
 }
 
 /// Phrases with spaces take `*` only at their ends (the matcher's greedy search relies on it).
@@ -527,35 +561,92 @@ pub fn read_list(path: &str) -> Result<Vec<String>, String> {
     Ok(entries)
 }
 
+/// Reads both node lists of the configuration; every problem is named with its variable.
+fn read_node_lists(config: &Config) -> Result<(Vec<String>, Vec<String>), Vec<String>> {
+    let mut problems = Vec::new();
+    let words = match config.automod_words_file.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(path) => read_terms(path).unwrap_or_else(|e| {
+            problems.push(format!("TAVRN_AUTOMOD_WORDS_FILE: {e}"));
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    let domains = match config.automod_links.trim() {
+        "" | "off" => Vec::new(),
+        path => match read_list(path) {
+            Ok(list) => list.into_iter().map(|d| d.trim_end_matches('.').to_string()).collect(),
+            Err(e) => {
+                problems.push(format!("TAVRN_AUTOMOD_LINKS: {e}"));
+                Vec::new()
+            }
+        },
+    };
+    if problems.is_empty() { Ok((words, domains)) } else { Err(problems) }
+}
+
 impl NodeFilter {
+    pub fn new(words: Vec<String>, domains: Vec<String>) -> Self {
+        Self { lists: std::sync::RwLock::new(NodeLists::new(words, domains)) }
+    }
+
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
-        let terms = match config.automod_words_file.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(path) => read_terms(path).map_err(|e| anyhow::anyhow!("TAVRN_AUTOMOD_WORDS_FILE: {e}"))?,
-            None => Vec::new(),
-        };
-        let domains = match config.automod_links.trim() {
-            "" | "off" => Vec::new(),
-            path => read_list(path)
-                .map_err(|e| anyhow::anyhow!("TAVRN_AUTOMOD_LINKS: {e}"))?
-                .into_iter()
-                .map(|d| d.trim_end_matches('.').to_string())
-                .collect(),
-        };
-        Ok(Self { terms: Terms::new(&terms, true), domains })
+        let (words, domains) = read_node_lists(config).map_err(|p| anyhow::anyhow!(p.join("; ")))?;
+        Ok(Self::new(words, domains))
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, NodeLists> {
+        self.lists.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reads the files again (validated like `check-config`). Invalid or unreadable files keep **both** lists in
+    /// force and return the problems; otherwise the new lists apply at once.
+    pub fn reload(&self, config: &Config) -> Result<ListChanges, Vec<String>> {
+        let (words, domains) = read_node_lists(config)?;
+        let mut lists = self.lists.write().unwrap_or_else(|e| e.into_inner());
+        let (words_added, words_removed) = diff(&lists.words, &words);
+        let (domains_added, domains_removed) = diff(&lists.domains, &domains);
+        let changes = ListChanges { words_added, words_removed, domains_added, domains_removed };
+        *lists = NodeLists::new(words, domains);
+        Ok(changes)
     }
 
     pub fn has_words(&self) -> bool {
-        !self.terms.is_empty()
+        !self.read().terms.is_empty()
     }
 
     pub fn has_links(&self) -> bool {
-        !self.domains.is_empty()
+        !self.read().domains.is_empty()
     }
 
     pub fn find(&self, texts: &[String]) -> Option<Matched> {
-        let links = if self.domains.is_empty() { Links::Off } else { Links::BlockList };
-        find_in(texts, &self.terms, links, &self.domains)
+        let lists = self.read();
+        let links = if lists.domains.is_empty() { Links::Off } else { Links::BlockList };
+        find_in(texts, &lists.terms, links, &lists.domains)
     }
+}
+
+/// Reads the node lists again (hourly housekeeping on every instance, and SIGHUP) and logs what changed or why the
+/// old lists stay in force.
+pub async fn reload_node_lists(state: &AppState) -> Result<ListChanges, Vec<String>> {
+    let (filter, config) = (state.node_automod.clone(), state.config.clone());
+    let result = tokio::task::spawn_blocking(move || filter.reload(&config))
+        .await
+        .unwrap_or_else(|e| Err(vec![format!("reload task failed: {e}")]));
+    match &result {
+        Ok(c) if !c.is_empty() => tracing::info!(
+            words_added = c.words_added,
+            words_removed = c.words_removed,
+            domains_added = c.domains_added,
+            domains_removed = c.domains_removed,
+            "Auto-moderation node lists reloaded"
+        ),
+        Ok(_) => {}
+        Err(problems) => tracing::warn!(
+            problems = %problems.join("; "),
+            "Auto-moderation node lists not reloaded, the previous lists stay in force"
+        ),
+    }
+    result
 }
 
 // ---------------------------------------------------------------- checking messages
@@ -917,6 +1008,43 @@ mod tests {
     }
 
     #[test]
+    fn node_lists_reload_and_keep_the_old_lists_when_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (words, links) = (dir.path().join("words.txt"), dir.path().join("links.txt"));
+        std::fs::write(&words, "spam\n").unwrap();
+        std::fs::write(&links, "evil.test\nbad.test\n").unwrap();
+        let config = Config {
+            automod_words_file: Some(words.to_string_lossy().into()),
+            automod_links: links.to_string_lossy().into(),
+            ..Config::default()
+        };
+        let f = NodeFilter::from_config(&config).unwrap();
+        let hit = |text: &str| f.find(&[normalize(text)]).map(|m| m.value);
+        assert_eq!(f.reload(&config), Ok(ListChanges::default()), "unchanged files change nothing");
+
+        std::fs::write(&words, "spam\nscam\neggs\n").unwrap();
+        std::fs::write(&links, "bad.test\n").unwrap();
+        let changes = f.reload(&config).unwrap();
+        assert_eq!(changes, ListChanges { words_added: 2, words_removed: 0, domains_added: 0, domains_removed: 1 });
+        assert!(!changes.is_empty());
+        assert_eq!(hit("a scam"), Some("scam".into()));
+        assert_eq!(hit("http://evil.test/x"), None, "removed domain");
+        assert_eq!(hit("http://bad.test/x"), Some("bad.test".into()));
+
+        // An invalid or unreadable list keeps both old lists.
+        std::fs::write(&words, "a*b*c*d*e*f*g\n").unwrap();
+        std::fs::write(&links, "").unwrap();
+        let err = f.reload(&config).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("TAVRN_AUTOMOD_WORDS_FILE")), "{err:?}");
+        assert_eq!(hit("a scam"), Some("scam".into()));
+        assert_eq!(hit("http://bad.test/x"), Some("bad.test".into()), "links kept too");
+        std::fs::remove_file(&links).unwrap();
+        std::fs::write(&words, "eggs\n").unwrap();
+        assert!(f.reload(&config).unwrap_err().iter().any(|e| e.contains("TAVRN_AUTOMOD_LINKS")));
+        assert_eq!(hit("a scam"), Some("scam".into()));
+    }
+
+    #[test]
     fn node_lists_read_and_match_whole_words() {
         let dir = std::env::temp_dir().join(format!("automod-{}", util::ulid()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -925,7 +1053,7 @@ mod tests {
         let list = read_list(&path.to_string_lossy()).unwrap();
         assert_eq!(list, vec!["scam*", "forbidden phrase"]);
         assert!(read_list("/nonexistent/list.txt").is_err());
-        let f = NodeFilter { terms: Terms::new(&list, true), domains: vec!["malware.test".into()] };
+        let f = NodeFilter::new(list, vec!["malware.test".into()]);
         assert!(f.has_words() && f.has_links());
         assert_eq!(f.find(&[normalize("scammers here")]).map(|m| m.value), Some("scam*".into()));
         assert_eq!(f.find(&[normalize("http://x.malware.test")]).map(|m| m.kind), Some("link"));

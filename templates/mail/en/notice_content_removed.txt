@@ -1,0 +1,5 @@
+Subject: Content removed ({case})
+
+The reported content was removed. Case: {case}
+
+{reason}

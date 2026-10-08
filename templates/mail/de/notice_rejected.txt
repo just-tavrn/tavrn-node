@@ -1,0 +1,5 @@
+Subject: Meldung abgelehnt ({case})
+
+Ihre Meldung wurde abgelehnt. Vorgang: {case}
+
+Begründung: {reason}

@@ -35,6 +35,9 @@ pub struct NodeInfo {
     /// Images up to this size (bytes) load as previews automatically where the user's `auto_preview`
     /// setting allows it; larger ones wait for a click (`TAVRN_PREVIEW_AUTO_MAX_BYTES`).
     pub preview_auto_max_bytes: u64,
+    /// Message retention of this node in days (`TAVRN_RETENTION_DAYS`, PROTOCOL.md §7f; 0 = messages are kept). Rooms
+    /// can only shorten it.
+    pub message_retention_days: u32,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,
 }
@@ -74,6 +77,7 @@ pub async fn get_node(State(state): State<AppState>) -> Result<Json<NodeInfo>, c
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default(),
         preview_auto_max_bytes: c.preview_auto_max_bytes,
+        message_retention_days: c.retention_days,
         voice: VoiceInfo {
             enabled: c.voice_enabled,
             max_bitrate_kbps: c.voice_max_bitrate_kbps,

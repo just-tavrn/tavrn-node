@@ -1,0 +1,5 @@
+Subject: Inhalte entfernt ({case})
+
+Die gemeldeten Inhalte wurden entfernt. Vorgang: {case}
+
+{reason}

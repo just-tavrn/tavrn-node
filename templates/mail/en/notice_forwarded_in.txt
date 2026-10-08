@@ -1,0 +1,5 @@
+Subject: Notice received ({case})
+
+The node {origin} forwarded your notice to {domain}, where the reported content is hosted. Case on this node: {case}
+
+The operator of {domain} will review it and inform you of the decision.

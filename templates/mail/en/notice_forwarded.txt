@@ -1,0 +1,3 @@
+Subject: Notice forwarded ({case})
+
+The reported content is hosted on another node. Your notice (case {case}) was forwarded to: {nodes}. That node's operator decides on it.

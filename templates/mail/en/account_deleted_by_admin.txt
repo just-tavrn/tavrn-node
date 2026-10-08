@@ -1,0 +1,5 @@
+Subject: Account deleted
+
+The account {address} on {domain} was deleted by a node admin.
+
+A node admin can undo the deletion until {purge_after}; after that the account is erased and the username becomes free.
