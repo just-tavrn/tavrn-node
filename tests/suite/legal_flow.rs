@@ -537,11 +537,16 @@ async fn notice_mails_speak_the_reporters_and_the_uploaders_language() {
         .await;
     assert_eq!(s, StatusCode::OK, "{r}");
     let mails = node.state.mailer.outbox.lock().unwrap().clone();
-    assert!(mails.iter().any(|(to, s, _)| to == "rita@example.org" && s.ends_with(&format!("Inhalte entfernt ({case})"))));
+    assert!(
+        mails.iter().any(|(to, s, _)| to == "rita@example.org" && s.ends_with(&format!("Inhalte entfernt ({case})")))
+    );
     // The statement of reasons is stored (and mailed) in the uploader's language.
     let (_, mine) = node.get_auth("/api/v1/users/me/legal-notices", &bob.token).await;
     let statement = mine[0]["statement"].as_str().unwrap();
-    assert!(statement.starts_with("Entscheidung: Inhalte entfernt") && statement.contains("Das Foto ist geschützt."), "{statement}");
+    assert!(
+        statement.starts_with("Entscheidung: Inhalte entfernt") && statement.contains("Das Foto ist geschützt."),
+        "{statement}"
+    );
     assert!(statement.contains("Gegendarstellung"), "{statement}");
 }
 

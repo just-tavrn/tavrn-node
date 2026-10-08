@@ -38,7 +38,8 @@ async fn verify(node: &TestNode) {
 }
 
 async fn forgot(node: &TestNode, account: &str) -> (String, String, String) {
-    let (s, _) = node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": account }))).await;
+    let (s, _) =
+        node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": account }))).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     last_mail(node)
 }
@@ -48,7 +49,10 @@ async fn the_registration_language_and_the_locale_setting_choose_the_mail_langua
     let node = test_node("t.local").await;
     let carol = register(&node, "carol", Some("de-DE,de;q=0.9,en;q=0.8")).await;
     let (to, subject, body) = last_mail(&node);
-    assert_eq!((to.as_str(), subject.as_str()), ("carol@example.org", "Test node t.local: Bestätige deine E-Mail-Adresse"));
+    assert_eq!(
+        (to.as_str(), subject.as_str()),
+        ("carol@example.org", "Test node t.local: Bestätige deine E-Mail-Adresse")
+    );
     assert!(body.starts_with("Hallo carol,") && body.contains("/verify-email?token="), "{body}");
     verify(&node).await;
     let (_, me) = node.get_auth("/api/v1/users/me", &carol).await;
@@ -91,7 +95,10 @@ async fn operators_override_templates_per_language() {
     verify(&node).await;
     let (_, subject, body) = forgot(&node, "erik").await;
     assert_eq!(subject, "Test node t.local: Passwort vergessen?");
-    assert!(body.starts_with("Servus erik, hier entlang: http") && body.ends_with("Dein Team von Test node t.local"), "{body}");
+    assert!(
+        body.starts_with("Servus erik, hier entlang: http") && body.ends_with("Dein Team von Test node t.local"),
+        "{body}"
+    );
     // The other templates keep the built-in texts.
     register(&node, "fritz", Some("de")).await;
     assert!(last_mail(&node).1.ends_with("Bestätige deine E-Mail-Adresse"));
@@ -141,7 +148,10 @@ async fn app_token_expiry_mails_reach_owners_with_a_confirmed_address_once_per_s
     let sent = mails(&node);
     assert_eq!(sent.len(), before + 1, "only the confirmed address");
     let (to, subject, body) = sent.last().unwrap().clone();
-    assert_eq!((to.as_str(), subject.as_str()), ("gina@example.org", "Test node t.local: Ein App-Token läuft in 7 Tagen ab"));
+    assert_eq!(
+        (to.as_str(), subject.as_str()),
+        ("gina@example.org", "Test node t.local: Ein App-Token läuft in 7 Tagen ab")
+    );
     assert!(body.contains("Wetterbot") && body.contains("/settings/applications") && body.contains(" UTC"), "{body}");
     assert_eq!(notify_expiring_tokens(&node.state, week).await.unwrap(), 0);
     assert_eq!(mails(&node).len(), before + 1, "once per token and step");

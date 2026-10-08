@@ -291,9 +291,8 @@ pub async fn submit_notice(
     state.captcha.check(captcha, req.captcha_token.as_deref(), &ip).await?;
     let valid = notices::validate(&req)?;
     // Reporters have no account: their browser's language picks the mails' language.
-    let locale = crate::mail_templates::from_accept_language(
-        headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()),
-    );
+    let locale =
+        crate::mail_templates::from_accept_language(headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()));
     let (row, mailed) = notices::create(&state, &valid, None, locale.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(NoticeCreated { case_id: row.id, state: row.state, mailed })))
 }

@@ -139,7 +139,11 @@ impl Mailer {
     /// Renders the template `name` in `locale` (falling back to English) with `vars` and the common variables.
     pub fn render(&self, locale: Option<&str>, name: &str, vars: &[(&str, &str)]) -> Rendered {
         let mut all = vars.to_vec();
-        all.extend([("node", self.node_name.as_str()), ("domain", self.domain.as_str()), ("public_url", self.public_url.as_str())]);
+        all.extend([
+            ("node", self.node_name.as_str()),
+            ("domain", self.domain.as_str()),
+            ("public_url", self.public_url.as_str()),
+        ]);
         mail_templates::render(Some(&self.templates_dir), locale, name, &all)
     }
 

@@ -769,11 +769,16 @@ async fn mail_token_expiry(
         return Ok(());
     }
     let locale = store::users::locale(&state.db, &owner.id).await?;
-    let expires = util::parse_time(expires_at).map_or_else(|| expires_at.to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+    let expires = util::parse_time(expires_at)
+        .map_or_else(|| expires_at.to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
     let link = format!("{}/settings/applications", state.mailer.public_url());
     let template = if days <= 1 { "app_token_expiring_day" } else { "app_token_expiring_week" };
-    let vars =
-        [("name", owner.display_name.as_str()), ("application", app.name.as_str()), ("expires_at", &expires), ("link", &link)];
+    let vars = [
+        ("name", owner.display_name.as_str()),
+        ("application", app.name.as_str()),
+        ("expires_at", &expires),
+        ("link", &link),
+    ];
     state.mailer.send_template(email, locale.as_deref(), template, &vars).await;
     Ok(())
 }

@@ -97,15 +97,20 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
     let room_id = room["id"].as_str().unwrap().to_string();
     let channel = TestNode::text_channel(&room);
     let perms = common::perms(&[1 << 0, 1 << 1, 1 << 13]);
-    let (_, role) =
-        node.post(&format!("/api/v1/rooms/{room_id}/roles"), &alice.token, json!({ "name": "Mods", "permissions": perms })).await;
+    let (_, role) = node
+        .post(&format!("/api/v1/rooms/{room_id}/roles"), &alice.token, json!({ "name": "Mods", "permissions": perms }))
+        .await;
     for who in [&moder, &quiet, &bob, &carl] {
         let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
         node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &who.token, json!({})).await;
     }
     for m in [&moder, &quiet] {
         let (s, j) = node
-            .patch(&format!("/api/v1/rooms/{room_id}/members/{}", m.user_id), &alice.token, json!({ "roles": [role["id"]] }))
+            .patch(
+                &format!("/api/v1/rooms/{room_id}/members/{}", m.user_id),
+                &alice.token,
+                json!({ "roles": [role["id"]] }),
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{j}");
     }
@@ -113,7 +118,11 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
     let (_, settings) = node.get_auth("/api/v1/users/me/notification-settings", &quiet.token).await;
     assert!(settings["global"].get("reports").is_none(), "{settings}");
     let (s, j) = node
-        .put("/api/v1/users/me/notification-settings", &quiet.token, json!({ "global": { "mode": "all", "reports": false } }))
+        .put(
+            "/api/v1/users/me/notification-settings",
+            &quiet.token,
+            json!({ "global": { "mode": "all", "reports": false } }),
+        )
         .await;
     assert_eq!((s, j["global"]["reports"].as_bool()), (StatusCode::OK, Some(false)), "{j}");
 
@@ -127,8 +136,10 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
         Browser::subscribe(&node, &fake, &bob).await,
     ];
     let report = |kind: &str| match kind {
-        "message" => json!({ "kind": "message", "conversation_id": channel, "message_id": msg["id"], "category": "spam",
-            "detail": "secret detail" }),
+        "message" => {
+            json!({ "kind": "message", "conversation_id": channel, "message_id": msg["id"], "category": "spam",
+            "detail": "secret detail" })
+        }
         _ => json!({ "kind": "user", "user": "alice@t.local", "category": "harassment", "detail": "secret detail" }),
     };
     let (s, j) = node.post("/api/v1/reports", &bob.token, report("message")).await;
@@ -146,7 +157,11 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
     }
     // A second report in the same room within the coalescing window pushes no one again.
     let (s, _) = node
-        .post("/api/v1/reports", &bob.token, json!({ "kind": "user", "user": "moder@t.local", "room_id": room_id, "category": "spam" }))
+        .post(
+            "/api/v1/reports",
+            &bob.token,
+            json!({ "kind": "user", "user": "moder@t.local", "room_id": room_id, "category": "spam" }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED);
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -158,8 +173,11 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
     let (s, j) = node.post("/api/v1/reports", &bob.token, report("user")).await;
     assert_eq!(s, StatusCode::CREATED, "{j}");
     fake.wait("admin", 2).await;
-    assert_eq!(browsers[0].last(&fake), json!({ "v": 1, "type": "report", "node": "t.local", "local": true,
-        "report_kind": "user", "encrypted": false }));
+    assert_eq!(
+        browsers[0].last(&fake),
+        json!({ "v": 1, "type": "report", "node": "t.local", "local": true,
+        "report_kind": "user", "encrypted": false })
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(fake.count("alice"), 1, "node reports go to the node admins only");
 }

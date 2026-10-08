@@ -164,10 +164,8 @@ async fn node_retention_deletes_old_messages_but_not_pinned_welcome_or_young_one
         .await
         .unwrap();
     assert_eq!(rows, 0);
-    let (_, list) = r
-        .node
-        .get_auth(&format!("/api/v1/rooms/{}/channels/{}/messages", r.room_id, r.channel), &r.member.token)
-        .await;
+    let (_, list) =
+        r.node.get_auth(&format!("/api/v1/rooms/{}/channels/{}/messages", r.room_id, r.channel), &r.member.token).await;
     let ids: Vec<&str> = list.as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
     assert!(ids.contains(&pinned.as_str()) && !ids.contains(&old.as_str()), "{list}");
 

@@ -1026,9 +1026,11 @@ async fn send_statement(
     deadline: &str,
     actor: &str,
 ) -> Result<(), ApiError> {
-    let template = if decision == "account disabled" { "statement_account_disabled" } else { "statement_content_removed" };
+    let template =
+        if decision == "account disabled" { "statement_account_disabled" } else { "statement_content_removed" };
     let locale = store::users::locale(&state.db, uploader_id).await?;
-    let vars = [("case", row.id.as_str()), ("basis", row.basis.as_str()), ("statement", statement), ("deadline", deadline)];
+    let vars =
+        [("case", row.id.as_str()), ("basis", row.basis.as_str()), ("statement", statement), ("deadline", deadline)];
     let mail = state.mailer.render(locale.as_deref(), template, &vars);
     let text = mail.body.clone();
     sqlx::query("UPDATE legal_notices SET statement = $1, statement_at = $2 WHERE id = $3")
@@ -1074,7 +1076,8 @@ async fn mail_reporter(
     let mut all = vec![("case", row.id.as_str())];
     all.extend_from_slice(vars);
     let mail = state.mailer.send_template(&row.reporter_email, locale.as_deref(), template, &all).await;
-    event(&state.db, &row.id, Some(actor), "mail.reporter", json!({ "subject": mail.subject, "template": template })).await
+    event(&state.db, &row.id, Some(actor), "mail.reporter", json!({ "subject": mail.subject, "template": template }))
+        .await
 }
 
 /// Runs an admin action on a case.

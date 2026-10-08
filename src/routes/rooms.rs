@@ -290,10 +290,8 @@ pub async fn update_room(
         .attachment_retention_days
         .map(|d| validate::range("attachment_retention_days", d, 0, 36_500))
         .transpose()?;
-    let message_retention = req
-        .message_retention_days
-        .map(|d| validate::range("message_retention_days", d, 0, 36_500))
-        .transpose()?;
+    let message_retention =
+        req.message_retention_days.map(|d| validate::range("message_retention_days", d, 0, 36_500)).transpose()?;
     store::rooms::update_room(
         &state.db,
         &room_id,

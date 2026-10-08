@@ -1007,7 +1007,11 @@ pub async fn bans(db: &Pool, room_id: Option<&str>) -> Result<Vec<Ban>, ApiError
 
 /// Sets a room's message retention (`None` = the node's value, PROTOCOL.md §7f).
 pub async fn set_message_retention(db: &Pool, room_id: &str, days: Option<i64>) -> Result<(), ApiError> {
-    sqlx::query("UPDATE rooms SET message_retention_days = $1 WHERE id = $2").bind(days).bind(room_id).execute(db).await?;
+    sqlx::query("UPDATE rooms SET message_retention_days = $1 WHERE id = $2")
+        .bind(days)
+        .bind(room_id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 

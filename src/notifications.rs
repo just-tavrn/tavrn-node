@@ -285,7 +285,14 @@ mod tests {
             "channels": { CHAN: { "muted_until": "forever" } }
         }))
         .unwrap();
-        assert_eq!(s.global, GlobalSettings { mode: Mode::Mentions, sound: true, browser: false, push_text: false });
+        assert_eq!(
+            s.global,
+            GlobalSettings { mode: Mode::Mentions, sound: true, browser: false, push_text: false, reports: true }
+        );
+        // `reports` is on by default and appears in the document only while off.
+        assert!(serde_json::to_value(&s.global).unwrap().get("reports").is_none());
+        let off = parse(serde_json::json!({ "global": { "mode": "all", "reports": false } })).unwrap();
+        assert_eq!(serde_json::to_value(&off.global).unwrap()["reports"], false);
         assert_eq!(s.rooms.len(), 1, "empty entries are dropped");
         assert_eq!(s.rooms[ROOM].muted_until.as_deref(), Some("2029-12-31T23:00:00.000Z"));
         assert_eq!(s.channels[CHAN].muted_until.as_deref(), Some(FOREVER));

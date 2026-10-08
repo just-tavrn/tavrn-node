@@ -398,7 +398,8 @@ pub async fn expire_messages(
                 report.incomplete = true;
                 break 'passes;
             }
-            let ids = crate::store::messages::retention_candidates(db, &cutoff, room.as_deref(), RETENTION_BATCH).await?;
+            let ids =
+                crate::store::messages::retention_candidates(db, &cutoff, room.as_deref(), RETENTION_BATCH).await?;
             if ids.is_empty() {
                 break;
             }
