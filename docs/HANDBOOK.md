@@ -1660,8 +1660,13 @@ channels; actions block, delete or timeout), checked on send and edit, including
 you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
 (one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
 line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;
-`check-config` names problems); restart the node after a change. Matches are audited with the matched term, never
-the message text, and show up in the moderators' inbox.
+`check-config` names problems) and read again, without a restart, by the hourly housekeeping and when the node gets
+`SIGHUP` (`docker compose kill -s HUP tavrn`; with several instances every instance reads its own copy, so signal
+each one or wait for the hour). A reload validates both files like `check-config`: when one of them is invalid or
+unreadable, the node keeps **both** previous lists and logs a warning naming the problem; otherwise it logs how many
+terms and domains were added and removed ("Auto-moderation node lists reloaded"). Point the variables at a file, not
+at a path that does not exist yet: the paths themselves are read from the configuration at start. Matches are
+audited with the matched term, never the message text, and show up in the moderators' inbox.
 
 The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);

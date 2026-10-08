@@ -108,6 +108,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let directory = federation::announce::spawn(state.clone());
     let conformance = federation::conformance::spawn(state.clone());
     let whiteboards = whiteboard::spawn_sweeper(state.clone());
+    let reloads = spawn_reload_on_hangup(state.clone());
     if config.federation_allow_private {
         tracing::warn!(
             "TAVRN_FEDERATION_ALLOW_PRIVATE=true: peers on private and loopback addresses are allowed (SSRF protection off)"
@@ -151,6 +152,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     directory.abort();
     conformance.abort();
     whiteboards.abort();
+    reloads.abort();
     if let Some(r) = reconciler {
         r.abort();
     }
@@ -165,6 +167,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     }
     tracing::info!("shut down cleanly");
     Ok(())
+}
+
+/// SIGHUP reads the operator's auto-moderation lists again (MODERATION.md §2.3); the hourly housekeeping does it too.
+fn spawn_reload_on_hangup(state: app::AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        match signal::unix::signal(signal::unix::SignalKind::hangup()) {
+            Ok(mut hangup) => {
+                while hangup.recv().await.is_some() {
+                    tracing::info!("SIGHUP received, reading the auto-moderation node lists again");
+                    let _ = automod::reload_node_lists(&state).await;
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "could not install the SIGHUP handler"),
+        }
+        #[cfg(not(unix))]
+        let _ = state;
+    })
 }
 
 async fn shutdown_signal() {

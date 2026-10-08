@@ -483,6 +483,8 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
         }
         loop {
             tick.tick().await;
+            // Every instance holds its own copy of the operator's auto-moderation lists (MODERATION.md §2.3).
+            let _ = crate::automod::reload_node_lists(&state).await;
             if !state.cluster.is_leader() {
                 continue;
             }
