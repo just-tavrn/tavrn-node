@@ -100,11 +100,19 @@ pub struct VideoLimits {
     pub max_fps: u32,
 }
 
+/// LiveKit's Opus codec always offers in-band FEC (`useinbandfec=1`); announced so clients that set up Opus
+/// themselves choose the same robustness.
+pub const AUDIO_FEC: bool = true;
+
 /// Quality limits the client applies to what it publishes.
 #[derive(Serialize, ToSchema)]
 pub struct VoiceLimits {
     /// Channel bitrate, capped by `TAVRN_VOICE_MAX_BITRATE_KBPS`.
     pub audio_bitrate_kbps: i64,
+    /// Opus in-band forward error correction: the node's media server negotiates it (`useinbandfec=1`), so
+    /// publishers encode with it and a lost packet is partly recovered from the next one. DTX stays on, RED
+    /// stays off (end-to-end encryption).
+    pub audio_fec: bool,
     pub screenshare: VideoLimits,
     pub camera: VideoLimits,
     /// Entitlement `stream.max_height` for this user in this room (pixels, 0 = only `screenshare`). Enforced
@@ -222,6 +230,7 @@ pub async fn join(
         epoch: current.epoch,
         limits: VoiceLimits {
             audio_bitrate_kbps: vc.channel.bitrate_kbps.min(max_bitrate),
+            audio_fec: AUDIO_FEC,
             screenshare: VideoLimits {
                 enabled: sources.screen,
                 max_resolution: config.screenshare_max_resolution.clone(),

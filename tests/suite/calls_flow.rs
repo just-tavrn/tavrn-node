@@ -122,6 +122,10 @@ async fn a_dm_call_rings_is_answered_and_ends_with_its_duration() {
     assert_eq!(start["call"]["ringing"], json!(["bob@t.local"]));
     assert_eq!(start["call"]["group"], false);
     assert!(start["ice_aliases"].as_array().unwrap().is_empty());
+    // Calls are speech: the bitrate of a new voice channel (64), not the node's cap (192, room for the music
+    // preset), with Opus in-band FEC announced (VOICE.md §3).
+    assert_eq!(start["limits"]["audio_bitrate_kbps"], 64, "{start}");
+    assert_eq!(start["limits"]["audio_fec"], true);
     let claims = node.state.voice.verify(start["token"].as_str().unwrap()).unwrap();
     assert_eq!(claims.video.room, format!("call:{id}"));
     assert_eq!(claims.video.can_publish_data, Some(false));
