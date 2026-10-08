@@ -577,6 +577,49 @@ pub async fn purge(db: &Pool, f: &PurgeFilter) -> Result<i64, ApiError> {
     Ok(q.execute(db).await?.rows_affected() as i64)
 }
 
+/// Messages due for deletion by message retention (PROTOCOL.md §7f): created before `cutoff`, not pinned, not
+/// in a welcome channel (the room's security log); every conversation, or only the channels of the room `room_id`.
+/// Oldest first, at most `limit`.
+pub async fn retention_candidates(
+    db: &Pool,
+    cutoff: &str,
+    room_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<String>, ApiError> {
+    let room_filter = if room_id.is_some() {
+        "AND m.conversation_id IN (SELECT id FROM conversations WHERE room_id = $3)"
+    } else {
+        "AND $3 = ''"
+    };
+    let sql = format!(
+        "SELECT m.id FROM messages m WHERE m.created_at < $1 {room_filter} AND {RETENTION_EXEMPT}
+         ORDER BY m.created_at LIMIT $2"
+    );
+    Ok(sqlx::query_scalar(&sql).bind(cutoff).bind(limit).bind(room_id.unwrap_or("")).fetch_all(db).await?)
+}
+
+/// What message retention never deletes (on the row `m`): pinned messages and the welcome channel's entries.
+const RETENTION_EXEMPT: &str = "m.conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')
+    AND NOT EXISTS (SELECT 1 FROM pins p WHERE p.message_id = m.id)";
+
+/// Deletes the messages `ids` (from [`retention_candidates`]) unless they were pinned meanwhile; their attachments,
+/// reactions, pins and search rows cascade. Returns the number of deleted messages.
+pub async fn delete_for_retention(db: &Pool, ids: &[String]) -> Result<u64, ApiError> {
+    let mut deleted = 0;
+    for chunk in ids.chunks(500) {
+        let list = (1..=chunk.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "DELETE FROM messages WHERE id IN (SELECT m.id FROM messages m WHERE m.id IN ({list}) AND {RETENTION_EXEMPT})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        deleted += q.execute(db).await?.rows_affected();
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

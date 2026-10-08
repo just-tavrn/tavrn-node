@@ -9,7 +9,7 @@ use crate::{
     util::{now, ulid},
 };
 
-const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days";
+const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
 const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.sync_with_category, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags";
 const OVERRIDE_COLS: &str =
@@ -1004,6 +1004,19 @@ pub async fn bans(db: &Pool, room_id: Option<&str>) -> Result<Vec<Ban>, ApiError
 }
 
 // ---------------------------------------------------------------- Audit-Log
+
+/// Sets a room's message retention (`None` = the node's value, PROTOCOL.md §7f).
+pub async fn set_message_retention(db: &Pool, room_id: &str, days: Option<i64>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE rooms SET message_retention_days = $1 WHERE id = $2").bind(days).bind(room_id).execute(db).await?;
+    Ok(())
+}
+
+/// Rooms with an own message retention: (room id, days).
+pub async fn message_retention_rooms(db: &Pool) -> Result<Vec<(String, i64)>, ApiError> {
+    Ok(sqlx::query_as("SELECT id, message_retention_days FROM rooms WHERE message_retention_days > 0 ORDER BY id")
+        .fetch_all(db)
+        .await?)
+}
 
 pub async fn audit(
     db: &Pool,

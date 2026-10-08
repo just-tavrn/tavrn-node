@@ -358,6 +358,96 @@ pub async fn expire_attachments(
     Ok(report)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MessageRetentionReport {
+    /// Messages deleted.
+    pub deleted: u64,
+    /// The time budget ran out; the rest follows in the next round.
+    pub incomplete: bool,
+}
+
+/// Message retention (PROTOCOL.md §7f): deletes messages older than the retention of their conversation, with
+/// their attachments (rows cascade, files are deleted here; a crash in between leaves files the orphan sweep
+/// removes), reactions, pins and search rows. The node value (`TAVRN_RETENTION_DAYS`, DMs, group DMs and every room)
+/// runs first; rooms with a shorter own value (`message_retention_days`) follow. Exempt: pinned messages and the
+/// welcome channel's entries (the room's security log). Threads that lost messages count again. Works in batches of
+/// [`RETENTION_BATCH`] within `budget`; writes one node audit entry `retention.messages` when it deleted something.
+pub async fn expire_messages(
+    state: &AppState,
+    now: DateTime<Utc>,
+    budget: Duration,
+) -> Result<MessageRetentionReport, ApiError> {
+    let started = std::time::Instant::now();
+    let db = &state.db;
+    let node_days = i64::from(state.config.retention_days);
+    let mut passes: Vec<(Option<String>, i64)> = Vec::new();
+    if node_days > 0 {
+        passes.push((None, node_days));
+    }
+    for (room, days) in crate::store::rooms::message_retention_rooms(db).await? {
+        if days > 0 && (node_days == 0 || days < node_days) {
+            passes.push((Some(room), days));
+        }
+    }
+    let rooms = passes.iter().filter(|(room, _)| room.is_some()).count();
+    let mut report = MessageRetentionReport::default();
+    'passes: for (room, days) in passes {
+        let cutoff = util::format_time(now - chrono::Duration::days(days));
+        loop {
+            if started.elapsed() >= budget {
+                report.incomplete = true;
+                break 'passes;
+            }
+            let ids = crate::store::messages::retention_candidates(db, &cutoff, room.as_deref(), RETENTION_BATCH).await?;
+            if ids.is_empty() {
+                break;
+            }
+            report.deleted += delete_messages(state, &ids).await?;
+            if (ids.len() as i64) < RETENTION_BATCH {
+                break;
+            }
+        }
+    }
+    if report.deleted > 0 {
+        crate::store::rooms::audit(
+            db,
+            None,
+            None,
+            "retention.messages",
+            "",
+            "",
+            serde_json::json!({ "deleted": report.deleted, "node_days": node_days, "rooms": rooms,
+                "incomplete": report.incomplete }),
+        )
+        .await?;
+    }
+    Ok(report)
+}
+
+/// Deletes the messages `ids` for retention: rows first, then the files of their attachments, then the threads count
+/// their messages again.
+async fn delete_messages(state: &AppState, ids: &[String]) -> Result<u64, ApiError> {
+    let db = &state.db;
+    let list = (1..=ids.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
+    let filter = format!("id IN ({list})");
+    let blobs = crate::store::blobs::ids_for_messages(db, &filter, ids).await?;
+    let threads = crate::store::threads::ids_for_messages(db, &filter, ids).await?;
+    let deleted = crate::store::messages::delete_for_retention(db, ids).await?;
+    // A message pinned meanwhile stays, and so do its files.
+    for chunk in blobs.chunks(ORPHAN_BATCH as usize) {
+        let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let kept = known_storage_ids(db, &refs).await?;
+        for id in chunk.iter().filter(|b| !kept.contains(b.as_str())) {
+            state.storage.delete(id).await;
+        }
+    }
+    crate::store::threads::recount(db, &threads).await?;
+    for id in &threads {
+        crate::threads::publish(state, "thread.update", id).await?;
+    }
+    Ok(deleted)
+}
+
 /// Expired entitlement grants are kept this long (shown as expired in the admin UI), then deleted.
 pub const GRANT_KEEP_DAYS: i64 = 7;
 
@@ -436,6 +526,13 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "Attachment retention failed"),
+            }
+            match expire_messages(&state, Utc::now(), RETENTION_BUDGET).await {
+                Ok(r) if r != MessageRetentionReport::default() => {
+                    tracing::info!(messages = r.deleted, incomplete = r.incomplete, "Expired messages deleted");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Message retention failed"),
             }
             let grants_cutoff = util::format_time(Utc::now() - chrono::Duration::days(GRANT_KEEP_DAYS));
             if let Err(e) = crate::store::entitlements::prune_grants(&db, &grants_cutoff).await {

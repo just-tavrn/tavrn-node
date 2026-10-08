@@ -245,6 +245,9 @@ pub struct Room {
     /// Attachments of the room's channels are deleted after this many days (null = the node's value; a room
     /// can only shorten it).
     pub attachment_retention_days: Option<i64>,
+    /// Messages of the room's channels are deleted after this many days (null = the node's value; a room can only
+    /// shorten it; pinned messages and the welcome channel are exempt, PROTOCOL.md §7f).
+    pub message_retention_days: Option<i64>,
 }
 
 impl Room {

@@ -307,6 +307,7 @@ fn retention(state: &AppState) -> Value {
     json!({
         "session_refresh_days": c.session_refresh_days,
         "device_stale_days": c.device_stale_days,
+        "message_retention_days": c.retention_days,
         "attachment_retention_days": c.attachment_retention_days,
         "legal_notice_retention_days": c.legal_notice_retention_days,
         "account_delete_grace_days": c.account_delete_grace_days,

@@ -47,6 +47,7 @@ mod suite {
     mod housekeeping_flow;
     mod identity_rotation_flow;
     mod legal_flow;
+    mod message_retention_flow;
     mod messages_flow;
     mod metrics_flow;
     mod mls_flow;

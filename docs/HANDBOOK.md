@@ -234,7 +234,7 @@ you out; those names are never given to accounts created by SSO. `TAVRN_OIDC_CLI
 | `TAVRN_UPLOAD_DM_CATEGORIES` | `images,audio,video,documents,archives,other` | Upload categories in DMs and group DMs hosted here. |
 | `TAVRN_STORAGE_QUOTA_PER_ROOM_BYTES` | `10737418240` (10 GiB) | Storage per room (entitlement `storage.max_bytes_per_room`). |
 | `TAVRN_STORAGE_ENCRYPTION` | `on` | Encryption at rest of every stored file; `off` stores new files unencrypted (debugging only; encrypted files stay readable). See [Storage and media](#storage-and-media). |
-| `TAVRN_RETENTION_DAYS` | `0` | Accepted for compatibility; this version does not use it. File retention is `TAVRN_ATTACHMENT_RETENTION_DAYS`. |
+| `TAVRN_RETENTION_DAYS` | `0` | Message retention: messages of channels, DMs and group DMs hosted here are deleted this many days after they were sent by the hourly housekeeping, with their attachments, reactions and pins. Pinned messages and the welcome channel's entries are kept. Rooms may only shorten it (room setting). 0–36500, `0` = keep forever. See [Message retention](#message-retention). |
 | `TAVRN_EMOJI_MAX_PER_ROOM` | `100` | Custom emojis per room (entitlement `emoji.max_per_room`). |
 | `TAVRN_EMOJI_MAX_BYTES` | `262144` (256 KiB) | Largest custom emoji file. |
 | `TAVRN_PREVIEW_AUTO_MAX_BYTES` | `5242880` (5 MiB) | Images up to this size load as previews by themselves where the user's setting allows it (always / friends and shared rooms / never); larger ones show a placeholder with a "Load" button. `0` = never automatically. |
@@ -688,7 +688,7 @@ still opens the files of that time.
   PostgreSQL version on an empty data directory, restore, then start the node. Do not just change the image tag of
   the `db` service on an existing `./pgdata`.
 - The node cleans up after itself through the hourly **housekeeping** (handshake log, federation state, orphaned
-  files, attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
+  files, message and attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
   PostgreSQL's own autovacuum is needed.
 
 ## Storage and media
@@ -743,6 +743,21 @@ Upload size, types, the executable rule, per-room quotas and attachment retentio
 hourly housekeeping deletes expired attachments (messages keep listing them as "file expired"; pinned messages keep
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
 Files channels can use external WebDAV/S3 stores only with `TAVRN_FILES_EXTERNAL=on`.
+
+### Message retention
+
+`TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
+sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
+together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
+again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
+and the entries of a room's **welcome channel** (the room's security log). A room owner or a member with "Manage
+room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
+node's value); a longer room value has no effect, a room can only shorten. Each run that deleted something writes one
+entry `retention.messages` to the node's audit log (`deleted`, `node_days`, `rooms` with an own shorter value,
+`incomplete` when the run's time budget of one minute ran out; the rest follows an hour later). Clients are not told:
+an open client keeps showing what it already loaded until it reloads, and messages users saved themselves (exports,
+the local search index of encrypted conversations) are outside the node's reach. `tavrn-node check-config` refuses
+values above 36500. Tell your users in the privacy policy.
 
 ### Profiles, presence and message requests
 
@@ -1367,7 +1382,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 | Job | Decision |
 |---|---|
-| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
+| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **message and attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
 | Federation outbox delivery | leader only (any instance queues and wakes it) |
 | Event subscription delivery | leader only (any instance queues and wakes it) |
 | Directory announce and pruning | leader only |
@@ -1596,8 +1611,8 @@ the node and remain responsible for it. Settings: [Legal settings](#legal-settin
 What the node can and cannot see, for the privacy policy: the content of encrypted conversations (messages, voice,
 whiteboards) is end-to-end encrypted and never readable by the node; metadata (who is in which room, when messages
 are sent, IP addresses in logs) and unencrypted channels are. Link previews show the node which URLs users preview.
-Web push payloads carry no content of encrypted conversations. Retention you control: attachments
-(`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
+Web push payloads carry no content of encrypted conversations. Retention you control: messages
+(`TAVRN_RETENTION_DAYS`), attachments (`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
