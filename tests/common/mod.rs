@@ -21,6 +21,7 @@ pub mod crossnode;
 pub mod databases;
 pub mod e2ee;
 pub mod federation;
+pub mod logs;
 pub mod oidc;
 pub mod webauthn;
 

@@ -1,44 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #![allow(clippy::unwrap_used)]
 //! Request logs never contain a webhook secret (APPLICATIONS.md §6.1, §9.4): the HTTP trace layer logs the path
-//! as `/api/v1/webhooks/<id>/***`, for successful, refused and mistyped requests alike. A thread-local subscriber
-//! captures the requests' events; tracing's callsite interest cache and max level are process-wide and every
-//! integration test shares this process, so the captures run one at a time and rebuild that cache first.
+//! as `/api/v1/webhooks/<id>/***`, for successful, refused and mistyped requests alike (log captures:
+//! `common::logs`).
 
 use crate::common;
 
-use std::{
-    io::Write,
-    sync::{Arc, Mutex},
-};
-
 use axum::http::{Method, StatusCode};
-use common::{TestNode, test_node};
+use common::{
+    TestNode,
+    logs::{CAPTURE, start},
+    test_node,
+};
 use serde_json::json;
-
-/// One log capture at a time (see the module comment).
-static CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Collects everything the subscriber writes.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Capture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 #[tokio::test]
 async fn webhook_secrets_never_reach_the_request_log() {
@@ -57,15 +31,7 @@ async fn webhook_secrets_never_reach_the_request_log() {
     let id = j["webhook"]["id"].as_str().unwrap().to_string();
     let secret = path.rsplit('/').next().unwrap().to_string();
 
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    // Interest computed on other threads (without this subscriber) must not hide this thread's events.
-    tracing::callsite::rebuild_interest_cache();
+    let (capture, guard) = start();
     let body = json!({ "content": { "type": "text", "body": "deployed" } });
     let (s, j) = node.req(Method::POST, &path, None, Some(body.clone())).await;
     assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
@@ -77,7 +43,7 @@ async fn webhook_secrets_never_reach_the_request_log() {
     assert_eq!(node.req(Method::POST, &mistyped, None, Some(body)).await.0, StatusCode::NOT_FOUND);
     drop(guard);
 
-    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let logs = capture.text();
     assert!(logs.contains(&format!("/api/v1/webhooks/{id}/***")), "the redacted path is logged:\n{logs}");
     assert!(!logs.contains(&secret), "the secret leaked into the logs:\n{logs}");
 }
@@ -114,15 +80,7 @@ async fn node_sealed_payloads_never_reach_the_logs() {
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
 
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    // Interest computed on other threads (without this subscriber) must not hide this thread's events.
-    tracing::callsite::rebuild_interest_cache();
+    let (capture, guard) = start();
     let body = json!({
         "content": { "type": "text", "body": "PLAINTEXT-BODY-7f3a", "embeds": [{ "title": "EMBED-TITLE-7f3a" }] },
         "username": "USERNAME-7f3a",
@@ -143,7 +101,7 @@ async fn node_sealed_payloads_never_reach_the_logs() {
     }
     drop(guard);
 
-    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let logs = capture.text();
     assert!(logs.contains("webhook executed"), "the execution is logged:\n{logs}");
     for needle in ["PLAINTEXT-BODY", "EMBED-TITLE", "USERNAME-7f3a", "7f3a"] {
         assert!(!logs.contains(needle), "{needle} leaked into the logs:\n{logs}");
