@@ -276,7 +276,7 @@ pub fn dir_of(config: &crate::config::Config) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     #[test]
@@ -327,6 +327,7 @@ mod tests {
         assert_eq!(r.body, "Hello Eve\r\nBcc: x@y.z\tok", "bodies keep the value");
     }
 
+    #[test]
     fn values_are_inserted_once_and_unknown_braces_stay() {
         assert_eq!(fill("a {x} b {y} {x}", &[("x", "{y}"), ("y", "Y")]), "a {y} b Y {y}");
         assert_eq!(fill("{unknown} {} {", &[("x", "1")]), "{unknown} {} {");
