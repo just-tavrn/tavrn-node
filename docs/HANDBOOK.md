@@ -1424,6 +1424,10 @@ curl -X POST "$WEBHOOK_URL" -H 'content-type: application/json' \
   -d '{ "content": { "type": "text", "body": "Deploy **v1.2** finished" }, "username": "CI" }'
 ```
 
+A webhook of a forum channel posts into one of its posts: add `"thread_id": "<post id>"` (the id is in the post's
+link). Forum channels show posts only, so a message without `thread_id` is refused there (`400
+message.thread_required`); in text and announcement channels `thread_id` is optional and posts into a thread.
+
 ### Webhooks in end-to-end encrypted channels
 
 The person who creates the webhook chooses who seals the messages:
