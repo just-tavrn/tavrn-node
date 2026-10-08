@@ -621,7 +621,11 @@ fn push_report(state: &AppState, row: &ReportRow, room_name: Option<String>, aud
     if !state.push.enabled() || audience.is_empty() {
         return;
     }
-    let (state, room_id, kind) = (state.clone(), row.room_id.clone(), row.kind.clone());
+    // Room reports name their room; node reports (also those about a room or its owner) name none: the client opens
+    // the room's Reports tab or the admin inbox accordingly.
+    let room_id = row.room_id.clone().filter(|_| row.scope == "room");
+    let room_name = room_name.filter(|_| room_id.is_some());
+    let (state, kind) = (state.clone(), row.kind.clone());
     tokio::spawn(async move {
         let result: Result<(), ApiError> = async {
             for user_id in store::push::users_with_subscriptions(&state.db, &audience).await? {
