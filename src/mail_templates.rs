@@ -217,7 +217,9 @@ pub fn render(dir: Option<&Path>, locale: Option<&str>, name: &str, vars: &[(&st
             .and_then(|d| override_text(d, &lang, name))
             .or_else(|| builtin(&lang, name).and_then(|t| parse(name, t).ok()));
         if let Some((subject, body)) = text {
-            return Rendered { subject: fill(&subject, vars), body: fill(&body, vars), language: lang };
+            // A subject is one header line: values (display names, application names) never break it.
+            let subject: String = fill(&subject, vars).chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+            return Rendered { subject, body: fill(&body, vars), language: lang };
         }
     }
     // Unreachable for the names of TEMPLATES (the English texts exist and are tested).
@@ -234,7 +236,10 @@ pub fn check_dir(dir: &Path) -> Vec<String> {
         let path = lang.path();
         let lang_name = lang.file_name().to_string_lossy().to_string();
         if !path.is_dir() || normalize_locale(&lang_name).as_deref() != Some(lang_name.as_str()) {
-            problems.push(format!("{}: expected a directory named by a lowercase language tag (en, de, de-at)", path.display()));
+            problems.push(format!(
+                "{}: expected a directory named by a lowercase language tag (en, de, de-at)",
+                path.display()
+            ));
             continue;
         }
         let Ok(files) = std::fs::read_dir(&path) else {
@@ -313,6 +318,15 @@ mod tests {
     }
 
     #[test]
+    fn subjects_stay_one_line_whatever_the_values() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("en")).unwrap();
+        std::fs::write(dir.path().join("en/verify_email.txt"), "Subject: Hi {name}\n\nHello {name}\n").unwrap();
+        let r = render(Some(dir.path()), None, "verify_email", &[("name", "Eve\r\nBcc: x@y.z\tok")]);
+        assert_eq!(r.subject, "Hi Eve  Bcc: x@y.z ok");
+        assert_eq!(r.body, "Hello Eve\r\nBcc: x@y.z\tok", "bodies keep the value");
+    }
+
     fn values_are_inserted_once_and_unknown_braces_stay() {
         assert_eq!(fill("a {x} b {y} {x}", &[("x", "{y}"), ("y", "Y")]), "a {y} b Y {y}");
         assert_eq!(fill("{unknown} {} {", &[("x", "1")]), "{unknown} {} {");
@@ -335,8 +349,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("de")).unwrap();
         std::fs::create_dir_all(dir.path().join("fr")).unwrap();
-        std::fs::write(dir.path().join("de/password_reset.txt"), "Subject: Neues Passwort\r\n\r\nServus {name}: {link}\n")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("de/password_reset.txt"),
+            "Subject: Neues Passwort\r\n\r\nServus {name}: {link}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("fr/password_reset.txt"), "Subject: Mot de passe\n\nBonjour {name}\n").unwrap();
         std::fs::write(dir.path().join("de/verify_email.txt"), "Subject: x\n\n{unknown}").unwrap();
         let vars = [("name", "Anna"), ("link", "L")];
