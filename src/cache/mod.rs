@@ -469,6 +469,13 @@ impl Cluster {
         self.cache.put(&key, sealed, ttl).await
     }
 
+    /// Reads a value of [`Cluster::put_sealed`] without taking it; `Ok(None)` if absent, expired or not genuine.
+    pub async fn get_sealed<T: DeserializeOwned>(&self, name: &str) -> CacheResult<Option<T>> {
+        let key = self.key(name);
+        let Some(sealed) = self.cache.get(&key).await? else { return Ok(None) };
+        Ok(self.open(&key, &sealed).and_then(|plain| serde_json::from_slice(&plain).ok()))
+    }
+
     /// Takes (and deletes) a value of [`Cluster::put_sealed`]; `Ok(None)` if absent, expired or not genuine.
     pub async fn take_sealed<T: DeserializeOwned>(&self, name: &str) -> CacheResult<Option<T>> {
         let key = self.key(name);
