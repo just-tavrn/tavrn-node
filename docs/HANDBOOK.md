@@ -1241,22 +1241,25 @@ at any time; the leader moves by itself.
 | `TAVRN_INSTANCE_ID` | random per start (logged) | `[A-Za-z0-9._-]{1,64}`; names the instance in logs, the cache and `livekit-<id>.yaml` |
 | `TAVRN_INSTANCE_URL` | address towards the cache + listen port | `http(s)://host[:port]` where the other instances reach this one |
 
-> **Command interactions (APPLICATIONS.md §5.6)** reach a bot connected to any instance. The instance that takes the >
-invocation owns the pending interaction, in memory as on a single node; the 3-second wait happens there. Every >
-instance registers its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field >
-`<instance>/<connection>`, removed when the connection closes; entries of instances that stopped sending heartbeats >
-are ignored). Without a local receiver the owner picks one live instance holding a receiver (round robin) and >
-publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to one of its >
-connections (round robin over the bot's devices as before). The owner also stores `interaction:<id>` = its instance id
-> (TTL 16 minutes, the interaction's lifetime plus a minute). The bot answers over REST, which the load balancer may
-send > anywhere: callbacks and follow-ups (`/interactions/{id}/callback|messages`) for an interaction that is not
-pending on > the receiving instance are relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` (like the requests
-relayed to the > leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when the owner does
-not answer). > Chosen over moving pending interactions into the cache because the waiting invocation, the "first
-response wins" > claim and the follow-up counter stay in one process, with no distributed locking. A restart or crash
-of the owner > loses its pending interactions (invokers get `504 interaction.no_ack`), as on a single node. The
-interactions URL > (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` nothing
-changes.
+> **Command interactions (APPLICATIONS.md §5.6)** reach a bot connected to any instance. Every instance registers
+> its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field `<instance>/<connection>`, removed
+> when the connection closes; entries of instances that stopped sending heartbeats are ignored). Without a local
+> receiver the instance that took the invocation (the owner) picks one live instance holding a receiver (round
+> robin) and publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to
+> one of its connections (round robin over the bot's devices as before). The pending interaction lives in the cache,
+> sealed with a key derived from `secrets.key` like connect codes (`interaction-state:<id>`, TTL 16 minutes: the
+> interaction's lifetime plus a minute); the first response is a lease (`interaction-claim:<id>`, held by the claim
+> or by `dropped` once nobody answered in 3 seconds) and the follow-ups a counter (`interaction-followups:<id>`), so
+> "the first response wins" and "at most ten follow-ups" hold across instances. Only the invoker's waiting request
+> (the 3-second wait) stays in the owner's memory; the owner also stores `interaction:<id>` = its instance id. The
+> bot answers over REST, which the load balancer may send anywhere: callbacks and follow-ups
+> (`/interactions/{id}/callback|messages`) for an interaction that is not pending on the receiving instance are
+> relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` while it lives, so the invoker gets the answer at once (like
+> the requests relayed to the leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when
+> the owner does not answer). When the owner is gone (restarted or stopped), any instance takes them from the cache:
+> a deferred command's follow-ups still arrive, and a callback within the 3 seconds is stored as the reply message.
+> The interactions URL (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` the
+> interactions stay in memory, and a restart loses them.
 
 
 ### How the instances act as one node
@@ -1309,7 +1312,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | Custom status expiry timers | per instance | Readers filter expired statuses anyway; the timer only pushes the update. |
 | Typing throttle (per connection) | per instance | Bound to the WebSocket. |
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
-| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** registry + owner | Receivers in the hash `cmdrecv:<bot user id>`; a pending interaction lives on the instance that took the invocation, `interaction:<id>` names it, callbacks and follow-ups are relayed there (see the note at the end). |
+| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives (see the note at the end). |
 | `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
 
 #### Rate limits
