@@ -11,7 +11,8 @@
 //!
 //! **App sessions** (`connect.app`, `crate::connect_sessions`): a native app without an https origin creates a
 //! session with its challenge, opens `/connect?session=…`, and polls the session for the code the page's
-//! confirmation stored there (`POST /auth/connect/code { session_id }`); the exchange is the same.
+//! confirmation stored there (`POST /auth/connect/code { session_id }`); the exchange is the same. The confirmation
+//! may carry sealed unlock material for the app (`sealed_unlock`), and an unlock session yields only that.
 //!
 //! Also here: `GET /federation/peer/{domain}`, the discovery document of another node through this
 //! node's federation client, for browsers that cannot fetch it directly.
@@ -25,7 +26,7 @@ use std::{
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -36,8 +37,8 @@ use utoipa::ToSchema;
 
 use crate::{
     app::AppState,
-    auth::{AuthUser, ClientIp},
-    connect_sessions,
+    auth::{self, AuthUser, ClientIp},
+    connect_sessions::{self, Purpose},
     error::{ApiError, ApiJson, ProblemDetails},
     federation::{self, guard::local_only},
     routes::auth::{AuthResponse, client_header, device_name},
@@ -177,6 +178,10 @@ pub struct ConnectCodeRequest {
     /// Name of the new device the exchange creates (default: "Browser on <origin host>"); ignored with
     /// `session_id` (the session's name).
     pub device_name: Option<String>,
+    /// With `session_id` only: sealed unlock material for the app (base64url, 49–1024 bytes; FEDERATION.md §8 step
+    /// 3), handed out once with the code. Required for an `unlock` session. Opaque to the node.
+    #[serde(default)]
+    pub sealed_unlock: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -195,15 +200,17 @@ fn challenge_invalid() -> ApiError {
 
 /// One-time code for the web client of another node or a native app (connect flow, FEDERATION.md §8). Needs a full
 /// session of a local user; remote users get `federation.local_only`. With `origin` the page redirects the code to
-/// that web client; with `session_id` the node keeps it for the app's next poll of its app session.
+/// that web client; with `session_id` the node keeps it, and the optional `sealed_unlock`, for the app's next poll of
+/// its app session. An `unlock` session issues no code: its own user sends `sealed_unlock` and gets `204`.
 #[utoipa::path(post, path = "/api/v1/auth/connect/code", security(("bearer" = [])), request_body = ConnectCodeRequest,
-    responses((status = 200, body = ConnectCodeResponse), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails),
+    responses((status = 200, body = ConnectCodeResponse), (status = 204, description = "Unlock session: the sealed unlock material waits for the app's poll"),
+        (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails),
         (status = 403, body = ProblemDetails), (status = 410, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn connect_code(
     State(state): State<AppState>,
     auth: AuthUser,
     ApiJson(req): ApiJson<ConnectCodeRequest>,
-) -> Result<Json<ConnectCodeResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     if auth.is_remote() {
         return Err(local_only());
     }
@@ -218,8 +225,12 @@ pub async fn connect_code(
             });
         }
     };
+    let sealed_unlock = req.sealed_unlock.as_deref();
+    if sealed_unlock.is_some_and(|s| session_id.is_none() || !connect_sessions::valid_sealed_unlock(s)) {
+        return Err(connect_sessions::sealed_unlock_invalid());
+    }
     if let Some(id) = session_id {
-        return app_session_code(&state, &auth, id, challenge).await;
+        return app_session_code(&state, &auth, id, challenge, sealed_unlock).await;
     }
     let origin = req.origin.as_deref().unwrap_or_default().trim();
     if !valid_origin(origin, state.config.dev) {
@@ -245,20 +256,38 @@ pub async fn connect_code(
         )
         .await?;
     tracing::info!(origin, device = auth.device_id, "connect code issued");
-    Ok(Json(ConnectCodeResponse { code, expires_in: CODE_TTL_SECS }))
+    Ok(Json(ConnectCodeResponse { code, expires_in: CODE_TTL_SECS }).into_response())
 }
 
-/// The confirmation of an app session: the code is bound to the session's challenge and device name and waits for
-/// the app's poll.
+fn user_mismatch() -> ApiError {
+    ApiError::Forbidden {
+        code: "connect.user_mismatch",
+        detail: "This unlock belongs to another account; sign in here with the account of the app".into(),
+    }
+}
+
+/// The confirmation of an app session: the code is bound to the session's challenge and device name and waits, with
+/// the sealed unlock material, for the app's poll. An unlock session takes only the material of its own user.
 async fn app_session_code(
     state: &AppState,
     auth: &AuthUser,
     session_id: &str,
     challenge: Option<&str>,
-) -> Result<Json<ConnectCodeResponse>, ApiError> {
+    sealed_unlock: Option<&str>,
+) -> Result<Response, ApiError> {
     let session = state.connect_sessions.open(session_id).await?;
     if challenge.is_some_and(|c| !bool::from(c.as_bytes().ct_eq(session.challenge.as_bytes()))) {
         return Err(challenge_invalid());
+    }
+    if session.purpose == Purpose::Unlock {
+        if session.user_id.as_deref() != Some(auth.user.id.as_str()) {
+            return Err(user_mismatch());
+        }
+        let Some(sealed_unlock) = sealed_unlock else { return Err(connect_sessions::sealed_unlock_invalid()) };
+        state.federation_token_limiter.check_all(&[format!("connect:{}", auth.device_id)]).await?;
+        state.connect_sessions.confirm(session_id, &session, None, Some(sealed_unlock)).await?;
+        tracing::info!(device = auth.device_id, "unlock material stored for an app session");
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     state.federation_token_limiter.check_all(&[format!("connect:{}", auth.device_id)]).await?;
     let code = util::random_token(32);
@@ -277,9 +306,13 @@ async fn app_session_code(
             },
         )
         .await?;
-    state.connect_sessions.confirm(session_id, &session, &code).await?;
-    tracing::info!(device = auth.device_id, "connect code issued for an app session");
-    Ok(Json(ConnectCodeResponse { code, expires_in: CODE_TTL_SECS }))
+    state.connect_sessions.confirm(session_id, &session, Some(&code), sealed_unlock).await?;
+    tracing::info!(
+        device = auth.device_id,
+        sealed_unlock = sealed_unlock.is_some(),
+        "connect code issued for an app session"
+    );
+    Ok(Json(ConnectCodeResponse { code, expires_in: CODE_TTL_SECS }).into_response())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -289,6 +322,10 @@ pub struct ConnectSessionRequest {
     /// Name of the device the exchange creates, shown on the confirmation page (at most 64 characters, default
     /// "Desktop app").
     pub device_name: Option<String>,
+    /// `login` (default: sign the app in, no authentication) or `unlock` (sealed unlock material only, no code; needs
+    /// the app's full session and binds the session to its user).
+    #[serde(default)]
+    pub purpose: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -299,8 +336,8 @@ pub struct ConnectSessionResponse {
     pub expires_in: u64,
 }
 
-/// State of an app session: `pending` (with the device name) until the user confirmed, then `ready` with the code
-/// exactly once.
+/// State of an app session: `pending` (with the device name and purpose) until the user confirmed, then `ready`
+/// with the code and the sealed unlock material exactly once.
 #[derive(Serialize, ToSchema)]
 pub struct ConnectSessionStatus {
     /// `pending` or `ready`.
@@ -308,9 +345,15 @@ pub struct ConnectSessionStatus {
     /// `pending`: the name of the device the sign-in creates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
-    /// `ready`: the one-time code for `POST /auth/connect/token`.
+    /// `pending`: `login` or `unlock` (nodes that support sealed unlock material always send it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// `ready` of a `login` session: the one-time code for `POST /auth/connect/token`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// `ready`: the sealed unlock material the page sent, if any (base64url; only the app can open it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_unlock: Option<String>,
     /// `ready`: the identity domain of this node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -319,30 +362,55 @@ pub struct ConnectSessionStatus {
 }
 
 /// Creates an app session of the connect flow (FEDERATION.md §8 step 3, `connect.app`) for a native app without an
-/// https origin. No authentication; rate-limited per client IP and for the whole node.
-#[utoipa::path(post, path = "/api/v1/auth/connect/session", request_body = ConnectSessionRequest,
-    responses((status = 200, body = ConnectSessionResponse), (status = 400, body = ProblemDetails), (status = 429, body = ProblemDetails),
-        (status = 503, body = ProblemDetails)))]
+/// https origin. No authentication for a sign-in; an `unlock` session needs the app's full session of a local user and
+/// belongs to that user. Rate-limited per client IP and for the whole node.
+#[utoipa::path(post, path = "/api/v1/auth/connect/session", request_body = ConnectSessionRequest, security((), ("bearer" = [])),
+    responses((status = 200, body = ConnectSessionResponse), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
 pub async fn create_session(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     ApiJson(req): ApiJson<ConnectSessionRequest>,
 ) -> Result<Json<ConnectSessionResponse>, ApiError> {
     let challenge = req.code_challenge.trim();
     if !valid_challenge(challenge) {
         return Err(challenge_invalid());
     }
+    let purpose = match req.purpose.as_deref() {
+        None => Purpose::Login,
+        Some(p) => Purpose::parse(p).ok_or_else(|| ApiError::BadRequest {
+            code: "connect.purpose_invalid",
+            detail: "purpose: expected login or unlock".into(),
+        })?,
+    };
+    // An unlock session belongs to the signed-in user of the app: only that user can confirm it on the page.
+    let user_id = match purpose {
+        Purpose::Login => None,
+        Purpose::Unlock => {
+            let token = auth::bearer(&headers).ok_or(ApiError::Unauthorized { code: "auth.required" })?;
+            let user = auth::authenticate(&state, token).await?;
+            if user.is_remote() {
+                return Err(local_only());
+            }
+            if user.user.is_bot() {
+                return Err(crate::applications::bot_forbidden());
+            }
+            Some(user.user.id)
+        }
+    };
     state.connect_session_limiter.check_all(&[format!("ip:{ip}")]).await?;
     state.connect_session_node_limiter.check_all(&["node".to_string()]).await?;
     let name = device_name(req.device_name.as_deref(), connect_sessions::DEFAULT_DEVICE_NAME);
-    let (session_id, expires_in) = state.connect_sessions.create(challenge, &name).await?;
-    tracing::info!(ip, "connect app session created");
+    let (session_id, expires_in) = state.connect_sessions.create(challenge, &name, purpose, user_id.as_deref()).await?;
+    tracing::info!(ip, purpose = purpose.as_str(), "connect app session created");
     Ok(Json(ConnectSessionResponse { session_id, expires_in }))
 }
 
 /// Polls an app session (FEDERATION.md §8 step 3): `pending` until the user confirmed on the node's page, then
-/// `ready` with the one-time code exactly once, then `410 connect.session_expired`. No authentication: the code is
-/// useless without the app's PKCE verifier. Rate-limited per session and per client IP.
+/// `ready` with the one-time code and the sealed unlock material exactly once, then `410 connect.session_expired`.
+/// No authentication: the code is useless without the app's PKCE verifier, the sealed material without the app's
+/// key. Rate-limited per session and per client IP.
 #[utoipa::path(get, path = "/api/v1/auth/connect/session/{session_id}", params(("session_id" = String, Path)),
     responses((status = 200, body = ConnectSessionStatus), (status = 404, body = ProblemDetails), (status = 410, body = ProblemDetails),
         (status = 429, body = ProblemDetails)))]
@@ -359,19 +427,23 @@ pub async fn poll_session(
     let status = match state.connect_sessions.poll(&session_id).await? {
         connect_sessions::Poll::Unknown => return Err(connect_sessions::session_invalid_404()),
         connect_sessions::Poll::Expired => return Err(connect_sessions::session_expired()),
-        connect_sessions::Poll::Pending { device_name, expires_in } => ConnectSessionStatus {
+        connect_sessions::Poll::Pending { device_name, purpose, expires_in } => ConnectSessionStatus {
             status: "pending".into(),
             device_name: Some(device_name),
+            purpose: Some(purpose.as_str().into()),
             code: None,
+            sealed_unlock: None,
             node: None,
             expires_in,
         },
-        connect_sessions::Poll::Ready { code, expires_in } => {
-            tracing::info!(ip, "connect app session handed out its code");
+        connect_sessions::Poll::Ready { code, sealed_unlock, expires_in } => {
+            tracing::info!(ip, sealed_unlock = sealed_unlock.is_some(), "connect app session handed out its result");
             ConnectSessionStatus {
                 status: "ready".into(),
                 device_name: None,
-                code: Some(code),
+                purpose: None,
+                code,
+                sealed_unlock,
                 node: Some(state.config.domain.clone()),
                 expires_in,
             }

@@ -585,3 +585,169 @@ async fn well_known_announces_app_sessions() {
 async fn test_node_with_federation_off() -> TestNode {
     common::test_node_with(A, |c| c.federation_enabled = false).await
 }
+
+// ---- Sealed unlock material and unlock sessions (FEDERATION.md §8 step 3, "Sealed unlock material").
+
+/// A stand-in for `crypto_box_seal` output: the node treats it as opaque base64url of 49–1024 bytes.
+fn sealed(len: usize) -> String {
+    URL_SAFE_NO_PAD.encode((0..len).map(|i| (i * 7 % 251) as u8).collect::<Vec<u8>>())
+}
+
+#[tokio::test]
+async fn a_login_session_hands_out_the_sealed_unlock_once_with_its_code() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let id = new_session(&a, "Desktop app").await;
+    let (_, pending) = poll(&a, &id).await;
+    assert_eq!(pending["purpose"], "login", "nodes that know sealed unlock material say the purpose: {pending}");
+
+    let box_ = sealed(120);
+    let (status, issued) = confirm(&a, &alice.token, json!({ "session_id": id, "sealed_unlock": box_ })).await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    assert!(issued.get("sealed_unlock").is_none(), "the page gets only the code back");
+
+    let (status, ready) = poll(&a, &id).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["code"], issued["code"]);
+    assert_eq!(ready["sealed_unlock"], box_.as_str());
+    let (status, gone) = poll(&a, &id).await;
+    assert_eq!((status, gone["code"].as_str()), (StatusCode::GONE, Some("connect.session_expired")), "delivered once");
+
+    // The code still works as before.
+    let (status, session) = exchange(&a, None, ready["code"].as_str().unwrap(), VERIFIER).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+
+    // Without sealed unlock material the answer has none (the app falls back to the recovery key).
+    let id = new_session(&a, "Desktop app").await;
+    let (status, _) = confirm(&a, &alice.token, json!({ "session_id": id })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, ready) = poll(&a, &id).await;
+    assert!(ready.get("sealed_unlock").is_none(), "{ready}");
+    assert!(ready["code"].is_string());
+}
+
+#[tokio::test]
+async fn sealed_unlock_material_is_base64url_of_at_most_one_kib() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    for bad in
+        [json!(""), json!("a+b/"), json!(format!("{}=", sealed(60))), json!(sealed(48)), json!(sealed(1025)), json!(42)]
+    {
+        let id = new_session(&a, "Desktop app").await;
+        let (status, json) = confirm(&a, &alice.token, json!({ "session_id": id, "sealed_unlock": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+        if bad.is_string() {
+            assert_eq!(json["code"], "connect.sealed_unlock_invalid", "{bad}");
+        }
+        // A refused confirmation leaves the session pending.
+        assert_eq!(poll(&a, &id).await.1["status"], "pending");
+    }
+    for ok in [sealed(49), sealed(1024)] {
+        let id = new_session(&a, "Desktop app").await;
+        let (status, json) = confirm(&a, &alice.token, json!({ "session_id": id, "sealed_unlock": ok })).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+    // Only app sessions carry it: never with an origin.
+    let (status, json) = confirm(
+        &a,
+        &alice.token,
+        json!({ "origin": ORIGIN, "code_challenge": challenge(VERIFIER), "sealed_unlock": sealed(80) }),
+    )
+    .await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::BAD_REQUEST, Some("connect.sealed_unlock_invalid")));
+}
+
+async fn unlock_session(node: &TestNode, token: &str) -> (StatusCode, Value) {
+    node.post(
+        "/api/v1/auth/connect/session",
+        token,
+        json!({ "code_challenge": challenge(VERIFIER), "device_name": "Laptop", "purpose": "unlock" }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_unlock_session_belongs_to_its_user_and_hands_out_no_code() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let bob = a.register("bob").await;
+
+    // Unlock sessions need the app's own full session; logins do not.
+    let body = json!({ "code_challenge": challenge(VERIFIER), "purpose": "unlock" });
+    let (status, json) = create_session(&a, body).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.required")));
+    let (status, json) = create_session(&a, json!({ "code_challenge": challenge(VERIFIER), "purpose": "other" })).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::BAD_REQUEST, Some("connect.purpose_invalid")));
+    let (status, json) = create_session(&a, json!({ "code_challenge": challenge(VERIFIER), "purpose": "login" })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let (status, created) = unlock_session(&a, &alice.token).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["session_id"].as_str().unwrap().to_string();
+    let (_, pending) = poll(&a, &id).await;
+    assert_eq!((pending["status"].as_str(), pending["purpose"].as_str()), (Some("pending"), Some("unlock")));
+    assert_eq!(pending["device_name"], "Laptop");
+    assert!(pending.get("user").is_none() && !pending.to_string().contains("alice"), "{pending}");
+
+    // Someone else's unlock session is useless: the confirming user must be the session's.
+    let (status, json) = confirm(&a, &bob.token, json!({ "session_id": id, "sealed_unlock": sealed(90) })).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::FORBIDDEN, Some("connect.user_mismatch")));
+    // The material is the point of an unlock session.
+    let (status, json) = confirm(&a, &alice.token, json!({ "session_id": id })).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::BAD_REQUEST, Some("connect.sealed_unlock_invalid")));
+    assert_eq!(poll(&a, &id).await.1["status"], "pending", "refusals leave the session pending");
+
+    let box_ = sealed(90);
+    let (status, json) = confirm(&a, &alice.token, json!({ "session_id": id, "sealed_unlock": box_ })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let (status, ready) = poll(&a, &id).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!((ready["status"].as_str(), ready["node"].as_str()), (Some("ready"), Some(A)));
+    assert_eq!(ready["sealed_unlock"], box_.as_str());
+    assert!(ready.get("code").is_none(), "no sign-in code for an unlock: {ready}");
+    let (status, _) = poll(&a, &id).await;
+    assert_eq!(status, StatusCode::GONE, "delivered once");
+    let (status, json) = confirm(&a, &alice.token, json!({ "session_id": id, "sealed_unlock": sealed(90) })).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::GONE, Some("connect.session_expired")));
+}
+
+#[tokio::test]
+async fn remote_users_cannot_create_unlock_sessions() {
+    let (a, b) = two_nodes().await;
+    let bob = b.register("bob").await;
+    let remote = a.sign_in_from(&b, &bob).await;
+    let (status, json) = unlock_session(&a, &remote.token).await;
+    assert_eq!((status, json["code"].as_str()), (StatusCode::FORBIDDEN, Some("federation.local_only")));
+}
+
+/// The node never logs sealed unlock material: neither when it stores it, nor when it hands it out, nor when it
+/// refuses it.
+#[tokio::test]
+async fn sealed_unlock_material_never_reaches_the_logs() {
+    let _capture = common::logs::CAPTURE.lock().await;
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let box_ = sealed(200);
+    let refused = format!("{}+", sealed(60));
+    let login = new_session(&a, "Desktop app").await;
+    let (_, created) = unlock_session(&a, &alice.token).await;
+    let unlock = created["session_id"].as_str().unwrap().to_string();
+
+    let (capture, guard) = common::logs::start();
+    let (status, _) = confirm(&a, &alice.token, json!({ "session_id": login, "sealed_unlock": refused })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = confirm(&a, &alice.token, json!({ "session_id": login, "sealed_unlock": box_ })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(poll(&a, &login).await.1["sealed_unlock"], box_.as_str());
+    let (status, _) = confirm(&a, &alice.token, json!({ "session_id": unlock, "sealed_unlock": box_ })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(poll(&a, &unlock).await.1["sealed_unlock"], box_.as_str());
+    drop(guard);
+
+    let logs = capture.text();
+    assert!(logs.contains("connect"), "the requests were captured:\n{logs}");
+    for secret in [&box_[..40], &refused[..40]] {
+        assert!(!logs.contains(secret), "sealed unlock material leaked into the logs:\n{logs}");
+    }
+}

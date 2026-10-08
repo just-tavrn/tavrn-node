@@ -158,8 +158,10 @@ The second factor (TOTP or passkeys) is mandatory for every account and cannot b
 
 The desktop app signs in on the node's own web client (app sessions of the connect flow, FEDERATION.md §8 step 3,
 capability `connect.app`): the user signs in or registers there with any method, including passkeys, single sign-on
-and the captcha, and the app picks up the session. There is nothing to configure; `/connect` must be served like
-every other page of the web client.
+and the captcha, and the app picks up the session. A passkey used there also unlocks the app's encryption keys: the
+page seals the passkey's unlock secret to a key only the app holds, and the node keeps that sealed box (at most
+1 KiB, never logged, handed out once) until the app picks it up. There is nothing to configure; `/connect` must be
+served like every other page of the web client.
 
 ### Single sign-on (OpenID Connect)
 
