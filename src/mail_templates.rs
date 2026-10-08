@@ -40,6 +40,8 @@ pub const TEMPLATES: &[(&str, &[&str])] = &[
     ("counter_upheld", &["case", "reason"]),
     ("statement_content_removed", &["case", "basis", "statement", "deadline"]),
     ("statement_account_disabled", &["case", "basis", "statement", "deadline"]),
+    ("app_token_expiring_week", &["name", "application", "expires_at", "link"]),
+    ("app_token_expiring_day", &["name", "application", "expires_at", "link"]),
 ];
 
 /// The compiled-in text of a template.
@@ -72,6 +74,8 @@ fn builtin(lang: &str, name: &str) -> Option<&'static str> {
         "counter_upheld",
         "statement_content_removed",
         "statement_account_disabled",
+        "app_token_expiring_week",
+        "app_token_expiring_day",
     )
 }
 

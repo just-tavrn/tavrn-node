@@ -112,3 +112,45 @@ fn check_config_validates_the_template_directory() {
     std::fs::write(dir.path().join("en/verify_email.txt"), "Subject: Hi\n\n{link}\n").unwrap();
     assert!(c.validate().is_ok());
 }
+
+#[tokio::test]
+async fn app_token_expiry_mails_reach_owners_with_a_confirmed_address_once_per_step() {
+    use tavrn_node::applications::notify_expiring_tokens;
+    let node = test_node("t.local").await;
+    let gina = register(&node, "gina", Some("de")).await;
+    verify(&node).await;
+    // An address nobody confirmed gets no notices.
+    let hans = register(&node, "hans", None).await;
+    let mut apps = Vec::new();
+    for (owner, name) in [(&gina, "Wetterbot"), (&hans, "Other")] {
+        let (s, app) = node.post("/api/v1/applications", owner, json!({ "name": name })).await;
+        assert_eq!(s, StatusCode::CREATED, "{app}");
+        let id = app["id"].as_str().unwrap().to_string();
+        let (s, t) = node.post(&format!("/api/v1/applications/{id}/tokens"), owner, json!({ "name": "main" })).await;
+        assert_eq!(s, StatusCode::CREATED, "{t}");
+        apps.push(id);
+    }
+    let mails = |node: &TestNode| node.state.mailer.outbox.lock().unwrap().clone();
+    let before = mails(&node).len();
+    let now = chrono::Utc::now();
+    assert_eq!(notify_expiring_tokens(&node.state, now).await.unwrap(), 0);
+    assert_eq!(mails(&node).len(), before, "nothing expires soon");
+
+    let week = now + chrono::Duration::days(359);
+    assert_eq!(notify_expiring_tokens(&node.state, week).await.unwrap(), 2);
+    let sent = mails(&node);
+    assert_eq!(sent.len(), before + 1, "only the confirmed address");
+    let (to, subject, body) = sent.last().unwrap().clone();
+    assert_eq!((to.as_str(), subject.as_str()), ("gina@example.org", "Test node t.local: Ein App-Token läuft in 7 Tagen ab"));
+    assert!(body.contains("Wetterbot") && body.contains("/settings/applications") && body.contains(" UTC"), "{body}");
+    assert_eq!(notify_expiring_tokens(&node.state, week).await.unwrap(), 0);
+    assert_eq!(mails(&node).len(), before + 1, "once per token and step");
+
+    let day = now + chrono::Duration::days(364) + chrono::Duration::hours(12);
+    assert_eq!(notify_expiring_tokens(&node.state, day).await.unwrap(), 2);
+    let sent = mails(&node);
+    assert_eq!(sent.len(), before + 2);
+    assert!(sent.last().unwrap().1.ends_with("Ein App-Token läuft morgen ab"), "{:?}", sent.last());
+    assert_eq!(notify_expiring_tokens(&node.state, day).await.unwrap(), 0);
+    assert_eq!(mails(&node).len(), before + 2);
+}

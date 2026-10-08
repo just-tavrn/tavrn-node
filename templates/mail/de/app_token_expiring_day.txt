@@ -1,0 +1,10 @@
+Subject: Ein App-Token läuft morgen ab
+
+Hallo {name},
+
+ein Token deiner Anwendung „{application}“ läuft am {expires_at} ab. Danach kann sich die Anwendung damit nicht mehr anmelden.
+
+Setze das Token in den Einstellungen der Anwendung mit einer neuen Laufzeit zurück oder erstelle ein neues:
+{link}
+
+Du bekommst diese Mail 7 Tage und 1 Tag bevor ein Token einer deiner Anwendungen abläuft.

@@ -1435,7 +1435,10 @@ are in [tavrn-js](https://github.com/just-tavrn/tavrn-js). What the operator dec
 - **How many**: `TAVRN_APPS_PER_USER` (default 5 per owner, node admins included), `TAVRN_APPS_PER_ROOM` (default 25
   installed per room).
 - **Tokens and load**: `TAVRN_APP_TOKEN_MAX_DAYS` (default 365) caps the token lifetime; `TAVRN_APP_RATE_REQUESTS`
-  (default 1200 per application and minute) caps REST and WebSocket operations.
+  (default 1200 per application and minute) caps REST and WebSocket operations. Seven days and one day before a token
+  expires, the hourly housekeeping tells the owner in the client and, with SMTP and a confirmed address, by e-mail
+  (once per token and step, in the owner's language; templates `app_token_expiring_week` and `app_token_expiring_day`,
+  see [Mail languages and templates](#mail-languages-and-templates)).
 - **Command review**: `TAVRN_APP_COMMANDS_REQUIRE_APPROVAL=true` makes node admins approve every command definition
   (and every change of one) before it is offered in this node's rooms.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and

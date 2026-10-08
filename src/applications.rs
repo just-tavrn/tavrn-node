@@ -748,10 +748,34 @@ pub async fn notify_expiring_tokens(state: &AppState, now: chrono::DateTime<chro
                 json!({ "application_id": app.id, "token_id": t.id, "expires_at": t.expires_at, "days": days }),
             );
             store::installations::mark_notified(&state.db, &t.id, days).await?;
+            mail_token_expiry(state, &app, &t.expires_at, days).await?;
             sent += 1;
         }
     }
     Ok(sent)
+}
+
+/// The e-mail of a token expiry notice (§2.2) to the application's owner, in the owner's language: only to a local
+/// owner with a confirmed address (an unconfirmed one may belong to someone else).
+async fn mail_token_expiry(
+    state: &AppState,
+    app: &store::applications::ApplicationRow,
+    expires_at: &str,
+    days: i64,
+) -> Result<(), ApiError> {
+    let Some(owner) = store::users::by_id(&state.db, &app.owner_id).await? else { return Ok(()) };
+    let Some(email) = owner.email.as_deref().filter(|_| owner.email_verified_at.is_some()) else { return Ok(()) };
+    if owner.domain != state.config.domain || owner.disabled_at.is_some() {
+        return Ok(());
+    }
+    let locale = store::users::locale(&state.db, &owner.id).await?;
+    let expires = util::parse_time(expires_at).map_or_else(|| expires_at.to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+    let link = format!("{}/settings/applications", state.mailer.public_url());
+    let template = if days <= 1 { "app_token_expiring_day" } else { "app_token_expiring_week" };
+    let vars =
+        [("name", owner.display_name.as_str()), ("application", app.name.as_str()), ("expires_at", &expires), ("link", &link)];
+    state.mailer.send_template(email, locale.as_deref(), template, &vars).await;
+    Ok(())
 }
 
 /// The application reference `<domain>/<ULID>` (§0).
