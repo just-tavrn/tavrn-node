@@ -40,6 +40,9 @@ pub struct NodeInfo {
     pub message_retention_days: u32,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,
+    /// WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain): clients pass it
+    /// as `rpId` on the assertions they build themselves (PROTOCOL.md §5a.4).
+    pub webauthn: crate::routes::wellknown::WebauthnInfo,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -95,5 +98,6 @@ pub async fn get_node(State(state): State<AppState>) -> Result<Json<NodeInfo>, c
                 login: c.captcha_login,
             }),
         },
+        webauthn: crate::routes::wellknown::WebauthnInfo::of(c),
     }))
 }

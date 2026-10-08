@@ -608,7 +608,8 @@ be the origin's host or a parent domain of it: `example.org` covers `chat.exampl
 later move to `app.example.org` keeps every passkey. A public URL on an unrelated host (`chat.example.net` for
 `example.org`) needs `TAVRN_WEBAUTHN_RP_ID=chat.example.net`; the node refuses to start otherwise. Changing the
 relying party id later invalidates all registered passkeys (users sign in with TOTP or a recovery code and
-register them again).
+register them again). The node publishes the id as `webauthn.rp_id` (`GET /api/v1/node`, `/.well-known/tavrn`), so
+clients use it for the assertions they build themselves (unlocking the secret storage with a passkey).
 
 Everything else that builds absolute URLs (mail links, invite and application add links, the OIDC redirect URI
 `<public URL>/api/v1/auth/oidc/callback`, the LiveKit signaling URL, `turn.<public host>`) uses the public URL.
