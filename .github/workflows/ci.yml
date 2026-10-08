@@ -7,7 +7,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Draft pull requests get the Rust and hygiene checks only; the image build runs once a pull request is
+  # marked ready for review, on every push after that, and on main.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -87,7 +90,7 @@ jobs:
     # with the branch name alone ("main") a rebuilt image would keep the cached, stale bundle of an earlier main.
     # Resolving the branch to its current commit here makes every change of the web client a cache miss.
     name: Web client commit
-    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
+    if: ${{ vars.CI_ENABLED == 'true' && ((github.event_name == 'pull_request' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
@@ -114,7 +117,7 @@ jobs:
     # against by default. Releases are tagged by release.yml.
     name: Container image
     needs: web-ref
-    if: ${{ vars.CI_ENABLED == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
+    if: ${{ vars.CI_ENABLED == 'true' && ((github.event_name == 'pull_request' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main') }}
     uses: just-tavrn/.github/.github/workflows/docker-publish.yml@main
     permissions:
       contents: read
