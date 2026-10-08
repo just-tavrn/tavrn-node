@@ -41,28 +41,49 @@ pub struct NewSubscription<'a> {
     pub expires_at: Option<&'a str>,
 }
 
-/// Registers a subscription, or updates the one with the same endpoint (a browser that signs in again, possibly as
-/// another user, takes its endpoint over; keys and device are replaced, the failure count is reset). Returns the
-/// row and whether it is new. Refuses (`None`) when the user already has [`MAX_PER_USER`] other subscriptions.
-pub async fn upsert(db: &Pool, s: NewSubscription<'_>) -> Result<Option<(SubscriptionRow, bool)>, ApiError> {
+/// Outcome of [`upsert`].
+#[derive(Debug)]
+pub enum Upsert {
+    /// The row and whether it is new.
+    Saved(SubscriptionRow, bool),
+    /// The user already has [`MAX_PER_USER`] other subscriptions.
+    TooMany,
+    /// The endpoint belongs to a live subscription of another user.
+    Taken,
+}
+
+/// Registers a subscription, or updates the one with the same endpoint (keys and device are replaced, the failure
+/// count is reset). The same user moves an endpoint between its devices; another user's endpoint is refused while
+/// that subscription is live (not expired, its device has a live session) and taken over once it is stale, so a
+/// known endpoint URL cannot be used to cut another account off its pushes (tavrn-node #9).
+pub async fn upsert(db: &Pool, s: NewSubscription<'_>) -> Result<Upsert, ApiError> {
     let mut tx = db.begin().await?;
-    let existing: Option<(String, String)> =
-        sqlx::query_as("SELECT id, user_id FROM push_subscriptions WHERE endpoint = $1")
-            .bind(s.endpoint)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let own_existing = existing.as_ref().is_some_and(|(_, u)| u == s.user_id);
+    let ts = now();
+    let existing: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, user_id, CASE WHEN (expires_at IS NULL OR expires_at > $2)
+                AND EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = p.device_id AND s.revoked_at IS NULL
+                            AND s.expires_at > $2) THEN 1 ELSE 0 END
+         FROM push_subscriptions p WHERE endpoint = $1",
+    )
+    .bind(s.endpoint)
+    .bind(&ts)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let own_existing = existing.as_ref().is_some_and(|(_, u, _)| u == s.user_id);
     if !own_existing {
+        if existing.as_ref().is_some_and(|(_, _, live)| *live == 1) {
+            return Ok(Upsert::Taken);
+        }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_subscriptions WHERE user_id = $1")
             .bind(s.user_id)
             .fetch_one(&mut *tx)
             .await?;
         if count >= MAX_PER_USER {
-            return Ok(None);
+            return Ok(Upsert::TooMany);
         }
     }
     let (id, created) = match existing {
-        Some((id, _)) => {
+        Some((id, _, _)) => {
             sqlx::query(
                 "UPDATE push_subscriptions SET user_id = $1, device_id = $2, p256dh = $3, auth = $4, expires_at = $5,
                  failures = 0, retry_at = NULL WHERE id = $6",
@@ -101,7 +122,7 @@ pub async fn upsert(db: &Pool, s: NewSubscription<'_>) -> Result<Option<(Subscri
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Some((row, created)))
+    Ok(Upsert::Saved(row, created))
 }
 
 /// The user's subscriptions, oldest first.
@@ -229,6 +250,15 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    impl Upsert {
+        fn unwrap(self) -> (SubscriptionRow, bool) {
+            match self {
+                Upsert::Saved(row, created) => (row, created),
+                other => panic!("not saved: {other:?}"),
+            }
+        }
+    }
+
     async fn db_with_user(users: &[&str]) -> Pool {
         let db = crate::db::connect("sqlite::memory:").await.unwrap();
         for u in users {
@@ -283,7 +313,18 @@ mod tests {
         assert_eq!(again.id, a.id, "same endpoint, same row");
         upsert(&db, sub("u1", "u1-d2", "https://push.example/b")).await.unwrap().unwrap();
         assert_eq!(list(&db, "u1").await.unwrap().len(), 2);
-        // The browser signs in as another user: the endpoint moves.
+        // The same user moves it to another device.
+        let (moved, created) = upsert(&db, sub("u1", "u1-d2", "https://push.example/a")).await.unwrap().unwrap();
+        assert_eq!((moved.id.as_str(), moved.device_id.as_str(), created), (a.id.as_str(), "u1-d2", false));
+        // Another user is refused while the subscription is live (tavrn-node #9).
+        assert!(matches!(upsert(&db, sub("u2", "u2-d1", "https://push.example/a")).await.unwrap(), Upsert::Taken));
+        assert_eq!(list(&db, "u1").await.unwrap().len(), 2);
+        // An expired subscription is stale: another user takes it over.
+        sqlx::query("UPDATE push_subscriptions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = $1")
+            .bind(&a.id)
+            .execute(&db)
+            .await
+            .unwrap();
         let (moved, _) = upsert(&db, sub("u2", "u2-d1", "https://push.example/a")).await.unwrap().unwrap();
         assert_eq!((moved.id.as_str(), moved.user_id.as_str()), (a.id.as_str(), "u2"));
         assert_eq!(list(&db, "u1").await.unwrap().len(), 1);
@@ -299,8 +340,11 @@ mod tests {
         for i in 0..MAX_PER_USER {
             upsert(&db, sub("u1", "u1-d1", &format!("https://push.example/{i}"))).await.unwrap().unwrap();
         }
-        assert!(upsert(&db, sub("u1", "u1-d1", "https://push.example/new")).await.unwrap().is_none());
-        assert!(upsert(&db, sub("u1", "u1-d1", "https://push.example/0")).await.unwrap().is_some(), "updates pass");
+        assert!(matches!(upsert(&db, sub("u1", "u1-d1", "https://push.example/new")).await.unwrap(), Upsert::TooMany));
+        assert!(
+            matches!(upsert(&db, sub("u1", "u1-d1", "https://push.example/0")).await.unwrap(), Upsert::Saved(..)),
+            "updates pass"
+        );
     }
 
     #[tokio::test]

@@ -133,8 +133,10 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<
 /// Register a push subscription.
 ///
 /// Registers the browser's push subscription (`PushSubscription.toJSON()`) for the requesting device, or updates
-/// the one with the same endpoint (a browser that signs in again, also as another account, takes its endpoint
-/// over). `201` when new, `200` when updated. The endpoint must be an `https://` URL of a public host (`400
+/// the account's one with the same endpoint (also from another of its devices). `201` when new, `200` when
+/// updated. An endpoint of another account's live subscription is refused (`409 push.endpoint_taken`: the client
+/// unsubscribes the browser and subscribes again); a stale one (expired, or its device has no live session) is
+/// taken over. The endpoint must be an `https://` URL of a public host (`400
 /// push.endpoint_invalid`), `keys.p256dh` an uncompressed P-256 point and `keys.auth` 16 bytes, both base64url
 /// (`400 push.keys_invalid`). At most 20 subscriptions per account (`409 push.too_many`), 30 registrations per
 /// hour (`429`). `404 push.disabled` while push is off. The subscription is deleted with the device and when its
@@ -194,12 +196,21 @@ pub async fn register(
         },
     )
     .await?;
-    let Some((row, created)) = saved else {
-        return Err(ApiError::Conflict {
-            code: "push.too_many",
-            detail: format!("At most {} push subscriptions per account", store::push::MAX_PER_USER),
-            meta: serde_json::json!({ "max": store::push::MAX_PER_USER }),
-        });
+    let (row, created) = match saved {
+        store::push::Upsert::Saved(row, created) => (row, created),
+        store::push::Upsert::TooMany => {
+            return Err(ApiError::Conflict {
+                code: "push.too_many",
+                detail: format!("At most {} push subscriptions per account", store::push::MAX_PER_USER),
+                meta: serde_json::json!({ "max": store::push::MAX_PER_USER }),
+            });
+        }
+        store::push::Upsert::Taken => {
+            return Err(ApiError::conflict(
+                "push.endpoint_taken",
+                "The endpoint belongs to another account's subscription; subscribe the browser again",
+            ));
+        }
     };
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
     Ok((status, Json(PushRegistration::of(row, &auth.device_id))))
