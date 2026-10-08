@@ -45,7 +45,7 @@ pub struct NewSubscription<'a> {
 #[derive(Debug)]
 pub enum Upsert {
     /// The row and whether it is new.
-    Saved(SubscriptionRow, bool),
+    Saved(Box<SubscriptionRow>, bool),
     /// The user already has [`MAX_PER_USER`] other subscriptions.
     TooMany,
     /// The endpoint belongs to a live subscription of another user.
@@ -122,7 +122,7 @@ pub async fn upsert(db: &Pool, s: NewSubscription<'_>) -> Result<Upsert, ApiErro
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Upsert::Saved(row, created))
+    Ok(Upsert::Saved(Box::new(row), created))
 }
 
 /// The user's subscriptions, oldest first.
@@ -247,13 +247,13 @@ pub async fn prune(db: &Pool) -> Result<u64, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     impl Upsert {
         fn unwrap(self) -> (SubscriptionRow, bool) {
             match self {
-                Upsert::Saved(row, created) => (row, created),
+                Upsert::Saved(row, created) => (*row, created),
                 other => panic!("not saved: {other:?}"),
             }
         }

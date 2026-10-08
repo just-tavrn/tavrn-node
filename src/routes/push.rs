@@ -197,7 +197,7 @@ pub async fn register(
     )
     .await?;
     let (row, created) = match saved {
-        store::push::Upsert::Saved(row, created) => (row, created),
+        store::push::Upsert::Saved(row, created) => (*row, created),
         store::push::Upsert::TooMany => {
             return Err(ApiError::Conflict {
                 code: "push.too_many",

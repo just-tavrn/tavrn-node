@@ -317,7 +317,7 @@ impl Info {
 #[derive(Debug, Clone)]
 pub enum Ack {
     Reply(Box<Message>),
-    Ephemeral(EphemeralReply),
+    Ephemeral(Box<EphemeralReply>),
     Defer,
     Error(String),
 }
@@ -333,7 +333,7 @@ impl Ack {
         };
         match self {
             Self::Reply(m) => r.message = Some((**m).clone()),
-            Self::Ephemeral(e) => r.ephemeral = Some(e.clone()),
+            Self::Ephemeral(e) => r.ephemeral = Some((**e).clone()),
             Self::Defer => r.outcome = "defer".into(),
             Self::Error(e) => {
                 r.outcome = "error".into();
@@ -1160,7 +1160,7 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
     }
     if ephemeral {
         let stored: Value = if conv.encrypted { Value::String(v.content.clone()) } else { content };
-        return Ok(Ack::Ephemeral(EphemeralReply {
+        return Ok(Ack::Ephemeral(Box::new(EphemeralReply {
             interaction_id: info.id.clone(),
             conversation_id: info.conversation_id.clone(),
             thread_id: thread.as_ref().map(|t| t.id.clone()),
@@ -1169,7 +1169,7 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
             content: stored,
             epoch,
             created_at: util::now(),
-        }));
+        })));
     }
     let id = util::ulid();
     store::messages::insert(
@@ -1222,7 +1222,7 @@ pub async fn follow_up(
     match answer(state, auth, &info, a).await {
         Ok(Ack::Ephemeral(reply)) => {
             state.hub.users(vec![info.user_id.clone()], "interaction.reply", &reply);
-            Ok(FollowUpResponse { message: None, ephemeral: Some(reply) })
+            Ok(FollowUpResponse { message: None, ephemeral: Some(*reply) })
         }
         Ok(Ack::Reply(message)) => Ok(FollowUpResponse { message: Some(*message), ephemeral: None }),
         Ok(_) => Ok(FollowUpResponse { message: None, ephemeral: None }),
