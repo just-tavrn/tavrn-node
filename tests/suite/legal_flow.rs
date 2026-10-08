@@ -503,6 +503,49 @@ async fn admins_review_remove_and_the_uploader_gets_a_statement_and_may_counter(
 }
 
 #[tokio::test]
+async fn notice_mails_speak_the_reporters_and_the_uploaders_language() {
+    use tower::ServiceExt;
+    let node = notices_node().await;
+    let admin = node.register("admin").await;
+    let bob = node.register("bob").await;
+    let (s, _) = node.patch("/api/v1/users/me", &bob.token, json!({ "locale": "de" })).await;
+    assert_eq!(s, StatusCode::OK);
+    let room = node.plaintext_room(&bob.token, "Fotos").await;
+    let (room_id, channel) = (room["id"].as_str().unwrap().to_string(), TestNode::text_channel(&room));
+    let (_, m) = node.send(&bob.token, &room_id, &channel, "geklautes Foto").await;
+    let link = format!("https://t.local/rooms/{room_id}/channels/{channel}?message={}", m["id"].as_str().unwrap());
+    // The reporter has no account: the notice's Accept-Language decides.
+    let req = axum::http::Request::post(NOTICES)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::ACCEPT_LANGUAGE, "de-AT,de;q=0.9")
+        .body(axum::body::Body::from(notice(&link).to_string()))
+        .unwrap();
+    let resp = node.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let case = created["case_id"].as_str().unwrap().to_string();
+    let (_, subject, body) = node.state.mailer.outbox.lock().unwrap().last().unwrap().clone();
+    assert_eq!(subject, format!("Test node t.local: Meldung erhalten ({case})"));
+    assert!(body.contains("Wir haben Ihre Meldung erhalten") && body.contains("/legal/notice/"), "{body}");
+
+    let (s, r) = node
+        .post(
+            &format!("/api/v1/admin/legal/notices/{case}/actions"),
+            &admin.token,
+            json!({ "action": "remove_content", "reason": "Verletzt Urheberrecht", "statement": "Das Foto ist geschützt." }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let mails = node.state.mailer.outbox.lock().unwrap().clone();
+    assert!(mails.iter().any(|(to, s, _)| to == "rita@example.org" && s.ends_with(&format!("Inhalte entfernt ({case})"))));
+    // The statement of reasons is stored (and mailed) in the uploader's language.
+    let (_, mine) = node.get_auth("/api/v1/users/me/legal-notices", &bob.token).await;
+    let statement = mine[0]["statement"].as_str().unwrap();
+    assert!(statement.starts_with("Entscheidung: Inhalte entfernt") && statement.contains("Das Foto ist geschützt."), "{statement}");
+    assert!(statement.contains("Gegendarstellung"), "{statement}");
+}
+
+#[tokio::test]
 async fn reject_disable_set_state_repeat_counter_window_and_retention() {
     let (c, case) = reported().await;
     let node = &c.node;

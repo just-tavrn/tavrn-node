@@ -1,0 +1,3 @@
+Subject: Konto wiederhergestellt
+
+Ein Node-Admin hat das Konto {address} wiederhergestellt. Melde dich erneut an, um es zu nutzen.

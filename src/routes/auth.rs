@@ -99,6 +99,7 @@ fn valid_email(e: &str) -> bool {
 pub async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<PreAuthResponse>), ApiError> {
     state.register_limiter.check_all(&[format!("ip:{ip}")]).await?;
@@ -196,10 +197,17 @@ pub async fn register(
     if let Some(version) = terms {
         crate::legal::documents::accept(&state.db, &user.id, version).await?;
     }
+    // The browser's language until the client sends the one the user picked (mails, `mail_templates.rs`).
+    let locale = crate::mail_templates::from_accept_language(
+        headers.get(axum::http::header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()),
+    );
+    if locale.is_some() {
+        store::users::set_locale(&state.db, &user.id, locale.as_deref()).await?;
+    }
     if email.is_some() && cfg.email != EmailMode::None {
         let token = util::random_token(32);
         store::users::set_email_verification(&state.db, &user.id, &util::sha256_b64(&token), 24 * 3600).await?;
-        state.mailer.send_verification(&user, &token).await;
+        state.mailer.send_verification(&user, locale.as_deref(), &token).await;
     }
 
     let token = second_factor::issue_preauth(
@@ -425,7 +433,8 @@ pub async fn forgot_password(
     if let Some(user) = user.filter(|u| u.disabled_at.is_none() && u.email.is_some() && u.password_hash.is_some()) {
         let token = util::random_token(32);
         store::admin::set_password_reset(&state.db, &user.id, &util::sha256_b64(&token), 3600).await?;
-        state.mailer.send_password_reset(&user, &token).await;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        state.mailer.send_password_reset(&user, locale.as_deref(), &token).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -469,6 +478,7 @@ pub async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Us
     if !auth.is_remote() && auth.user.domain == state.config.domain {
         me.notification_settings = Some(crate::notifications::load(&state.db, &auth.user.id).await?);
         me.auto_preview = Some(store::users::auto_preview(&state.db, &auth.user.id).await?);
+        me.locale = store::users::locale(&state.db, &auth.user.id).await?;
     }
     Ok(Json(me))
 }

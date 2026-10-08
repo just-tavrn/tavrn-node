@@ -143,6 +143,7 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_EMAIL` | `optional` | `none`, `optional` or `required` (`required` needs `TAVRN_SMTP_URL`). |
 | `TAVRN_SMTP_URL` | unset | `smtp://host:port` (plain, internal relay), `smtps://host:port` (TLS) or `smtp+starttls://host:port`, optionally `user:pass@`. Test it with `tavrn-node send-test-mail you@example.org`. |
 | `TAVRN_SMTP_FROM` | `noreply@<TAVRN_DOMAIN>` | Sender address. |
+| `TAVRN_MAIL_TEMPLATES_DIR` | `<TAVRN_DATA_DIR>/templates/mail` | Your own texts for the node's mails, per language: `<dir>/<language>/<name>.txt`. See [Mail languages and templates](#mail-languages-and-templates). |
 | `TAVRN_CAPTCHA_PROVIDER` | `none` | `none` or `turnstile` (Cloudflare Turnstile). |
 | `TAVRN_TURNSTILE_SITE_KEY`, `TAVRN_TURNSTILE_SECRET_KEY` | unset | Required with `TAVRN_CAPTCHA_PROVIDER=turnstile`. |
 | `TAVRN_CAPTCHA_REGISTER` | `true` | Require the captcha at registration (only with a provider). |
@@ -162,6 +163,33 @@ and the captcha, and the app picks up the session. A passkey used there also unl
 page seals the passkey's unlock secret to a key only the app holds, and the node keeps that sealed box (at most
 1 KiB, never logged, handed out once) until the app picks it up. There is nothing to configure; `/connect` must be
 served like every other page of the web client.
+
+#### Mail languages and templates
+
+The node's mails (email confirmation, password reset, account deleted and restored, takedown notices and statements
+of reasons, app token expiry) are written in the recipient's language: the language the user picked in the client
+(the client stores it on the node; a new account starts with the browser's language), for reporters of takedown
+notices the browser language of the notice form. The node has English and German texts; any other language falls
+back to English. The texts are the templates in `templates/mail/<language>/<name>.txt` of this repository:
+
+```text
+Subject: Reset your password
+
+Hello {name},
+
+you can set a new password via this link:
+{link}
+```
+
+The first line is the subject (the node puts its name in front), the second is empty, the rest is the plain-text
+body. `{name}`-style variables are filled in; every template knows `{node}` (`TAVRN_NAME`), `{domain}` and
+`{public_url}` plus its own (`check-config` names them when one is wrong). To change a text, copy the file to
+`TAVRN_MAIL_TEMPLATES_DIR` (default `/data/templates/mail`) under the same language and name, for example
+`/data/templates/mail/de/password_reset.txt`, and edit it; you can also add a language the node has no texts for
+(`/data/templates/mail/fr/…`, used for users whose language is `fr` or `fr-ca`). The files are read when a mail is
+sent, so changes apply without a restart. `tavrn-node check-config` validates the directory (unknown names, a
+missing subject line, unknown variables, files over 64 KiB); a file that is broken when a mail goes out is skipped
+with a warning and the built-in text is sent instead.
 
 ### Single sign-on (OpenID Connect)
 

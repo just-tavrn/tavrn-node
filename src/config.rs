@@ -216,6 +216,9 @@ pub struct Config {
     pub smtp_url: Option<String>,
     /// Sender address; default `noreply@<domain>`.
     pub smtp_from: Option<String>,
+    /// Operator overrides of the mail templates, `<dir>/<language>/<name>.txt` (`mail_templates.rs`); default
+    /// `<TAVRN_DATA_DIR>/templates/mail`.
+    pub mail_templates_dir: Option<String>,
     /// Optional captcha: `none` or `turnstile` (Cloudflare).
     pub captcha_provider: CaptchaProvider,
     pub turnstile_site_key: Option<String>,
@@ -544,6 +547,7 @@ impl Default for Config {
             email: EmailMode::Optional,
             smtp_url: None,
             smtp_from: None,
+            mail_templates_dir: None,
             captcha_provider: CaptchaProvider::None,
             turnstile_site_key: None,
             turnstile_secret_key: None,
@@ -842,6 +846,15 @@ impl Config {
             && from.parse::<lettre::message::Mailbox>().is_err()
         {
             problems.push(format!("TAVRN_SMTP_FROM='{from}' is not a valid sender address"));
+        }
+        let templates = crate::mail_templates::dir_of(self);
+        let explicit = self.mail_templates_dir.as_deref().is_some_and(|d| !d.trim().is_empty());
+        if explicit && !templates.is_dir() {
+            problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR='{}' is not a directory", templates.display()));
+        } else if templates.is_dir() {
+            for p in crate::mail_templates::check_dir(&templates) {
+                problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR: {p}"));
+            }
         }
 
         if self.gif_provider != GifProvider::None && self.gif_api_key.as_deref().unwrap_or("").trim().is_empty() {

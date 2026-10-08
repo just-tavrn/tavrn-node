@@ -1,0 +1,10 @@
+Subject: Statement of reasons ({case})
+
+Decision: content removed
+Legal basis of the notice: {basis}
+
+{statement}
+
+This decision was taken by a person, not by automated means.
+
+You can answer with a counter-notice until {deadline} in the app (Settings → Legal & privacy) or at {public_url}/settings/legal. You may also use an out-of-court dispute settlement body or the courts. Case: {case}

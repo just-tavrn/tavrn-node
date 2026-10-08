@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Email delivery via SMTP (`lettre`). Without `TAVRN_SMTP_URL`, mails are only logged.
+//! Email delivery via SMTP (`lettre`). Without `TAVRN_SMTP_URL`, mails are only logged. The texts are localized
+//! templates (`mail_templates.rs`).
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +10,11 @@ use lettre::{
     transport::smtp::authentication::Credentials,
 };
 
-use crate::{config::Config, models::UserRow};
+use crate::{
+    config::Config,
+    mail_templates::{self, Rendered},
+    models::UserRow,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmtpSecurity {
@@ -85,6 +90,9 @@ pub struct Mailer {
     public_url: String,
     from: String,
     node_name: String,
+    domain: String,
+    /// Operator overrides of the templates (`TAVRN_MAIL_TEMPLATES_DIR`).
+    templates_dir: std::path::PathBuf,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
     /// Most recently sent mails (recipient, subject, body), for development and tests.
     pub outbox: Arc<Mutex<Vec<(String, String, String)>>>,
@@ -103,6 +111,8 @@ impl Mailer {
             public_url: config.public_url(),
             from: config.smtp_from(),
             node_name: config.name.clone(),
+            domain: config.domain.clone(),
+            templates_dir: mail_templates::dir_of(config),
             transport,
             outbox: Arc::new(Mutex::new(Vec::new())),
         }
@@ -112,39 +122,41 @@ impl Mailer {
         self.transport.is_some()
     }
 
-    pub async fn send_verification(&self, user: &UserRow, token: &str) {
+    /// The confirmation mail of a new email address, in the user's language.
+    pub async fn send_verification(&self, user: &UserRow, locale: Option<&str>, token: &str) {
         let Some(email) = &user.email else { return };
         let link = format!("{}/verify-email?token={token}", self.public_url);
-        let subject = format!("{}: Confirm your email address", self.node_name);
-        let body = format!(
-            "Hello {},\n\nplease confirm the email address of your tavrn account:\n{link}\n\nThe link is valid for 24 hours. If you did not create an account, ignore this mail.",
-            user.display_name
-        );
-        if let Err(e) = self.deliver(email, subject, body).await {
-            tracing::error!(error = %e, to = email, "email delivery failed");
-        }
+        self.send_template(email, locale, "verify_email", &[("name", &user.display_name), ("link", &link)]).await;
     }
 
-    pub async fn send_password_reset(&self, user: &UserRow, token: &str) {
+    /// The password reset mail, in the user's language.
+    pub async fn send_password_reset(&self, user: &UserRow, locale: Option<&str>, token: &str) {
         let Some(email) = &user.email else { return };
         let link = format!("{}/reset-password?token={token}", self.public_url);
-        let subject = format!("{}: Reset your password", self.node_name);
-        let body = format!(
-            "Hello {},\n\nyou can set a new password via this link:\n{link}\n\nThe link is valid for one hour. If you did not request this, ignore this mail.",
-            user.display_name
-        );
-        if let Err(e) = self.deliver(email, subject, body).await {
-            tracing::error!(error = %e, to = email, "email delivery failed");
+        self.send_template(email, locale, "password_reset", &[("name", &user.display_name), ("link", &link)]).await;
+    }
+
+    /// Renders the template `name` in `locale` (falling back to English) with `vars` and the common variables.
+    pub fn render(&self, locale: Option<&str>, name: &str, vars: &[(&str, &str)]) -> Rendered {
+        let mut all = vars.to_vec();
+        all.extend([("node", self.node_name.as_str()), ("domain", self.domain.as_str()), ("public_url", self.public_url.as_str())]);
+        mail_templates::render(Some(&self.templates_dir), locale, name, &all)
+    }
+
+    /// Sends a rendered mail (the subject gets the node's name in front). Failures are logged and never returned: the
+    /// action the mail reports has happened either way.
+    pub async fn send_rendered(&self, to: &str, mail: &Rendered) {
+        let subject = format!("{}: {}", self.node_name, mail.subject);
+        if let Err(e) = self.deliver(to, subject, mail.body.clone()).await {
+            tracing::error!(error = %e, to, "email delivery failed");
         }
     }
 
-    /// A plain-text mail of the legal flows (notices, statements of reasons, account deletion). Failures are logged and
-    /// never returned: the action the mail reports has happened either way.
-    pub async fn send(&self, to: &str, subject: &str, body: &str) {
-        let subject = format!("{}: {subject}", self.node_name);
-        if let Err(e) = self.deliver(to, subject, body.to_string()).await {
-            tracing::error!(error = %e, to, "email delivery failed");
-        }
+    /// Renders and sends the template `name`; returns what was sent.
+    pub async fn send_template(&self, to: &str, locale: Option<&str>, name: &str, vars: &[(&str, &str)]) -> Rendered {
+        let mail = self.render(locale, name, vars);
+        self.send_rendered(to, &mail).await;
+        mail
     }
 
     /// The node's public URL (links in mails).

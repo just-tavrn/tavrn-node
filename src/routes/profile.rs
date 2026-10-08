@@ -125,6 +125,8 @@ pub struct UpdateMeRequest {
     pub hide_activity: Option<bool>,
     /// Load image previews automatically: always | friends_and_shared | never.
     pub auto_preview: Option<String>,
+    /// The language of the node's mails: a language tag such as `de` or `pt-BR` (stored lowercase), `""` = English.
+    pub locale: Option<String>,
 }
 
 /// Change the own profile and settings.
@@ -145,6 +147,16 @@ pub async fn update_me(
     let dm_policy = req.dm_policy.as_deref().map(|d| validate::one_of("dm_policy", d, &DmPolicy::ALL)).transpose()?;
     let auto_preview =
         req.auto_preview.as_deref().map(|a| validate::one_of("auto_preview", a, &AUTO_PREVIEW)).transpose()?;
+    let locale = req
+        .locale
+        .as_deref()
+        .map(|l| match l.trim() {
+            "" => Ok(None),
+            tag => crate::mail_templates::normalize_locale(tag)
+                .map(Some)
+                .ok_or_else(|| validate::bad("validation.locale", "locale: a language tag such as de or pt-BR")),
+        })
+        .transpose()?;
     if let Some(d) = &display_name {
         store::users::update_profile(&state.db, &auth.user.id, d).await?;
     }
@@ -168,11 +180,15 @@ pub async fn update_me(
     if let Some(a) = &auto_preview {
         store::users::set_auto_preview(&state.db, &auth.user.id, a).await?;
     }
+    if let Some(l) = &locale {
+        store::users::set_locale(&state.db, &auth.user.id, l.as_deref()).await?;
+    }
     let user = store::users::by_id(&state.db, &auth.user.id)
         .await?
         .ok_or(ApiError::Unauthorized { code: "auth.token_invalid" })?;
     let mut me = user.to_private();
     me.auto_preview = Some(store::users::auto_preview(&state.db, &auth.user.id).await?);
+    me.locale = store::users::locale(&state.db, &auth.user.id).await?;
     Ok(Json(me))
 }
 

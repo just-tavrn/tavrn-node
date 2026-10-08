@@ -1,0 +1,8 @@
+Subject: Confirm your email address
+
+Hello {name},
+
+please confirm the email address of your tavrn account:
+{link}
+
+The link is valid for 24 hours. If you did not create an account, ignore this mail.

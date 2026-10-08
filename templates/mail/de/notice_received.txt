@@ -1,0 +1,10 @@
+Subject: Meldung erhalten ({case})
+
+Wir haben Ihre Meldung erhalten. Vorgang: {case}
+
+Den Stand des Vorgangs können Sie hier verfolgen:
+{link}
+
+Geben Sie diesen Link nicht weiter: Nur mit ihm lässt sich die Statusseite öffnen.
+
+Diese Mail wurde gesendet, weil diese Adresse in einer Meldung auf {domain} angegeben wurde.

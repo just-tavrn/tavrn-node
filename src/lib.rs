@@ -37,6 +37,7 @@ pub mod jwt;
 pub mod keys;
 pub mod legal;
 pub mod mail;
+pub mod mail_templates;
 pub mod media;
 pub mod metrics;
 pub mod models;
