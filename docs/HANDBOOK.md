@@ -281,7 +281,7 @@ The node starts and supervises `livekit-server` with a configuration generated f
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_VOICE_ENABLED` | `true` | `false`: no voice channels, no LiveKit process. |
-| `TAVRN_VOICE_MAX_BITRATE_KBPS` | `96` | Audio bitrate cap for every voice channel (8–512). |
+| `TAVRN_VOICE_MAX_BITRATE_KBPS` | `192` | Audio bitrate cap for every voice channel (8–512). New channels start at 64 kbps; owners pick a quality preset up to the cap (Saver 8, Standard 32, High 64, Studio 128, Music 192 stereo). Calls in DMs use 64 kbps, or the cap when it is lower. Lower it to save bandwidth: the clients show the presets above it as limited by this node. |
 | `TAVRN_VOICE_MAX_PARTICIPANTS` | `50` | Participants per voice channel at most (1–1000); channel user limits apply below it. |
 | `TAVRN_VOICE_RECONNECT_GRACE_SECS` | `45` | A dropped participant stays "reconnecting" this long (0–600; `0` = leave at once). |
 | `TAVRN_SCREENSHARE_ENABLED` | `true` | Screen sharing. |
@@ -966,6 +966,11 @@ like, but use direct (DNS-only, "grey cloud") records for media. With a home con
 - **Limits:** `TAVRN_VOICE_MAX_BITRATE_KBPS`, `TAVRN_VOICE_MAX_PARTICIPANTS`, `TAVRN_SCREENSHARE_*`,
   `TAVRN_CAMERA_*`, and the entitlement defaults `TAVRN_VOICE_CHANNEL_MAX_PARTICIPANTS`, `TAVRN_STREAM_*`,
   `TAVRN_CAMERA_MAX_HEIGHT`.
+- **Audio traffic:** every listener receives what a speaker publishes (the media server forwards, it does not
+  transcode), so a channel's bitrate is paid once upstream per speaker and once downstream per speaker and listener.
+  Opus with DTX sends almost nothing during silence; in-band FEC (announced as `limits.audio_fec`) adds a little
+  redundancy against packet loss. The music preset (stereo, 192 kbps, no DTX) costs about 86 MB per hour for every speaker and
+  listener; lower `TAVRN_VOICE_MAX_BITRATE_KBPS` to 128 or 64 on nodes with metered traffic.
 - **Dropped connections:** a participant whose connection breaks stays in the channel as "reconnecting" for
   `TAVRN_VOICE_RECONNECT_GRACE_SECS` (default 45) while the client rejoins by itself; a join from another device of
   the same user replaces the first.

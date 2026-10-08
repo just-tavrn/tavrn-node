@@ -252,6 +252,7 @@ async fn join_returns_a_token_with_exactly_the_allowed_grants() {
     assert!(j["epoch"].is_null(), "no MLS group yet");
     assert_eq!(j["reconnect_grace_secs"], 45);
     assert_eq!(j["limits"]["audio_bitrate_kbps"], 64);
+    assert_eq!(j["limits"]["audio_fec"], true, "Opus in-band FEC is announced");
     assert_eq!(j["limits"]["screenshare"], json!({ "enabled": true, "max_resolution": "1080p", "max_fps": 30 }));
     assert_eq!(j["limits"]["camera"], json!({ "enabled": true, "max_resolution": "720p", "max_fps": 30 }));
     let c = claims(&v.node, j["token"].as_str().unwrap());
@@ -369,6 +370,58 @@ async fn node_policies_remove_sources_and_are_announced() {
     let (s, j) =
         v.node.post(&path, &v.alice.token, json!({ "kind": "voice", "name": "Loud", "bitrate_kbps": 64 })).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.bitrate_too_high")), "{j}");
+}
+
+#[tokio::test]
+async fn the_default_cap_allows_the_music_preset_and_refuses_more() {
+    // Default node: TAVRN_VOICE_MAX_BITRATE_KBPS = 192, so every client preset up to "Music" (stereo,
+    // 192 kbps) is reachable; new channels still start at 64 kbps.
+    let v = setup().await;
+    let node = common::body_json(v.node.get("/api/v1/node").await).await;
+    assert_eq!(node["voice"]["max_bitrate_kbps"], 192);
+    let wk = common::body_json(v.node.get("/.well-known/tavrn").await).await;
+    assert_eq!(wk["policies"]["voice_max_bitrate_kbps"], 192);
+    let path = format!("/api/v1/rooms/{}/channels", v.room_id);
+    let (s, j) = v.node.post(&path, &v.alice.token, json!({ "kind": "voice", "name": "New" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert_eq!(j["bitrate_kbps"], 64, "the default of a new channel stays 64 kbps");
+
+    let channel = format!("{path}/{}", v.voice_id);
+    for kbps in [8, 32, 64, 128, 192] {
+        let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "bitrate_kbps": kbps })).await;
+        assert_eq!(s, StatusCode::OK, "{kbps}: {j}");
+        assert_eq!(j["bitrate_kbps"], kbps);
+    }
+    let (s, j) = v.join(&v.alice).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["limits"]["audio_bitrate_kbps"], 192);
+    assert_eq!(j["limits"]["audio_fec"], true);
+    let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "bitrate_kbps": 193 })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.bitrate_too_high")), "{j}");
+    let (s, j) = v.node.patch(&channel, &v.alice.token, json!({ "bitrate_kbps": 7 })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "below the Opus minimum of the protocol: {j}");
+    // Members without `manage_channels` cannot change the quality.
+    let (s, j) = v.node.patch(&channel, &v.bob.token, json!({ "bitrate_kbps": 8 })).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
+}
+
+#[tokio::test]
+async fn a_lowered_cap_limits_existing_channels_at_join() {
+    // A channel set to the music preset keeps its setting when the operator lowers the cap later; the join
+    // hands out the node's maximum.
+    let v = setup_with(|c| c.voice_max_bitrate_kbps = 128).await;
+    sqlx::query("UPDATE channels SET bitrate_kbps = 192 WHERE id = $1")
+        .bind(&v.voice_id)
+        .execute(&v.node.state.db)
+        .await
+        .unwrap();
+    let (s, j) = v.join(&v.alice).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["limits"]["audio_bitrate_kbps"], 128);
+    // Calls stay at the default channel bitrate below the cap, and follow a cap below it.
+    let low = setup_with(|c| c.voice_max_bitrate_kbps = 48).await;
+    assert_eq!(low.node.state.config.call_audio_bitrate_kbps(), 48);
+    assert_eq!(v.node.state.config.call_audio_bitrate_kbps(), 64);
 }
 
 #[tokio::test]
