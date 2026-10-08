@@ -13,6 +13,7 @@ pub mod calls;
 pub mod captcha;
 pub mod commands;
 pub mod config;
+pub mod connect_sessions;
 pub mod db;
 pub mod device_cleanup;
 pub mod device_proof;

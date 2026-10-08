@@ -156,6 +156,11 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 
 The second factor (TOTP or passkeys) is mandatory for every account and cannot be switched off.
 
+The desktop app signs in on the node's own web client (app sessions of the connect flow, FEDERATION.md §8 step 3,
+capability `connect.app`): the user signs in or registers there with any method, including passkeys, single sign-on
+and the captcha, and the app picks up the session. There is nothing to configure; `/connect` must be served like
+every other page of the web client.
+
 ### Single sign-on (OpenID Connect)
 
 | Variable | Default | Meaning |
@@ -1310,6 +1315,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | `claim_pair_limiter` | **shared** | Protects KeyPackages from being drained by one requester. |
 | `webhook_burst_limiter`, `webhook_minute_limiter` | **shared** | Webhook execution is unauthenticated apart from the URL secret. |
 | `app_request_limiter`, `app_token_limiter`, `app_rotate_limiter`, `app_create_limiter` | **shared** | Protocol limits of applications and token issuance (APPLICATIONS.md §2.7). |
+| `connect_session_limiter`, `connect_session_node_limiter`, `connect_poll_limiter`, `connect_poll_ip_limiter` | **shared** | App sessions of the connect flow (FEDERATION.md §8 step 3): unauthenticated creation per IP and for the whole node, polls per session and IP. |
 | `voice_limiter`, ring limiter of calls, `ephemeral_limiter` | node-wide by relaying | Their routes are relayed to the leader, so the leader's counter is the node's. |
 | `claim_limiter`, `key_package_limiter`, `commit_limiter`, `backup_limiter`, `friend_limiter`, `conversation_limiter`, `secret_storage_limiter`, `read_limiter`, `presence_limiter`, `media_limiter`, `scene_limiter`, `admin_limiter`, `direct_invite_limiter`, `room_invite_inbox_limiter`, `notify_limiter`, `keys_fetch_limiter`, `directory_announce_limiter`, `directory_limiter`, `federation_api_limiter`, `federation_claim_limiter`, `bot_message_limiter`, `bot_dm_limiter`, unfurl per user, OIDC start/token per IP, files backend changes | per instance | Load shedding and spam damping of authenticated or already-signed traffic: with N instances a client gets at most N× the budget, which bounds the load per instance exactly as before. The OIDC exchange guards 256-bit codes, not a guessable secret. |
 
@@ -1322,6 +1328,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | WebAuthn challenges (registration, login, re-auth) | database (already) | Ceremony state rows (`store/factors.rs`). |
 | Re-auth tokens (`Tavrn-Reauth`) | stateless (already) | JWT bound to the live session. |
 | Connect codes (FEDERATION.md §8) | **shared** (cache, sealed) | Issued and exchanged by different requests; volume tiny, TTL 2 min. |
+| App sessions of the connect flow (FEDERATION.md §8 step 3, `connect_sessions.rs`) | **shared** (cache, sealed) | Created, confirmed and polled by different requests and clients: a data record that is only overwritten (polls never miss it), a marker taken by the one confirmation and the code taken by the one poll that hands it out; keys are SHA-256 of the session id; TTL 10 min pending, 2 min confirmed, plus 10 min of `410` answers. |
 | OIDC provider `state` (10 min) and one-time codes (60 s) | **shared** (cache, sealed) | Start, callback and exchange are three requests. |
 | OIDC re-auth map (`Oidc::issue_reauth`) | per instance | Unused: SSO re-authentication returns the stateless reauth JWT; nothing issues these. |
 | Federation inbox `jti` replay protection, inbox dedupe | database (already) | |
