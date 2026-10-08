@@ -141,3 +141,68 @@ async fn malformed_and_misplaced_signatures_are_rejected() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
     assert_eq!(j["code"], "message.signature_invalid");
 }
+
+/// A forum post's first message is signed (tavrn-protocol #3, tavrn-node #7): the client picks the thread id, so
+/// the signature covers `thread_id` like every reply; the node keeps the id and checks it.
+#[tokio::test]
+async fn forum_posts_carry_a_client_chosen_id_and_a_signed_first_message() {
+    let (node, alice, bob, room_id, _) = setup().await;
+    // Clients send their own id only to nodes announcing it (older nodes would ignore it and the signature break).
+    let (_, info) = node.get_auth("/api/v1/node", &alice.token).await;
+    assert!(info["capabilities"].as_array().unwrap().contains(&json!("threads.client_ids")), "{info}");
+    let (s, forum) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels"),
+            &alice.token,
+            json!({ "name": "help", "kind": "forum", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{forum}");
+    let forum_id = forum["id"].as_str().unwrap().to_string();
+    let threads = format!("/api/v1/rooms/{room_id}/channels/{forum_id}/threads");
+    let device = Device::generate("alice@t.local", &alice.device_id).unwrap();
+    let id = tavrn_node::util::ulid();
+    let fields = PlaintextFields {
+        conversation: format!("{DOMAIN}/{forum_id}"),
+        author: "alice@t.local".into(),
+        device_id: alice.device_id.clone(),
+        reply_to: None,
+        thread_id: Some(id.clone()),
+        mentions_everyone: false,
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let content = json!({ "type": "text", "body": "How do I set this up?" });
+    let sig = sign_plaintext(&device, &fields, &content).unwrap().to_base64url();
+    let post = |id: &str| json!({ "id": id, "title": "Setup", "message": { "content": content, "signature": sig } });
+
+    // Malformed ids: not a ULID, not canonical (the signature covers the exact string), a time far off the node's.
+    let far = ulid::Ulid::from_parts(0, 1).to_string();
+    for bad in ["nope".to_string(), id.to_lowercase(), far] {
+        let (s, j) = node.post(&threads, &alice.token, post(&bad)).await;
+        assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("thread.id_invalid")), "{bad}: {j}");
+    }
+
+    let (s, thread) = node.post(&threads, &alice.token, post(&id)).await;
+    assert_eq!(s, StatusCode::CREATED, "{thread}");
+    assert_eq!(thread["id"], id.as_str());
+    let first = &thread["first_message"];
+    assert_eq!((first["thread_id"].as_str(), first["signature"].as_str()), (Some(id.as_str()), Some(sig.as_str())));
+    // Bob verifies the first message like any other.
+    let (_, list) = node.get_auth(&format!("/api/v1/conversations/{forum_id}/messages?thread={id}"), &bob.token).await;
+    let stored = &list[0];
+    verify_plaintext(&fields_of(stored), &stored["content"], &sig, &device.public_key()).unwrap();
+
+    // The id is taken now, also in another channel; without an id the node picks one as before.
+    let (s, j) = node.post(&threads, &alice.token, post(&id)).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("thread.id_taken")), "{j}");
+    let (s, j) = node
+        .post(
+            &threads,
+            &alice.token,
+            json!({ "title": "Plain", "message": { "content": { "type": "text", "body": "x" } } }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert!(tavrn_node::util::is_ulid(j["id"].as_str().unwrap()) && j["id"] != id.as_str());
+}
