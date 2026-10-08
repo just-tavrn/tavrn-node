@@ -56,15 +56,23 @@ pub struct GlobalSettings {
     /// conversations). Left out of the document while off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub push_text: bool,
+    /// Web push for new reports (MODERATION.md §1.5) to the room moderators and node admins who receive them (default
+    /// on). Left out of the document while on.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub reports: bool,
 }
 
 fn yes() -> bool {
     true
 }
 
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
-        Self { mode: Mode::All, sound: true, browser: false, push_text: false }
+        Self { mode: Mode::All, sound: true, browser: false, push_text: false, reports: true }
     }
 }
 

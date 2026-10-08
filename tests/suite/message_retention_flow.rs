@@ -175,7 +175,7 @@ async fn node_retention_deletes_old_messages_but_not_pinned_welcome_or_young_one
     assert_eq!(audit.len(), 1, "{audit:?}");
     assert_eq!((audit[0]["deleted"].as_i64(), audit[0]["node_days"].as_i64()), (Some(3), Some(30)), "{audit:?}");
 
-    // The account's data summary names the retention (LEGAL.md §2).
+    // The account's data summary names the retention (LEGAL.md §3.1).
     let (_, summary) = r.node.get_auth("/api/v1/users/me/data", &r.member.token).await;
     assert_eq!(summary["retention"]["message_retention_days"], 30, "{summary}");
 

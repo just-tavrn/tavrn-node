@@ -1048,7 +1048,13 @@ How it behaves:
   endpoints are chosen by the browsers (hosts of Google, Mozilla, Apple, Microsoft and others), so egress HTTPS to
   the internet must be allowed. Endpoints on private or loopback addresses are refused.
 - **Remote conversations**: notifications for rooms on other nodes arrive through the federation `notify` hint at
-  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations).
+  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations). A
+  channel set to "all messages" in a room on another node therefore does not push for ordinary messages; the client
+  says so in the notification settings. This is a design decision: subscriptions stay with the home node, which holds
+  the settings (PROTOCOL.md §6d).
+- **Reports**: room moderators and node admins without an open connection get a push for every new report (its kind
+  and room only, at most one per room every 30 seconds); each of them can turn it off ("Reports" in the notification
+  settings).
 - **Several instances**: any instance sends; the rate counters live in Valkey.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
@@ -1677,11 +1683,13 @@ can release the plaintext of the reported message and up to ten messages before 
 "released by the reporter", the node cannot verify it. Plaintext messages are linked and snapshotted instead. The
 inbox offers shortcuts (delete the message, time out, kick, ban, delete the user's content) that run the normal
 moderation actions and note the report in the audit log. Every moderator of a room sees the room's reports,
-including those about channels hidden from them.
+including those about channels hidden from them: moderation needs the context, and the reporter addressed the
+room's moderators as a whole (MODERATION.md §1.1). Give a private area that needs its own moderators its own room.
 
 `TAVRN_REPORTS_RATE_PER_HOUR` (default 10) limits reports per user, `TAVRN_REPORTS_RETENTION_DAYS` (default 90)
 deletes resolved and dismissed reports with their evidence; admins can delete a report at any time. Reports are
-announced in the client (bell and toast), not by web push.
+announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
+only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
 ### Content auto-moderation
 

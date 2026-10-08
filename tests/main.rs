@@ -59,6 +59,7 @@ mod suite {
     mod profiles_flow;
     mod push_flow;
     mod reauth_flow;
+    mod report_push_flow;
     mod reports_flow;
     mod room_invites_flow;
     mod room_profiles_flow;
