@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn serve(node: &common::TestNode) -> String {
+pub(crate) async fn serve(node: &common::TestNode) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = node.router.clone();
@@ -138,7 +138,7 @@ async fn events_flow_to_room_members_only() {
     assert_eq!(marker.as_deref(), msg["id"].as_str());
 }
 
-async fn hello(url: &str, token: &str) -> Socket {
+pub(crate) async fn hello(url: &str, token: &str) -> Socket {
     let mut ws = connect(url).await;
     ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
     assert_eq!(next_json(&mut ws).await["op"], "ready");

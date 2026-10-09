@@ -265,7 +265,7 @@ fn may_write(scopes: Option<&[String]>) -> bool {
     scopes.is_none_or(|s| s.iter().any(|x| x == "messages:write"))
 }
 
-/// Forwards a typing notice: room channels to the room members (the connection must be a member who may view the
+/// Forwards a typing notice: room channels to the room members (the connection must be a member who may send in the
 /// channel; the fan-out reaches only the channel's viewers), DMs and group DMs to their members (the sender must be
 /// one).
 async fn typing(
@@ -278,7 +278,18 @@ async fn typing(
 ) {
     match (room_id, channel_id, conversation_id) {
         (Some(room_id), Some(channel_id), _) if rooms.contains(&room_id) => {
-            if !crate::visibility::can_view(state, &room_id, &channel_id, &auth.user.id).await {
+            // Typing is writing: a member in timeout (or without `send_messages`) types nowhere (permissions.md step 5).
+            let may_send = match crate::visibility::room(state, &room_id).await {
+                Ok(Some(view)) => view
+                    .perms(&channel_id, &auth.user.id)
+                    .is_some_and(|p| crate::permissions::has(p, crate::permissions::SEND_MESSAGES)),
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::debug!(error = %e, "typing notice not deliverable");
+                    false
+                }
+            };
+            if !may_send {
                 return;
             }
             state.hub.room(

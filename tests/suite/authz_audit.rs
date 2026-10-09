@@ -143,6 +143,53 @@ async fn timed_out_thread_creator_cannot_change_the_thread() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
 }
 
+/// permissions.md step 5: a timeout limits writing. Cursors and whiteboard strokes are writing too: a member in
+/// timeout sends no ephemeral events in the room (`403 member.timed_out`), and opens no whiteboard.
+#[tokio::test]
+async fn timed_out_member_sends_no_ephemeral_events() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, channel_id) = room_with(&node, &alice, &[&bob]).await;
+    let path = format!("/api/v1/conversations/{channel_id}/ephemeral");
+    let cursor = json!({ "type": "cursor", "content": { "x": 1, "y": 2 } });
+    let (s, j) = node.post(&path, &bob.token, cursor.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/members/{}/timeout", bob.user_id),
+            &alice.token,
+            json!({ "minutes": 10 }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    for body in [
+        cursor,
+        json!({ "type": "whiteboard.stroke", "content": { "points": [] } }),
+        json!({ "type": "whiteboard.open", "content": {} }),
+    ] {
+        let (s, j) = node.post(&path, &bob.token, body).await;
+        assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.timed_out"), "{j}");
+    }
+    let (s, j) = node.post(&path, &alice.token, json!({ "type": "cursor", "content": {} })).await;
+    assert_eq!(s, StatusCode::OK, "the owner is never timed out: {j}");
+    // Typing is writing too: bob's notice reaches nobody.
+    let mut rx = node.state.hub.subscribe();
+    let ws = crate::suite::ws_flow::serve(&node).await;
+    let mut bob_ws = crate::suite::ws_flow::hello(&ws, &bob.token).await;
+    use futures::SinkExt;
+    bob_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "op": "typing", "room_id": room_id, "channel_id": channel_id }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    while let Ok(ev) = rx.try_recv() {
+        assert_ne!(ev.kind, "typing", "a timed-out member's typing went out");
+    }
+}
+
 // ---------------------------------------------------------------- Roles, hierarchy and moderation
 
 async fn role(node: &TestNode, owner: &str, room_id: &str, name: &str, bits: &[u64], position: i64) -> String {
