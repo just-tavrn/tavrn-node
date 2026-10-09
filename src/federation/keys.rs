@@ -124,11 +124,28 @@ fn parse_device(
         signature,
     };
     tavrn_crypto::verify_device_attestation(&attestation, &identity).ok()?;
+    let (share_public_key, share_key_signature) = match share_key(device_id, &public_key, d) {
+        Some((pk, sig)) => (Some(pk), Some(sig)),
+        None => (None, None),
+    };
     Some(RemoteDeviceKey {
         home_device_id: device_id.to_string(),
         public_key: tavrn_crypto::util::b64url_encode(&public_key),
         identity_signature: tavrn_crypto::util::b64url_encode(&signature),
+        share_public_key,
+        share_key_signature,
     })
+}
+
+/// The share key of a device entry whose device signature verifies (ENCRYPTION.md §3.1), re-encoded; `None` when it
+/// is missing, partial or invalid (the device itself stays usable, it just gets v1 history shares).
+fn share_key(device_id: &str, device_key: &[u8; 32], d: &Value) -> Option<(String, String)> {
+    let public: [u8; 32] =
+        tavrn_crypto::util::b64url_decode(d.get("share_public_key")?.as_str()?).ok()?.try_into().ok()?;
+    let signature: [u8; 64] =
+        tavrn_crypto::util::b64url_decode(d.get("share_key_signature")?.as_str()?).ok()?.try_into().ok()?;
+    tavrn_crypto::share::verify_share_key(device_key, device_id, &public, &signature).ok()?;
+    Some((tavrn_crypto::util::b64url_encode(&public), tavrn_crypto::util::b64url_encode(&signature)))
 }
 
 /// Fetches the keys of a remote user from its home node and stores them. Returns the home device ids
@@ -336,6 +353,40 @@ mod tests {
         assert!(parse_keys(ADDR, v.to_string().as_bytes()).unwrap().continuity.is_empty());
         v["continuity"] = json!([{ "old_key": 1 }]);
         assert!(parse_keys(ADDR, v.to_string().as_bytes()).unwrap().continuity.is_empty());
+    }
+
+    #[test]
+    fn share_keys_are_kept_only_with_a_valid_device_signature() {
+        // ENCRYPTION.md §3.1: the share key is signed by the device key; a bad or partial one is dropped, the device
+        // itself stays.
+        let master = MasterSecret::generate().unwrap();
+        let id = util::ulid();
+        let d = Device::generate(ADDR, &id).unwrap();
+        let att = d.attest(&master).unwrap();
+        let entry = |pk: Value, sig: Value| {
+            json!({ "device_id": id, "device_public_key": b64(&att.device_public_key),
+                    "identity_signature": b64(&att.signature), "created_at": util::now(),
+                    "share_public_key": pk, "share_key_signature": sig })
+        };
+        let (pk, sig) = (json!(b64(&d.share_public_key())), json!(b64(&d.share_key_signature())));
+        let keys = parse_keys(ADDR, &doc(&master, vec![entry(pk.clone(), sig.clone())])).unwrap();
+        assert_eq!(keys.devices[0].share_public_key.as_deref(), pk.as_str());
+        assert_eq!(keys.devices[0].share_key_signature.as_deref(), sig.as_str());
+        let other = Device::generate(ADDR, &id).unwrap();
+        for (pk, sig) in [
+            (json!(b64(&other.share_public_key())), sig.clone()),
+            (pk.clone(), json!(b64(&other.share_key_signature()))),
+            (pk.clone(), Value::Null),
+            (json!("AAAA"), sig.clone()),
+            (Value::Null, Value::Null),
+        ] {
+            let keys = parse_keys(ADDR, &doc(&master, vec![entry(pk, sig)])).unwrap();
+            assert_eq!(keys.devices.len(), 1, "the device stays");
+            assert_eq!(
+                (keys.devices[0].share_public_key.clone(), keys.devices[0].share_key_signature.clone()),
+                (None, None)
+            );
+        }
     }
 
     #[test]

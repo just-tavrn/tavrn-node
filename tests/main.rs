@@ -49,6 +49,7 @@ mod suite {
     mod friends_flow;
     mod history_flow;
     mod history_restore_flow;
+    mod history_shares_v2_flow;
     mod housekeeping_flow;
     mod identity_rotation_flow;
     mod legal_flow;

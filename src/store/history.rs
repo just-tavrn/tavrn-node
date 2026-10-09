@@ -17,10 +17,11 @@ pub struct ShareRow {
     pub ciphertext: String,
     pub created_at: String,
     pub acked_at: Option<String>,
+    /// Share format (1 or 2, ENCRYPTION.md §7b).
+    pub version: i64,
+    /// Format 2: the box of the requesting device.
+    pub sealed: Option<String>,
 }
-
-const SHARE_COLS: &str =
-    "id, conversation_id, to_user, from_user, from_device, epoch_from, epoch_to, ciphertext, created_at, acked_at";
 
 pub struct NewShare<'a> {
     pub conversation_id: &'a str,
@@ -30,13 +31,18 @@ pub struct NewShare<'a> {
     pub epoch_from: i64,
     pub epoch_to: i64,
     pub ciphertext: &'a str,
+    pub version: i64,
+    /// Format 2: `(recipient device id, base64url box)`.
+    pub boxes: &'a [(String, String)],
 }
 
+/// Stores a share and (format 2) its boxes in one transaction.
 pub async fn insert_share(db: &Pool, s: NewShare<'_>) -> Result<String, ApiError> {
     let id = util::ulid();
+    let mut tx = db.begin().await?;
     sqlx::query(
-        "INSERT INTO history_key_shares (id, conversation_id, to_user, from_user, from_device, epoch_from, epoch_to, ciphertext, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "INSERT INTO history_key_shares (id, conversation_id, to_user, from_user, from_device, epoch_from, epoch_to, ciphertext, created_at, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(&id)
     .bind(s.conversation_id)
@@ -47,8 +53,18 @@ pub async fn insert_share(db: &Pool, s: NewShare<'_>) -> Result<String, ApiError
     .bind(s.epoch_to)
     .bind(s.ciphertext)
     .bind(util::now())
-    .execute(db)
+    .bind(s.version)
+    .execute(&mut *tx)
     .await?;
+    for (device_id, sealed) in s.boxes {
+        sqlx::query("INSERT INTO history_share_boxes (share_id, device_id, sealed) VALUES ($1, $2, $3)")
+            .bind(&id)
+            .bind(device_id)
+            .bind(sealed)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -65,19 +81,26 @@ pub async fn count_since(db: &Pool, conversation_id: &str, to_user: &str, since:
     Ok(row.try_get("n")?)
 }
 
-/// Unacknowledged shares addressed to `to_user`, oldest first.
+/// Unacknowledged shares addressed to `to_user` that device `device_id` (public id) can read, oldest first: every
+/// format 1 share, and the format 2 shares with a box for that device (with only that box).
 pub async fn shares_for(
     db: &Pool,
     conversation_id: &str,
     to_user: &str,
+    device_id: &str,
     limit: i64,
 ) -> Result<Vec<ShareRow>, ApiError> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT {SHARE_COLS} FROM history_key_shares WHERE conversation_id = $1 AND to_user = $2 AND acked_at IS NULL
-         ORDER BY created_at, id LIMIT $3"
-    ))
+    Ok(sqlx::query_as(
+        "SELECT s.id, s.conversation_id, s.to_user, s.from_user, s.from_device, s.epoch_from, s.epoch_to, s.ciphertext,
+                s.created_at, s.acked_at, s.version, b.sealed
+         FROM history_key_shares s
+         LEFT JOIN history_share_boxes b ON b.share_id = s.id AND b.device_id = $3
+         WHERE s.conversation_id = $1 AND s.to_user = $2 AND s.acked_at IS NULL AND (s.version = 1 OR b.sealed IS NOT NULL)
+         ORDER BY s.created_at, s.id LIMIT $4",
+    )
     .bind(conversation_id)
     .bind(to_user)
+    .bind(device_id)
     .bind(limit)
     .fetch_all(db)
     .await?)
@@ -95,7 +118,11 @@ pub async fn ack(db: &Pool, conversation_id: &str, to_user: &str, id: &str) -> R
     .bind(to_user)
     .execute(db)
     .await?;
-    Ok(r.rows_affected() > 0)
+    if r.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM history_share_boxes WHERE share_id = $1").bind(id).execute(db).await?;
+    Ok(true)
 }
 
 /// `member_since` of the user's pending mark in the conversation (pending or already handled).
@@ -213,6 +240,15 @@ pub struct HistoryPrune {
 /// Housekeeping: shares acknowledged before `acked_before` or created before `older_than`, and pending
 /// marks created before `older_than`.
 pub async fn prune(db: &Pool, acked_before: &str, older_than: &str) -> Result<HistoryPrune, ApiError> {
+    // The boxes first (the foreign key cascades too; this keeps it independent of the database's settings).
+    sqlx::query(
+        "DELETE FROM history_share_boxes WHERE share_id IN (SELECT id FROM history_key_shares
+         WHERE (acked_at IS NOT NULL AND acked_at < $1) OR created_at < $2)",
+    )
+    .bind(acked_before)
+    .bind(older_than)
+    .execute(db)
+    .await?;
     let shares =
         sqlx::query("DELETE FROM history_key_shares WHERE (acked_at IS NOT NULL AND acked_at < $1) OR created_at < $2")
             .bind(acked_before)
