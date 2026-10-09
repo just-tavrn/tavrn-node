@@ -505,3 +505,48 @@ async fn ciphertext_without_group_is_refused() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
     assert_eq!(j["code"], "message.epoch_unknown");
 }
+
+/// ENCRYPTION.md §5.3: content only under the current epoch, or the previous one within 60 s of its commit.
+#[tokio::test]
+async fn stale_epochs_are_refused_after_a_short_grace() {
+    let (node, mut alice, _bob, dm) = dm_setup().await;
+    let conv = qualified(&dm);
+    let path = format!("/api/v1/conversations/{dm}/messages");
+    let at0 = alice.client.encrypt_content(&conv, r#"{"type":"text","body":"in flight"}"#).unwrap();
+    let late0 = alice.client.encrypt_content(&conv, r#"{"type":"text","body":"late"}"#).unwrap();
+    let (s, first) = node.post(&path, alice.token(), json!({ "content": at0, "epoch": 0 })).await;
+    assert_eq!(s, StatusCode::CREATED, "{first}");
+    node.add_user(&mut alice, &dm, "bob").await;
+
+    // Just after the commit: the previous epoch is still accepted (content on its way while the group moved on).
+    let (s, j) = node.post(&path, alice.token(), json!({ "content": at0, "epoch": 0 })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    // A minute later it is stale.
+    sqlx::query("UPDATE mls_groups SET updated_at = $1 WHERE conversation_id = $2")
+        .bind(tavrn_node::util::format_time(chrono::Utc::now() - chrono::Duration::seconds(61)))
+        .bind(&dm)
+        .execute(&node.state.db)
+        .await
+        .unwrap();
+    let (s, j) = node.post(&path, alice.token(), json!({ "content": late0, "epoch": 0 })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("mls.epoch_stale")), "{j}");
+    assert_eq!(j["meta"]["epoch"], 1, "{j}");
+    let mid = first["id"].as_str().unwrap();
+    let (s, j) = node.patch(&format!("{path}/{mid}"), alice.token(), json!({ "content": late0, "epoch": 0 })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("mls.epoch_stale")), "{j}");
+    // The current epoch is always fine.
+    let (s, j) = node.send_encrypted(&alice, &dm, "current").await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+
+    // Two epochs back is stale at once, whatever the time.
+    let at1 = alice.client.encrypt_content(&conv, r#"{"type":"text","body":"two behind"}"#).unwrap();
+    for _ in 0..2 {
+        let out = alice.client.self_update(&conv).unwrap();
+        let (s, j) = node.post_commit(alice.token(), &dm, &out).await;
+        assert_eq!(s, StatusCode::CREATED, "{j}");
+        alice.client.merge_pending_commit(&conv).unwrap();
+    }
+    let (s, j) = node.post(&path, alice.token(), json!({ "content": at1, "epoch": 1 })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("mls.epoch_stale")), "{j}");
+    assert_eq!(j["meta"]["epoch"], 3, "{j}");
+}

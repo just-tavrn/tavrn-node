@@ -427,8 +427,12 @@ fn validate_signature(
     Ok(Some(signature.to_owned()))
 }
 
+/// How long after a commit content under the epoch it ended is still accepted (ENCRYPTION.md §5.3).
+pub const PREVIOUS_EPOCH_GRACE_SECS: i64 = 60;
+
 /// Node checks for encrypted content (ENCRYPTION.md §5.3): header, epoch equal to the envelope
-/// epoch and not newer than the group, sending device attested. Returns the epoch.
+/// epoch, the group's current epoch (or the previous one within [`PREVIOUS_EPOCH_GRACE_SECS`] of the
+/// commit that ended it), sending device attested. Returns the epoch.
 pub(crate) async fn check_ciphertext(
     state: &AppState,
     auth: &AuthUser,
@@ -441,9 +445,22 @@ pub(crate) async fn check_ciphertext(
     let epoch = epoch
         .filter(|e| *e >= 0 && *e as u64 == header.epoch)
         .ok_or_else(|| bad("message.epoch_mismatch", "epoch must match the epoch in the encrypted content"))?;
-    match store::e2ee::group_epoch(&state.db, conversation_id).await? {
-        Some(current) if epoch <= current => {}
-        _ => return Err(bad("message.epoch_unknown", "The node does not know this epoch (yet)")),
+    let Some((current, since)) = store::e2ee::group_epoch_since(&state.db, conversation_id).await? else {
+        return Err(bad("message.epoch_unknown", "The node does not know this epoch (yet)"));
+    };
+    if epoch > current {
+        return Err(bad("message.epoch_unknown", "The node does not know this epoch (yet)"));
+    }
+    let in_grace = || {
+        util::parse_time(&since)
+            .is_some_and(|t| chrono::Utc::now() - t <= chrono::Duration::seconds(PREVIOUS_EPOCH_GRACE_SECS))
+    };
+    if epoch < current && !(epoch == current - 1 && in_grace()) {
+        return Err(ApiError::Conflict {
+            code: "mls.epoch_stale",
+            detail: "The group has moved on: process the missing commits and encrypt again".into(),
+            meta: serde_json::json!({ "epoch": current }),
+        });
     }
     e2ee::attested_session_key(state, auth).await?;
     Ok(epoch)
@@ -491,7 +508,7 @@ pub async fn system_message(
 
 /// Send a message (`send_messages`; `mention_everyone` for @everyone).
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/messages", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = CreateMessageRequest,
-    responses((status = 201, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
+    responses((status = 201, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn create_message(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -504,7 +521,7 @@ pub async fn create_message(
 
 /// Send a message to any conversation. DMs and group DMs only accept encrypted content.
 #[utoipa::path(post, path = "/api/v1/conversations/{conversation_id}/messages", security(("bearer" = [])), params(("conversation_id" = String, Path)), request_body = CreateMessageRequest,
-    responses((status = 201, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
+    responses((status = 201, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn create_conversation_message(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -761,7 +778,7 @@ pub struct EditMessageRequest {
 }
 
 /// Edit an own message.
-#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/messages/{message_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path), ("message_id" = String, Path)), request_body = EditMessageRequest, responses((status = 200, body = Message)))]
+#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/messages/{message_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path), ("message_id" = String, Path)), request_body = EditMessageRequest, responses((status = 200, body = Message), (status = 409, body = ProblemDetails)))]
 pub async fn edit_message(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -773,7 +790,7 @@ pub async fn edit_message(
 }
 
 /// Edit an own message in any conversation.
-#[utoipa::path(patch, path = "/api/v1/conversations/{conversation_id}/messages/{message_id}", security(("bearer" = [])), params(("conversation_id" = String, Path), ("message_id" = String, Path)), request_body = EditMessageRequest, responses((status = 200, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+#[utoipa::path(patch, path = "/api/v1/conversations/{conversation_id}/messages/{message_id}", security(("bearer" = [])), params(("conversation_id" = String, Path), ("message_id" = String, Path)), request_body = EditMessageRequest, responses((status = 200, body = Message), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails)))]
 pub async fn edit_conversation_message(
     State(state): State<AppState>,
     auth: AuthUser,

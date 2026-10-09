@@ -317,6 +317,17 @@ pub async fn group_epoch(db: &Pool, conversation_id: &str) -> Result<Option<i64>
     Ok(row.map(|r| r.try_get::<i64, _>("epoch")).transpose()?)
 }
 
+/// The group's current epoch and when it began (the time of the commit that started it, or of the group's creation).
+pub async fn group_epoch_since(db: &Pool, conversation_id: &str) -> Result<Option<(i64, String)>, ApiError> {
+    let row = sqlx::query("SELECT epoch, updated_at FROM mls_groups WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row
+        .map(|r| Ok::<_, sqlx::Error>((r.try_get::<i64, _>("epoch")?, r.try_get::<String, _>("updated_at")?)))
+        .transpose()?)
+}
+
 /// Creates the group state (epoch 0). `false` if a group already exists (first wins).
 pub async fn create_group(
     db: &Pool,
