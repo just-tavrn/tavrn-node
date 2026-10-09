@@ -11,7 +11,7 @@ use crate::{
 
 const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate, history_restore";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
-const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.sync_with_category, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
+const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
 const OVERRIDE_COLS: &str =
     "id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny";
 const MEMBER_COLS: &str = "room_id, user_id, nickname, joined_at, rules_accepted_at, timeout_until, avatar_media_id, avatar_animated, bio, key_reset_at, history_restored_at";
@@ -647,7 +647,6 @@ pub struct ChannelUpdate<'a> {
     pub topic: Option<&'a str>,
     pub category_id: Option<Option<&'a str>>,
     pub position: Option<i64>,
-    pub sync_with_category: Option<bool>,
     pub slowmode_secs: Option<i64>,
     pub bitrate_kbps: Option<i64>,
     pub user_limit: Option<i64>,
@@ -659,13 +658,12 @@ pub async fn update_channel(db: &Pool, channel_id: &str, u: ChannelUpdate<'_>) -
     sqlx::query(
         "UPDATE channels SET system_name = CASE WHEN $1 IS NOT NULL AND $1 <> name THEN NULL ELSE system_name END,
          name = COALESCE($1, name), topic = COALESCE($2, topic), position = COALESCE($3, position),
-         sync_with_category = COALESCE($4, sync_with_category), slowmode_secs = COALESCE($5, slowmode_secs),
-         bitrate_kbps = COALESCE($6, bitrate_kbps), user_limit = COALESCE($7, user_limit) WHERE id = $8",
+         slowmode_secs = COALESCE($4, slowmode_secs),
+         bitrate_kbps = COALESCE($5, bitrate_kbps), user_limit = COALESCE($6, user_limit) WHERE id = $7",
     )
     .bind(u.name)
     .bind(u.topic)
     .bind(u.position)
-    .bind(u.sync_with_category.map(|b| b as i64))
     .bind(u.slowmode_secs)
     .bind(u.bitrate_kbps)
     .bind(u.user_limit)
@@ -746,13 +744,6 @@ pub async fn set_override(db: &Pool, o: SetOverride<'_>) -> Result<(), ApiError>
         .bind(o.subject_id)
         .execute(&mut *tx)
         .await?;
-    if o.target_type == "channel" {
-        // Overrides of its own mean the channel no longer follows its category.
-        sqlx::query("UPDATE channels SET sync_with_category = 0 WHERE id = $1")
-            .bind(o.target_id)
-            .execute(&mut *tx)
-            .await?;
-    }
     if o.allow != 0 || o.deny != 0 || upload_allow != 0 || upload_deny != 0 {
         sqlx::query("INSERT INTO permission_overrides (id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
             .bind(ulid())

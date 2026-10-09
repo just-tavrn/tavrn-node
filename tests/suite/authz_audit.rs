@@ -495,11 +495,9 @@ async fn bot_cannot_lift_no_bots_through_the_category() {
 
 // ---------------------------------------------------------------- Open: need a design decision
 
-/// `GET /rooms/{id}` sends every channel (name, topic) and every override to every member; only bots get the
-/// channels they can view. Hiding private channels from members changes the client (channel list, events of
-/// `channel.*`/`override.update`) and belongs with the event audience work (feat/ws-visibility).
+/// `GET /rooms/{id}` sent every channel (name, topic) to every member; only bots got the channels they can view.
+/// Since the layered permissions it lists only the channels the requester can view (permissions.md "Evaluation").
 #[tokio::test]
-#[ignore = "design: RoomDetail and channel.* events list private channels to every member (event audience work)"]
 async fn room_detail_hides_channels_the_member_cannot_view() {
     use tavrn_node::permissions as p;
     let node = test_node(DOMAIN).await;
