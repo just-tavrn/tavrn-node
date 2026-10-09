@@ -71,9 +71,7 @@ pub async fn create_share(
         // DMs: both participants are members from the start; group DMs: `since_join`.
         return Err(forbidden("History keys are shared only in room channels"));
     };
-    if !Policy::of(channel.history_for_new_members.as_deref()).grants_history() {
-        return Err(forbidden("The channel does not give new members its history"));
-    }
+    let grants = Policy::of(channel.history_for_new_members.as_deref()).grants_history();
     if req.ciphertext.len() > history::MAX_SHARE_BYTES {
         return Err(ApiError::PayloadTooLarge {
             code: "history.too_large",
@@ -108,8 +106,31 @@ pub async fn create_share(
         None => return Err(bad("history.invalid", "to_user must be an address name@domain")),
     };
     let Some(recipient) = recipient else { return Err(forbidden("The recipient is not a member")) };
-    if !recipient_may_read_history(&state, &conv, &recipient).await? {
-        return Err(forbidden("The recipient may not receive this channel's history"));
+    let Some(target) = recipient_access(&state, &conv, &recipient).await? else {
+        return Err(forbidden("The recipient is not a member"));
+    };
+    // After the recipient's key reset, keys up to the reset epoch are a restore (ENCRYPTION.md §7b "History after a
+    // key reset"): only from a member with `restore_history` while an approved restore is valid.
+    let reset_epoch = match target.member.key_reset_at {
+        Some(_) => store::history::reset_epoch(&state.db, &conv.id, &recipient.id).await?,
+        None => None,
+    };
+    if reset_epoch.is_some_and(|e| req.epoch_from <= e) {
+        let valid_since = util::format_time(Utc::now() - Duration::days(history::RESTORE_VALID_DAYS));
+        let approved = target.member.history_restored_at.as_deref().is_some_and(|t| t >= valid_since.as_str());
+        if !approved || !permissions::has(conv.perms, permissions::RESTORE_HISTORY) {
+            return Err(forbidden("Keys from before the recipient's key reset need an approved restore"));
+        }
+        if !permissions::has(target.perms, permissions::VIEW_CHANNEL) {
+            return Err(forbidden("The recipient may not read this channel"));
+        }
+    } else {
+        if !grants {
+            return Err(forbidden("The channel does not give new members its history"));
+        }
+        if !permissions::has(target.perms, permissions::VIEW_CHANNEL | permissions::READ_HISTORY) {
+            return Err(forbidden("The recipient may not receive this channel's history"));
+        }
     }
     let to = recipient.address();
     let since = util::format_time(Utc::now() - Duration::hours(24));
@@ -133,23 +154,29 @@ pub async fn create_share(
     Ok((StatusCode::CREATED, Json(HistoryShareCreated { id })))
 }
 
-/// Entitled to the channel (member with `view_channel`, not disabled) and `read_history` there.
-async fn recipient_may_read_history(
+/// The recipient's membership and channel permissions; `None` for non-members and disabled accounts.
+struct Recipient {
+    member: crate::models::MemberRow,
+    perms: permissions::Perms,
+}
+
+async fn recipient_access(
     state: &AppState,
     conv: &Conv,
     user: &crate::models::UserRow,
-) -> Result<bool, ApiError> {
-    let ConvKind::Channel { access, channel } = &conv.kind else { return Ok(false) };
+) -> Result<Option<Recipient>, ApiError> {
+    let ConvKind::Channel { access, channel } = &conv.kind else { return Ok(None) };
     if user.disabled_at.is_some() {
-        return Ok(false);
+        return Ok(None);
     }
     let member_access = match access::room_access(state, &access.room.id, user).await {
-        Ok(a) if a.member.is_some() => a,
-        Ok(_) | Err(ApiError::Forbidden { .. }) => return Ok(false),
+        Ok(a) => a,
+        Err(ApiError::Forbidden { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
+    let Some(member) = member_access.member.clone() else { return Ok(None) };
     let perms = access::channel_perms(state, &member_access, channel, &user.id).await?;
-    Ok(permissions::has(perms, permissions::VIEW_CHANNEL | permissions::READ_HISTORY))
+    Ok(Some(Recipient { member, perms }))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -215,8 +242,13 @@ pub async fn ack_share(
 pub struct HistoryPendingMember {
     /// Member address.
     pub user: String,
-    /// The membership's `joined_at` (start of the policy window).
+    /// Start of the automatic window: the membership's `joined_at`, after a key reset its `key_reset_at`.
     pub since: String,
+    /// After a key reset of the member (ENCRYPTION.md §7b "History after a key reset"): the reset time; null otherwise.
+    pub key_reset_at: Option<String>,
+    /// After a key reset: the lowest epoch an automatic share may carry (reset epoch + 1); null without a
+    /// pre-reset range.
+    pub min_epoch: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -242,10 +274,18 @@ pub async fn list_pending(
     }
     let newer_than = util::format_time(Utc::now() - Duration::days(history::MAX_AGE_DAYS));
     let rows = store::history::pending_members(&state.db, &conv.id, &access.room.id, &newer_than).await?;
-    Ok(Json(HistoryPendingList {
-        items: rows
-            .into_iter()
-            .map(|(_, username, domain, since)| HistoryPendingMember { user: format!("{username}@{domain}"), since })
-            .collect(),
-    }))
+    let mut items = Vec::with_capacity(rows.len());
+    for r in rows {
+        let min_epoch = match r.key_reset_at {
+            Some(_) => history::min_epoch(&state, &conv.id, &r.user_id).await?,
+            None => None,
+        };
+        items.push(HistoryPendingMember {
+            user: format!("{}@{}", r.username, r.domain),
+            since: r.member_since,
+            key_reset_at: r.key_reset_at,
+            min_epoch,
+        });
+    }
+    Ok(Json(HistoryPendingList { items }))
 }

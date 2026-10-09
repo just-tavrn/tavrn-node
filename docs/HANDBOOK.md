@@ -1719,6 +1719,21 @@ The welcome channel is the room's security log: its entries cannot be deleted or
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
 
+### History restore after a key reset
+
+A user who resets their security key (lost every device and the recovery key) keeps their rooms but not their
+encrypted history: the node stops serving the encrypted messages from before the reset to them, and other members'
+apps no longer hand those keys over automatically (protocol: ENCRYPTION.md §7b). The member can ask the room for the
+history; the owner, administrators and roles with **Restore history** (`restore_history`, never `@everyone`, never a
+bot) approve or deny it in room settings → History requests. The approving member's app sends the keys from its own
+device, so an approval restores only what that device can read. Requests, approvals and denials are in the room's
+audit log (`history.restore_requested`, `history.restore_approved`, `history.restore_denied` with the reason) and the
+decision is an entry in the welcome channel. Rooms switch requests off in room settings → Overview ("History after a
+key reset"); remote members' resets are learned through federation like the key change itself. There is nothing to
+configure and nothing an operator can restore: the node never holds the keys. Decided requests are deleted after 30
+days by the housekeeping; an approval stays valid for key shares for 30 days. Tell moderators to verify the person's
+identity on another channel before approving: a key reset is also what someone who took over the account would do.
+
 ## Threads and forum channels
 
 Every text and announcement channel has threads: "Create thread" on a message (or the "Threads" list of the

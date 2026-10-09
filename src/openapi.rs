@@ -9,6 +9,7 @@ use utoipa::{
 use crate::routes::applications;
 use crate::routes::calls;
 use crate::routes::history;
+use crate::routes::history_requests;
 use crate::routes::identity;
 use crate::routes::peer_resolve;
 use crate::routes::whiteboard;
@@ -64,6 +65,7 @@ impl Modify for BearerAuth {
         identity::rotate, identity::blob,
         mls::create_group, mls::group_info, mls::post_commit, mls::log, mls::welcomes, mls::delete_welcome,
         history::create_share, history::list_shares, history::ack_share, history::list_pending,
+        history_requests::create, history_requests::mine, history_requests::cancel, history_requests::list, history_requests::approve, history_requests::deny,
         backups::put_backup, backups::get_backup, backups::list_backups,
         friends::list, friends::send_request, friends::accept, friends::delete_request, friends::remove, friends::block, friends::unblock, friends::blocks,
         conversations::create, conversations::list, conversations::get, conversations::update, conversations::add_member, conversations::remove_member, read::mark_read,
@@ -125,6 +127,7 @@ impl Modify for BearerAuth {
         messages::CreateMessageRequest, messages::EditMessageRequest,
         keys::IdentityKeyRequest, keys::DeviceKey, keys::UserKeys, keys::DeviceKeyRequest, keys::KeyPackagesRequest, keys::KeyPackageCount, keys::ClaimedKeyPackage, keys::ClaimedKeyPackages, keys::IdentityResetRequest,
         history::CreateHistoryShareRequest, history::HistoryShareCreated, history::HistoryShare, history::HistoryShareList, history::HistoryPendingMember, history::HistoryPendingList,
+        history_requests::HistoryRequest, history_requests::HistoryRequestChannel, history_requests::HistoryRequestList, history_requests::MyHistoryState, history_requests::CreateHistoryRequest, history_requests::ApproveHistoryRequest, history_requests::DenyHistoryRequest,
         mls::CreateGroupRequest, mls::EpochResponse, mls::GroupInfoResponse, mls::CommitRequest, mls::LogEntry, mls::LogPage, mls::WelcomeItem, mls::WelcomeList,
         backups::BackupInfo, backups::BackupList,
         friends::Friend, friends::FriendRequest, friends::FriendList, friends::UserRef, friends::FriendRequestResult, friends::FriendRequestBody, friends::BlockRequest, friends::BlockedUser,

@@ -253,6 +253,8 @@ pub struct Room {
     /// Messages of the room's channels are deleted after this many days (null = the node's value; a room can only
     /// shorten it; pinned messages and the welcome channel are exempt, PROTOCOL.md §7f).
     pub message_retention_days: Option<i64>,
+    /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
+    pub history_restore: String,
 }
 
 impl Room {
@@ -569,6 +571,10 @@ pub struct MemberRow {
     pub avatar_animated: i64,
     /// Per-room bio ('' = none).
     pub bio: String,
+    /// The member's identity key was reset at this time (ENCRYPTION.md §7b "History after a key reset").
+    pub key_reset_at: Option<String>,
+    /// A member with `restore_history` approved restoring the history from before the reset.
+    pub history_restored_at: Option<String>,
 }
 
 impl MemberRow {
