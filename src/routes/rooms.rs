@@ -1291,6 +1291,10 @@ pub async fn purge(
 ) -> Result<Json<PurgeResponse>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
+    // A preview counts messages across the room's channels: limited per moderator.
+    if req.confirm_token.is_none() {
+        state.purge_limiter.check_all(&[format!("purge:{}", auth.user.id)])?;
+    }
     let all_channels = store::rooms::channels(&state.db, &room_id).await?;
     let room_channels: Vec<String> = all_channels.iter().map(|c| c.id.clone()).collect();
     // Only channels in which the actor holds `purge` (permissions.md step 4: nothing without `view_channel`).

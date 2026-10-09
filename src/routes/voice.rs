@@ -1059,6 +1059,7 @@ pub async fn update_sound(
     responses((status = 200, description = "Audio file"), (status = 304), (status = 404, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
 pub async fn public_sound_audio(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     Path(sound_id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<SoundQuery>,
     headers: HeaderMap,
@@ -1076,6 +1077,7 @@ pub async fn public_sound_audio(
         if let Some(r) = crate::routes::emojis::not_modified(&headers, &tag) {
             return Ok(r);
         }
+        crate::routes::emojis::proxy_limit(&state, &ip)?;
         let cached = crate::emoji_cache::get(&state, crate::emoji_cache::CacheKind::Sound, host, &sound_id).await?;
         return Ok(crate::routes::emojis::file_response_tagged(
             cached.data,

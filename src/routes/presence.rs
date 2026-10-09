@@ -126,6 +126,8 @@ pub async fn put_room_setting(
     ApiJson(req): ApiJson<RoomPresenceSetting>,
 ) -> Result<Json<RoomPresenceSetting>, ApiError> {
     member(&state, &auth, &room_id).await?;
+    // Each toggle fans out to the whole room.
+    state.presence_limiter.check_all(&[format!("presence-room:{}", auth.user.id)])?;
     presence::set_room_hidden(&state, &room_id, &auth.user.id, req.hidden).await?;
     // The room's members now see the presence (or no longer do): one update for everyone.
     if req.hidden {

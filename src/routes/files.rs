@@ -579,6 +579,7 @@ pub async fn list(
     Path((room_id, channel_id)): Path<(String, String)>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<FileList>, ApiError> {
+    state.files_limiter.check_all(&[format!("files:{}", auth.user.id)])?;
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let limit = validate::limit(q.limit, files::LIST_DEFAULT, files::LIST_MAX);
     if conv.encrypted && q.q.as_deref().is_some_and(|s| !s.trim().is_empty()) {
@@ -776,6 +777,7 @@ pub async fn upload(
             detail: "Uploads are switched off on this node".into(),
         });
     }
+    state.files_limiter.check_all(&[format!("files-upload:{}", auth.user.id)])?;
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
     let room = room_of(&conv).clone();

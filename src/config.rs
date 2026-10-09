@@ -380,6 +380,8 @@ pub struct Config {
     /// Accept bots of other nodes (APPLICATIONS.md §2.8; whether this node's own bots may federate is
     /// `apps_federate`).
     pub federation_remote_bots: bool,
+    /// API requests per user and minute (every authenticated route; `0` = off, the default in development mode).
+    pub rate_user_per_minute: u32,
     /// Federated logins per remote domain and minute.
     pub federation_rate_logins: u32,
     /// Inbox messages per remote domain and minute.
@@ -624,6 +626,7 @@ impl Default for Config {
             federation_srv_fallback: true,
             federation_dev_peers: String::new(),
             federation_remote_bots: true,
+            rate_user_per_minute: 1200,
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
@@ -752,6 +755,7 @@ impl Config {
     pub fn defaults_for(dev: bool) -> Self {
         let mut c = Self::default();
         if dev {
+            c.rate_user_per_minute = 0;
             c.domain = "localhost".into();
             c.listen = "127.0.0.1:8080".into();
             c.database_url = "sqlite://data-dev/tavrn.db?mode=rwc".into();
@@ -2507,6 +2511,19 @@ mod tests {
                 let err = Config::load(false).unwrap_err();
                 assert!(err.problems.iter().any(|p| p.contains("TAVRN_SEARCH_RATE_PER_MINUTE")), "{err}");
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_general_user_limit_is_on_in_production_and_off_in_development() {
+        assert_eq!(Config::defaults_for(false).rate_user_per_minute, 1200);
+        assert_eq!(Config::defaults_for(true).rate_user_per_minute, 0);
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            jail.set_env("TAVRN_RATE_USER_PER_MINUTE", "90");
+            assert_eq!(Config::load(false).unwrap().rate_user_per_minute, 90);
             Ok(())
         });
     }
