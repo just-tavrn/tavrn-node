@@ -20,6 +20,7 @@ pub mod files;
 pub mod friends;
 pub mod health;
 pub mod history;
+pub mod history_requests;
 pub mod identity;
 pub mod installations;
 pub mod invites;

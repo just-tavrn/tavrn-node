@@ -562,6 +562,13 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "History share housekeeping failed"),
             }
+            let decided_before =
+                util::format_time(Utc::now() - chrono::Duration::days(crate::history::RESTORE_VALID_DAYS));
+            match crate::store::history::prune_requests(&db, &decided_before).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(requests = n, "Decided history restore requests pruned"),
+                Err(e) => tracing::warn!(error = %e, "History request housekeeping failed"),
+            }
             match crate::device_cleanup::run(&state, Utc::now()).await {
                 Ok(r) if r != crate::device_cleanup::CleanupReport::default() => {
                     tracing::info!(

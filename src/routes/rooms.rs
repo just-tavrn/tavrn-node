@@ -269,6 +269,9 @@ pub struct UpdateRoomRequest {
     /// `none` or `adults_only` (PROTOCOL.md §5e): the room's age gate, the minimum of every channel. Only an adult can
     /// switch it on. Audited as `room.age_gate`.
     pub age_gate: Option<String>,
+    /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
+    /// Owner or `manage_room`; never a bot.
+    pub history_restore: Option<String>,
 }
 
 /// Change room settings (`manage_room`).
@@ -282,7 +285,7 @@ pub async fn update_room(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROOM, "room.manage_forbidden", "Manage room")?;
     // Bots never decide who may read along (APPLICATIONS.md §3.5).
-    if req.no_bots.is_some() || req.bots_in_encrypted_channels.is_some() {
+    if req.no_bots.is_some() || req.bots_in_encrypted_channels.is_some() || req.history_restore.is_some() {
         crate::bot_channels::refuse_bots(&auth.user)?;
     }
     let bots_setting =
@@ -308,6 +311,11 @@ pub async fn update_room(
     if let Some(gate) = &age_gate {
         crate::age::require_adult_to_gate(&state, &auth.user, gate, "room").await?;
     }
+    let history_restore = req
+        .history_restore
+        .as_deref()
+        .map(|v| validate::one_of("history_restore", v, crate::history::RESTORE_SETTINGS))
+        .transpose()?;
     store::rooms::update_room(
         &state.db,
         &room_id,
@@ -326,12 +334,18 @@ pub async fn update_room(
     if let Some(days) = message_retention {
         store::rooms::set_message_retention(&state.db, &room_id, Some(days).filter(|d| *d > 0)).await?;
     }
+    if let Some(value) = &history_restore {
+        store::history::set_room_setting(&state.db, &room_id, value).await?;
+    }
     let mut meta = serde_json::json!({});
     if let (Some(days), Some(obj)) = (retention, meta.as_object_mut()) {
         obj.insert("attachment_retention_days".into(), days.into());
     }
     if let (Some(days), Some(obj)) = (message_retention, meta.as_object_mut()) {
         obj.insert("message_retention_days".into(), days.into());
+    }
+    if let (Some(value), Some(obj)) = (history_restore, meta.as_object_mut()) {
+        obj.insert("history_restore".into(), value.into());
     }
     store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "room.update", &room_id, "", meta).await?;
     let access = access::room_access(&state, &room_id, &auth.user).await?;

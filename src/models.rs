@@ -271,6 +271,8 @@ pub struct Room {
     /// `none` or `adults_only` (PROTOCOL.md §5e): users below 18 never find the room in Discover and cannot join it;
     /// every channel of the room is locked for them.
     pub age_gate: String,
+    /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
+    pub history_restore: String,
 }
 
 impl Room {
@@ -614,6 +616,10 @@ pub struct MemberRow {
     pub avatar_animated: i64,
     /// Per-room bio ('' = none).
     pub bio: String,
+    /// The member's identity key was reset at this time (ENCRYPTION.md §7b "History after a key reset").
+    pub key_reset_at: Option<String>,
+    /// A member with `restore_history` approved restoring the history from before the reset.
+    pub history_restored_at: Option<String>,
 }
 
 impl MemberRow {

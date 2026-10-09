@@ -53,6 +53,7 @@ perms! {
     READ_HISTORY = 34, "read_history";
     MANAGE_APPLICATIONS = 35, "manage_applications";
     MANAGE_THREADS = 36, "manage_threads";
+    RESTORE_HISTORY = 37, "restore_history";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -105,6 +106,7 @@ pub const EVERYONE_RESTRICTED: Perms = ADMINISTRATOR
     | MANAGE_NICKNAMES
     | MANAGE_APPLICATIONS
     | MANAGE_THREADS
+    | RESTORE_HISTORY
     | PURGE;
 
 /// Permissions a member keeps while timed out.
@@ -425,7 +427,7 @@ mod tests {
     fn everyone_defaults_contain_nothing_restricted() {
         assert_eq!(DEFAULT_EVERYONE & EVERYONE_RESTRICTED, 0);
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_130_924_452_740);
+        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_268_363_406_212);
         assert!(has(DEFAULT_EVERYONE, USE_WHITEBOARD));
         assert!(!has(DEFAULT_EVERYONE, MANAGE_WHITEBOARD));
         assert_eq!(names(USE_WHITEBOARD | MANAGE_WHITEBOARD), vec!["use_whiteboard", "manage_whiteboard"]);
@@ -444,7 +446,11 @@ mod tests {
         assert!(!has(write, MANAGE_MESSAGES));
         assert_eq!(scope_mask(&["nonsense".to_string()]), BOT_ALWAYS, "unknown scopes add nothing");
         assert!(!has(scope_mask(&all_scopes()), ADMINISTRATOR), "administrator is never unlocked by a scope");
-        assert_eq!(scope_mask(&all_scopes()) | ADMINISTRATOR, ALL, "every other bit is reachable through a scope");
+        assert_eq!(
+            scope_mask(&all_scopes()) | ADMINISTRATOR | RESTORE_HISTORY,
+            ALL,
+            "every other bit is reachable through a scope (restore_history never is)"
+        );
         assert!(is_scope("dms") && !is_scope("admin"));
     }
 
@@ -459,7 +465,7 @@ mod tests {
             BOT_ALWAYS | READ_HISTORY,
             "unknown kinds fail closed"
         );
-        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !ADMINISTRATOR);
+        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !(ADMINISTRATOR | RESTORE_HISTORY));
     }
 
     #[test]
@@ -486,6 +492,17 @@ mod tests {
         assert!(has(scope_mask(&["messages:write".to_string()]), CREATE_THREADS));
         assert_eq!(names(MANAGE_THREADS), vec!["manage_threads"]);
         assert_eq!(parse(&MANAGE_THREADS.to_string()), Some(MANAGE_THREADS));
+    }
+
+    #[test]
+    fn restore_history_is_management_class_and_never_a_bot_scope() {
+        assert_eq!(RESTORE_HISTORY, 1 << 37);
+        assert!(has(EVERYONE_RESTRICTED, RESTORE_HISTORY), "never on @everyone");
+        assert!(!has(DEFAULT_EVERYONE, RESTORE_HISTORY));
+        let every_scope: Vec<String> = SCOPES.iter().map(|(s, _)| s.to_string()).collect();
+        assert!(!has(scope_mask(&every_scope), RESTORE_HISTORY), "no app-token scope covers it");
+        assert!(has(ALL, RESTORE_HISTORY), "owners and administrators hold it");
+        assert_eq!(names(RESTORE_HISTORY), vec!["restore_history"]);
     }
 
     #[derive(Deserialize)]
