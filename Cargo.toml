@@ -47,7 +47,9 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
+# ed25519-dalek stays on 2 together with tavrn-crypto: openmls_rust_crypto and jsonwebtoken still use 2, and 3 would
+# add a second Ed25519 implementation beside the one that verifies device proofs.
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
 # SRV lookups for the server-to-server DNS fallback `_tavrn._tcp.<domain>`; the system resolver
@@ -80,6 +82,8 @@ subtle = "2"
 # The encryption core, consumed by tag while the repositories are private (workspace dependency: a git
 # dependency; set CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo uses your git credentials, README.md "Building").
 tavrn-crypto.workspace = true
+# utoipa stays on 5: 6 omits the (required) empty response descriptions and reorders `oneOf` with null, which
+# changes protocol/openapi.json, the protocol's source of truth.
 utoipa = { version = "5", features = ["axum_extras"] }
 # Second factor: TOTP (RFC 6238) and WebAuthn. webauthn-rs needs OpenSSL; it is
 # vendored (built from source) so neither developers nor the image need system OpenSSL headers.
