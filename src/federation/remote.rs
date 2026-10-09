@@ -138,6 +138,8 @@ async fn login_inner(
     )
     .await?;
     store::federation::touch_login(&state.db, &user.id).await?;
+    // The home node's age claim of this login (FEDERATION.md §2.2): the latest one counts; never exposed.
+    store::users::set_age_claim(&state.db, &user.id, t.age_over_18).await?;
     if t.kind == "bot" {
         // T keeps the application and the scopes with the session and applies them (APPLICATIONS.md §2.8).
         let app_ref = t.app.as_deref().map(|a| format!("{}/{a}", t.domain));

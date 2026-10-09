@@ -341,6 +341,9 @@ impl FromRequestParts<AppState> for AuthUser {
         check_route(state, &auth, parts)?;
         // `TAVRN_LEGAL_TERMS_MODE=require`: nothing but the legal flow until the current terms are accepted.
         let path = parts.extensions.get::<axum::extract::MatchedPath>().map(axum::extract::MatchedPath::as_str);
+        // `age.v1`: accounts without a date of birth complete it first (PROTOCOL.md §5e). Checked before the terms, so
+        // the terms dialog stays reachable while the date of birth is missing (and the other way round).
+        crate::age::check_required(state, &auth.user, path)?;
         crate::legal::documents::check_required(state, &auth.user, path).await?;
         Ok(auth)
     }

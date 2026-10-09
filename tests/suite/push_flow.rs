@@ -597,3 +597,35 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
     assert_eq!(p["conversation_id"], own.as_str());
     let _ = thread_id;
 }
+
+#[tokio::test]
+async fn gated_channels_push_nothing_to_minors() {
+    let node = test_node(DOMAIN).await;
+    let fake = FakePushService::start().await;
+    let alice = node.register("alice").await;
+    let sixteen = chrono::Utc::now().date_naive().checked_sub_months(chrono::Months::new(16 * 12)).unwrap();
+    let bob = node.register_born("bob", &sixteen.format("%Y-%m-%d").to_string()).await;
+    let room = node.plaintext_room(&alice.token, "Tavern").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let open = TestNode::text_channel(&room);
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    let (st, gated) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels"),
+            &alice.token,
+            json!({ "name": "late", "kind": "text", "encrypted": false, "age_gate": "adults_only" }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{gated}");
+    let browser = Browser::new(&fake, "ok/bob");
+    subscribe(&node, &bob, &browser).await;
+    let body = json!({ "content": { "type": "text", "body": "@everyone late", "mentions_everyone": true } });
+    let gated = gated["id"].as_str().unwrap();
+    let (st, m) = node.post(&format!("/api/v1/conversations/{gated}/messages"), &alice.token, body).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    fake.settle(&browser.path, 0).await;
+    let (st, m) = node.post(&format!("/api/v1/conversations/{open}/messages"), &alice.token, text("early")).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    fake.wait(&browser.path, 1).await;
+}

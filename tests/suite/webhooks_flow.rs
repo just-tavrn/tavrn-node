@@ -462,7 +462,7 @@ async fn the_pseudo_user_is_in_no_member_list_and_receives_nothing() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "wh.mine", "password": "password-123456" })),
+            Some(json!({ "username": "wh.mine", "date_of_birth": "1990-01-01", "password": "password-123456" })),
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::CONFLICT, "auth.username_taken"));
@@ -475,7 +475,7 @@ async fn the_pseudo_user_is_in_no_member_list_and_receives_nothing() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": username, "password": "irrelevant-123" })),
+            Some(json!({ "username": username, "date_of_birth": "1990-01-01", "password": "irrelevant-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);

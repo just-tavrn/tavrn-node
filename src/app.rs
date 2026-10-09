@@ -70,6 +70,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
             caps.push("screenshare");
         }
     }
+    // Date of birth, private age status and age gates (PROTOCOL.md §5e).
+    caps.push(crate::age::CAPABILITY);
     caps
 }
 
@@ -938,7 +940,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::commands::routes())
                 .merge(routes::legal::routes())
                 .merge(routes::push::routes())
-                .merge(routes::moderation::routes()),
+                .merge(routes::moderation::routes())
+                .merge(routes::age::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
         .merge(routes::legal::page_routes())

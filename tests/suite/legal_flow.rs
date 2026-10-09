@@ -155,7 +155,7 @@ async fn admins_publish_sanitized_pages_that_everyone_can_read() {
 
 /// Registration with an accepted terms version; returns the full session.
 async fn register_accepting(node: &TestNode, username: &str, version: Option<i64>) -> (StatusCode, Value) {
-    let mut body = json!({ "username": username, "password": password(username), "device_name": "t" });
+    let mut body = json!({ "username": username, "date_of_birth": "1990-01-01", "password": password(username), "device_name": "t" });
     if let Some(v) = version {
         body["accept_terms"] = json!(v);
     }

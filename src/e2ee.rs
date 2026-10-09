@@ -147,6 +147,34 @@ pub async fn bots_excluded(state: &AppState, room_id: &str, channel_ids: &[Strin
     Ok(())
 }
 
+/// An age gate was switched on (PROTOCOL.md §5e): the leaves of the room's members below it in these channels'
+/// groups, and those members leave the room's voice channels.
+pub async fn below_age_gate(state: &AppState, room_id: &str, channel_ids: &[String]) -> Result<(), ApiError> {
+    let mut below = Vec::new();
+    for user in store::users::by_ids(&state.db, &store::rooms::member_ids(&state.db, room_id).await?).await? {
+        if !crate::age::is_adult(state, &user).await? {
+            let (room, user_id) = (room_id.to_string(), user.id.clone());
+            crate::voice::spawn_effect(state, move |s| async move {
+                crate::voice::disconnect_user(&s, &room, &user_id).await;
+            });
+            below.push(user.address());
+        }
+    }
+    if below.is_empty() {
+        return Ok(());
+    }
+    let groups: Vec<(String, Vec<u8>)> = store::e2ee::groups_in_room(&state.db, room_id)
+        .await?
+        .into_iter()
+        .filter(|(id, _)| channel_ids.contains(id))
+        .collect();
+    remove_needed(state, groups, store::pending_removals::NOT_MEMBER, move |identity: &str| {
+        identity.split_once('/').is_some_and(|(a, _)| below.iter().any(|b| b == a))
+    })
+    .await;
+    Ok(())
+}
+
 /// A user left (or was removed from) a group DM.
 pub async fn user_left_conversation(state: &AppState, conversation_id: &str, user: &UserRow) -> Result<(), ApiError> {
     if let Some(ds) = store::e2ee::group_state(&state.db, conversation_id).await? {

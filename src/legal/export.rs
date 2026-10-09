@@ -76,6 +76,8 @@ pub async fn head(state: &AppState, user: &UserRow) -> Result<Map<String, Value>
             "custom_status": user.custom_status.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
             "hide_activity": user.hide_activity != 0,
             "auto_preview": crate::store::users::auto_preview(&state.db, id).await.ok(),
+            // The self-declared date of birth (PROTOCOL.md §5e).
+            "date_of_birth": user.date_of_birth,
         }),
     );
     m.insert(

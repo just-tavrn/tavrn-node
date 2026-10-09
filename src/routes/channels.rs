@@ -148,6 +148,9 @@ pub struct CreateChannelRequest {
     pub encrypted: Option<bool>,
     pub bitrate_kbps: Option<i64>,
     pub user_limit: Option<i64>,
+    /// `none` (default) or `adults_only` (PROTOCOL.md §5e); the room's gate is the minimum. Only an adult can set
+    /// `adults_only`.
+    pub age_gate: Option<String>,
 }
 
 fn files_never_encrypted() -> ApiError {
@@ -191,6 +194,10 @@ pub async fn create_channel(
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let kind = validate::one_of("kind", &req.kind, CHANNEL_KINDS)?;
     let name = channel_name(&kind, &req.name)?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "channel").await?;
+    }
     let topic = validate::text("topic", req.topic.as_deref().unwrap_or(""), 0, 1024)?;
     if let Some(cat) = &req.category_id
         && !store::rooms::category_exists(&state.db, &room_id, cat).await?
@@ -241,6 +248,9 @@ pub async fn create_channel(
         },
     )
     .await?;
+    if let Some(gate) = age_gate.as_deref().filter(|g| *g != crate::age::GATE_NONE) {
+        store::rooms::set_channel_age_gate(&state.db, &id, gate).await?;
+    }
     let channel = store::rooms::channel_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| access::not_found("Channel", "channel.not_found"))?
@@ -252,7 +262,7 @@ pub async fn create_channel(
         "channel.create",
         &id,
         "",
-        serde_json::json!({ "name": name, "kind": kind, "encrypted": encrypted }),
+        serde_json::json!({ "name": name, "kind": kind, "encrypted": encrypted, "age_gate": channel.age_gate }),
     )
     .await?;
     state.hub.room(&room_id, "channel.create", &channel);
@@ -284,6 +294,9 @@ pub struct UpdateChannelRequest {
     pub auto_archive_minutes: Option<i64>,
     /// Forum channels: the complete new tag list (at most 20; entries without `id` are new tags). Audit-logged.
     pub tags: Option<Vec<crate::threads::TagInput>>,
+    /// `none` or `adults_only` (PROTOCOL.md §5e): the channel's own age gate; the room's gate stays the minimum.
+    /// Only an adult can switch it on. Audited as `channel.age_gate`.
+    pub age_gate: Option<String>,
 }
 
 /// Update a channel (`manage_channels`).
@@ -325,6 +338,10 @@ pub async fn update_channel(
         })
         .transpose()?;
     let tags = req.tags.as_deref().map(|t| crate::threads::check_channel_tags(&current, t)).transpose()?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "channel").await?;
+    }
     let history_policy = req.history_for_new_members.as_deref().map(crate::history::validate).transpose()?;
     let name = req.name.as_deref().map(|n| channel_name(&current.kind, n)).transpose()?;
     let topic = req.topic.as_deref().map(|t| validate::text("topic", t, 0, 1024)).transpose()?;
@@ -388,6 +405,22 @@ pub async fn update_channel(
     }
     if let Some(minutes) = auto_archive {
         store::threads::set_auto_archive(&state.db, &channel_id, minutes).await?;
+    }
+    if let Some(gate) = age_gate.filter(|g| *g != current.age_gate) {
+        store::rooms::set_channel_age_gate(&state.db, &channel_id, &gate).await?;
+        store::rooms::audit(
+            &state.db,
+            Some(&room_id),
+            Some(&auth.user.id),
+            "channel.age_gate",
+            &channel_id,
+            "",
+            serde_json::json!({ "age_gate": gate }),
+        )
+        .await?;
+        if gate == crate::age::GATE_ADULTS {
+            crate::e2ee::below_age_gate(&state, &room_id, std::slice::from_ref(&channel_id)).await?;
+        }
     }
     if let Some(tags) = &tags {
         let json = serde_json::to_string(tags).map_err(|e| ApiError::Internal(e.into()))?;

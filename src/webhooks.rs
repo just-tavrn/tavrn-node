@@ -255,6 +255,8 @@ async fn channel_conv(state: &AppState, channel: ChannelRow) -> Result<Conv, Api
         room_perms: 0,
         kind: "webhook".into(),
         scopes: None,
+        // Webhooks only post (into channels their room manager chose); `channel_conv` never checks the gate here.
+        adult: true,
     };
     Ok(Conv {
         id: channel.id.clone(),

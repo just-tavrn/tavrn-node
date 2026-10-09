@@ -80,6 +80,8 @@ pub struct WellKnown {
     /// Present while federation is enabled (FEDERATION.md §1.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub federation: Option<FederationInfo>,
+    /// Date of birth and age gates (`age.v1`, PROTOCOL.md §5e).
+    pub age: crate::age::AgeInfo,
 }
 
 /// Per-domain limits this node applies to peers, so they can pace themselves (FEDERATION.md §1.1).
@@ -127,6 +129,7 @@ pub fn build_from(c: &crate::config::Config, keys: &[crate::keys::NodeKey]) -> W
             preview_auto_max_bytes: c.preview_auto_max_bytes,
         },
         directory_listing: c.directory_listing,
+        age: crate::age::info(c),
         federation: c.federation_enabled.then_some(FederationInfo {
             version: 1,
             limits: FederationLimits {

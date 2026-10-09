@@ -518,6 +518,9 @@ pub struct Config {
     pub admin_users: String,
     pub log_level: String,
     pub log_format: LogFormat,
+    /// Minimum age for registration (13–99, default 16; PROTOCOL.md §5e): every registration path refuses younger
+    /// people with `age.below_minimum`.
+    pub minimum_age: u32,
 }
 
 impl Default for Config {
@@ -674,6 +677,7 @@ impl Default for Config {
             admin_users: String::new(),
             log_level: "info".into(),
             log_format: LogFormat::Text,
+            minimum_age: 16,
         }
     }
 }
@@ -939,6 +943,9 @@ impl Config {
         }
         if self.device_stale_days > 36_500 {
             problems.push("TAVRN_DEVICE_STALE_DAYS must be between 0 and 36500 (0 = never)".into());
+        }
+        if !(13..=99).contains(&self.minimum_age) {
+            problems.push("TAVRN_MINIMUM_AGE must be between 13 and 99".into());
         }
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError { problems }) }

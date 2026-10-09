@@ -88,6 +88,8 @@ pub struct DirectoryRoom {
     pub member_count: i64,
     /// JWT signed by the hosting node (`typ = listing`, `aud = tavrn-directory`, `sub` = room id, 48 hours).
     pub listing: String,
+    /// `none` or `adults_only` (PROTOCOL.md §5e). Gated rooms are listed only to requests with an adult's session.
+    pub age_gate: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -299,9 +301,12 @@ fn parse_room_cursor(s: &str) -> Result<dir::RoomCursor, ApiError> {
 pub async fn rooms(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: axum::http::HeaderMap,
     Query(q): Query<RoomQuery>,
 ) -> Result<Json<DirectoryRoomList>, ApiError> {
     state.directory_limiter.check_all(&[format!("dir-ip:{ip}")])?;
+    // Rooms with an age gate only for an adult's session (optional `Authorization`, FEDERATION.md §7.3).
+    let include_gated = crate::age::requester_is_adult(&state, &headers).await;
     let limit = validate::limit(q.limit, 50, announce::MAX_ROOMS_PER_NODE as i64);
     let after = q.cursor.as_deref().filter(|c| !c.is_empty()).map(parse_room_cursor).transpose()?;
     let node = q.node.unwrap_or_default().to_lowercase();
@@ -323,6 +328,7 @@ pub async fn rooms(
             after: after.as_ref(),
             now: &now,
             limit,
+            include_gated,
         },
     )
     .await?;
@@ -345,6 +351,7 @@ pub async fn rooms(
             icon_url: None,
             member_count: row.member_count,
             listing,
+            age_gate: row.age_gate,
         });
     }
     Ok(Json(DirectoryRoomList { items, next }))
@@ -750,6 +757,7 @@ mod tests {
             description: String::new(),
             member_count: 7,
             listing: String::new(),
+            age_gate: "none".into(),
         };
         let c = parse_room_cursor(&room_cursor(&row)).unwrap();
         assert_eq!((c.member_count, c.node.as_str(), c.room_id.as_str()), (7, "a.example", row.room_id.as_str()));

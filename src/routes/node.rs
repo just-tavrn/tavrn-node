@@ -37,6 +37,8 @@ pub struct NodeInfo {
     pub preview_auto_max_bytes: u64,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,
+    /// Date of birth and age gates (`age.v1`, PROTOCOL.md §5e).
+    pub age: crate::age::AgeInfo,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -55,6 +57,7 @@ pub async fn get_node(State(state): State<AppState>) -> Result<Json<NodeInfo>, c
     let legal = crate::legal::info(&state).await?;
     Ok(Json(NodeInfo {
         legal,
+        age: crate::age::info(c),
         domain: c.domain.clone(),
         name: c.name.clone(),
         description: c.description.clone(),

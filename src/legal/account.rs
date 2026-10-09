@@ -611,12 +611,14 @@ pub async fn receive_remote(
     // The stub goes now: nothing refers to it any more (a later federated login creates a new one).
     if let Err(e) = sqlx::query("DELETE FROM users WHERE id = $1").bind(&user.id).execute(&state.db).await {
         tracing::warn!(error = %e, user = user.address(), "remote stub not deletable, renamed");
-        sqlx::query("UPDATE users SET username = $1, deleted_at = $2, disabled_at = $2 WHERE id = $3")
-            .bind(tombstone_username())
-            .bind(util::now())
-            .bind(&user.id)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET username = $1, deleted_at = $2, disabled_at = $2, age_over_18 = NULL WHERE id = $3",
+        )
+        .bind(tombstone_username())
+        .bind(util::now())
+        .bind(&user.id)
+        .execute(&state.db)
+        .await?;
     }
     if delete_messages {
         spawn_redaction(state, id);
@@ -794,11 +796,13 @@ async fn purge(state: &AppState, d: &DeletionRow) -> Result<(), ApiError> {
     {
         // Something still refers to the row: free the username at least, the rest stays disabled.
         tracing::warn!(error = %e, user = d.user_id, "deleted account not erasable, username released");
-        sqlx::query("UPDATE users SET username = $1, email = NULL, password_hash = NULL WHERE id = $2")
-            .bind(tombstone_username())
-            .bind(&d.user_id)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET username = $1, email = NULL, password_hash = NULL, date_of_birth = NULL WHERE id = $2",
+        )
+        .bind(tombstone_username())
+        .bind(&d.user_id)
+        .execute(&state.db)
+        .await?;
         sqlx::query("DELETE FROM external_identities WHERE user_id = $1").bind(&d.user_id).execute(&state.db).await?;
     }
     sqlx::query(

@@ -197,6 +197,9 @@ pub struct PublicRoom {
     pub icon_still: Option<String>,
     pub icon_animated: bool,
     pub member_count: i64,
+    /// `none` or `adults_only` (PROTOCOL.md §5e). Gated rooms are listed only to adults; invite previews carry the
+    /// gate so clients can explain a refused join.
+    pub age_gate: String,
 }
 
 impl PublicRoom {
@@ -210,15 +213,21 @@ impl PublicRoom {
             name: room.name,
             description: room.description,
             member_count,
+            age_gate: room.age_gate,
         }
     }
 }
 
-/// Public rooms of this node ("Discover").
+/// Public rooms of this node ("Discover"). Rooms with an age gate are listed only when the request carries the
+/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e).
 #[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>)))]
-pub async fn discover_rooms(State(state): State<AppState>) -> Result<Json<Vec<PublicRoom>>, ApiError> {
+pub async fn discover_rooms(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<PublicRoom>>, ApiError> {
+    let adult = crate::age::requester_is_adult(&state, &headers).await;
     let mut out = Vec::new();
-    for r in store::rooms::public_rooms(&state.db, 100).await? {
+    for r in store::rooms::public_rooms(&state.db, 100, adult).await? {
         let member_count = store::rooms::member_count(&state.db, &r.id).await?;
         out.push(PublicRoom::of(r, member_count));
     }
@@ -254,6 +263,9 @@ pub struct UpdateRoomRequest {
     /// Delete attachments after this many days (1–36500; 0 = use the node's value). Effective is the
     /// shortest non-zero of this, the node value and room grants: a room can only shorten.
     pub attachment_retention_days: Option<i64>,
+    /// `none` or `adults_only` (PROTOCOL.md §5e): the room's age gate, the minimum of every channel. Only an adult can
+    /// switch it on. Audited as `room.age_gate`.
+    pub age_gate: Option<String>,
 }
 
 /// Change room settings (`manage_room`).
@@ -287,6 +299,10 @@ pub async fn update_room(
         .attachment_retention_days
         .map(|d| validate::range("attachment_retention_days", d, 0, 36_500))
         .transpose()?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "room").await?;
+    }
     store::rooms::update_room(
         &state.db,
         &room_id,
@@ -338,8 +354,40 @@ pub async fn update_room(
         }
         _ => access,
     };
+    let access = match age_gate {
+        Some(gate) if gate != access.room.age_gate => {
+            set_room_age_gate(&state, &access.room, &auth.user, &gate).await?;
+            access::room_access(&state, &room_id, &auth.user).await?
+        }
+        _ => access,
+    };
     state.hub.room(&room_id, "room.update", &access.room);
     Ok(Json(detail(&state, &access).await?))
+}
+
+/// Sets the room's age gate (PROTOCOL.md §5e): audited, every channel changes its effective gate (`channel.update`),
+/// members below a new gate leave the encrypted groups and voice of the room.
+async fn set_room_age_gate(state: &AppState, room: &Room, actor: &UserRow, gate: &str) -> Result<(), ApiError> {
+    store::rooms::set_room_age_gate(&state.db, &room.id, gate).await?;
+    store::rooms::audit(
+        &state.db,
+        Some(&room.id),
+        Some(&actor.id),
+        "room.age_gate",
+        &room.id,
+        "",
+        serde_json::json!({ "age_gate": gate }),
+    )
+    .await?;
+    let channels = store::rooms::channels(&state.db, &room.id).await?;
+    if gate == crate::age::GATE_ADULTS {
+        let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+        crate::e2ee::below_age_gate(state, &room.id, &ids).await?;
+    }
+    for channel in channels {
+        state.hub.room(&room.id, "channel.update", channel.to_api());
+    }
+    Ok(())
 }
 
 /// Sets the room-level "no bots" flag: every bot member is removed (uninstall, reason `no_bots`), and the
@@ -448,6 +496,13 @@ async fn banned(state: &AppState, room_id: &str, user: &UserRow) -> Result<bool,
 async fn join(state: &AppState, user: &UserRow, room: &Room, accept_rules: bool) -> Result<RoomDetail, ApiError> {
     if banned(state, &room.id, user).await? {
         return Err(ApiError::Forbidden { code: "room.banned", detail: "You are banned from this room".into() });
+    }
+    // Age gate (PROTOCOL.md §5e): also with an invite link or a direct invite; existing members stay.
+    if room.age_gate == crate::age::GATE_ADULTS
+        && store::rooms::member(&state.db, &room.id, &user.id).await?.is_none()
+        && !crate::age::is_adult(state, user).await?
+    {
+        return Err(crate::age::restricted("room"));
     }
     if !room.rules.trim().is_empty() && !accept_rules {
         return Err(ApiError::Forbidden {
