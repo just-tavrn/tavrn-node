@@ -413,6 +413,11 @@ async fn private_channel_and_category_metadata_reach_only_their_audience() {
         .await;
     assert_eq!(s, StatusCode::CREATED, "{ch}");
     let notes = ch["id"].as_str().unwrap().to_string();
+    // Let bob's connection deliver the gain before the loss below: a connection checks each event against the
+    // state at delivery time, so on a slow machine a gain and a loss that are both committed before it catches up
+    // would cancel out (the end state is the same, the intermediate frames are not sent).
+    r.post(&r.open, "sync").await;
+    let mut bob_saw = until_marker(&mut bob_ws, "sync").await;
     // Hiding the category from @everyone: bob loses its channel and the category, both hidden.
     let (s, j) = r
         .node
@@ -428,7 +433,7 @@ async fn private_channel_and_category_metadata_reach_only_their_audience() {
     assert!(s.is_success(), "{j}");
     r.post(&r.open, "marker").await;
 
-    let bob_saw = until_marker(&mut bob_ws, "marker").await;
+    bob_saw.extend(until_marker(&mut bob_ws, "marker").await);
     assert_eq!(about(&bob_saw, &r.secret), Vec::<String>::new(), "bob saw: {bob_saw:?}");
     let seen: Vec<(String, Value)> = bob_saw
         .iter()

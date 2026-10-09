@@ -225,7 +225,10 @@ async fn cors_allows_bearer_requests_from_any_origin_without_credentials() {
         .uri("/api/v1/users/me/conversations-index")
         .header(header::ORIGIN, "https://visited.example")
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
-        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization, content-type, if-match, tavrn-client")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization, content-type, if-match, tavrn-client, idempotency-key, accept-language",
+        )
         .body(Body::empty())
         .unwrap();
     let resp = a.router.clone().oneshot(preflight).await.unwrap();
@@ -253,6 +256,31 @@ async fn cors_allows_bearer_requests_from_any_origin_without_credentials() {
     for name in ["etag", "retry-after", "location"] {
         assert!(exposed.contains(name), "{name} in {exposed}");
     }
+}
+
+/// Uploads from the desktop app (origin `tauri.localhost`) carry the `Tavrn-*` request headers of the files
+/// routes; the preflight must allow every header a client sends, else the upload never leaves the browser
+/// engine ("network error"). The node mirrors the requested headers: bearer tokens, no cookies, any origin.
+#[tokio::test]
+async fn cors_preflight_allows_every_request_header_of_the_upload_routes() {
+    let a = test_node(A).await;
+    let names = "authorization, content-type, tavrn-file-name, tavrn-upload-category, tavrn-parent, tavrn-record, \
+                 tavrn-record-epoch, tavrn-entry-id, tavrn-conflict, tavrn-reauth, tavrn-scene-name";
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/v1/rooms/r/channels/c/files/upload")
+        .header(header::ORIGIN, "https://tauri.localhost")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, names)
+        .body(Body::empty())
+        .unwrap();
+    let resp = a.router.clone().oneshot(preflight).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let allowed = resp.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS].to_str().unwrap().to_lowercase();
+    for name in names.split(',').map(|n| n.trim()) {
+        assert!(allowed.contains(name), "{name} in {allowed}");
+    }
+    assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none());
 }
 
 /// `POST /auth/connect/token` with a device proof (ENCRYPTION.md §3.4).
