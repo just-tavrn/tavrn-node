@@ -599,7 +599,8 @@ async fn every_scope_boundary_and_administrator_masking() {
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &reader.secret).await;
     assert_eq!(detail["my_permissions"], (p::BOT_ALWAYS | p::READ_HISTORY).to_string());
-    // With every scope the administrator role gives every bit except administrator itself.
+    // With every scope the administrator role gives every bit except administrator itself and restore_history, which
+    // no scope covers (ENCRYPTION.md §7b).
     let full = bot(&node, &alice, "Full", None).await;
     joined(&node, &alice, &room_id, &full).await;
     node.patch(
@@ -609,7 +610,7 @@ async fn every_scope_boundary_and_administrator_masking() {
     )
     .await;
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &full.secret).await;
-    assert_eq!(detail["my_permissions"], (p::ALL & !p::ADMINISTRATOR).to_string());
+    assert_eq!(detail["my_permissions"], (p::ALL & !(p::ADMINISTRATOR | p::RESTORE_HISTORY)).to_string());
     // A role cannot be granted beyond the bot's own capped permissions through overrides either.
     let (s, j) = node
         .put(
