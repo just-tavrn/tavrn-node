@@ -45,6 +45,7 @@ pub const LOCAL_ONLY: &[(&str, &str)] = &[
     ("*", "/api/v1/users/me/identity/rotate"),
     ("*", "/api/v1/users/me/identity/blob"),
     ("*", "/api/v1/users/me/devices/{device_id}/key"),
+    ("*", "/api/v1/users/me/devices/{device_id}/share-key"),
     ("*", "/api/v1/users/me/devices/{device_id}/key-packages"),
     ("*", "/api/v1/users/me/backups"),
     ("*", "/api/v1/users/me/backups/{domain}/{conversation_id}"),

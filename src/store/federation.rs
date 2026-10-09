@@ -360,6 +360,9 @@ pub struct RemoteDeviceKey {
     pub home_device_id: String,
     pub public_key: String,
     pub identity_signature: String,
+    /// The device's share key and its device signature (ENCRYPTION.md §3.1), both or neither (signature verified).
+    pub share_public_key: Option<String>,
+    pub share_key_signature: Option<String>,
 }
 
 /// Stores the key view of a remote user's home node: identity key, attested devices (device rows
@@ -400,7 +403,8 @@ pub async fn store_remote_keys(
     .await?;
     for d in devices {
         let updated = sqlx::query(
-            "UPDATE devices SET public_key = $1, identity_signature = $2, attested_identity_key = $3, attested_at = $4
+            "UPDATE devices SET public_key = $1, identity_signature = $2, attested_identity_key = $3, attested_at = $4,
+                                share_public_key = $7, share_key_signature = $8
              WHERE user_id = $5 AND home_device_id = $6",
         )
         .bind(&d.public_key)
@@ -409,13 +413,16 @@ pub async fn store_remote_keys(
         .bind(&ts)
         .bind(user_id)
         .bind(&d.home_device_id)
+        .bind(&d.share_public_key)
+        .bind(&d.share_key_signature)
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() == 0 {
             sqlx::query(
                 "INSERT INTO devices (id, user_id, name, client, created_at, last_seen_at, home_device_id, home_domain,
-                                      public_key, identity_signature, attested_identity_key, attested_at)
-                 VALUES ($1, $2, '', '', $3, $3, $4, $5, $6, $7, $8, $3)",
+                                      public_key, identity_signature, attested_identity_key, attested_at,
+                                      share_public_key, share_key_signature)
+                 VALUES ($1, $2, '', '', $3, $3, $4, $5, $6, $7, $8, $3, $9, $10)",
             )
             .bind(ulid())
             .bind(user_id)
@@ -425,6 +432,8 @@ pub async fn store_remote_keys(
             .bind(&d.public_key)
             .bind(&d.identity_signature)
             .bind(identity)
+            .bind(&d.share_public_key)
+            .bind(&d.share_key_signature)
             .execute(&mut *tx)
             .await?;
         }
@@ -442,14 +451,22 @@ pub async fn store_remote_keys(
     Ok(before.into_iter().filter(|h| !still.contains(&h.as_str())).collect())
 }
 
-/// Attested devices of a remote user from the key cache: `(home device id, public key, signature,
-/// created_at)`.
-pub async fn remote_attested_devices(
-    db: &Pool,
-    user_id: &str,
-) -> Result<Vec<(String, String, String, String)>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT d.home_device_id AS home, d.public_key AS pk, d.identity_signature AS sig, d.created_at AS created
+/// An attested device of a remote user from the key cache.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RemoteAttestedDevice {
+    pub home_device_id: String,
+    pub public_key: String,
+    pub identity_signature: String,
+    pub created_at: String,
+    pub share_public_key: Option<String>,
+    pub share_key_signature: Option<String>,
+}
+
+/// Attested devices of a remote user from the key cache.
+pub async fn remote_attested_devices(db: &Pool, user_id: &str) -> Result<Vec<RemoteAttestedDevice>, ApiError> {
+    Ok(sqlx::query_as(
+        "SELECT d.home_device_id, d.public_key, d.identity_signature, d.created_at, d.share_public_key,
+                d.share_key_signature
          FROM devices d JOIN users u ON u.id = d.user_id
          WHERE d.user_id = $1 AND d.home_device_id IS NOT NULL AND d.public_key IS NOT NULL
            AND d.identity_signature IS NOT NULL AND d.attested_identity_key = u.identity_pubkey
@@ -457,8 +474,7 @@ pub async fn remote_attested_devices(
     )
     .bind(user_id)
     .fetch_all(db)
-    .await?;
-    rows.iter().map(|r| Ok((r.try_get("home")?, r.try_get("pk")?, r.try_get("sig")?, r.try_get("created")?))).collect()
+    .await?)
 }
 
 /// Local row id of a remote user's device by its home device id.

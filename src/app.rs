@@ -63,6 +63,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.push("automod.v1");
     // History restore after a key reset by request and approval (ENCRYPTION.md §7b).
     caps.push("history.restore");
+    // History shares sealed per recipient device (ENCRYPTION.md §7b "Format v2").
+    caps.push("history.shares2");
     // End-to-end encrypted files channels (FILES.md §8).
     caps.push("files.e2ee");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
@@ -638,6 +640,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/users/me/identity/blob", get(routes::identity::blob))
         .route("/users/me/devices/{device_id}/key", put(routes::keys::put_device_key).layer(small()))
+        .route("/users/me/devices/{device_id}/share-key", put(routes::keys::put_share_key).layer(small()))
         .route(
             "/users/me/devices/{device_id}/key-packages",
             get(routes::keys::count_key_packages)

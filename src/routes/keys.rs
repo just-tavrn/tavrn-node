@@ -77,6 +77,11 @@ pub struct DeviceKey {
     pub device_public_key: String,
     pub identity_signature: String,
     pub created_at: String,
+    /// The device's X25519 share key (ENCRYPTION.md §3.1), base64url; null until the device published one. Clients
+    /// verify `share_key_signature` with the attested device key before sealing anything to it.
+    pub share_public_key: Option<String>,
+    /// The device key's signature over the share key, base64url.
+    pub share_key_signature: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -132,11 +137,13 @@ pub async fn get_keys(State(state): State<AppState>, Path(username): Path<String
             identity_reset_at: user.identity_reset_at.clone(),
             devices: devices
                 .into_iter()
-                .map(|(device_id, device_public_key, identity_signature, created_at)| DeviceKey {
-                    device_id,
-                    device_public_key,
-                    identity_signature,
-                    created_at,
+                .map(|d| DeviceKey {
+                    device_id: d.home_device_id,
+                    device_public_key: d.public_key,
+                    identity_signature: d.identity_signature,
+                    created_at: d.created_at,
+                    share_public_key: d.share_public_key,
+                    share_key_signature: d.share_key_signature,
                 })
                 .collect(),
             retired: vec![],
@@ -162,6 +169,8 @@ pub async fn get_keys(State(state): State<AppState>, Path(username): Path<String
                     device_public_key: d.public_key?,
                     identity_signature: d.identity_signature?,
                     created_at: d.created_at,
+                    share_public_key: d.share_public_key,
+                    share_key_signature: d.share_key_signature,
                 })
             })
             .collect(),
@@ -301,6 +310,41 @@ pub struct DeviceKeyRequest {
     pub device_public_key: String,
     /// Signature of the identity key over the attestation message (§3.1), base64url (64 bytes).
     pub identity_signature: String,
+    /// The device's X25519 share key (§3.1), base64url (32 bytes); optional, together with `share_key_signature`.
+    #[serde(default)]
+    pub share_public_key: Option<String>,
+    /// The device key's signature over the share key, base64url (64 bytes).
+    #[serde(default)]
+    pub share_key_signature: Option<String>,
+}
+
+fn share_key_invalid(detail: &str) -> ApiError {
+    bad("e2ee.share_key_invalid", detail.to_string())
+}
+
+/// A share key with its device signature, checked against the device key (ENCRYPTION.md §3.1). Returns the
+/// re-encoded key and signature.
+fn checked_share_key(
+    device_key: &[u8; 32],
+    device_id: &str,
+    public_key: &str,
+    signature: &str,
+) -> Result<(String, String), ApiError> {
+    let public: [u8; 32] = tavrn_crypto::util::b64url_decode(public_key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| share_key_invalid("share_public_key must be 32 bytes of base64url"))?;
+    let sig: [u8; 64] = tavrn_crypto::util::b64url_decode(signature)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| share_key_invalid("share_key_signature must be 64 bytes of base64url"))?;
+    tavrn_crypto::share::verify_share_key(device_key, device_id, &public, &sig)
+        .map_err(|_| share_key_invalid("The share key signature does not match the device key"))?;
+    Ok((util_b64(&public), util_b64(&sig)))
+}
+
+fn share_key_exists() -> ApiError {
+    ApiError::conflict("e2ee.share_key_exists", "This device already has another share key; share keys are immutable")
 }
 
 fn own_device(auth: &AuthUser, device_id: &str) -> Result<(), ApiError> {
@@ -346,6 +390,18 @@ pub async fn put_device_key(
     if tavrn_crypto::verify_device_attestation(&attestation, &identity).is_err() {
         return Err(bad("e2ee.attestation_invalid", "The device attestation does not match the security key"));
     }
+    // The share key comes with the device key or not at all; it is checked before anything is stored.
+    let share = match (req.share_public_key.as_deref(), req.share_key_signature.as_deref()) {
+        (None, None) => None,
+        (Some(pk), Some(sig)) => Some(checked_share_key(&device_key, &device_id, pk, sig)?),
+        _ => return Err(share_key_invalid("share_public_key and share_key_signature go together")),
+    };
+    if let Some((pk, _)) = &share
+        && let Some(existing) = store::e2ee::device_key(&state.db, &device_id).await?.and_then(|d| d.share_public_key)
+        && &existing != pk
+    {
+        return Err(share_key_exists());
+    }
     let stored = store::e2ee::set_device_key(
         &state.db,
         &auth.user.id,
@@ -361,7 +417,45 @@ pub async fn put_device_key(
             "This device already has a key; a new key needs a new device",
         ));
     }
+    if let Some((pk, sig)) = share
+        && store::e2ee::set_share_key(&state.db, &auth.user.id, &device_id, &pk, &sig).await?
+            == store::e2ee::ShareKeyOutcome::Conflict
+    {
+        return Err(share_key_exists());
+    }
     crate::federation::remote::devices_changed(&state, &auth.user).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ShareKeyRequest {
+    /// The device's X25519 share key (ENCRYPTION.md §3.1), base64url (32 bytes).
+    pub share_public_key: String,
+    /// Signature of the device key over `"tavrn device share key v1" || 0x00 || share key || device key ||
+    /// str16(device id)`, base64url (64 bytes).
+    pub share_key_signature: String,
+}
+
+/// Publish the share key of the session's attested device (ENCRYPTION.md §3.1), for devices that were attested
+/// without one. The node verifies the signature against the stored device key. Share keys are immutable: the same key
+/// again is accepted, another one is `409 e2ee.share_key_exists`.
+#[utoipa::path(put, path = "/api/v1/users/me/devices/{device_id}/share-key", security(("bearer" = [])), params(("device_id" = String, Path)), request_body = ShareKeyRequest,
+    responses((status = 204), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
+pub async fn put_share_key(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(device_id): Path<String>,
+    ApiJson(req): ApiJson<ShareKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    own_device(&auth, &device_id)?;
+    state.key_package_limiter.check_all(&[format!("share:{device_id}")])?;
+    let device_key = e2ee::attested_session_key(&state, &auth).await?;
+    let (pk, sig) = checked_share_key(&device_key, &device_id, &req.share_public_key, &req.share_key_signature)?;
+    match store::e2ee::set_share_key(&state.db, &auth.user.id, &device_id, &pk, &sig).await? {
+        store::e2ee::ShareKeyOutcome::Stored => crate::federation::remote::devices_changed(&state, &auth.user).await?,
+        store::e2ee::ShareKeyOutcome::Unchanged => {}
+        store::e2ee::ShareKeyOutcome::Conflict => return Err(share_key_exists()),
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -559,4 +653,35 @@ pub async fn reset_identity(
     crate::welcome::key_changed(&state, &auth.user, false).await;
     crate::federation::remote::identity_changed(&state, &auth.user, &util_b64(&key), &reset_at).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use serde_json::Value;
+
+    use super::*;
+
+    /// The protocol's reference values (`testvectors/encryption.json`, `device_share_key`): the node accepts the
+    /// published share key and refuses it for another device id or device key (ENCRYPTION.md §3.1).
+    #[test]
+    fn the_published_share_key_vector_passes_the_node_check() {
+        let v: Value =
+            serde_json::from_str(include_str!("../../protocol/testvectors/encryption.json")).expect("vectors JSON");
+        let s = |f: &str| v["device_share_key"][f].as_str().expect("string").to_owned();
+        let device_key: [u8; 32] =
+            tavrn_crypto::util::b64url_decode(&s("device_public_key")).unwrap().try_into().unwrap();
+        let (pk, sig) = checked_share_key(&device_key, &s("device_id"), &s("share_public_key"), &s("signature"))
+            .expect("valid share key");
+        assert_eq!((pk, sig), (s("share_public_key"), s("signature")));
+        assert!(
+            checked_share_key(&device_key, "01J9ZK3G5M8Q2W4E6R8T0Y2VA2", &s("share_public_key"), &s("signature"))
+                .is_err()
+        );
+        assert!(checked_share_key(&[9u8; 32], &s("device_id"), &s("share_public_key"), &s("signature")).is_err());
+        assert!(checked_share_key(&device_key, &s("device_id"), "AAAA", &s("signature")).is_err());
+        // The history share v2 ciphertext passes the node's content check with the current epoch in its header.
+        let header = tavrn_crypto::content_header(v["history_share_v2"]["ciphertext"].as_str().unwrap()).unwrap();
+        assert_eq!(Some(header.epoch), v["history_share_v2"]["epoch"].as_u64());
+    }
 }

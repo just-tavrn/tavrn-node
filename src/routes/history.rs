@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! History key shares (ENCRYPTION.md §7b): members hand the content keys of past
-//! epochs to a new member, encrypted under the conversation's current content key. The node cannot read
-//! a share; it checks who may send one to whom, limits size and rate, stores it until the recipient
-//! acknowledges it and tells the recipient's sockets that keys are waiting.
+//! epochs to a new member, encrypted under the conversation's current content key (format 1) or under a fresh key
+//! sealed to each device of the recipient (format 2). The node cannot read a share; it checks who may send one to
+//! whom, limits size and rate, stores it until the recipient acknowledges it, serves every recipient device only its
+//! own box and tells the recipient's sockets that keys are waiting.
+
+use std::collections::BTreeMap;
 
 use axum::{
     Json,
@@ -44,8 +47,71 @@ pub struct CreateHistoryShareRequest {
     pub epoch_from: i64,
     pub epoch_to: i64,
     /// The key list, encrypted like message content under the current epoch (ENCRYPTION.md §7b), base64url;
-    /// at most 64 KiB.
+    /// at most 64 KiB. Format 2: under the share's fresh key, with the current epoch in the header.
     pub ciphertext: String,
+    /// Share format: 1 (default) or 2 (sealed per recipient device, capability `history.shares2`).
+    #[serde(default)]
+    pub v: Option<i64>,
+    /// Format 2: the share's key sealed to each device of the recipient, device id → base64url box: 1 to 20 boxes,
+    /// each at most 128 bytes, every device an attested device of `to_user` with a share key.
+    #[serde(default)]
+    pub boxes: Option<BTreeMap<String, String>>,
+}
+
+/// Boxes per v2 share.
+pub const MAX_BOXES: usize = 20;
+/// Largest box (bytes, decoded): a sealed 32-byte key is 80.
+pub const MAX_BOX_BYTES: usize = 128;
+
+/// The format and the decoded-and-checked boxes of a share request (`history.invalid` otherwise).
+fn share_format(req: &CreateHistoryShareRequest) -> Result<(i64, Vec<(String, String)>), ApiError> {
+    match (req.v.unwrap_or(1), &req.boxes) {
+        (1, None) => Ok((1, Vec::new())),
+        (2, Some(boxes)) if (1..=MAX_BOXES).contains(&boxes.len()) => {
+            let mut out = Vec::with_capacity(boxes.len());
+            for (device_id, sealed) in boxes {
+                let size = tavrn_crypto::util::b64url_decode(sealed).map(|b| b.len()).unwrap_or(0);
+                if !tavrn_crypto::util::valid_ulid(device_id) || size == 0 || size > MAX_BOX_BYTES {
+                    return Err(bad(
+                        "history.invalid",
+                        "Every box must name a device id and be 1 to 128 bytes of base64url",
+                    ));
+                }
+                out.push((device_id.clone(), sealed.clone()));
+            }
+            Ok((2, out))
+        }
+        (2, _) => Err(bad("history.invalid", "A format 2 share carries 1 to 20 boxes")),
+        (1, Some(_)) => Err(bad("history.invalid", "A format 1 share carries no boxes")),
+        _ => Err(bad("history.invalid", "Unknown share format")),
+    }
+}
+
+/// Every box of a v2 share must be for an attested device of the recipient that has a share key (ENCRYPTION.md
+/// §7b). For a recipient of another node the key cache is refreshed once when a device is missing.
+async fn check_box_devices(
+    state: &AppState,
+    recipient: &crate::models::UserRow,
+    boxes: &[(String, String)],
+) -> Result<(), ApiError> {
+    if boxes.is_empty() {
+        return Ok(());
+    }
+    let mut known = store::e2ee::share_key_devices(&state.db, &recipient.id).await?;
+    let missing = |known: &[String]| boxes.iter().find(|(d, _)| !known.contains(d)).map(|(d, _)| d.clone());
+    if let Some(first) = missing(&known)
+        && recipient.domain != state.config.domain
+    {
+        crate::federation::keys::ensure(state, recipient, Some(&first)).await?;
+        known = store::e2ee::share_key_devices(&state.db, &recipient.id).await?;
+    }
+    if missing(&known).is_some() {
+        return Err(bad(
+            "history.invalid",
+            "Every box must be for an attested device of the recipient with a share key",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, ToSchema)]
@@ -72,6 +138,7 @@ pub async fn create_share(
         return Err(forbidden("History keys are shared only in room channels"));
     };
     let grants = Policy::of(channel.history_for_new_members.as_deref()).grants_history();
+    let (version, boxes) = share_format(&req)?;
     if req.ciphertext.len() > history::MAX_SHARE_BYTES {
         return Err(ApiError::PayloadTooLarge {
             code: "history.too_large",
@@ -132,6 +199,7 @@ pub async fn create_share(
             return Err(forbidden("The recipient may not receive this channel's history"));
         }
     }
+    check_box_devices(&state, &recipient, &boxes).await?;
     let to = recipient.address();
     let since = util::format_time(Utc::now() - Duration::hours(24));
     if store::history::count_since(&state.db, &conv.id, &to, &since).await? >= history::SHARES_PER_DAY {
@@ -147,6 +215,8 @@ pub async fn create_share(
             epoch_from: req.epoch_from,
             epoch_to: req.epoch_to,
             ciphertext: &req.ciphertext,
+            version,
+            boxes: &boxes,
         },
     )
     .await?;
@@ -189,6 +259,12 @@ pub struct HistoryShare {
     pub epoch_to: i64,
     pub ciphertext: String,
     pub created_at: String,
+    /// Share format: 1 or 2.
+    pub v: i64,
+    /// Format 2: the share's key sealed to the requesting device (base64url); null for format 1.
+    #[serde(rename = "box")]
+    #[schema(rename = "box")]
+    pub sealed_box: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -196,7 +272,8 @@ pub struct HistoryShareList {
     pub items: Vec<HistoryShare>,
 }
 
-/// Unacknowledged shares addressed to the requester (oldest first, at most 100).
+/// Unacknowledged shares addressed to the requester (oldest first, at most 100): every format 1 share and the format 2
+/// shares with a box for the requesting device, with only that box.
 #[utoipa::path(get, path = "/api/v1/conversations/{conversation_id}/history-keys", security(("bearer" = [])), params(("conversation_id" = String, Path)),
     responses((status = 200, body = HistoryShareList), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn list_shares(
@@ -205,7 +282,8 @@ pub async fn list_shares(
     Path(conversation_id): Path<String>,
 ) -> Result<Json<HistoryShareList>, ApiError> {
     let conv = entitled(&state, &auth, &conversation_id).await?;
-    let rows = store::history::shares_for(&state.db, &conv.id, &auth.user.address(), 100).await?;
+    let rows =
+        store::history::shares_for(&state.db, &conv.id, &auth.user.address(), auth.public_device_id(), 100).await?;
     Ok(Json(HistoryShareList {
         items: rows
             .into_iter()
@@ -217,6 +295,8 @@ pub async fn list_shares(
                 epoch_to: r.epoch_to,
                 ciphertext: r.ciphertext,
                 created_at: r.created_at,
+                v: r.version,
+                sealed_box: r.sealed,
             })
             .collect(),
     }))
