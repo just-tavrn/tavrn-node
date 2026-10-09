@@ -4890,15 +4890,15 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tavrn-crypto"
 version = "0.1.0"
-source = "git+https://github.com/just-tavrn/tavrn-crypto?rev=a240c3aeebff4e0e413f8f49e6e06e9d02a96cc5#a240c3aeebff4e0e413f8f49e6e06e9d02a96cc5"
+source = "git+https://github.com/just-tavrn/tavrn-crypto?rev=864fd4a2707f9fba00574ab283299864bc3b79c0#864fd4a2707f9fba00574ab283299864bc3b79c0"
 dependencies = [
  "aes-gcm 0.10.3",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bip39",
  "crypto_box",
  "ed25519-dalek",
  "getrandom 0.2.17",
- "hkdf 0.12.4",
+ "hkdf 0.13.0",
  "js-sys",
  "openmls",
  "openmls_rust_crypto",
@@ -4907,7 +4907,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "wasm-bindgen",
  "zeroize",
@@ -4997,7 +4997,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
