@@ -583,3 +583,114 @@ async fn the_room_node_learns_the_reset_of_a_remote_member() {
     let (st, list) = b.get_auth(&format!("/api/v1/rooms/{room_id}/history-requests"), carol.token()).await;
     assert_eq!((st, list["items"][0]["id"].clone()), (StatusCode::OK, req["id"].clone()), "{list}");
 }
+
+/// ENCRYPTION.md §7b "History after a key reset", end to end with policy `all` and real keys: Bob's re-attested device
+/// is pending for the range since the reset only, asks, is approved, receives a restore share with the old epochs'
+/// keys, reads every message with them, keeps them in his new backup (the reset dropped the old one) and acknowledges
+/// the share, which clears his pending mark.
+#[tokio::test]
+async fn a_restore_after_a_reset_reaches_the_new_device_and_its_backup() {
+    let mut s = setup().await;
+    rejoin(&mut s).await;
+    let conv = qualified(&s.channel);
+    let alice_address = format!("alice@{DOMAIN}");
+    let (_, backups) = s.node.get_auth("/api/v1/users/me/backups", s.bob.token()).await;
+    assert_eq!(backups["items"], json!([]), "the reset leaves no backup: {backups}");
+    let pending_path = format!("/api/v1/conversations/{}/history-pending", s.channel);
+    let (_, j) = s.node.get_auth(&pending_path, s.alice.token()).await;
+    assert_eq!(
+        (j["items"][0]["user"].as_str(), j["items"][0]["min_epoch"].as_i64()),
+        (Some(bob_address().as_str()), Some(2))
+    );
+    // Bob's new device holds no key of the old epochs.
+    assert!(s.bob.client.export_epoch_key(&conv, 1).is_err());
+
+    let (st, req) = ask(&s, s.bob.token(), "New phone, same Bob").await;
+    assert_eq!(st, StatusCode::CREATED, "{req}");
+    let (st, j) = s
+        .node
+        .post(&format!("{}/{}/approve", requests(&s), req["id"].as_str().unwrap()), s.alice.token(), json!({}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+
+    // The approving device shares the pre-reset epochs as a real, signed payload under the current epoch.
+    let epochs: Vec<Value> =
+        (0..=1u64).map(|e| json!([e, b64(s.alice.client.export_epoch_key(&conv, e).unwrap().as_slice())])).collect();
+    let payload =
+        json!({ "type": "history_keys", "v": 1, "conversation": conv, "to": bob_address(), "epochs": epochs })
+            .to_string();
+    let ciphertext = s.alice.client.encrypt_content(&conv, &payload).unwrap();
+    let base = format!("/api/v1/conversations/{}/history-keys", s.channel);
+    let (st, j) = s
+        .node
+        .post(
+            &base,
+            s.alice.token(),
+            json!({ "to_user": bob_address(), "epoch_from": 0, "epoch_to": 1, "ciphertext": ciphertext }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+
+    // Bob receives it, checks it and imports the keys.
+    let (_, j) = s.node.get_auth(&base, s.bob.token()).await;
+    let item = j["items"][0].clone();
+    assert_eq!((item["from_user"].as_str(), item["epoch_from"].as_i64()), (Some(alice_address.as_str()), Some(0)));
+    let plain = s
+        .bob
+        .client
+        .decrypt_content(&conv, &alice_address, &s.alice.session.device_id, item["ciphertext"].as_str().unwrap(), None)
+        .unwrap();
+    let share: Value = serde_json::from_str(&plain).unwrap();
+    assert_eq!(
+        (share["to"].as_str(), share["conversation"].as_str()),
+        (Some(bob_address().as_str()), Some(conv.as_str()))
+    );
+    for pair in share["epochs"].as_array().unwrap() {
+        let key: [u8; 32] = common::e2ee::unb64(&pair[1]).try_into().unwrap();
+        s.bob.client.import_epoch_key(&conv, pair[0].as_u64().unwrap(), &key).unwrap();
+    }
+    // The whole history is served again and readable with the restored keys.
+    let (_, list) = s.node.get_auth(&format!("/api/v1/conversations/{}/messages", s.channel), s.bob.token()).await;
+    let mut bodies: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["encrypted"] == true)
+        .map(|m| {
+            let json = s
+                .bob
+                .client
+                .decrypt_content(
+                    &conv,
+                    &alice_address,
+                    &s.alice.session.device_id,
+                    m["content"].as_str().unwrap(),
+                    None,
+                )
+                .unwrap();
+            serde_json::from_str::<Value>(&json).unwrap()["body"].as_str().unwrap().to_string()
+        })
+        .collect();
+    bodies.sort();
+    assert_eq!(bodies, ["After the reset", "Before Bob", "Bob was there"]);
+
+    // The restored keys go into Bob's new backup (under his new backup key).
+    let blob = s.bob.client.export_backup(&conv, &s.bob.master.backup_key()).unwrap();
+    let path = format!("/api/v1/users/me/backups/{DOMAIN}/{}", s.channel);
+    let (st, _, body) = s
+        .node
+        .raw(axum::http::Method::PUT, &path, s.bob.token(), &[("content-type", "application/octet-stream")], blob)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let (st, _, stored) = s.node.raw(axum::http::Method::GET, &path, s.bob.token(), &[], vec![]).await;
+    assert_eq!(st, StatusCode::OK);
+    let mut fresh =
+        tavrn_crypto::Client::new(tavrn_crypto::Device::generate(&bob_address(), &s.bob.session.device_id).unwrap());
+    assert!(fresh.import_backup(&conv, &s.bob.master.backup_key(), &stored).unwrap() >= 3, "epochs 0, 1 and 2");
+
+    // The acknowledgement clears the pending mark.
+    let (st, _) = s.node.delete(&format!("{base}/{}", item["id"].as_str().unwrap()), s.bob.token()).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, j) = s.node.get_auth(&pending_path, s.alice.token()).await;
+    assert_eq!(j["items"], json!([]), "{j}");
+}
