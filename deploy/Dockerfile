@@ -118,7 +118,7 @@ RUN curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSI
 
 # ---- LiveKit binary ---------------------------------------------------------
 # Pinned; keep in sync with livekit_version in the justfile and LIVEKIT_VERSION in .github/workflows/ci.yml.
-FROM livekit/livekit-server:v1.13.7 AS livekit
+FROM livekit/livekit-server:v1.13.8 AS livekit
 
 # ---- Runtime image ---------------------------------------------------------
 FROM debian:bookworm-slim
