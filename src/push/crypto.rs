@@ -310,21 +310,21 @@ mod tests {
     /// wrote, here for the RFC 8291 sender key: it must keep loading, and a new file must be written the same way.
     #[test]
     fn vapid_key_file_format_is_stable() {
-        const PEM: &str = "-----BEGIN PRIVATE KEY-----
+        const EXAMPLE_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyfWPiYE+n46HLnH0
 KqZOF1fJJU3MYrct3AELtAQ+oRyhRANCAAT+M/SrDepxkU21WCP3O1SUj0EwbZIH
 Mtu5pZpTKGSCIA5Zent7wmC6HCJ5mFgJkuk5cwAvMBKiiujwa7t45ewP
 -----END PRIVATE KEY-----
 ";
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(VAPID_KEY_FILE), PEM).unwrap();
+        std::fs::write(dir.path().join(VAPID_KEY_FILE), EXAMPLE_PEM).unwrap();
         let key = VapidKey::load_or_create(dir.path()).unwrap();
         assert_eq!(
             key.public_key(),
             "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
         );
         let written = SecretKey::from(&key.signing).to_pkcs8_pem(LineEnding::LF).unwrap();
-        assert_eq!(written.as_str(), PEM);
+        assert_eq!(written.as_str(), EXAMPLE_PEM);
     }
 
     #[test]
