@@ -56,18 +56,18 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
     let id = &access.room.id;
     let mut channels = store::rooms::channels(db, id).await?;
     let overrides = store::rooms::overrides_of_room(db, id).await?;
-    // Channels a bot cannot view (e.g. "no bots" zones) are invisible to it (APPLICATIONS.md §3.5).
-    if p::is_bot_kind(&access.kind) {
-        let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
-        channels.retain(|c| p::has(access::channel_perms_with(access, c, &overrides, &user_id), p::VIEW_CHANNEL));
+    // Channels the requester cannot view are not listed (layered overrides, protocol permissions.md "Evaluation"),
+    // for bots "no bots" zones included (APPLICATIONS.md §3.5). Owners, node admins and administrators see all.
+    let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
+    channels.retain(|c| p::has(access::channel_perms_with(access, c, &overrides, &user_id), p::VIEW_CHANNEL));
+    // A category is a container: it is listed when one of its channels is visible, or to those who manage channels.
+    let mut categories = store::rooms::categories(db, id).await?;
+    if !access.has(p::MANAGE_CHANNELS) {
+        categories.retain(|cat| channels.iter().any(|c| c.category_id.as_deref() == Some(cat.id.as_str())));
     }
     let read_states = match &access.member {
         Some(member) => {
-            let visible: Vec<String> = channels
-                .iter()
-                .filter(|c| p::has(access::channel_perms_with(access, c, &overrides, &member.user_id), p::VIEW_CHANNEL))
-                .map(|c| c.id.clone())
-                .collect();
+            let visible: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
             let system: Vec<String> = channels.iter().filter(|c| c.kind == "system").map(|c| c.id.clone()).collect();
             let user = store::users::by_id(db, &member.user_id)
                 .await?
@@ -91,7 +91,7 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
     Ok(RoomDetail {
         room: access.room.clone(),
         member_count: store::rooms::member_count(db, id).await?,
-        categories: store::rooms::categories(db, id).await?,
+        categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
         roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
         overrides: overrides.iter().map(|o| o.to_api()).collect(),

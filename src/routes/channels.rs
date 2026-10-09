@@ -266,6 +266,9 @@ pub struct UpdateChannelRequest {
     #[serde(default, with = "crate::serde_with_double_option")]
     pub category_id: Option<Option<String>>,
     pub position: Option<i64>,
+    /// Deprecated and ignored (protocol permissions.md "Changes", 2026-10-09): overrides are layered, a channel
+    /// always inherits its category's overrides underneath its own. Accepted for one release, then unknown.
+    #[schema(deprecated)]
     pub sync_with_category: Option<bool>,
     pub slowmode_secs: Option<i64>,
     pub bitrate_kbps: Option<i64>,
@@ -301,7 +304,6 @@ pub async fn update_channel(
         && (req.name.is_some()
             || req.category_id.is_some()
             || req.position.is_some()
-            || req.sync_with_category.is_some()
             || req.slowmode_secs.is_some()
             || req.bitrate_kbps.is_some()
             || req.user_limit.is_some()
@@ -365,7 +367,6 @@ pub async fn update_channel(
             topic: topic.as_deref(),
             category_id: req.category_id.as_ref().map(|c| c.as_deref()),
             position: req.position,
-            sync_with_category: req.sync_with_category,
             slowmode_secs: slowmode,
             bitrate_kbps: bitrate,
             user_limit,
@@ -523,8 +524,29 @@ pub struct SetOverrideRequest {
     pub upload_deny: Option<Vec<String>>,
 }
 
+/// Overrides carry channel-scoped bits only (protocol permissions.md "Channel-scoped bits"): room-level bits are
+/// granted through roles. `400 permissions.not_channel_scoped` with the refused names in `meta.names`.
+fn check_channel_scoped(bits: u64) -> Result<(), ApiError> {
+    let refused = bits & !p::CHANNEL_SCOPED;
+    if refused == 0 {
+        return Ok(());
+    }
+    Err(ApiError::BadRequestMeta {
+        code: "permissions.not_channel_scoped",
+        detail: format!(
+            "These permissions are room-wide and cannot be set per channel: {}",
+            p::names(refused).join(", ")
+        ),
+        meta: serde_json::json!({ "names": p::names(refused) }),
+    })
+}
+
 /// Set an override, or remove it when allow = deny = 0 (`manage_roles`).
-#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>)))]
+///
+/// Overrides are layered (protocol permissions.md "Evaluation"): a category's overrides apply to the role base of
+/// every channel in it, the channel's own on top; a bit an override neither allows nor denies inherits from the
+/// layer below. Only channel-scoped bits are accepted (`400 permissions.not_channel_scoped`).
+#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn set_override(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -542,6 +564,9 @@ pub async fn set_override(
     if !exists {
         return Err(access::not_found("Target", "override.target_not_found"));
     }
+    let allow = validate::permissions("allow", &req.allow)?;
+    let deny = validate::permissions("deny", &req.deny)?;
+    check_channel_scoped(allow | deny)?;
     match subject_type.as_str() {
         "role" => {
             let role = store::rooms::role_by_id(&state.db, &room_id, &req.subject_id)
@@ -554,7 +579,7 @@ pub async fn set_override(
                 });
             }
             if role.is_everyone != 0 {
-                crate::routes::roles::check_everyone(validate::permissions("allow", &req.allow)?)?;
+                crate::routes::roles::check_everyone(allow)?;
             }
         }
         _ => {
@@ -563,8 +588,6 @@ pub async fn set_override(
             }
         }
     }
-    let allow = validate::permissions("allow", &req.allow)?;
-    let deny = validate::permissions("deny", &req.deny)?;
     if allow & deny != 0 {
         return Err(bad("override.conflict", "A permission cannot be allowed and denied at once"));
     }

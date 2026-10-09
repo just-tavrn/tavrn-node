@@ -1672,6 +1672,11 @@ room-creation grants, delete all content, reset a locked-out user's second facto
 entitlements, legal pages and notices, and the node audit log. Room moderation (kicks, bans, timeouts, roles and
 permissions) is done by each room's owners and moderators.
 
+Room permissions are layered (protocol `permissions.md`): roles give the base, a category's overrides apply to all
+of its channels, and a channel's own overrides win over the category's. Overrides only hold channel-scoped
+permissions; at start the node removes room-wide permissions from overrides created by older versions and records
+each change in the room's audit log (`role.override_restricted`). Nothing needs to be done by the operator.
+
 ### Spam bursts
 
 `TAVRN_AUTOMOD_BURST_LIMIT` (default 10): more than this many messages of one user in one room channel within 5

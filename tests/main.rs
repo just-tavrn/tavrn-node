@@ -55,6 +55,7 @@ mod suite {
     mod notifications_flow;
     mod pending_removals_flow;
     mod permissions_flow;
+    mod permissions_layered_flow;
     mod presence_flow;
     mod profiles_flow;
     mod push_flow;

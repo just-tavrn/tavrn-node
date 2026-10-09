@@ -632,7 +632,6 @@ mod tests {
             name: "f".into(),
             topic: String::new(),
             position: 0,
-            sync_with_category: 1,
             slowmode_secs: 0,
             bitrate_kbps: 64,
             user_limit: 0,

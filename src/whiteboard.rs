@@ -315,7 +315,6 @@ pub async fn channel_viewers(state: &AppState, room: &Room, channel: &ChannelRow
                 .collect(),
             category_overrides: category_overrides.clone(),
             channel_overrides: channel_overrides.clone(),
-            sync_with_category: channel.sync_with_category != 0 && channel.category_id.is_some(),
             timed_out: member.is_timed_out(),
             // Bots never see a "no bots" channel; their scopes filter their WebSocket (APPLICATIONS.md §2.6).
             kind: if bots.contains(&member.user_id) { "bot".into() } else { "user".into() },
