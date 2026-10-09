@@ -436,6 +436,17 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         }
         _ => return Ok(()),
     };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Room channels: who may view the channel now (the WebSocket fan-out's check, PROTOCOL.md §6).
+    let view = match (row.kind.as_str(), &row.room_id) {
+        ("channel", Some(room_id)) => match crate::visibility::room(state, room_id).await? {
+            Some(view) => Some(view),
+            None => return Ok(()),
+        },
+        _ => None,
+    };
     let author = store::users::by_id(&state.db, author_id).await?;
     let sender = message
         .author_room_profile
@@ -456,25 +467,39 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         if user.domain != state.config.domain || user.disabled_at.is_some() {
             continue;
         }
-        // The user's own view of the conversation: membership, `view_channel`, message requests.
-        let conv = match access::conversation(state, &row.id, &user).await {
-            Ok(c) => c,
-            Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
-            Err(e) => return Err(e),
-        };
-        if !conv.entitled() || conv.is_request_for(&user.id) {
-            continue;
-        }
-        let (room_id, role_ids, room_name, channel_name) = match &conv.kind {
-            ConvKind::Channel { access, channel } => {
+        let (room_id, role_ids, room_name, channel_name) = match &view {
+            // Room channels: membership and `view_channel` from the room's visibility snapshot.
+            Some(view) => {
+                let Some(channel) = view.channel(&row.id) else { return Ok(()) };
                 // Welcome and system channels never notify.
                 if channel.kind == "system" {
+                    return Ok(());
+                }
+                let Some(member) = view.member(&user.id).filter(|_| view.can_view(&row.id, &user.id)) else {
+                    continue;
+                };
+                (
+                    Some(view.room.id.clone()),
+                    member.role_ids.clone(),
+                    Some(view.room.name.clone()),
+                    Some(channel.name.clone()),
+                )
+            }
+            // DMs and group DMs: the user's own view of the conversation (membership, message requests).
+            None => {
+                let conv = match access::conversation(state, &row.id, &user).await {
+                    Ok(c) => c,
+                    Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+                if !conv.entitled() || conv.is_request_for(&user.id) {
                     continue;
                 }
-                let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &user.id).await?;
-                (Some(access.room.id.clone()), roles, Some(access.room.name.clone()), Some(channel.name.clone()))
+                match &conv.kind {
+                    ConvKind::Direct { row, .. } => (None, Vec::new(), None, row.name.clone()),
+                    ConvKind::Channel { .. } => continue,
+                }
             }
-            ConvKind::Direct { row, .. } => (None, Vec::new(), None, row.name.clone()),
         };
         if let Some(author) = &author
             && store::social::blocked_either(&state.db, &user.id, &author.id).await?

@@ -18,13 +18,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{
-    app::AppState,
-    error::ApiError,
-    models::{ChannelRow, Room},
-    permissions::{self, Perms},
-    store,
-};
+use crate::{app::AppState, error::ApiError, store};
 
 /// Largest `content` of an ephemeral event (the ciphertext string or the serialized plaintext object).
 pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
@@ -285,51 +279,6 @@ impl Whiteboards {
     }
 }
 
-/// User ids of the room members who may view `channel` (owner and administrators included).
-pub async fn channel_viewers(state: &AppState, room: &Room, channel: &ChannelRow) -> Result<Vec<String>, ApiError> {
-    let roles = store::rooms::roles(&state.db, &room.id).await?;
-    let Some(everyone) = roles.iter().find(|r| r.is_everyone != 0) else { return Ok(Vec::new()) };
-    let perms_of: HashMap<&str, Perms> = roles.iter().map(|r| (r.id.as_str(), r.perms())).collect();
-    let overrides = store::rooms::overrides_of_room(&state.db, &room.id).await?;
-    let of = |target_type: &str, target_id: Option<&str>| -> Vec<permissions::Override> {
-        overrides
-            .iter()
-            .filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id)
-            .map(|o| o.to_eval())
-            .collect()
-    };
-    let category_overrides = of("category", channel.category_id.as_deref());
-    let channel_overrides = of("channel", Some(&channel.id));
-    let mut viewers = Vec::new();
-    let bots = store::applications::bot_member_ids(&state.db, &room.id).await?;
-    for (member, role_ids) in store::rooms::members_with_roles(&state.db, &room.id).await? {
-        let input = permissions::Input {
-            user_id: member.user_id.clone(),
-            is_owner: room.owner_id == member.user_id,
-            everyone_role_id: everyone.id.clone(),
-            everyone_permissions: everyone.perms(),
-            member_roles: role_ids
-                .iter()
-                .filter_map(|id| perms_of.get(id.as_str()).map(|p| (id.clone(), *p)))
-                .filter(|(id, _)| *id != everyone.id)
-                .collect(),
-            category_overrides: category_overrides.clone(),
-            channel_overrides: channel_overrides.clone(),
-            sync_with_category: channel.sync_with_category != 0 && channel.category_id.is_some(),
-            timed_out: member.is_timed_out(),
-            // Bots never see a "no bots" channel; their scopes filter their WebSocket (APPLICATIONS.md §2.6).
-            kind: if bots.contains(&member.user_id) { "bot".into() } else { "user".into() },
-            no_bots: channel.no_bots(),
-            scopes: None,
-            system_channel: channel.kind == "system",
-        };
-        if permissions::has(permissions::compute(&input), permissions::VIEW_CHANNEL) {
-            viewers.push(member.user_id);
-        }
-    }
-    Ok(viewers)
-}
-
 /// Who receives the ephemeral events of a conversation: room members with read access to the channel,
 /// or the accepted members of a DM or group DM. Cached for [`AUDIENCE_TTL`].
 pub async fn audience(state: &AppState, conversation_id: &str) -> Result<Arc<Vec<String>>, ApiError> {
@@ -341,16 +290,11 @@ pub async fn audience(state: &AppState, conversation_id: &str) -> Result<Arc<Vec
         return Ok(Arc::new(Vec::new()));
     };
     let users = match (row.kind.as_str(), &row.room_id) {
-        ("channel", Some(room_id)) => {
-            let room = store::rooms::room_by_id(&state.db, room_id).await?;
-            let channel = store::rooms::channel_by_id(&state.db, conversation_id).await?;
-            match (room, channel) {
-                (Some(room), Some(channel)) if channel.room_id == room.id => {
-                    channel_viewers(state, &room, &channel).await?
-                }
-                _ => Vec::new(),
-            }
-        }
+        // The members who may view the channel (`crate::visibility`, the check of every per-room fan-out).
+        ("channel", Some(room_id)) => match crate::visibility::room(state, room_id).await? {
+            Some(view) => view.viewers(conversation_id).iter().cloned().collect(),
+            None => Vec::new(),
+        },
         ("dm" | "group", _) => {
             let requested = store::social::requested_ids(&state.db, conversation_id).await?;
             store::social::member_ids(&state.db, conversation_id)

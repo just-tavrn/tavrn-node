@@ -98,16 +98,33 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         });
     }
     let roles = store::rooms::roles(&state.db, room_id).await?;
+    let role_ids = match &member {
+        Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
+        None => Vec::new(),
+    };
+    let adult = crate::age::is_adult(state, user).await?;
+    member_access(room, &roles, member, &role_ids, user, adult)
+}
+
+/// The [`RoomAccess`] of `user` from already loaded room data: the room's `roles` (with @everyone), the user's
+/// membership and role ids, and whether the user passes age gates (`age::is_adult`). [`room_access`] uses it for one request, the channel visibility snapshot
+/// (`visibility.rs`) for every member of a room at once.
+pub fn member_access(
+    room: Room,
+    roles: &[RoleRow],
+    member: Option<MemberRow>,
+    role_ids: &[String],
+    user: &UserRow,
+    adult: bool,
+) -> Result<RoomAccess, ApiError> {
+    let is_node_admin = user.is_node_admin();
     let everyone = roles
         .iter()
         .find(|r| r.is_everyone != 0)
         .cloned()
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("room without an @everyone role")))?;
-    let role_ids = match &member {
-        Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
-        None => Vec::new(),
-    };
-    let member_roles: Vec<RoleRow> = roles.into_iter().filter(|r| role_ids.contains(&r.id)).collect();
+    let member_roles: Vec<RoleRow> =
+        roles.iter().filter(|r| r.is_everyone == 0 && role_ids.contains(&r.id)).cloned().collect();
     let is_owner = room.owner_id == user.id;
     let eval_roles: Vec<(String, Perms)> = member_roles.iter().map(|r| (r.id.clone(), r.perms())).collect();
     let mut room_perms = permissions::room_level(is_owner || is_node_admin, everyone.perms(), &eval_roles);
@@ -126,7 +143,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         room_perms,
         kind: user.kind.clone(),
         scopes: user.app_scopes.clone(),
-        adult: crate::age::is_adult(state, user).await?,
+        adult,
     })
 }
 

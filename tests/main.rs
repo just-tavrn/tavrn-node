@@ -22,6 +22,7 @@ mod suite {
     mod blob_deletion_flow;
     mod bots_encrypted_flow;
     mod calls_flow;
+    mod channel_visibility_flow;
     mod cluster_flow;
     mod cluster_outage_flow;
     mod commands_flow;
