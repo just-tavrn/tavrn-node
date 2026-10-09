@@ -1244,3 +1244,66 @@ async fn remote_applications_and_remote_users() {
         .unwrap();
     assert_eq!(left, 0);
 }
+
+/// Commands invoked in a thread are answered there (tavrn-node #6): the invocation carries `thread_id`, the reply and
+/// the follow-ups go into the thread unless they name another thread of the conversation.
+#[tokio::test]
+async fn commands_in_threads_are_answered_in_the_thread() {
+    let w = world().await;
+    let (node, bob) = (&w.node, &w.bob);
+    let path = invoke_path(&w.channel);
+    let mut r = receiver(node, &w.bot.user_id, &w.bot.device_id);
+    let threads = format!("/api/v1/rooms/{}/channels/{}/threads", w.room_id, w.channel);
+    let (s, thread) = node.post(&threads, &bob.token, json!({ "title": "Forecasts" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{thread}");
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+    let (_, other) = node.post(&threads, &bob.token, json!({ "title": "Elsewhere" })).await;
+    let other_id = other["id"].as_str().unwrap().to_string();
+
+    // Unknown threads and threads of other conversations are refused before the bot hears anything.
+    let (s, j) = node.post(&path, &bob.token, json!({ "command": w.r("ping"), "thread_id": util::ulid() })).await;
+    assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"), "{j}");
+
+    let task =
+        spawn_post(node, path.clone(), &bob.token, json!({ "command": w.r("ping"), "thread_id": thread_id }), None);
+    let data = r.invocation().await;
+    assert_eq!(data["thread_id"], thread_id.as_str());
+    let id = data["interaction_id"].as_str().unwrap().to_string();
+    let (s, j) = node
+        .post(
+            &format!("/api/v1/interactions/{id}/callback"),
+            &w.bot.secret,
+            json!({ "type": "reply", "content": { "type": "text", "body": "pong" } }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (_, res) = task.await.unwrap();
+    assert_eq!(res["message"]["thread_id"], thread_id.as_str(), "{res}");
+    let (_, t) = node.get_auth(&format!("/api/v1/threads/{thread_id}"), &bob.token).await;
+    assert_eq!(t["last_message_id"], res["message"]["id"], "{t}");
+
+    // Follow-ups: the interaction's thread, or another thread of the conversation they name.
+    let follow = format!("/api/v1/interactions/{id}/messages");
+    let (s, j) = node.post(&follow, &w.bot.secret, json!({ "content": { "type": "text", "body": "more" } })).await;
+    assert_eq!((s, j["message"]["thread_id"].as_str()), (StatusCode::CREATED, Some(thread_id.as_str())), "{j}");
+    let (s, j) = node
+        .post(&follow, &w.bot.secret, json!({ "content": { "type": "text", "body": "there" }, "thread_id": other_id }))
+        .await;
+    assert_eq!((s, j["message"]["thread_id"].as_str()), (StatusCode::CREATED, Some(other_id.as_str())), "{j}");
+    let (s, j) = node
+        .post(&follow, &w.bot.secret, json!({ "content": { "type": "text", "body": "x" }, "thread_id": util::ulid() }))
+        .await;
+    assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"), "{j}");
+    // Ephemeral replies name the thread for the invoker's client.
+    let (s, j) = node
+        .post(&follow, &w.bot.secret, json!({ "ephemeral": true, "content": { "type": "text", "body": "psst" } }))
+        .await;
+    assert_eq!((s, j["ephemeral"]["thread_id"].as_str()), (StatusCode::CREATED, Some(thread_id.as_str())), "{j}");
+
+    // A locked thread: members without manage_threads cannot invoke commands there.
+    let (s, j) = node.patch(&format!("/api/v1/threads/{thread_id}"), &w.carol.token, json!({ "locked": true })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node.post(&path, &bob.token, json!({ "command": w.r("ping"), "thread_id": thread_id })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "thread.locked"), "{j}");
+    drop(r);
+}

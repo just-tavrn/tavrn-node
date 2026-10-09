@@ -56,15 +56,23 @@ pub struct GlobalSettings {
     /// conversations). Left out of the document while off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub push_text: bool,
+    /// Web push for new reports (MODERATION.md §1.5) to the room moderators and node admins who receive them (default
+    /// on). Left out of the document while on.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub reports: bool,
 }
 
 fn yes() -> bool {
     true
 }
 
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
-        Self { mode: Mode::All, sound: true, browser: false, push_text: false }
+        Self { mode: Mode::All, sound: true, browser: false, push_text: false, reports: true }
     }
 }
 
@@ -277,7 +285,14 @@ mod tests {
             "channels": { CHAN: { "muted_until": "forever" } }
         }))
         .unwrap();
-        assert_eq!(s.global, GlobalSettings { mode: Mode::Mentions, sound: true, browser: false, push_text: false });
+        assert_eq!(
+            s.global,
+            GlobalSettings { mode: Mode::Mentions, sound: true, browser: false, push_text: false, reports: true }
+        );
+        // `reports` is on by default and appears in the document only while off.
+        assert!(serde_json::to_value(&s.global).unwrap().get("reports").is_none());
+        let off = parse(serde_json::json!({ "global": { "mode": "all", "reports": false } })).unwrap();
+        assert_eq!(serde_json::to_value(&off.global).unwrap()["reports"], false);
         assert_eq!(s.rooms.len(), 1, "empty entries are dropped");
         assert_eq!(s.rooms[ROOM].muted_until.as_deref(), Some("2029-12-31T23:00:00.000Z"));
         assert_eq!(s.channels[CHAN].muted_until.as_deref(), Some(FOREVER));

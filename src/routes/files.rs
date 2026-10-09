@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Routes of files channels (`protocol/FILES.md`): list and search, folders, streamed
 //! uploads and ranged downloads, rename/move, recursive delete, usage, and the per-channel storage backend.
+//! End-to-end encrypted channels (§8) take client-chosen ids and entry records instead of names, store the
+//! clients' ciphertext as it is, keep thumbnails, and serve records only inside the requester's history window.
 //!
 //! Permissions (channel level): `view_channel` browses and downloads; `attach_files` uploads, creates folders
 //! and renames, moves or deletes the member's own entries; `manage_files` does that for everybody's entries;
 //! the backend needs `manage_channels` and `manage_files`. Bots have no access (not in `APP_ROUTES`).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -52,6 +54,12 @@ pub fn routes() -> Router<AppState> {
         .route(base, get(list))
         .route(&format!("{base}/folders"), post(create_folder).layer(small()))
         .route(&format!("{base}/usage"), get(usage))
+        .route(&format!("{base}/mine"), get(mine))
+        .route(&format!("{base}/records"), get(records))
+        .route(
+            &format!("{base}/{{entry_id}}/thumbnail"),
+            get(get_thumbnail).put(put_thumbnail).layer(DefaultBodyLimit::disable()),
+        )
         .route(&format!("{base}/backend"), get(get_backend).put(put_backend).layer(small()))
         .route(&format!("{base}/backend/test"), post(test_backend).layer(small()))
         .route(&format!("{base}/{{entry_id}}"), get(get_entry).patch(update).delete(delete).layer(small()))
@@ -78,6 +86,10 @@ pub fn upload_route() -> axum::routing::MethodRouter<AppState> {
         update,
         delete,
         usage,
+        mine,
+        records,
+        put_thumbnail,
+        get_thumbnail,
         get_backend,
         put_backend,
         test_backend
@@ -91,6 +103,8 @@ pub fn upload_route() -> axum::routing::MethodRouter<AppState> {
         UpdateEntryRequest,
         DeleteResult,
         FilesInfo,
+        MineList,
+        RecordList,
         BackendInfo,
         BackendRequest,
         BackendTest
@@ -145,6 +159,58 @@ async fn entry_in(state: &AppState, conv: &Conv, entry_id: &str) -> Result<Entry
         return Err(entry_not_found());
     }
     store::files::entry(&state.db, &conv.id, entry_id).await?.ok_or_else(entry_not_found)
+}
+
+/// Start of the requester's history window for entry records (RFC 3339; FILES.md §8.7), `None` = no limit.
+/// Only encrypted channels and room members (node admins who are not members cannot decrypt anyway).
+fn record_cut(conv: &Conv) -> Option<String> {
+    if !conv.encrypted {
+        return None;
+    }
+    let ConvKind::Channel { access, channel } = &conv.kind else { return None };
+    let member = access.member.as_ref()?;
+    let joined = util::parse_time(&member.joined_at)?;
+    let policy = crate::history::Policy::of(channel.history_for_new_members.as_deref());
+    crate::history::cutoff(policy, p::has(conv.perms, p::READ_HISTORY), joined).map(util::format_time)
+}
+
+/// Checks an entry record like message content (FILES.md §8.4) and returns it as stored with the session's user
+/// and device.
+async fn check_record<'a>(
+    state: &AppState,
+    auth: &'a AuthUser,
+    author: &'a str,
+    conv: &Conv,
+    record: Option<&'a str>,
+    epoch: Option<i64>,
+) -> Result<store::files::Record<'a>, ApiError> {
+    let record = files::record_shape(record)?;
+    let epoch = crate::routes::messages::check_ciphertext(state, auth, &conv.id, record, epoch).await?;
+    Ok(store::files::Record { record, epoch, author, device_id: auth.public_device_id() })
+}
+
+fn encrypted_names() -> ApiError {
+    bad("files.encrypted", "This channel is end-to-end encrypted: names travel inside the entry record")
+}
+
+fn not_encrypted() -> ApiError {
+    bad("files.not_encrypted", "This files channel is not end-to-end encrypted")
+}
+
+fn crumbs(path: Vec<EntryRow>, cut: Option<&str>) -> Vec<Crumb> {
+    path.into_iter()
+        .map(|f| {
+            let e = f.to_api_cut(cut);
+            Crumb {
+                id: f.id,
+                name: f.name,
+                record: e.record,
+                record_epoch: e.record_epoch,
+                record_author: e.record_author,
+                record_device_id: e.record_device_id,
+            }
+        })
+        .collect()
 }
 
 /// A folder of this channel (`None` = top level).
@@ -265,74 +331,195 @@ pub async fn storage_of(state: &AppState, channel_id: &str) -> Result<Storage, A
     })
 }
 
-/// Removes the bytes of deleted entries: internal files now, external objects in the background.
-async fn remove_bytes(state: &AppState, storage: Option<Storage>, entries: Vec<EntryRow>) {
-    let mut remote_keys = Vec::new();
-    for e in entries.into_iter().filter(|e| !e.is_folder()) {
+/// The sealed configuration of a channel's external store, read before its rows go.
+#[derive(Clone)]
+pub struct StoreRef {
+    kind: String,
+    config: String,
+}
+
+/// The external stores of `channels` (channels without one are left out).
+async fn stores_of(state: &AppState, channels: &[String]) -> Result<HashMap<String, StoreRef>, ApiError> {
+    let mut out = HashMap::new();
+    for c in channels {
+        if let Some(row) = store::files::backend(&state.db, c).await?
+            && row.kind != "internal"
+        {
+            out.insert(c.clone(), StoreRef { kind: row.kind, config: row.config });
+        }
+    }
+    Ok(out)
+}
+
+/// Removes the bytes of deleted entries: internal files and thumbnails now; external objects go through the queue
+/// of pending deletes (FILES.md §6), except those of the channels in `keep` (§9). Returns the objects kept.
+async fn remove_bytes(
+    state: &AppState,
+    entries: Vec<EntryRow>,
+    stores: &HashMap<String, StoreRef>,
+    keep: &HashSet<String>,
+) -> u64 {
+    let mut remote: HashMap<String, Vec<String>> = HashMap::new();
+    let mut kept = 0;
+    for e in entries {
+        if let Some(tid) = e.thumbnail_id.as_deref().filter(|s| util::is_ulid(s)) {
+            state.storage.delete(tid).await;
+        }
+        if e.is_folder() {
+            continue;
+        }
         if let Some(sid) = e.storage_id.as_deref().filter(|s| util::is_ulid(s)) {
             state.storage.delete(sid).await;
         } else if e.backend != "internal" {
-            remote_keys.push((e.id, e.encrypted != 0));
+            if keep.contains(&e.channel_id) {
+                kept += 1;
+                continue;
+            }
+            if e.encrypted != 0 {
+                // Without its key the wrapped object is unreadable at once, whenever the store deletes it.
+                state.storage.delete_key(&e.id).await;
+            }
+            remote.entry(e.channel_id.clone()).or_default().push(e.id);
         }
     }
-    if remote_keys.is_empty() {
-        return;
+    for (channel, keys) in remote {
+        let Some(store_ref) = stores.get(&channel) else {
+            tracing::warn!(channel = %channel, objects = keys.len(), "external objects not deleted (no store configuration)");
+            continue;
+        };
+        match store::files::enqueue_deletes(&state.db, &channel, &store_ref.kind, &store_ref.config, &keys).await {
+            Ok(ids) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_pending_deletes(&state, Some(&ids), chrono::Utc::now()).await {
+                        tracing::warn!(error = %e, "external objects not deleted yet (retried by housekeeping)");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, channel = %channel, "external deletes could not be queued"),
+        }
     }
-    let Some(Storage::Remote { store, .. }) = storage else {
-        tracing::warn!(objects = remote_keys.len(), "external objects not deleted (store not available)");
-        return;
-    };
-    let state = state.clone();
-    tokio::spawn(async move {
-        let store = Arc::new(store);
-        futures::stream::iter(remote_keys)
-            .for_each_concurrent(4, |(key, encrypted)| {
-                let (store, state) = (store.clone(), state.clone());
-                async move {
-                    if let Err(e) = store.delete(&key).await {
-                        tracing::warn!(object = %key, error = ?e, "external object could not be deleted");
-                    }
-                    if encrypted {
-                        state.storage.delete_key(&key).await;
-                    }
-                }
+    kept
+}
+
+/// What a run of the queue of pending external deletes did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PendingReport {
+    pub deleted: u64,
+    pub failed: u64,
+    /// Objects older than [`PENDING_GIVE_UP_DAYS`] that were dropped from the queue (logged).
+    pub given_up: u64,
+}
+
+/// Queued deletes older than this are given up.
+pub const PENDING_GIVE_UP_DAYS: i64 = 7;
+const PENDING_BATCH: i64 = 500;
+
+/// Deletes queued external objects (FILES.md §6): the given queue ids, or every entry due at `now` (housekeeping).
+/// A failure is retried after 1, 2, 4 … (at most 24) hours; entries older than 7 days are given up. Paused while
+/// `TAVRN_FILES_EXTERNAL=off`.
+pub async fn run_pending_deletes(
+    state: &AppState,
+    ids: Option<&[String]>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PendingReport, ApiError> {
+    let mut report = PendingReport::default();
+    if !state.config.files_external.on() {
+        return Ok(report);
+    }
+    let now_s = util::format_time(now);
+    let give_up_before = util::format_time(now - chrono::Duration::days(PENDING_GIVE_UP_DAYS));
+    loop {
+        let rows = store::files::pending_deletes(&state.db, &now_s, ids, PENDING_BATCH).await?;
+        let count = rows.len() as i64;
+        let mut stores: HashMap<(String, String), Option<Arc<RemoteStore>>> = HashMap::new();
+        let mut work = Vec::new();
+        for row in rows {
+            if row.created_at < give_up_before {
+                tracing::warn!(object = %row.object_key, channel = %row.channel_id, "external object given up after 7 days");
+                store::files::delete_pending(&state.db, &row.id).await?;
+                report.given_up += 1;
+                continue;
+            }
+            let store = stores
+                .entry((row.channel_id.clone(), row.config.clone()))
+                .or_insert_with(|| {
+                    let kind = Kind::parse(&row.kind).filter(|k| *k != Kind::Internal)?;
+                    let config = files::open_config(state, &row.channel_id, &row.config).ok()?;
+                    Some(Arc::new(RemoteStore::new(kind, config, state.config.files_external_private.on())))
+                })
+                .clone();
+            work.push((row, store));
+        }
+        let results: Vec<(store::files::PendingDelete, bool)> = futures::stream::iter(work)
+            .map(|(row, store)| async move {
+                let ok = match store {
+                    Some(store) => store.delete(&row.object_key).await.is_ok(),
+                    None => false,
+                };
+                (row, ok)
             })
+            .buffer_unordered(4)
+            .collect()
             .await;
-    });
+        for (row, ok) in results {
+            if ok {
+                store::files::delete_pending(&state.db, &row.id).await?;
+                report.deleted += 1;
+            } else {
+                let attempts = row.attempts + 1;
+                let hours = 1i64 << (attempts - 1).clamp(0, 5);
+                let next = util::format_time(now + chrono::Duration::hours(hours.min(24)));
+                store::files::pending_failed(&state.db, &row.id, attempts, &next).await?;
+                report.failed += 1;
+            }
+        }
+        if ids.is_some() || count < PENDING_BATCH {
+            break;
+        }
+    }
+    Ok(report)
 }
 
 /// What deleting a channel or a room must remove besides its rows: collected before the delete.
 pub struct Cleanup {
     entries: Vec<EntryRow>,
-    storages: Vec<(String, Option<Storage>)>,
+    stores: HashMap<String, StoreRef>,
+    keep: HashSet<String>,
 }
 
 impl Cleanup {
-    /// Collects the stored entries of a channel (`channel_id`) or a room (`room_id`).
-    pub async fn collect(state: &AppState, column: &str, id: &str) -> Result<Self, ApiError> {
+    /// Collects the stored entries of a channel (`channel_id`) or a room (`room_id`) and the configurations of
+    /// their external stores. `keep_external`: the objects of unencrypted external channels stay (FILES.md §9).
+    pub async fn collect(state: &AppState, column: &str, id: &str, keep_external: bool) -> Result<Self, ApiError> {
         let entries = store::files::stored_of(&state.db, column, id).await?;
         let mut channels: Vec<String> =
             entries.iter().filter(|e| e.backend != "internal").map(|e| e.channel_id.clone()).collect();
         channels.sort();
         channels.dedup();
-        let mut storages = Vec::new();
-        for c in channels {
-            let s = storage_of(state, &c).await.ok();
-            storages.push((c, s));
+        let stores = stores_of(state, &channels).await?;
+        let mut keep = HashSet::new();
+        if keep_external {
+            for c in &channels {
+                if !store::files::channel_encrypted(&state.db, c).await? {
+                    keep.insert(c.clone());
+                }
+            }
         }
-        Ok(Self { entries, storages })
+        Ok(Self { entries, stores, keep })
+    }
+
+    /// External objects that will be kept.
+    pub fn kept_objects(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| !e.is_folder() && e.backend != "internal" && self.keep.contains(&e.channel_id))
+            .count() as u64
     }
 
     /// Deletes the bytes (after the rows are gone).
     pub async fn run(self, state: &AppState) {
-        let Self { mut entries, storages } = self;
-        for (channel, storage) in storages {
-            let (theirs, rest): (Vec<EntryRow>, Vec<EntryRow>) =
-                entries.into_iter().partition(|e| e.channel_id == channel && e.backend != "internal");
-            entries = rest;
-            remove_bytes(state, storage, theirs).await;
-        }
-        remove_bytes(state, None, entries).await;
+        remove_bytes(state, self.entries, &self.stores, &self.keep).await;
     }
 }
 
@@ -359,7 +546,17 @@ pub struct ListQuery {
 #[derive(Serialize, ToSchema)]
 pub struct Crumb {
     pub id: String,
+    /// Empty in encrypted channels (the name is in the folder's record).
     pub name: String,
+    /// Encrypted channels: the folder's record as in [`FileEntry`] (absent elsewhere).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_device_id: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -375,15 +572,20 @@ pub struct FileList {
 /// Entries of a folder, or a name search across the channel (`view_channel`).
 #[utoipa::path(get, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path), ListQuery),
-    responses((status = 200, body = FileList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, body = FileList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<FileList>, ApiError> {
+    state.files_limiter.check_all(&[format!("files:{}", auth.user.id)])?;
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let limit = validate::limit(q.limit, files::LIST_DEFAULT, files::LIST_MAX);
+    if conv.encrypted && q.q.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        return Err(bad("files.search_unavailable", "Search runs on the clients in end-to-end encrypted channels"));
+    }
+    let cut = record_cut(&conv);
     let after = match q.after.as_deref().filter(|a| !a.is_empty()) {
         Some(a) => Some(entry_in(&state, &conv, a).await.map_err(|_| bad("files.cursor_invalid", "Unknown cursor"))?),
         None => None,
@@ -408,11 +610,11 @@ pub async fn list(
         }
     };
     let more = rows.len() as i64 > limit;
-    let entries: Vec<FileEntry> = rows.iter().take(limit as usize).map(EntryRow::to_api).collect();
+    let entries: Vec<FileEntry> = rows.iter().take(limit as usize).map(|r| r.to_api_cut(cut.as_deref())).collect();
     Ok(Json(FileList {
         next_after: if more { entries.last().map(|e| e.id.clone()) } else { None },
         entries,
-        path: path.into_iter().map(|f| Crumb { id: f.id, name: f.name }).collect(),
+        path: crumbs(path, cut.as_deref()),
     }))
 }
 
@@ -435,10 +637,8 @@ pub async fn get_entry(
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let entry = entry_in(&state, &conv, &entry_id).await?;
     let path = ancestors(&state, &conv, Some(&entry)).await?;
-    Ok(Json(FileEntryDetail {
-        entry: entry.to_api(),
-        path: path.into_iter().map(|f| Crumb { id: f.id, name: f.name }).collect(),
-    }))
+    let cut = record_cut(&conv);
+    Ok(Json(FileEntryDetail { entry: entry.to_api_cut(cut.as_deref()), path: crumbs(path, cut.as_deref()) }))
 }
 
 // ---------------------------------------------------------------- Folders
@@ -447,7 +647,12 @@ pub async fn get_entry(
 pub struct CreateFolderRequest {
     /// Parent folder (`null` or absent: top level).
     pub parent_id: Option<String>,
-    pub name: String,
+    /// Unencrypted channels: the name (refused in encrypted channels).
+    pub name: Option<String>,
+    /// Encrypted channels: the client-chosen id (a fresh ULID), the entry record and its epoch (FILES.md §8.5).
+    pub id: Option<String>,
+    pub record: Option<String>,
+    pub record_epoch: Option<i64>,
 }
 
 /// Creates a folder (`attach_files`); 409 `files.name_taken` when the name exists in the parent.
@@ -465,13 +670,25 @@ pub async fn create_folder(
     if !enabled_for(&state, room_of(&conv)).await? {
         return Err(disabled());
     }
-    let name = files::entry_name(&req.name)?;
+    let author = auth.user.address();
+    let (id, name, record) = if conv.encrypted {
+        if req.name.is_some() {
+            return Err(encrypted_names());
+        }
+        let id = files::client_id(req.id.as_deref(), now_ms())?;
+        let record = check_record(&state, &auth, &author, &conv, req.record.as_deref(), req.record_epoch).await?;
+        (id, String::new(), Some(record))
+    } else {
+        if req.id.is_some() || req.record.is_some() {
+            return Err(not_encrypted());
+        }
+        (store::files::new_id(), files::entry_name(req.name.as_deref().unwrap_or(""))?, None)
+    };
     let parent = folder_in(&state, &conv, req.parent_id.as_deref()).await?;
     if ancestors(&state, &conv, parent.as_ref()).await?.len() >= MAX_DEPTH {
         return Err(bad("files.too_deep", format!("Folders nest at most {MAX_DEPTH} levels deep")));
     }
     check_entry_count(&state, &conv).await?;
-    let id = store::files::new_id();
     let row = store::files::insert(
         &state.db,
         store::files::NewEntry {
@@ -488,12 +705,21 @@ pub async fn create_folder(
             size: 0,
             sha256: "",
             created_by: &auth.user.id,
+            record,
         },
     )
     .await?
-    .ok_or_else(|| name_taken(&name))?;
+    .ok_or_else(|| if conv.encrypted { id_taken() } else { name_taken(&name) })?;
     changed(&state, &conv, &[row.parent_id.as_deref()]);
     Ok((StatusCode::CREATED, Json(row.to_api())))
+}
+
+fn id_taken() -> ApiError {
+    ApiError::conflict("files.id_taken", "An entry with this id exists already")
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
 }
 
 async fn check_entry_count(state: &AppState, conv: &Conv) -> Result<(), ApiError> {
@@ -537,7 +763,7 @@ fn quota_exceeded(limit: i64, used: i64) -> ApiError {
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/upload", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
-    responses((status = 201, body = FileEntry), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
+    responses((status = 201, body = FileEntry), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
 pub async fn upload(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -551,6 +777,7 @@ pub async fn upload(
             detail: "Uploads are switched off on this node".into(),
         });
     }
+    state.files_limiter.check_all(&[format!("files-upload:{}", auth.user.id)])?;
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
     let room = room_of(&conv).clone();
@@ -561,14 +788,38 @@ pub async fn upload(
     let max = ent.upload_max_bytes(&state.config);
     let quota = ent.limit(entitlements::FILES_CHANNELS_MAX_BYTES);
 
-    let raw_name = header_str(&headers, "tavrn-file-name")
-        .map(crate::routes::attachments::percent_decode)
-        .ok_or_else(|| bad("files.name_invalid", "Tavrn-File-Name is missing"))?;
-    let mut name = files::entry_name(&raw_name)?;
+    let author = auth.user.address();
+    // Encrypted channels: client-chosen id, the record instead of a name, the category as declared (FILES.md §8.5).
+    let mut e2ee = None;
+    if conv.encrypted {
+        if headers.contains_key("tavrn-file-name") || headers.contains_key("tavrn-conflict") {
+            return Err(encrypted_names());
+        }
+        let id = files::client_id(header_str(&headers, "tavrn-entry-id"), now_ms())?;
+        let epoch = header_str(&headers, "tavrn-record-epoch").and_then(|v| v.trim().parse::<i64>().ok());
+        let record = check_record(&state, &auth, &author, &conv, header_str(&headers, "tavrn-record"), epoch).await?;
+        let class = crate::uploads::declared(header_str(&headers, "tavrn-upload-category")).ok_or_else(|| {
+            bad(
+                "upload.category_invalid",
+                "Tavrn-Upload-Category: images, audio, video, documents, archives, other or executable",
+            )
+        })?;
+        if store::files::id_exists(&state.db, &id).await? {
+            return Err(id_taken());
+        }
+        e2ee = Some((id, record, class));
+    }
     let parent = folder_in(&state, &conv, header_str(&headers, "tavrn-parent")).await?;
     let parent_id = parent.as_ref().map(|p| p.id.clone());
+    let mut name = String::new();
+    if e2ee.is_none() {
+        let raw_name = header_str(&headers, "tavrn-file-name")
+            .map(crate::routes::attachments::percent_decode)
+            .ok_or_else(|| bad("files.name_invalid", "Tavrn-File-Name is missing"))?;
+        name = files::entry_name(&raw_name)?;
+    }
     let rename = header_str(&headers, "tavrn-conflict").is_some_and(|v| v.eq_ignore_ascii_case("rename"));
-    if store::files::name_taken(&state.db, &conv.id, parent_id.as_deref(), &name).await? {
+    if e2ee.is_none() && store::files::name_taken(&state.db, &conv.id, parent_id.as_deref(), &name).await? {
         if !rename {
             return Err(name_taken(&name));
         }
@@ -611,27 +862,38 @@ pub async fn upload(
         std::io::Error::other(e)
     }));
     let (stream, meter) = files::metered(body, limit);
-    let (head, stream) = files::read_head(stream, files::SNIFF_BYTES)
-        .await
-        .map_err(|_| upload_error(&meter, &client_failed, max, quota, used))?;
-    let mime = files::upload_mime(header_str(&headers, "content-type"), &name, &head);
-    let class = crate::uploads::classify(&head, &name, &mime);
-    crate::routes::attachments::check_category(&state, &conv, &auth.user.id, class).await?;
-
-    let id = store::files::new_id();
+    let (id, mime, stream, record) = match e2ee {
+        Some((id, record, class)) => {
+            crate::routes::attachments::check_category(&state, &conv, &auth.user.id, class).await?;
+            (id, String::new(), stream, Some(record))
+        }
+        None => {
+            let (head, stream) = files::read_head(stream, files::SNIFF_BYTES)
+                .await
+                .map_err(|_| upload_error(&meter, &client_failed, max, quota, used))?;
+            let mime = files::upload_mime(header_str(&headers, "content-type"), &name, &head);
+            let class = crate::uploads::classify(&head, &name, &mime);
+            crate::routes::attachments::check_category(&state, &conv, &auth.user.id, class).await?;
+            (store::files::new_id(), mime, stream, None)
+        }
+    };
+    // Client-chosen ids never name a stored file: the node picks the storage id (they share one namespace).
+    let internal_id = if record.is_some() { store::files::new_id() } else { id.clone() };
     let (storage_id, backend, encrypted) = match &storage {
         Storage::Internal => {
-            if let Err(e) = state.storage.write_stream(&id, stream).await {
+            if let Err(e) = state.storage.write_stream(&internal_id, stream).await {
                 let err = upload_error(&meter, &client_failed, max, quota, used);
                 if matches!(err, ApiError::Internal(_)) {
                     return Err(ApiError::Internal(e));
                 }
                 return Err(err);
             }
-            (Some(id.clone()), "internal", false)
+            (Some(internal_id.clone()), "internal", false)
         }
         Storage::Remote { store, encrypt } => {
             let plain_len = declared.unwrap_or(0);
+            // End-to-end encrypted channels store the clients' ciphertext as it is.
+            let encrypt = &(*encrypt && record.is_none());
             let (body, len) = if *encrypt {
                 let key = state.storage.new_external_key(&id).await.map_err(ApiError::Internal)?;
                 (files::sealed(stream, key), crate::storage::encrypted_len(plain_len))
@@ -659,6 +921,7 @@ pub async fn upload(
         let m = meter.lock().map_err(|_| ApiError::Internal(anyhow::anyhow!("meter poisoned")))?;
         (m.len as i64, m.sha256())
     };
+    let is_e2ee = record.is_some();
     let inserted = store::files::insert(
         &state.db,
         store::files::NewEntry {
@@ -675,13 +938,17 @@ pub async fn upload(
             size,
             sha256: &sha256,
             created_by: &auth.user.id,
+            record,
         },
     )
     .await;
     let row = match inserted {
         Ok(Some(row)) => row,
         other => {
-            // Name taken meanwhile (or a database error): the stored bytes go again.
+            // Name or id taken meanwhile (or a database error): the stored bytes go again, unless an entry that
+            // took the same client-chosen id owns the external object of that id.
+            let owned_elsewhere =
+                is_e2ee && storage_id.is_none() && store::files::id_exists(&state.db, &id).await.unwrap_or(true);
             let ghost = EntryRow {
                 id: id.clone(),
                 room_id: room.id.clone(),
@@ -699,10 +966,21 @@ pub async fn upload(
                 created_by: None,
                 created_at: String::new(),
                 updated_at: String::new(),
+                record: None,
+                record_epoch: None,
+                record_author: None,
+                record_device_id: None,
+                record_at: None,
+                thumbnail_id: None,
+                thumbnail_size: 0,
             };
-            remove_bytes(&state, Some(storage), vec![ghost]).await;
+            if !owned_elsewhere {
+                let stores = stores_of(&state, std::slice::from_ref(&conv.id)).await.unwrap_or_default();
+                remove_bytes(&state, vec![ghost], &stores, &HashSet::new()).await;
+            }
             return Err(match other {
                 Err(e) => e,
+                _ if is_e2ee => id_taken(),
                 _ => name_taken(&name),
             });
         }
@@ -837,7 +1115,8 @@ pub async fn download(
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    h.insert(header::CONTENT_DISPOSITION, disposition(&entry.name));
+    // Encrypted entries have no name on the node: the download is named by its id.
+    h.insert(header::CONTENT_DISPOSITION, disposition(if entry.record.is_some() { &entry.id } else { &entry.name }));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", entry.sha256)) {
         h.insert(header::ETAG, v);
@@ -851,8 +1130,11 @@ pub async fn download(
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateEntryRequest {
-    /// New name.
+    /// New name (unencrypted channels).
     pub name: Option<String>,
+    /// Encrypted channels: a new entry record (rename) and its epoch (FILES.md §8.5).
+    pub record: Option<String>,
+    pub record_epoch: Option<i64>,
     /// New folder (`null`: top level; absent: unchanged).
     #[serde(default, with = "crate::serde_with_double_option")]
     #[schema(value_type = Option<String>)]
@@ -873,6 +1155,21 @@ pub async fn update(
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let entry = entry_in(&state, &conv, &entry_id).await?;
     require_modify(&conv, &auth.user.id, &[&entry])?;
+    let author = auth.user.address();
+    let record = if conv.encrypted {
+        if req.name.is_some() {
+            return Err(encrypted_names());
+        }
+        match req.record.as_deref() {
+            Some(r) => Some(check_record(&state, &auth, &author, &conv, Some(r), req.record_epoch).await?),
+            None => None,
+        }
+    } else {
+        if req.record.is_some() {
+            return Err(not_encrypted());
+        }
+        None
+    };
     let name = match &req.name {
         Some(n) => files::entry_name(n)?,
         None => entry.name.clone(),
@@ -894,15 +1191,17 @@ pub async fn update(
             folder.map(|f| f.id)
         }
     };
-    if name == entry.name && parent_id == entry.parent_id {
-        return Ok(Json(entry.to_api()));
+    if record.is_none() && name == entry.name && parent_id == entry.parent_id {
+        return Ok(Json(entry.to_api_cut(record_cut(&conv).as_deref())));
     }
-    if !store::files::update(&state.db, &entry.id, &name, parent_id.as_deref()).await? {
+    if conv.encrypted {
+        store::files::update_encrypted(&state.db, &entry.id, record, parent_id.as_deref()).await?;
+    } else if !store::files::update(&state.db, &entry.id, &name, parent_id.as_deref()).await? {
         return Err(name_taken(&name));
     }
     let fresh = store::files::entry(&state.db, &conv.id, &entry.id).await?.ok_or_else(entry_not_found)?;
     changed(&state, &conv, &[entry.parent_id.as_deref(), fresh.parent_id.as_deref()]);
-    Ok(Json(fresh.to_api()))
+    Ok(Json(fresh.to_api_cut(record_cut(&conv).as_deref())))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -933,10 +1232,10 @@ pub async fn delete(
     let result = DeleteResult {
         files: tree.iter().filter(|e| !e.is_folder()).count() as u64,
         folders: tree.iter().filter(|e| e.is_folder()).count() as u64,
-        bytes: tree.iter().map(|e| u64::try_from(e.size).unwrap_or(0)).sum(),
+        bytes: tree.iter().map(|e| u64::try_from(e.stored_bytes()).unwrap_or(0)).sum(),
     };
     let needs_remote = tree.iter().any(|e| !e.is_folder() && e.backend != "internal");
-    let storage = if needs_remote { storage_of(&state, &conv.id).await.ok() } else { None };
+    let stores = if needs_remote { stores_of(&state, std::slice::from_ref(&conv.id)).await? } else { HashMap::new() };
     // Deepest entries first, so that no parent row disappears before its children.
     let ids: Vec<String> = tree.iter().rev().map(|e| e.id.clone()).collect();
     store::files::delete_ids(&state.db, &ids).await?;
@@ -953,7 +1252,7 @@ pub async fn delete(
         }),
     )
     .await?;
-    remove_bytes(&state, storage, tree).await;
+    remove_bytes(&state, tree, &stores, &HashSet::new()).await;
     changed(&state, &conv, &[entry.parent_id.as_deref()]);
     Ok(Json(result))
 }
@@ -975,6 +1274,13 @@ pub struct FilesInfo {
     pub backend: String,
     /// External store with encryption (files unreadable outside tavrn).
     pub encrypt_files: bool,
+    /// The channel is end-to-end encrypted (FILES.md §8).
+    pub encrypted: bool,
+    /// Members with `manage_channels`: the external store's host (`""` for the node's storage), for the deletion
+    /// dialog (FILES.md §9); `null` for everybody else.
+    pub backend_host: Option<String>,
+    /// Members with `manage_channels`: the object prefix on the external store (`""` for the node's storage).
+    pub backend_prefix: Option<String>,
     /// The requester may upload and create folders.
     pub can_upload: bool,
     /// The requester may manage everybody's entries (`manage_files`).
@@ -1002,6 +1308,14 @@ pub async fn usage(
     let backend = store::files::backend(&state.db, &conv.id).await?;
     let allowed = access::upload_categories(&state, &conv, &auth.user.id).await?;
     let can_upload = enabled && state.config.uploads_enabled && p::has(conv.perms, p::ATTACH_FILES);
+    // Where the files are, for those who may delete the channel (never the credentials).
+    let location = if p::has(conv.perms, p::MANAGE_CHANNELS) {
+        let c = stored_config(&state, &conv.id, backend.as_ref().filter(|b| b.kind != "internal")).unwrap_or_default();
+        let host = reqwest::Url::parse(&c.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+        Some((host, c.prefix))
+    } else {
+        None
+    };
     Ok(Json(FilesInfo {
         enabled,
         used_bytes: used,
@@ -1011,12 +1325,227 @@ pub async fn usage(
         max_upload_bytes: ent.upload_max_bytes(&state.config),
         backend: backend.as_ref().map_or("internal".to_string(), |b| b.kind.clone()),
         encrypt_files: backend.as_ref().is_some_and(|b| b.encrypt_files != 0),
+        encrypted: conv.encrypted,
+        backend_host: location.as_ref().map(|l| l.0.clone()),
+        backend_prefix: location.map(|l| l.1),
         can_upload,
         can_manage: p::has(conv.perms, p::MANAGE_FILES),
         can_configure: p::has(conv.perms, p::MANAGE_CHANNELS | p::MANAGE_FILES),
         allowed_categories: crate::uploads::names(allowed),
         executables_allowed: state.config.upload_allow_executables && allowed & crate::uploads::OTHER != 0,
     }))
+}
+
+// ---------------------------------------------------------------- Own entries, records, thumbnails
+
+#[derive(Deserialize, IntoParams)]
+pub struct MineQuery {
+    /// 1–200, default 100.
+    pub limit: Option<i64>,
+    /// Cursor: the last entry id of the previous page.
+    pub after: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MineList {
+    /// The requester's entries, oldest first, without records.
+    pub entries: Vec<FileEntry>,
+    pub next_after: Option<String>,
+    /// Totals of all the requester's entries in the channel (bytes: files and thumbnails).
+    pub files: i64,
+    pub folders: i64,
+    pub bytes: i64,
+}
+
+/// The requester's own entries with ids, kinds, sizes and dates, never records or names (`view_channel`): a member
+/// who lost their keys can still find and delete their uploads (FILES.md §8.8).
+#[utoipa::path(get, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/mine", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), MineQuery),
+    responses((status = 200, body = MineList), (status = 403, body = ProblemDetails)))]
+pub async fn mine(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room_id, channel_id)): Path<(String, String)>,
+    Query(q): Query<MineQuery>,
+) -> Result<Json<MineList>, ApiError> {
+    let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
+    let limit = validate::limit(q.limit, files::LIST_DEFAULT, files::LIST_MAX);
+    let after = q.after.unwrap_or_default();
+    if !after.is_empty() && !util::is_ulid(&after) {
+        return Err(bad("files.cursor_invalid", "Unknown cursor"));
+    }
+    let rows = store::files::mine(&state.db, &conv.id, &auth.user.id, &after, limit + 1).await?;
+    let more = rows.len() as i64 > limit;
+    let entries: Vec<FileEntry> = rows
+        .iter()
+        .take(limit as usize)
+        .map(|r| {
+            let mut e = r.to_api();
+            (e.record, e.record_epoch, e.record_author, e.record_device_id) = (None, None, None, None);
+            e
+        })
+        .collect();
+    let (files_n, folders_n, bytes) = store::files::mine_totals(&state.db, &conv.id, &auth.user.id).await?;
+    Ok(Json(MineList {
+        next_after: if more { entries.last().map(|e| e.id.clone()) } else { None },
+        entries,
+        files: files_n,
+        folders: folders_n,
+        bytes,
+    }))
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct RecordsQuery {
+    /// Only records of this epoch.
+    pub epoch: Option<i64>,
+    /// Only records written at or after this time (RFC 3339).
+    pub since: Option<String>,
+    /// Cursor: the last entry id of the previous page.
+    pub after: Option<String>,
+    /// 1–200, default 100.
+    pub limit: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RecordList {
+    /// Entries with a record inside the requester's history window, oldest record first.
+    pub entries: Vec<FileEntry>,
+    pub next_after: Option<String>,
+}
+
+/// Entry records of an encrypted files channel in the order they were written (`view_channel`), only inside the
+/// requester's history window (FILES.md §8.7): for the key checks of history shares and the clients' search sync.
+#[utoipa::path(get, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/records", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), RecordsQuery),
+    responses((status = 200, body = RecordList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails)))]
+pub async fn records(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room_id, channel_id)): Path<(String, String)>,
+    Query(q): Query<RecordsQuery>,
+) -> Result<Json<RecordList>, ApiError> {
+    let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
+    if !conv.encrypted {
+        return Err(not_encrypted());
+    }
+    let limit = validate::limit(q.limit, files::LIST_DEFAULT, files::LIST_MAX);
+    if q.epoch.is_some_and(|e| e < 0) {
+        return Err(bad("validation.range", "epoch must not be negative"));
+    }
+    let since = match q.since.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            util::parse_time(s)
+                .map(util::format_time)
+                .ok_or_else(|| bad("validation.time", "since must be an RFC 3339 time"))?,
+        ),
+        None => None,
+    };
+    let cut = record_cut(&conv);
+    let since = match (since, cut) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let after = match q.after.as_deref().filter(|a| !a.is_empty()) {
+        Some(a) => {
+            let e = entry_in(&state, &conv, a).await.map_err(|_| bad("files.cursor_invalid", "Unknown cursor"))?;
+            Some((e.record_at.unwrap_or_default(), e.id))
+        }
+        None => None,
+    };
+    let rows = store::files::records(
+        &state.db,
+        &conv.id,
+        store::files::RecordQuery {
+            epoch: q.epoch,
+            since: since.as_deref(),
+            after: after.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            limit: limit + 1,
+        },
+    )
+    .await?;
+    let more = rows.len() as i64 > limit;
+    let entries: Vec<FileEntry> = rows.iter().take(limit as usize).map(EntryRow::to_api).collect();
+    Ok(Json(RecordList { next_after: if more { entries.last().map(|e| e.id.clone()) } else { None }, entries }))
+}
+
+/// Store the client-made thumbnail of a file in an encrypted channel (own entries `attach_files`, others'
+/// `manage_files`): ciphertext of the part `thumbnail` (FILES.md §8.3), at most 1 MiB; replaces an earlier one.
+#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), ("entry_id" = String, Path)),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses((status = 204), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 413, body = ProblemDetails)))]
+pub async fn put_thumbnail(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room_id, channel_id, entry_id)): Path<(String, String, String)>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
+    if !conv.encrypted {
+        return Err(not_encrypted());
+    }
+    let entry = entry_in(&state, &conv, &entry_id).await?;
+    if entry.is_folder() {
+        return Err(bad("files.is_folder", "Folders have no thumbnail"));
+    }
+    require_modify(&conv, &auth.user.id, &[&entry])?;
+    let too_large = || ApiError::PayloadTooLarge {
+        code: "files.thumbnail_too_large",
+        detail: "A thumbnail has at most 1 MiB".into(),
+        meta: serde_json::json!({ "max_bytes": files::MAX_THUMBNAIL_BYTES }),
+    };
+    let bytes = axum::body::to_bytes(body, files::MAX_THUMBNAIL_BYTES).await.map_err(|_| too_large())?;
+    if bytes.is_empty() {
+        return Err(bad("upload.empty", "Empty thumbnail"));
+    }
+    let size = bytes.len() as i64;
+    let ent = Entitlements::load(&state, Some(&auth.user), Some(room_of(&conv))).await?;
+    if let Some(quota) = ent.limit(entitlements::FILES_CHANNELS_MAX_BYTES) {
+        let (used, _, _) = store::files::usage(&state.db, &conv.id).await?;
+        if used.saturating_sub(entry.thumbnail_size).saturating_add(size) > quota {
+            return Err(quota_exceeded(quota, used));
+        }
+    }
+    let storage_id = store::files::new_id();
+    state.storage.write(&storage_id, &bytes).await.map_err(ApiError::Internal)?;
+    match store::files::set_thumbnail(&state.db, &entry.id, &storage_id, size).await {
+        Ok(Some(old)) if util::is_ulid(&old) => state.storage.delete(&old).await,
+        Ok(_) => {}
+        Err(e) => {
+            state.storage.delete(&storage_id).await;
+            return Err(e);
+        }
+    }
+    changed(&state, &conv, &[entry.parent_id.as_deref()]);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The thumbnail ciphertext of a file in an encrypted channel (`view_channel`).
+#[utoipa::path(get, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), ("entry_id" = String, Path)),
+    responses((status = 200, description = "Thumbnail ciphertext"), (status = 400, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+pub async fn get_thumbnail(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room_id, channel_id, entry_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
+    if !conv.encrypted {
+        return Err(not_encrypted());
+    }
+    let entry = entry_in(&state, &conv, &entry_id).await?;
+    let missing = || access::not_found("Thumbnail", "files.no_thumbnail");
+    let sid = entry.thumbnail_id.as_deref().filter(|s| util::is_ulid(s)).ok_or_else(missing)?;
+    let bytes = state.storage.read(sid).await.map_err(ApiError::Internal)?.ok_or_else(missing)?;
+    let mut resp = Response::new(Body::from(bytes));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------- Backend
@@ -1132,7 +1661,18 @@ fn requested_config(
         Some(r) if r.kind == kind.as_str() => stored_config(state, &conv.id, Some(r))?,
         _ => RemoteConfig::default(),
     };
-    let keep = |new: Option<String>, old: String| new.filter(|s| !s.is_empty()).unwrap_or(old);
+    // Stored secrets are reused only for the same server and account: otherwise anybody with the right to configure
+    // the backend could send the stored credentials to a host of their choice (FILES.md §5: secrets never leave).
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    let region = |s: &str| if s.trim().is_empty() { "us-east-1".to_string() } else { s.trim().to_string() };
+    let same_place = norm(req.url.as_deref().unwrap_or("")) == norm(&stored.url)
+        && req.username.as_deref().unwrap_or("") == stored.username
+        && req.access_key.as_deref().unwrap_or("") == stored.access_key
+        && req.bucket.as_deref().unwrap_or("") == stored.bucket
+        && (kind != Kind::S3 || region(req.region.as_deref().unwrap_or("")) == region(&stored.region));
+    let keep = |new: Option<String>, old: String| {
+        new.filter(|s| !s.is_empty()).unwrap_or(if same_place { old } else { String::new() })
+    };
     let config = RemoteConfig {
         url: req.url.unwrap_or_default(),
         username: req.username.unwrap_or_default(),
@@ -1165,6 +1705,12 @@ pub async fn put_backend(
     backend_limiter().check_all(&[format!("files-backend:{}", auth.user.id)])?;
     let row = store::files::backend(&state.db, &conv.id).await?;
     let (kind, config, encrypt) = requested_config(&state, &conv, req, row.as_ref())?;
+    if conv.encrypted && encrypt {
+        return Err(bad(
+            "files.backend_invalid",
+            "encrypt_files is only for channels that are not end-to-end encrypted (their files are ciphertext already)",
+        ));
+    }
     let old_kind = row.as_ref().and_then(|r| Kind::parse(&r.kind)).unwrap_or(Kind::Internal);
     let old_location = if old_kind == Kind::Internal {
         String::new()

@@ -1,0 +1,10 @@
+Subject: Notice received ({case})
+
+We received your notice. Case: {case}
+
+You can follow the case here:
+{link}
+
+Keep this link private: it is the only way to open the status page.
+
+This mail was sent because this address was given in a notice on {domain}.

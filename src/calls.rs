@@ -456,6 +456,34 @@ pub async fn after_change(state: &AppState, conversation_id: &str) {
     }
 }
 
+/// A member left the DM or group DM (or was removed): their devices leave its running call at once (they lost
+/// access, like a room member who loses `connect`); the call goes on for the others or ends as usual.
+pub async fn drop_member(state: &AppState, conversation_id: &str, user_id: &str) {
+    if crate::voice::hand_to_leader(state, || crate::cache::VoiceEffect::LeaveCall {
+        conversation_id: conversation_id.into(),
+        user_id: user_id.into(),
+    }) {
+        return;
+    }
+    if !state.calls.is_active(conversation_id) {
+        return;
+    }
+    let key = key(conversation_id);
+    let identities = state.calls.participants().identities_of(&key, user_id);
+    if identities.is_empty() {
+        return;
+    }
+    for identity in &identities {
+        state.calls.participants().remove(&key, identity);
+        if let Some(rooms) = state.voice.rooms()
+            && let Err(e) = rooms.remove_participant(&room_name(conversation_id), identity).await
+        {
+            tracing::debug!(error = %e, identity, "LiveKit participant of the call not removed (not connected?)");
+        }
+    }
+    after_change(state, conversation_id).await;
+}
+
 /// Ends a call: everybody is disconnected, the members get `call.end` and the conversation a system
 /// message. Does nothing if the call is already over.
 pub async fn end(state: &AppState, conversation_id: &str, reason: EndReason) {

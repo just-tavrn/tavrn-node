@@ -80,6 +80,10 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Err(ApiError::Unauthorized { code }) => return close(socket, CLOSE_AUTH, code).await,
         Err(_) => return close(socket, CLOSE_AUTH, "auth.token_invalid").await,
     };
+    // No date of birth yet (PROTOCOL.md §5e): no events; the client reconnects after adding it.
+    if crate::age::needs_date_of_birth(&state, &auth.user) {
+        return close(socket, CLOSE_PROTOCOL, "age.status_required").await;
+    }
     // Terms not accepted (`TAVRN_LEGAL_TERMS_MODE=require`): no events either; the client reconnects after accepting.
     if crate::legal::documents::check_required(&state, &auth.user, None).await.is_err() {
         return close(socket, CLOSE_PROTOCOL, "legal.terms_required").await;
@@ -88,6 +92,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
         Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
     };
+    let mut visible = crate::visibility::Filter::default();
     let mut rx = state.hub.subscribe();
     let _presence = state.hub.connect(&auth.user.id);
     let _status = crate::presence::Registry::connect(&state, &auth.user.id, &auth.device_id);
@@ -130,6 +135,8 @@ async fn run(state: AppState, mut socket: WebSocket) {
         return;
     }
 
+    // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`).
+    visible.know(&state, &rooms, &auth.user.id).await;
     let (mut sink, mut stream) = socket.split();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
@@ -175,6 +182,11 @@ async fn run(state: AppState, mut socket: WebSocket) {
                     }
                     Ok(ev) => {
                         track_membership(&ev.kind, &ev.data, &auth, &mut rooms);
+                        if let Scope::Room(r) = &ev.scope
+                            && !rooms.contains(r)
+                        {
+                            visible.forget(r);
+                        }
                         if let Some(s) = &scopes
                             && !crate::applications::event_allowed(&ev.kind, &ev.data, s)
                         {
@@ -195,6 +207,24 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             let frame = axum::extract::ws::CloseFrame { code: CLOSE_AUTH, reason: "session revoked".into() };
                             let _ = sink.send(WsMessage::Close(Some(frame))).await;
                             break;
+                        }
+                        // A room channel's events only to the members who may view it, a private channel's
+                        // metadata only to those it is listed to, and what they gained or lost (PROTOCOL.md §6).
+                        if relevant && let Scope::Room(room_id) = &ev.scope {
+                            let delivery = visible.deliver(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await;
+                            let mut closed = false;
+                            for frame in delivery.before {
+                                if sink.send(WsMessage::Text(frame.into())).await.is_err() {
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            if closed {
+                                break;
+                            }
+                            if !delivery.event {
+                                continue;
+                            }
                         }
                         // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                         if relevant && sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
@@ -235,8 +265,9 @@ fn may_write(scopes: Option<&[String]>) -> bool {
     scopes.is_none_or(|s| s.iter().any(|x| x == "messages:write"))
 }
 
-/// Forwards a typing notice: room channels to the room members (the connection must be a member),
-/// DMs and group DMs to their members (the sender must be one).
+/// Forwards a typing notice: room channels to the room members (the connection must be a member who may send in the
+/// channel; the fan-out reaches only the channel's viewers), DMs and group DMs to their members (the sender must be
+/// one).
 async fn typing(
     state: &AppState,
     auth: &AuthUser,
@@ -247,6 +278,20 @@ async fn typing(
 ) {
     match (room_id, channel_id, conversation_id) {
         (Some(room_id), Some(channel_id), _) if rooms.contains(&room_id) => {
+            // Typing is writing: a member in timeout (or without `send_messages`) types nowhere (permissions.md step 5).
+            let may_send = match crate::visibility::room(state, &room_id).await {
+                Ok(Some(view)) => view
+                    .perms(&channel_id, &auth.user.id)
+                    .is_some_and(|p| crate::permissions::has(p, crate::permissions::SEND_MESSAGES)),
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::debug!(error = %e, "typing notice not deliverable");
+                    false
+                }
+            };
+            if !may_send {
+                return;
+            }
             state.hub.room(
                 &room_id,
                 "typing",
@@ -320,6 +365,8 @@ mod tests {
                 owner_address: None,
                 application_id: None,
                 deleted_at: None,
+                date_of_birth: None,
+                age_over_18: None,
                 app_scopes: None,
             },
             device_id: "dev".into(),

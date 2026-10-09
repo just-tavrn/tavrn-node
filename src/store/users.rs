@@ -8,7 +8,7 @@ use crate::{
     util::{in_seconds, now, ulid},
 };
 
-pub(crate) const USER_COLS: &str = "id, username, domain, display_name, kind, owner_id, password_hash, email, email_verified_at, identity_pubkey, identity_reset_at, is_node_admin, avatar_blob_id, avatar_animated, header_blob_id, header_animated, dm_policy, presence_status, custom_status, hide_activity, created_at, disabled_at, owner_address, application_id, deleted_at";
+pub(crate) const USER_COLS: &str = "id, username, domain, display_name, kind, owner_id, password_hash, email, email_verified_at, identity_pubkey, identity_reset_at, is_node_admin, avatar_blob_id, avatar_animated, header_blob_id, header_animated, dm_policy, presence_status, custom_status, hide_activity, created_at, disabled_at, owner_address, application_id, deleted_at, date_of_birth, age_over_18";
 
 pub async fn by_id(db: &Pool, id: &str) -> Result<Option<UserRow>, ApiError> {
     Ok(sqlx::query_as(&format!("SELECT {USER_COLS} FROM users WHERE id = $1")).bind(id).fetch_optional(db).await?)
@@ -33,6 +33,16 @@ pub async fn by_ids(db: &Pool, ids: &[String]) -> Result<Vec<UserRow>, ApiError>
     Ok(out)
 }
 
+/// The user rows of a room's members, in one query (the channel visibility snapshot, `visibility.rs`).
+pub async fn members_of_room(db: &Pool, room_id: &str) -> Result<Vec<UserRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {USER_COLS} FROM users WHERE id IN (SELECT user_id FROM room_members WHERE room_id = $1) ORDER BY id"
+    ))
+    .bind(room_id)
+    .fetch_all(db)
+    .await?)
+}
+
 pub async fn count_local(db: &Pool, domain: &str) -> Result<i64, ApiError> {
     // The conformance probe (FEDERATION.md §9.1) is a system account, not a user.
     let row = sqlx::query("SELECT COUNT(*) AS n FROM users WHERE domain = $1 AND kind = 'user' AND username <> $2")
@@ -50,14 +60,16 @@ pub struct NewLocalUser<'a> {
     pub password_hash: &'a str,
     pub email: Option<&'a str>,
     pub is_node_admin: bool,
+    /// `YYYY-MM-DD` (PROTOCOL.md §5e), validated by the caller.
+    pub date_of_birth: Option<&'a str>,
 }
 
 /// Creates a local account. `Err(Conflict)` if the name is already taken.
 pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, ApiError> {
     let id = ulid();
     let result = sqlx::query(
-        "INSERT INTO users (id, username, domain, display_name, kind, password_hash, email, is_node_admin, created_at)
-         VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8)",
+        "INSERT INTO users (id, username, domain, display_name, kind, password_hash, email, is_node_admin, created_at, date_of_birth)
+         VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9)",
     )
     .bind(&id)
     .bind(u.username)
@@ -67,6 +79,7 @@ pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, Api
     .bind(u.email)
     .bind(u.is_node_admin as i64)
     .bind(now())
+    .bind(u.date_of_birth)
     .execute(db)
     .await;
     match result {
@@ -77,6 +90,26 @@ pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, Api
         Err(e) => return Err(e.into()),
     }
     by_id(db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("user not found after INSERT")))
+}
+
+/// Sets (or with `None` removes) the date of birth of a local user (PROTOCOL.md §5e).
+pub async fn set_date_of_birth(db: &Pool, user_id: &str, date_of_birth: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET date_of_birth = $1 WHERE id = $2")
+        .bind(date_of_birth)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Stores the `age_over_18` claim of a remote user's latest federation token (FEDERATION.md §2.2).
+pub async fn set_age_claim(db: &Pool, user_id: &str, age_over_18: Option<bool>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET age_over_18 = $1 WHERE id = $2")
+        .bind(age_over_18.map(i64::from))
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_email_verified(db: &Pool, user_id: &str) -> Result<(), ApiError> {
@@ -149,6 +182,20 @@ pub async fn update_profile_fields(db: &Pool, user_id: &str, u: ProfileUpdate<'_
     .bind(user_id)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// The language of a user's mails (`mail_templates.rs`), `None` = English.
+pub async fn locale(db: &Pool, user_id: &str) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_scalar::<_, Option<String>>("SELECT locale FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?
+        .flatten())
+}
+
+pub async fn set_locale(db: &Pool, user_id: &str, locale: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET locale = $1 WHERE id = $2").bind(locale).bind(user_id).execute(db).await?;
     Ok(())
 }
 
@@ -538,4 +585,46 @@ pub async fn device_id_in_use(db: &Pool, device_id: &str) -> Result<bool, ApiErr
         .fetch_optional(db)
         .await?
         .is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[tokio::test]
+    async fn members_of_room_returns_the_members_only() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let t = crate::util::now();
+        for id in ["u1", "u2", "u3"] {
+            sqlx::query(
+                "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $1, 'd', $1, $2)",
+            )
+            .bind(id)
+            .bind(&t)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        for room in ["r", "other"] {
+            sqlx::query("INSERT INTO rooms (id, name, owner_id, created_at) VALUES ($1, $1, 'u1', $2)")
+                .bind(room)
+                .bind(&t)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        for (room, user) in [("r", "u1"), ("r", "u3"), ("other", "u2")] {
+            sqlx::query("INSERT INTO room_members (room_id, user_id, joined_at) VALUES ($1, $2, $3)")
+                .bind(room)
+                .bind(user)
+                .bind(&t)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = members_of_room(&db, "r").await.unwrap().into_iter().map(|u| u.id).collect();
+        assert_eq!(ids, ["u1", "u3"]);
+        assert!(members_of_room(&db, "nope").await.unwrap().is_empty());
+    }
 }

@@ -312,6 +312,11 @@ async fn device_proof_works_for_passkey_and_sso_logins() {
         totp_secret: vec![],
         recovery_codes: vec![],
     };
+    // The provisioned account adds its date of birth first (PROTOCOL.md §5e).
+    let (s, j) = sso
+        .put("/api/v1/users/me/date-of-birth", &sam.token, json!({ "date_of_birth": common::ADULT_DATE_OF_BIRTH }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
     let master = MasterSecret::generate().unwrap();
     sso.put_identity(&sam, &master).await;
     let device = Device::generate("sam@sso.test", &sam.device_id).unwrap();

@@ -462,7 +462,7 @@ async fn the_pseudo_user_is_in_no_member_list_and_receives_nothing() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "wh.mine", "password": "password-123456" })),
+            Some(json!({ "username": "wh.mine", "date_of_birth": "1990-01-01", "password": "password-123456" })),
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::CONFLICT, "auth.username_taken"));
@@ -475,7 +475,7 @@ async fn the_pseudo_user_is_in_no_member_list_and_receives_nothing() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": username, "password": "irrelevant-123" })),
+            Some(json!({ "username": username, "date_of_birth": "1990-01-01", "password": "irrelevant-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -805,4 +805,83 @@ fn png() -> Option<Vec<u8>> {
         .ok()?
         .success();
     if ok { std::fs::read(out).ok() } else { None }
+}
+
+/// Forum channels show posts only (tavrn-node #8): a webhook there names the post with `thread_id`; a loose
+/// message is refused. Text channels take `thread_id` too (a reply into one of their threads).
+#[tokio::test]
+async fn forum_webhooks_post_into_threads_only() {
+    let node = unthrottled().await;
+    let (alice, bob, room) = setup(&node).await;
+    let (s, forum) = node
+        .post(
+            &format!("/api/v1/rooms/{}/channels", room.id),
+            &alice.token,
+            json!({ "name": "builds", "kind": "forum", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{forum}");
+    let forum = Room { id: room.id.clone(), channel: forum["id"].as_str().unwrap().to_string() };
+    let (_, path) = create(&node, &alice.token, &forum, json!({ "name": "CI" })).await;
+    let wait = format!("{path}?wait=true");
+
+    // Without a post: refused, nothing stored.
+    let (s, j) = exec(&node, &path, text("loose")).await;
+    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.thread_required"), "{j}");
+    let (_, all) =
+        node.get_auth(&format!("/api/v1/conversations/{}/messages?threads=all", forum.channel), &alice.token).await;
+    assert_eq!(all, json!([]));
+
+    // Into a post of the forum.
+    let (s, post) = node
+        .post(
+            &format!("/api/v1/rooms/{}/channels/{}/threads", room.id, forum.channel),
+            &bob.token,
+            json!({ "title": "Nightly", "message": text("Status of the nightly build?") }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{post}");
+    let post_id = post["id"].as_str().unwrap();
+    let mut body = text("Nightly **green**");
+    body["thread_id"] = json!(post_id.to_lowercase());
+    let (s, m) = exec(&node, &wait, body).await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert_eq!((m["thread_id"].as_str(), m["author_kind"].as_str()), (Some(post_id), Some("webhook")));
+    let (_, t) = node.get_auth(&format!("/api/v1/threads/{post_id}"), &bob.token).await;
+    assert_eq!((t["last_message_id"].clone(), t["message_count"].clone()), (m["id"].clone(), json!(2)), "{t}");
+    let (_, msgs) =
+        node.get_auth(&format!("/api/v1/conversations/{}/messages?thread={post_id}", forum.channel), &bob.token).await;
+    assert!(msgs.as_array().unwrap().iter().any(|x| x["id"] == m["id"]), "{msgs}");
+
+    // Unknown ids, malformed ids and threads of other channels are not found.
+    let (_, other) = node
+        .post(
+            &format!("/api/v1/rooms/{}/channels/{}/threads", room.id, room.channel),
+            &alice.token,
+            json!({ "title": "Elsewhere" }),
+        )
+        .await;
+    let other_id = other["id"].as_str().unwrap();
+    for id in [util_ulid(), "nope".to_string(), other_id.to_string()] {
+        let mut body = text("x");
+        body["thread_id"] = json!(id);
+        let (s, j) = exec(&node, &path, body).await;
+        assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "thread.not_found"), "{id}: {j}");
+    }
+    // A locked post is closed to webhooks too.
+    let (s, j) = node.patch(&format!("/api/v1/threads/{post_id}"), &alice.token, json!({ "locked": true })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let mut body = text("late");
+    body["thread_id"] = json!(post_id);
+    let (s, j) = exec(&node, &path, body).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "thread.locked"), "{j}");
+
+    // A text channel's webhook replies into one of its threads, or posts loose messages as before.
+    let (_, text_path) = create(&node, &alice.token, &room, json!({ "name": "Deploy" })).await;
+    let mut body = text("in the thread");
+    body["thread_id"] = json!(other_id);
+    let (s, m) = exec(&node, &format!("{text_path}?wait=true"), body).await;
+    assert_eq!((s, m["thread_id"].as_str()), (StatusCode::OK, Some(other_id)), "{m}");
+    let (s, m) = exec(&node, &format!("{text_path}?wait=true"), text("loose")).await;
+    assert_eq!((s, m["thread_id"].clone()), (StatusCode::OK, Value::Null), "{m}");
 }

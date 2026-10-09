@@ -1,0 +1,5 @@
+Subject: Account disabled ({case})
+
+The account was disabled. Case: {case}
+
+{reason}

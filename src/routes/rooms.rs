@@ -56,18 +56,23 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
     let id = &access.room.id;
     let mut channels = store::rooms::channels(db, id).await?;
     let overrides = store::rooms::overrides_of_room(db, id).await?;
-    // Channels a bot cannot view (e.g. "no bots" zones) are invisible to it (APPLICATIONS.md §3.5).
-    if p::is_bot_kind(&access.kind) {
-        let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
-        channels.retain(|c| p::has(access::channel_perms_with(access, c, &overrides, &user_id), p::VIEW_CHANNEL));
+    // Channels the requester cannot view are not listed (layered overrides, protocol permissions.md "Evaluation"),
+    // for bots "no bots" zones included (APPLICATIONS.md §3.5). Owners, node admins and administrators see all.
+    // Age-gated channels stay listed for users below the gate, without any permission in them (PROTOCOL.md §5e).
+    let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
+    let ungated = (!access.adult).then(|| RoomAccess { adult: true, ..access.clone() });
+    let viewable = |a: &RoomAccess, c: &crate::models::ChannelRow| {
+        p::has(access::channel_perms_with(a, c, &overrides, &user_id), p::VIEW_CHANNEL)
+    };
+    let visible: Vec<String> = channels.iter().filter(|c| viewable(access, c)).map(|c| c.id.clone()).collect();
+    channels.retain(|c| visible.contains(&c.id) || ungated.as_ref().is_some_and(|a| viewable(a, c)));
+    // A category is a container: it is listed when one of its channels is visible, or to those who manage channels.
+    let mut categories = store::rooms::categories(db, id).await?;
+    if !access.has(p::MANAGE_CHANNELS) {
+        categories.retain(|cat| channels.iter().any(|c| c.category_id.as_deref() == Some(cat.id.as_str())));
     }
     let read_states = match &access.member {
         Some(member) => {
-            let visible: Vec<String> = channels
-                .iter()
-                .filter(|c| p::has(access::channel_perms_with(access, c, &overrides, &member.user_id), p::VIEW_CHANNEL))
-                .map(|c| c.id.clone())
-                .collect();
             let system: Vec<String> = channels.iter().filter(|c| c.kind == "system").map(|c| c.id.clone()).collect();
             let user = store::users::by_id(db, &member.user_id)
                 .await?
@@ -88,13 +93,22 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
         }
         None => Vec::new(),
     };
+    // Only the overrides of the listed channels and categories (PROTOCOL.md §6 "Audiences").
+    let overrides = overrides
+        .iter()
+        .filter(|o| match o.target_type.as_str() {
+            "category" => categories.iter().any(|c| c.id == o.target_id),
+            _ => channels.iter().any(|c| c.id == o.target_id),
+        })
+        .map(|o| o.to_api())
+        .collect();
     Ok(RoomDetail {
         room: access.room.clone(),
         member_count: store::rooms::member_count(db, id).await?,
-        categories: store::rooms::categories(db, id).await?,
+        categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
         roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
-        overrides: overrides.iter().map(|o| o.to_api()).collect(),
+        overrides,
         my_roles: access.member_roles.iter().map(|r| r.id.clone()).collect(),
         my_permissions: access.room_perms.to_string(),
         is_owner: access.is_owner,
@@ -197,6 +211,9 @@ pub struct PublicRoom {
     pub icon_still: Option<String>,
     pub icon_animated: bool,
     pub member_count: i64,
+    /// `none` or `adults_only` (PROTOCOL.md §5e). Gated rooms are listed only to adults; invite previews carry the
+    /// gate so clients can explain a refused join.
+    pub age_gate: String,
 }
 
 impl PublicRoom {
@@ -210,15 +227,21 @@ impl PublicRoom {
             name: room.name,
             description: room.description,
             member_count,
+            age_gate: room.age_gate,
         }
     }
 }
 
-/// Public rooms of this node ("Discover").
+/// Public rooms of this node ("Discover"). Rooms with an age gate are listed only when the request carries the
+/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e).
 #[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>)))]
-pub async fn discover_rooms(State(state): State<AppState>) -> Result<Json<Vec<PublicRoom>>, ApiError> {
+pub async fn discover_rooms(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<PublicRoom>>, ApiError> {
+    let adult = crate::age::requester_is_adult(&state, &headers).await;
     let mut out = Vec::new();
-    for r in store::rooms::public_rooms(&state.db, 100).await? {
+    for r in store::rooms::public_rooms(&state.db, 100, adult).await? {
         let member_count = store::rooms::member_count(&state.db, &r.id).await?;
         out.push(PublicRoom::of(r, member_count));
     }
@@ -254,6 +277,15 @@ pub struct UpdateRoomRequest {
     /// Delete attachments after this many days (1–36500; 0 = use the node's value). Effective is the
     /// shortest non-zero of this, the node value and room grants: a room can only shorten.
     pub attachment_retention_days: Option<i64>,
+    /// Delete messages after this many days (1–36500; 0 = use the node's value, PROTOCOL.md §7f). Effective is the
+    /// shorter non-zero of this and the node's `TAVRN_RETENTION_DAYS`: a room can only shorten.
+    pub message_retention_days: Option<i64>,
+    /// `none` or `adults_only` (PROTOCOL.md §5e): the room's age gate, the minimum of every channel. Only an adult can
+    /// switch it on. Audited as `room.age_gate`.
+    pub age_gate: Option<String>,
+    /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
+    /// Owner or `manage_room`; never a bot.
+    pub history_restore: Option<String>,
 }
 
 /// Change room settings (`manage_room`).
@@ -267,7 +299,7 @@ pub async fn update_room(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROOM, "room.manage_forbidden", "Manage room")?;
     // Bots never decide who may read along (APPLICATIONS.md §3.5).
-    if req.no_bots.is_some() || req.bots_in_encrypted_channels.is_some() {
+    if req.no_bots.is_some() || req.bots_in_encrypted_channels.is_some() || req.history_restore.is_some() {
         crate::bot_channels::refuse_bots(&auth.user)?;
     }
     let bots_setting =
@@ -287,6 +319,17 @@ pub async fn update_room(
         .attachment_retention_days
         .map(|d| validate::range("attachment_retention_days", d, 0, 36_500))
         .transpose()?;
+    let message_retention =
+        req.message_retention_days.map(|d| validate::range("message_retention_days", d, 0, 36_500)).transpose()?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "room").await?;
+    }
+    let history_restore = req
+        .history_restore
+        .as_deref()
+        .map(|v| validate::one_of("history_restore", v, crate::history::RESTORE_SETTINGS))
+        .transpose()?;
     store::rooms::update_room(
         &state.db,
         &room_id,
@@ -302,9 +345,21 @@ pub async fn update_room(
     if let Some(days) = retention {
         store::entitlements::set_room_retention(&state.db, &room_id, Some(days).filter(|d| *d > 0)).await?;
     }
+    if let Some(days) = message_retention {
+        store::rooms::set_message_retention(&state.db, &room_id, Some(days).filter(|d| *d > 0)).await?;
+    }
+    if let Some(value) = &history_restore {
+        store::history::set_room_setting(&state.db, &room_id, value).await?;
+    }
     let mut meta = serde_json::json!({});
     if let (Some(days), Some(obj)) = (retention, meta.as_object_mut()) {
         obj.insert("attachment_retention_days".into(), days.into());
+    }
+    if let (Some(days), Some(obj)) = (message_retention, meta.as_object_mut()) {
+        obj.insert("message_retention_days".into(), days.into());
+    }
+    if let (Some(value), Some(obj)) = (history_restore, meta.as_object_mut()) {
+        obj.insert("history_restore".into(), value.into());
     }
     store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "room.update", &room_id, "", meta).await?;
     let access = access::room_access(&state, &room_id, &auth.user).await?;
@@ -338,8 +393,40 @@ pub async fn update_room(
         }
         _ => access,
     };
+    let access = match age_gate {
+        Some(gate) if gate != access.room.age_gate => {
+            set_room_age_gate(&state, &access.room, &auth.user, &gate).await?;
+            access::room_access(&state, &room_id, &auth.user).await?
+        }
+        _ => access,
+    };
     state.hub.room(&room_id, "room.update", &access.room);
     Ok(Json(detail(&state, &access).await?))
+}
+
+/// Sets the room's age gate (PROTOCOL.md §5e): audited, every channel changes its effective gate (`channel.update`),
+/// members below a new gate leave the encrypted groups and voice of the room.
+async fn set_room_age_gate(state: &AppState, room: &Room, actor: &UserRow, gate: &str) -> Result<(), ApiError> {
+    store::rooms::set_room_age_gate(&state.db, &room.id, gate).await?;
+    store::rooms::audit(
+        &state.db,
+        Some(&room.id),
+        Some(&actor.id),
+        "room.age_gate",
+        &room.id,
+        "",
+        serde_json::json!({ "age_gate": gate }),
+    )
+    .await?;
+    let channels = store::rooms::channels(&state.db, &room.id).await?;
+    if gate == crate::age::GATE_ADULTS {
+        let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+        crate::e2ee::below_age_gate(state, &room.id, &ids).await?;
+    }
+    for channel in channels {
+        state.hub.room(&room.id, "channel.update", channel.to_api());
+    }
+    Ok(())
 }
 
 /// Sets the room-level "no bots" flag: every bot member is removed (uninstall, reason `no_bots`), and the
@@ -374,11 +461,12 @@ async fn set_room_no_bots(state: &AppState, room: &Room, actor: &UserRow, value:
 }
 
 /// Permanently delete a room (owner or node admin only).
-#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}", security(("bearer" = [])), params(("room_id" = String, Path)), responses((status = 204), (status = 403, body = ProblemDetails)))]
+#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}", security(("bearer" = [])), params(("room_id" = String, Path), crate::routes::channels::DeleteFilesQuery), responses((status = 204), (status = 403, body = ProblemDetails)))]
 pub async fn delete_room(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
+    Query(q): Query<crate::routes::channels::DeleteFilesQuery>,
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     if !access.is_owner && !access.is_node_admin {
@@ -393,7 +481,8 @@ pub async fn delete_room(
     // custom emojis, soundboard clips and the members' per-room avatars. The rows cascade.
     let files = store::rooms::room_files(&state.db, &room_id).await?;
     let room_media = store::rooms::room_member_media(&state.db, &room_id).await?;
-    let channel_files = crate::routes::files::Cleanup::collect(&state, "room_id", &room_id).await?;
+    let channel_files = crate::routes::files::Cleanup::collect(&state, "room_id", &room_id, q.keep_external).await?;
+    let kept = channel_files.kept_objects();
     store::rooms::delete_room(&state.db, &room_id).await?;
     channel_files.run(&state).await;
     for id in &files {
@@ -416,7 +505,7 @@ pub async fn delete_room(
         "room.delete",
         &room_id,
         "",
-        serde_json::json!({ "name": access.room.name }),
+        serde_json::json!({ "name": access.room.name, "keep_external": q.keep_external && kept > 0, "kept_objects": kept }),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -448,6 +537,13 @@ async fn banned(state: &AppState, room_id: &str, user: &UserRow) -> Result<bool,
 async fn join(state: &AppState, user: &UserRow, room: &Room, accept_rules: bool) -> Result<RoomDetail, ApiError> {
     if banned(state, &room.id, user).await? {
         return Err(ApiError::Forbidden { code: "room.banned", detail: "You are banned from this room".into() });
+    }
+    // Age gate (PROTOCOL.md §5e): also with an invite link or a direct invite; existing members stay.
+    if room.age_gate == crate::age::GATE_ADULTS
+        && store::rooms::member(&state.db, &room.id, &user.id).await?.is_none()
+        && !crate::age::is_adult(state, user).await?
+    {
+        return Err(crate::age::restricted("room"));
     }
     if !room.rules.trim().is_empty() && !accept_rules {
         return Err(ApiError::Forbidden {
@@ -677,13 +773,15 @@ pub async fn update_member(
     if let Some(role_ids) = req.roles {
         access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
         let roles = store::rooms::roles(&state.db, &room_id).await?;
+        // Own roles at or above the own top position may stay in the list (they are not assigned anew).
+        let current = store::rooms::member_role_ids(&state.db, &room_id, &user_id).await?;
         let mut clean = Vec::new();
         for id in role_ids {
             let role = roles
                 .iter()
                 .find(|r| r.id == id && r.is_everyone == 0)
                 .ok_or_else(|| bad("role.unknown", format!("Role {id} does not exist in this room")))?;
-            if !access.outranks(role.position) {
+            if !access.outranks(role.position) && !current.contains(&id) {
                 return Err(ApiError::Forbidden {
                     code: "role.hierarchy",
                     detail: format!("The role '{}' is above your highest role", role.name),
@@ -692,6 +790,11 @@ pub async fn update_member(
             if !clean.contains(&id) {
                 clean.push(id);
             }
+        }
+        // The list replaces the member's roles: only members below the actor (permissions.md "Hierarchy"), so none
+        // of their current roles is at or above the actor's top position either.
+        if user_id != auth.user.id {
+            moderation_target(&state, &access, &user_id).await?;
         }
         store::rooms::set_member_roles(&state.db, &room_id, &user_id, &clean).await?;
         store::rooms::audit(
@@ -913,6 +1016,10 @@ pub async fn ban(
         let members = store::rooms::members_of_domain(&state.db, &room_id, &subject).await?;
         if members.contains(&access.room.owner_id) {
             return Err(ApiError::Forbidden { code: "member.is_owner", detail: "The owner cannot be banned".into() });
+        }
+        // Nobody of the domain may outrank the actor (permissions.md "Hierarchy"), checked before anyone leaves.
+        for user_id in &members {
+            moderation_target(&state, &access, user_id).await?;
         }
         for user_id in members {
             let Some(target) = store::users::by_id(&state.db, &user_id).await? else { continue };
@@ -1175,7 +1282,7 @@ struct ConfirmExtra {
 }
 
 /// Bulk deletion (`purge`): first a preview with count and confirmation token, then permanent deletion.
-#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails)))]
+#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn purge(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -1184,19 +1291,38 @@ pub async fn purge(
 ) -> Result<Json<PurgeResponse>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
+    // A preview counts messages across the room's channels: limited per moderator.
+    if req.confirm_token.is_none() {
+        state.purge_limiter.check_all(&[format!("purge:{}", auth.user.id)])?;
+    }
     let all_channels = store::rooms::channels(&state.db, &room_id).await?;
     let room_channels: Vec<String> = all_channels.iter().map(|c| c.id.clone()).collect();
+    // Only channels in which the actor holds `purge` (permissions.md step 4: nothing without `view_channel`).
+    let overrides = store::rooms::overrides_of_room(&state.db, &room_id).await?;
+    let may_purge = |c: &crate::models::ChannelRow| {
+        p::has(access::channel_perms_with(&access, c, &overrides, &auth.user.id), p::VIEW_CHANNEL | p::PURGE)
+    };
     let conversation_ids: Vec<String> = if req.channel_ids.is_empty() {
         // "All channels" are the members' channels; the welcome channel only when named.
-        all_channels.into_iter().filter(|c| c.kind != "system").map(|c| c.id).collect()
+        all_channels.iter().filter(|c| c.kind != "system" && may_purge(c)).map(|c| c.id.clone()).collect()
     } else {
         for id in &req.channel_ids {
             if !room_channels.contains(id) {
                 return Err(bad("channel.not_in_room", format!("Channel {id} does not belong to this room")));
             }
+            if !all_channels.iter().any(|c| &c.id == id && may_purge(c)) {
+                return Err(ApiError::Forbidden {
+                    code: "moderation.purge_forbidden",
+                    detail: format!("Missing permission in channel {id}: Purge"),
+                });
+            }
         }
         req.channel_ids.clone()
     };
+    // Never without a channel: the filter would otherwise reach every conversation of the node.
+    if conversation_ids.is_empty() {
+        return Err(bad("moderation.purge_no_channels", "There is no channel of this room you may purge"));
+    }
     if let Some(t) = req.from.as_deref().or(req.to.as_deref())
         && util::parse_time(t).is_none()
     {

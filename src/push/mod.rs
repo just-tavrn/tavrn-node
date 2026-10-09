@@ -90,6 +90,8 @@ pub enum Kind {
     Notice,
     /// The test push of the settings.
     Test,
+    /// A new report for a moderator or node admin (`report_kind` and the room only, MODERATION.md §1.5).
+    Report,
 }
 
 /// The decrypted payload a browser's service worker receives (`v` = 1). Field order is stable; absent fields are
@@ -128,6 +130,9 @@ pub struct PushPayload {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Reports: `message`, `user` or `room`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_kind: Option<String>,
 }
 
 /// A job of the sender.
@@ -302,6 +307,22 @@ pub fn custom(state: &AppState, user_id: &str, mut payload: PushPayload) {
     state.push.queue(Job::Notice { user_id: user_id.to_string(), payload });
 }
 
+/// A new report for a local moderator or node admin (MODERATION.md §1.5): the report's kind and its room, nothing of
+/// its content. The caller checks the user's `reports` setting; the limits of [`custom`] apply.
+pub fn report(state: &AppState, user_id: &str, room_id: Option<&str>, room: Option<&str>, report_kind: &str) {
+    custom(
+        state,
+        user_id,
+        PushPayload {
+            kind: Some(Kind::Report),
+            room_id: room_id.map(String::from),
+            room: room.map(|r| cut(r, NAME_CHARS)),
+            report_kind: Some(report_kind.to_string()),
+            ..PushPayload::default()
+        },
+    );
+}
+
 // ---------------------------------------------------------------- the sender
 
 /// Starts the sender task (once per state; [`crate::app::AppState::init`] calls it).
@@ -354,7 +375,11 @@ async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
             deliver_to_user(state, &user_id, Some(&conversation_id), kind == Kind::Call, payload).await
         }
         Job::Notice { user_id, payload } => {
-            let conversation = payload.conversation_id.clone();
+            // Reports coalesce per room (or per node for node reports): one push per moderator and 30 seconds.
+            let conversation = payload.conversation_id.clone().or_else(|| {
+                (payload.kind == Some(Kind::Report))
+                    .then(|| format!("report:{}", payload.room_id.as_deref().unwrap_or("node")))
+            });
             let payload = PushPayload { node: state.config.domain.clone(), local: true, ..payload };
             deliver_to_user(state, &user_id, conversation.as_deref(), false, payload).await
         }
@@ -411,6 +436,17 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         }
         _ => return Ok(()),
     };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Room channels: who may view the channel now (the WebSocket fan-out's check, PROTOCOL.md §6).
+    let view = match (row.kind.as_str(), &row.room_id) {
+        ("channel", Some(room_id)) => match crate::visibility::room(state, room_id).await? {
+            Some(view) => Some(view),
+            None => return Ok(()),
+        },
+        _ => None,
+    };
     let author = store::users::by_id(&state.db, author_id).await?;
     let sender = message
         .author_room_profile
@@ -431,25 +467,39 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         if user.domain != state.config.domain || user.disabled_at.is_some() {
             continue;
         }
-        // The user's own view of the conversation: membership, `view_channel`, message requests.
-        let conv = match access::conversation(state, &row.id, &user).await {
-            Ok(c) => c,
-            Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
-            Err(e) => return Err(e),
-        };
-        if !conv.entitled() || conv.is_request_for(&user.id) {
-            continue;
-        }
-        let (room_id, role_ids, room_name, channel_name) = match &conv.kind {
-            ConvKind::Channel { access, channel } => {
+        let (room_id, role_ids, room_name, channel_name) = match &view {
+            // Room channels: membership and `view_channel` from the room's visibility snapshot.
+            Some(view) => {
+                let Some(channel) = view.channel(&row.id) else { return Ok(()) };
                 // Welcome and system channels never notify.
                 if channel.kind == "system" {
+                    return Ok(());
+                }
+                let Some(member) = view.member(&user.id).filter(|_| view.can_view(&row.id, &user.id)) else {
+                    continue;
+                };
+                (
+                    Some(view.room.id.clone()),
+                    member.role_ids.clone(),
+                    Some(view.room.name.clone()),
+                    Some(channel.name.clone()),
+                )
+            }
+            // DMs and group DMs: the user's own view of the conversation (membership, message requests).
+            None => {
+                let conv = match access::conversation(state, &row.id, &user).await {
+                    Ok(c) => c,
+                    Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+                if !conv.entitled() || conv.is_request_for(&user.id) {
                     continue;
                 }
-                let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &user.id).await?;
-                (Some(access.room.id.clone()), roles, Some(access.room.name.clone()), Some(channel.name.clone()))
+                match &conv.kind {
+                    ConvKind::Direct { row, .. } => (None, Vec::new(), None, row.name.clone()),
+                    ConvKind::Channel { .. } => continue,
+                }
             }
-            ConvKind::Direct { row, .. } => (None, Vec::new(), None, row.name.clone()),
         };
         if let Some(author) = &author
             && store::social::blocked_either(&state.db, &user.id, &author.id).await?

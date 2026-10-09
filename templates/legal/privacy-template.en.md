@@ -21,6 +21,7 @@ Data protection officer: [[OPERATOR: data protection officer, if any (name and c
 tavrn is an end-to-end encrypted chat. Your devices create and keep your private keys; **private keys never leave your devices**. The node therefore cannot read encrypted messages, encrypted voice and video, or encrypted files. It holds the following data:
 
 - **Account:** username, e-mail address (optional, unless this node requires it), password hash (never the password), second factors if you set them up (TOTP secret stored encrypted, passkey public keys, hashed recovery codes), accepted terms version with time stamp, settings.
+- **Date of birth:** the date of birth you enter at registration (see "Date of birth and age gates" below).
 - **Profile:** display name, avatar, header image, bio, links, status and custom status text. Your profile is visible to other users.
 - **Devices and keys:** your devices and their public keys (MLS key packages, device attestations) and, if you create one, an encrypted key backup the node cannot open.
 - **Sessions and IP addresses:** active sessions (device, time of last use). IP addresses appear in the server logs and, for registrations, in the audit log.
@@ -51,6 +52,18 @@ tavrn is federated: users of different nodes can talk to each other. When you in
 - legal notices about content hosted on another node, which we may forward to that node with the case data.
 
 **Other nodes are run by separate, independent controllers** with their own privacy policies. We may block nodes (blocklist). When you delete content or your account, we forward deletion requests to the nodes involved; we cannot enforce that they comply, we can only request it and log the request.
+
+### Date of birth and age gates
+
+We ask for your date of birth when you register (accounts created earlier are asked once at their next sign-in). We use it only for two things: to check the minimum age for this node ({{minimum_age}} years) and to keep you out of rooms and channels that their managers marked "adults only" while you are under 18. The legal basis is Art. 6(1)(b) GDPR (providing the service as agreed, including the age rules of our terms) and, for protecting minors, Art. 6(1)(c) and (f) GDPR.
+
+- Your date of birth is stored **on this node only**. It is never shown to other users, room managers or moderators, and it is not part of your profile.
+- From it, the node derives whether you are 18 or older. Only you see this status (in your account).
+- When you join, read or call in a room on **another node**, this node tells that node only "18 or older: yes or no" in the signed sign-in it hands over (never the date itself), so that node can apply its own adults-only rules. That node must not show it to anyone.
+- Your date of birth is part of your data export, and it is deleted with your account.
+- You enter it once. If it is wrong, ask us to correct it (contact above); we correct it after checking your request, and the correction is logged without the date itself.
+
+The date of birth is your own statement; we do not verify it.
 
 ## 5. Service providers and optional features
 
@@ -115,7 +128,7 @@ We use no tracking cookies and no analytics. The app stores your session tokens 
 
 ## 10. Children
 
-You must be at least [[OPERATOR: minimum age, e.g. 16]] years old to use this node.
+You must be at least {{minimum_age}} years old to use this node; registration refuses younger people (see "Date of birth and age gates" above). [[OPERATOR: if you lower the minimum age below 16 in an EU country, describe the parental consent you obtain (Art. 8 GDPR).]]
 
 ## 11. Changes to this policy
 

@@ -25,23 +25,27 @@ async fn registration_validation_and_conflicts() {
     node.register("alice").await;
     let cases = [
         (
-            json!({ "username": "alice", "password": "password-long-enough" }),
+            json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" }),
             StatusCode::CONFLICT,
             "auth.username_taken",
         ),
         (
-            json!({ "username": "Alice Two", "password": "password-long-enough" }),
+            json!({ "username": "Alice Two", "date_of_birth": "1990-01-01", "password": "password-long-enough" }),
             StatusCode::BAD_REQUEST,
             "auth.username_invalid",
         ),
-        (json!({ "username": "carol", "password": "short" }), StatusCode::BAD_REQUEST, "auth.password_weak"),
         (
-            json!({ "username": "carol", "password": "password-long-enough", "email": "not-an-email" }),
+            json!({ "username": "carol", "date_of_birth": "1990-01-01", "password": "short" }),
+            StatusCode::BAD_REQUEST,
+            "auth.password_weak",
+        ),
+        (
+            json!({ "username": "carol", "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": "not-an-email" }),
             StatusCode::BAD_REQUEST,
             "auth.email_invalid",
         ),
         (
-            json!({ "username": "carol", "password": "password-long-enough", "display_name": "x\u{0}y" }),
+            json!({ "username": "carol", "date_of_birth": "1990-01-01", "password": "password-long-enough", "display_name": "x\u{0}y" }),
             StatusCode::BAD_REQUEST,
             "validation.control_chars",
         ),
@@ -57,7 +61,7 @@ async fn registration_validation_and_conflicts() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "ALICE", "password": "password-long-enough" })),
+            Some(json!({ "username": "ALICE", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "{j}");
@@ -71,7 +75,7 @@ async fn registration_modes() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -84,7 +88,7 @@ async fn registration_modes() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "bob", "password": "password-long-enough" })),
+            Some(json!({ "username": "bob", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -103,7 +107,7 @@ async fn email_required_mode_needs_verification_before_login() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
@@ -113,7 +117,7 @@ async fn email_required_mode_needs_verification_before_login() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough", "email": "Alice@Example.org" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": "Alice@Example.org" })),
         )
         .await;
     assert_eq!(s, StatusCode::CREATED);
@@ -122,7 +126,7 @@ async fn email_required_mode_needs_verification_before_login() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -142,7 +146,7 @@ async fn email_required_mode_needs_verification_before_login() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
@@ -159,7 +163,9 @@ async fn login_success_failure_and_rate_limit() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice@t.local", "password": "password-alice-123" })),
+            Some(
+                json!({ "username": "alice@t.local", "date_of_birth": "1990-01-01", "password": "password-alice-123" }),
+            ),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
@@ -171,7 +177,7 @@ async fn login_success_failure_and_rate_limit() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "wrong-wrong-wrong" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "wrong-wrong-wrong" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -181,7 +187,7 @@ async fn login_success_failure_and_rate_limit() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "nobody", "password": "wrong-wrong-wrong" })),
+            Some(json!({ "username": "nobody", "date_of_birth": "1990-01-01", "password": "wrong-wrong-wrong" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "an unknown user looks identical");
@@ -197,7 +203,7 @@ async fn login_success_failure_and_rate_limit() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "password-alice-123" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-alice-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{j}");
@@ -293,7 +299,7 @@ async fn captcha_is_enforced_when_enabled() {
     assert_eq!(info["captcha"]["site_key"], "site");
     assert_eq!(info["captcha"]["login"], true);
 
-    let body = json!({ "username": "alice", "password": "password-long-enough" });
+    let body = json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" });
     let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(body.clone())).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
     assert_eq!(j["code"], "auth.captcha_required");
@@ -312,7 +318,7 @@ async fn captcha_is_enforced_when_enabled() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough" })),
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
@@ -322,7 +328,7 @@ async fn captcha_is_enforced_when_enabled() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "password-long-enough", "captcha_token": "good" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "password-long-enough", "captcha_token": "good" })),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
@@ -373,7 +379,7 @@ async fn password_change_revokes_other_devices() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "new-password-123" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "new-password-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::OK);

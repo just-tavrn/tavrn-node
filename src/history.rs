@@ -16,10 +16,13 @@ use crate::{
     access::{self, Conv, ConvKind},
     app::AppState,
     error::ApiError,
-    models::UserRow,
+    models::{MemberRow, UserRow},
     permissions, store, util,
     validate::bad,
 };
+
+/// Larger than every message id: "up to now" for `has_encrypted_before`.
+const UNTIL_NOW: &str = "ZZZZZZZZZZZZZZZZZZZZZZZZZZ";
 
 /// Largest `days:<n>` value (ten years).
 pub const MAX_DAYS: i64 = 3650;
@@ -33,6 +36,19 @@ pub const SHARES_PER_DAY: i64 = 20;
 pub const MAX_AGE_DAYS: i64 = 30;
 /// Acknowledged shares are kept this long (they still count for the rate limit).
 pub const ACKED_KEEP_HOURS: i64 = 24;
+/// Restore shares are accepted this long after a restore was approved; decided requests are kept as long.
+pub const RESTORE_VALID_DAYS: i64 = 30;
+/// Requests per member, room and 24 hours.
+pub const REQUESTS_PER_DAY: i64 = 5;
+/// Longest request message and deny reason (characters).
+pub const MAX_REQUEST_TEXT: usize = 500;
+/// Values of the room setting `history_restore`.
+pub const RESTORE_SETTINGS: &[&str] = &["request", "off"];
+/// Channel kinds whose content a restore covers: every encrypted channel kind with stored content (voice channels
+/// store nothing).
+pub fn restorable_kind(kind: &str) -> bool {
+    kind != "voice" && kind != "system"
+}
 
 /// The channel setting `history_for_new_members`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,33 +132,70 @@ pub fn ulid_floor(t: DateTime<Utc>) -> String {
     ulid::Ulid::from_parts(ms, 0).to_string()
 }
 
-/// The cut for `GET …/messages` of the requester as a message id (ULID floor), or `None`:
-/// - room channels: the membership's `joined_at` with the channel policy and the `read_history` bit (node
-///   admins who are not members are not limited; they cannot decrypt anything anyway);
+/// The start of a room member's window: the policy and the `read_history` bit from `joined_at`, and after a key
+/// reset without an approved restore never before `key_reset_at` (ENCRYPTION.md §7b "History after a key reset").
+/// `None` = no limit.
+pub fn member_window(policy: Policy, read_history: bool, member: &MemberRow) -> Option<DateTime<Utc>> {
+    let base = util::parse_time(&member.joined_at).and_then(|joined| cutoff(policy, read_history, joined));
+    match reset_cut(member) {
+        Some(reset) => Some(base.map_or(reset, |b| b.max(reset))),
+        None => base,
+    }
+}
+
+/// `key_reset_at` of a membership whose history was not restored.
+pub fn reset_cut(member: &MemberRow) -> Option<DateTime<Utc>> {
+    if member.history_restored_at.is_some() {
+        return None;
+    }
+    member.key_reset_at.as_deref().and_then(util::parse_time)
+}
+
+/// The start of the requester's history window in a conversation, `None` = no limit:
+/// - room channels: [`member_window`] of the membership (node admins who are not members are not limited; they
+///   cannot decrypt anything anyway);
 /// - group DMs: the requester's `joined_at` (`since_join`: members added later start there);
-/// - DMs: no cut (both participants are members from the start).
+/// - DMs: no limit (both participants are members from the start).
 ///
-/// Only encrypted messages are cut; plaintext messages stay readable as before.
-pub async fn list_cutoff(state: &AppState, conv: &Conv, user: &UserRow) -> Result<Option<String>, ApiError> {
-    let (joined, policy, read) = match &conv.kind {
+/// Measured on message ids (`list_cutoff`) and on the records of files channels (FILES.md §8.7).
+pub async fn window_start(state: &AppState, conv: &Conv, user: &UserRow) -> Result<Option<DateTime<Utc>>, ApiError> {
+    match &conv.kind {
         ConvKind::Channel { access, channel } => {
             let Some(member) = &access.member else { return Ok(None) };
-            (
-                member.joined_at.clone(),
+            Ok(member_window(
                 Policy::of(channel.history_for_new_members.as_deref()),
                 permissions::has(conv.perms, permissions::READ_HISTORY),
-            )
+                member,
+            ))
         }
         ConvKind::Direct { row, .. } if row.kind == "group" => {
-            match store::history::direct_joined_at(&state.db, &conv.id, &user.id).await? {
-                Some(j) => (j, Policy::SinceJoin, true),
-                None => return Ok(None),
-            }
+            Ok(store::history::direct_joined_at(&state.db, &conv.id, &user.id)
+                .await?
+                .as_deref()
+                .and_then(util::parse_time))
         }
-        ConvKind::Direct { .. } => return Ok(None),
-    };
-    let Some(joined) = util::parse_time(&joined) else { return Ok(None) };
-    Ok(cutoff(policy, read, joined).map(ulid_floor))
+        ConvKind::Direct { .. } => Ok(None),
+    }
+}
+
+/// The cut for `GET …/messages` of the requester as a message id (ULID floor), or `None` ([`window_start`]).
+/// Only encrypted messages are cut; plaintext messages stay readable as before.
+pub async fn list_cutoff(state: &AppState, conv: &Conv, user: &UserRow) -> Result<Option<String>, ApiError> {
+    Ok(window_start(state, conv, user).await?.map(ulid_floor))
+}
+
+/// The user's identity key changed without continuity (a reset, ENCRYPTION.md §9; called with the welcome
+/// channel's `system.key_changed { rotated: false }`): every membership here gets `key_reset_at`, every encrypted
+/// group of those rooms records the reset epoch. Failures are logged (the key change already happened).
+pub async fn key_reset(state: &AppState, user: &UserRow, at: &str) {
+    if let Err(e) = store::history::mark_key_reset(&state.db, &user.id, at).await {
+        tracing::warn!(error = %e, user = user.address(), "key reset not recorded on the memberships");
+    }
+}
+
+/// `min_epoch` of a reset member (reset epoch + 1, ENCRYPTION.md §7b), `None` without a pre-reset range.
+pub async fn min_epoch(state: &AppState, conversation_id: &str, user_id: &str) -> Result<Option<i64>, ApiError> {
+    Ok(store::history::reset_epoch(&state.db, conversation_id, user_id).await?.map(|e| e + 1))
 }
 
 /// After an accepted commit: users who got their first leaf in the group (an external join of a user
@@ -184,7 +237,7 @@ async fn mark_new_members(
     }
     addresses.sort();
     addresses.dedup();
-    for address in addresses.into_iter().filter(|a| !had_leaf.contains(a)) {
+    for address in addresses {
         let Some((username, domain)) = util::parse_address(&address) else { continue };
         let Some(user) = store::federation::user_by_address(&state.db, username, domain).await? else { continue };
         let member_access = match access::room_access(state, &access.room.id, &user).await {
@@ -193,26 +246,47 @@ async fn mark_new_members(
             Err(e) => return Err(e),
         };
         let Some(member) = &member_access.member else { continue };
+        // After a key reset the user's old (now unattested) leaves may still be in the group: the first device
+        // back counts as new, once per reset.
+        let reset = member.key_reset_at.as_deref();
+        if reset.is_none() && had_leaf.contains(&address) {
+            continue;
+        }
         let perms = access::channel_perms(state, &member_access, channel, &user.id).await?;
         if !permissions::has(perms, permissions::VIEW_CHANNEL | permissions::READ_HISTORY) {
             continue;
         }
-        if store::history::pending_since(&state.db, &conv.id, &user.id).await?.as_deref()
-            == Some(member.joined_at.as_str())
-        {
-            continue; // this membership was handled already
+        let marker = reset.unwrap_or(member.joined_at.as_str());
+        if store::history::pending_since(&state.db, &conv.id, &user.id).await?.as_deref() == Some(marker) {
+            continue; // this membership (or this reset) was handled already
         }
-        let Some(joined) = util::parse_time(&member.joined_at) else { continue };
-        let window_start = cutoff(policy, true, joined).map(ulid_floor);
-        let older =
-            store::history::has_encrypted_before(&state.db, &conv.id, &ulid_floor(joined), window_start.as_deref())
-                .await?;
-        store::history::set_pending(&state.db, &conv.id, &user.id, &member.joined_at, older).await?;
+        // The automatic window: from the policy's start up to the join, or after a reset everything since the
+        // reset (never earlier, ENCRYPTION.md §7b "History after a key reset"). The same window as times for the
+        // entry records of a files channel.
+        let (until, from, until_time, from_time) = match reset.and_then(util::parse_time) {
+            Some(r) => (UNTIL_NOW.to_string(), Some(ulid_floor(r)), util::now(), Some(util::format_time(r))),
+            None => {
+                let Some(joined) = util::parse_time(&member.joined_at) else { continue };
+                let start = cutoff(policy, true, joined);
+                (ulid_floor(joined), start.map(ulid_floor), member.joined_at.clone(), start.map(util::format_time))
+            }
+        };
+        let mut older = store::history::has_encrypted_before(&state.db, &conv.id, &until, from.as_deref()).await?;
+        // Files channels have entry records instead of messages (FILES.md §8.7).
+        if !older && channel.kind == "files" {
+            older = store::files::has_records_between(&state.db, &conv.id, from_time.as_deref(), &until_time).await?;
+        }
+        store::history::set_pending(&state.db, &conv.id, &user.id, marker, older).await?;
         if older {
+            let min_epoch = match reset {
+                Some(_) => min_epoch(state, &conv.id, &user.id).await?,
+                None => None,
+            };
             conv.publish(
                 &state.hub,
                 "history.pending",
-                serde_json::json!({ "conversation_id": conv.id, "user": user.address(), "since": member.joined_at }),
+                serde_json::json!({ "conversation_id": conv.id, "user": user.address(), "since": marker,
+                                    "key_reset_at": reset, "min_epoch": min_epoch }),
             );
         }
     }
@@ -264,6 +338,45 @@ mod tests {
         // Without read_history the history starts at the join, whatever the policy.
         assert_eq!(cutoff(Policy::All, false, joined), Some(joined));
         assert_eq!(cutoff(Policy::Days(5), false, joined), Some(joined));
+    }
+
+    fn member(joined: &str, reset: Option<&str>, restored: Option<&str>) -> MemberRow {
+        MemberRow {
+            room_id: "r".into(),
+            user_id: "u".into(),
+            nickname: None,
+            joined_at: joined.into(),
+            rules_accepted_at: None,
+            timeout_until: None,
+            avatar_media_id: None,
+            avatar_animated: 0,
+            bio: String::new(),
+            key_reset_at: reset.map(Into::into),
+            history_restored_at: restored.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_key_reset_moves_the_window_until_a_restore() {
+        let t = |s: &str| util::parse_time(s);
+        let joined = "2026-10-01T12:00:00.000Z";
+        let reset = "2026-10-05T08:00:00.000Z";
+        // Without a reset: the policy.
+        assert_eq!(member_window(Policy::All, true, &member(joined, None, None)), None);
+        assert_eq!(member_window(Policy::SinceJoin, true, &member(joined, None, None)), t(joined));
+        // After a reset: never before it, whatever the policy and the bit.
+        for (policy, bit) in
+            [(Policy::All, true), (Policy::Days(30), true), (Policy::SinceJoin, true), (Policy::All, false)]
+        {
+            assert_eq!(member_window(policy, bit, &member(joined, Some(reset), None)), t(reset), "{policy} {bit}");
+        }
+        // An approved restore gives the normal window back.
+        let restored = member(joined, Some(reset), Some("2026-10-06T00:00:00.000Z"));
+        assert_eq!(member_window(Policy::All, true, &restored), None);
+        assert_eq!(member_window(Policy::Days(1), true, &restored), t("2026-09-30T12:00:00.000Z"));
+        assert_eq!(reset_cut(&restored), None);
+        assert!(restorable_kind("text") && restorable_kind("files") && restorable_kind("forum"));
+        assert!(!restorable_kind("voice") && !restorable_kind("system"));
     }
 
     #[test]

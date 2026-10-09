@@ -5,7 +5,8 @@ now described in the operator handbook: [Scaling with Valkey](HANDBOOK.md#scalin
 
 - Requirements, load balancer, voice, examples and failure behaviour:
   [Operating several instances](HANDBOOK.md#operating-several-instances)
-- Settings (`TAVRN_CACHE_URL`, `TAVRN_INSTANCE_ID`, `TAVRN_INSTANCE_URL`) and command interactions:
+- Settings (`TAVRN_CACHE_URL`, `TAVRN_INSTANCE_ID`, `TAVRN_INSTANCE_URL`) and command interactions (kept sealed in the
+  shared cache, so a restart or another instance takes their responses):
   [Settings for several instances](HANDBOOK.md#settings-for-several-instances)
 - How the instances act as one node: [How the instances act as one node](HANDBOOK.md#how-the-instances-act-as-one-node)
 - Where every piece of in-memory state went: [Audit of the in-memory state](HANDBOOK.md#audit-of-the-in-memory-state)

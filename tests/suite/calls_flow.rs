@@ -380,3 +380,41 @@ async fn members_who_blocked_the_caller_are_not_rung() {
     let (_, start) = node.post(&path(&id, "start"), &alice.token, json!({})).await;
     assert_eq!(start["call"]["ringing"], json!(["bob@t.local"]));
 }
+
+/// Authorization audit: a member removed from a group DM (or leaving it) is dropped from its running call at once,
+/// the call goes on for the others.
+#[tokio::test]
+async fn a_removed_group_member_is_dropped_from_the_call() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let carol = node.register("carol").await;
+    node.befriend(&alice, &bob).await;
+    node.befriend(&alice, &carol).await;
+    let (_, group) =
+        node.post("/api/v1/conversations", &alice.token, json!({ "kind": "group", "members": ["bob", "carol"] })).await;
+    let id = group["id"].as_str().unwrap().to_string();
+    node.post(&path(&id, "start"), &alice.token, json!({})).await;
+    for s in [&bob, &carol] {
+        let (st, j) = node.post(&path(&id, "join"), &s.token, json!({})).await;
+        assert!(st.is_success(), "{j}");
+    }
+    for s in [&alice, &bob, &carol] {
+        connected(&node, &id, s).await;
+    }
+    let mut rx = node.state.hub.subscribe();
+    let (st, j) = node.delete(&format!("/api/v1/conversations/{id}/members/bob"), &alice.token).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{j}");
+    let (update, _) = next(&mut rx, "call.update").await;
+    let users: Vec<&str> =
+        update["call"]["participants"].as_array().unwrap().iter().map(|p| p["user"].as_str().unwrap()).collect();
+    assert_eq!(users, vec!["alice@t.local", "carol@t.local"], "{update}");
+    assert!(node.state.calls.is_active(&id));
+    // Leaving by oneself drops the seat as well.
+    let (st, j) = node.delete(&format!("/api/v1/conversations/{id}/members/carol"), &carol.token).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{j}");
+    let (_, state) = node.get_auth(&path(&id, ""), &alice.token).await;
+    let users: Vec<&str> =
+        state["participants"].as_array().unwrap().iter().map(|p| p["user"].as_str().unwrap()).collect();
+    assert_eq!(users, vec!["alice@t.local"], "{state}");
+}

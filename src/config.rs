@@ -216,6 +216,9 @@ pub struct Config {
     pub smtp_url: Option<String>,
     /// Sender address; default `noreply@<domain>`.
     pub smtp_from: Option<String>,
+    /// Operator overrides of the mail templates, `<dir>/<language>/<name>.txt` (`mail_templates.rs`); default
+    /// `<TAVRN_DATA_DIR>/templates/mail`.
+    pub mail_templates_dir: Option<String>,
     /// Optional captcha: `none` or `turnstile` (Cloudflare).
     pub captcha_provider: CaptchaProvider,
     pub turnstile_site_key: Option<String>,
@@ -255,6 +258,9 @@ pub struct Config {
     pub preview_auto_max_bytes: u64,
     /// Sender-generated link previews (`GET /api/v1/unfurl`): `on` (default) or `off`.
     pub unfurl: crate::unfurl::UnfurlSetting,
+    /// Message retention (PROTOCOL.md §7f): messages are deleted this many days after they were sent by the hourly
+    /// housekeeping (`0` = keep forever, at most 36500); rooms may only shorten it. Pinned messages and the welcome
+    /// channel are exempt.
     pub retention_days: u32,
     /// Custom emojis per room: maximum count and maximum file size.
     pub emoji_max_per_room: u32,
@@ -374,6 +380,8 @@ pub struct Config {
     /// Accept bots of other nodes (APPLICATIONS.md §2.8; whether this node's own bots may federate is
     /// `apps_federate`).
     pub federation_remote_bots: bool,
+    /// API requests per user and minute (every authenticated route; `0` = off, the default in development mode).
+    pub rate_user_per_minute: u32,
     /// Federated logins per remote domain and minute.
     pub federation_rate_logins: u32,
     /// Inbox messages per remote domain and minute.
@@ -518,6 +526,9 @@ pub struct Config {
     pub admin_users: String,
     pub log_level: String,
     pub log_format: LogFormat,
+    /// Minimum age for registration (13–99, default 16; PROTOCOL.md §5e): every registration path refuses younger
+    /// people with `age.below_minimum`.
+    pub minimum_age: u32,
 }
 
 impl Default for Config {
@@ -541,6 +552,7 @@ impl Default for Config {
             email: EmailMode::Optional,
             smtp_url: None,
             smtp_from: None,
+            mail_templates_dir: None,
             captcha_provider: CaptchaProvider::None,
             turnstile_site_key: None,
             turnstile_secret_key: None,
@@ -614,6 +626,7 @@ impl Default for Config {
             federation_srv_fallback: true,
             federation_dev_peers: String::new(),
             federation_remote_bots: true,
+            rate_user_per_minute: 1200,
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
@@ -674,6 +687,7 @@ impl Default for Config {
             admin_users: String::new(),
             log_level: "info".into(),
             log_format: LogFormat::Text,
+            minimum_age: 16,
         }
     }
 }
@@ -741,6 +755,7 @@ impl Config {
     pub fn defaults_for(dev: bool) -> Self {
         let mut c = Self::default();
         if dev {
+            c.rate_user_per_minute = 0;
             c.domain = "localhost".into();
             c.listen = "127.0.0.1:8080".into();
             c.database_url = "sqlite://data-dev/tavrn.db?mode=rwc".into();
@@ -839,6 +854,15 @@ impl Config {
             && from.parse::<lettre::message::Mailbox>().is_err()
         {
             problems.push(format!("TAVRN_SMTP_FROM='{from}' is not a valid sender address"));
+        }
+        let templates = crate::mail_templates::dir_of(self);
+        let explicit = self.mail_templates_dir.as_deref().is_some_and(|d| !d.trim().is_empty());
+        if explicit && !templates.is_dir() {
+            problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR='{}' is not a directory", templates.display()));
+        } else if templates.is_dir() {
+            for p in crate::mail_templates::check_dir(&templates) {
+                problems.push(format!("TAVRN_MAIL_TEMPLATES_DIR: {p}"));
+            }
         }
 
         if self.gif_provider != GifProvider::None && self.gif_api_key.as_deref().unwrap_or("").trim().is_empty() {
@@ -939,6 +963,9 @@ impl Config {
         }
         if self.device_stale_days > 36_500 {
             problems.push("TAVRN_DEVICE_STALE_DAYS must be between 0 and 36500 (0 = never)".into());
+        }
+        if !(13..=99).contains(&self.minimum_age) {
+            problems.push("TAVRN_MINIMUM_AGE must be between 13 and 99".into());
         }
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError { problems }) }
@@ -1043,7 +1070,7 @@ impl Config {
         if self.upload_max_bytes_ceiling != 0 && self.upload_max_bytes_ceiling < self.upload_max_bytes {
             problems.push("TAVRN_UPLOAD_MAX_BYTES_CEILING must be 0 or at least TAVRN_UPLOAD_MAX_BYTES".into());
         }
-        let ranges: [(&str, u64, u64); 9] = [
+        let ranges: [(&str, u64, u64); 10] = [
             ("TAVRN_VOICE_CHANNEL_MAX_PARTICIPANTS", self.voice_channel_max_participants.into(), 1000),
             ("TAVRN_STREAM_MAX_HEIGHT", self.stream_max_height.into(), 4320),
             ("TAVRN_STREAM_MAX_FPS", self.stream_max_fps.into(), 240),
@@ -1052,6 +1079,7 @@ impl Config {
             ("TAVRN_SOUNDS_MAX_PER_ROOM", self.sounds_max_per_room.into(), 100_000),
             ("TAVRN_SOUNDS_MAX_PERSONAL", self.sounds_max_personal.into(), 100_000),
             ("TAVRN_ATTACHMENT_RETENTION_DAYS", self.attachment_retention_days.into(), 36_500),
+            ("TAVRN_RETENTION_DAYS", self.retention_days.into(), 36_500),
             ("TAVRN_MAX_ROOMS_PER_USER", self.max_rooms_per_user.into(), 1_000_000),
         ];
         for (name, value, max) in ranges {
@@ -2258,6 +2286,21 @@ mod tests {
     }
 
     #[test]
+    fn message_retention_is_validated() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            assert_eq!(Config::load(false).unwrap().retention_days, 0, "keep forever by default");
+            jail.set_env("TAVRN_RETENTION_DAYS", "365");
+            assert_eq!(Config::load(false).unwrap().retention_days, 365);
+            jail.set_env("TAVRN_RETENTION_DAYS", "36501");
+            let err = Config::load(false).unwrap_err().to_string();
+            assert!(err.contains("TAVRN_RETENTION_DAYS must be between 0 and 36500"), "{err}");
+            Ok(())
+        });
+    }
+
+    #[test]
     fn load_reports_errors_from_env() {
         figment::Jail::expect_with(|jail| {
             jail.set_env("TAVRN_DOMAIN", "env.example");
@@ -2468,6 +2511,19 @@ mod tests {
                 let err = Config::load(false).unwrap_err();
                 assert!(err.problems.iter().any(|p| p.contains("TAVRN_SEARCH_RATE_PER_MINUTE")), "{err}");
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_general_user_limit_is_on_in_production_and_off_in_development() {
+        assert_eq!(Config::defaults_for(false).rate_user_per_minute, 1200);
+        assert_eq!(Config::defaults_for(true).rate_user_per_minute, 0);
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            jail.set_env("TAVRN_RATE_USER_PER_MINUTE", "90");
+            assert_eq!(Config::load(false).unwrap().rate_user_per_minute, 90);
             Ok(())
         });
     }

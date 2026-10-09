@@ -214,6 +214,7 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
             let mut users = Vec::new();
             // Thread messages (PROTOCOL.md §7e) reach the thread's followers (every message; their home node applies
             // their settings) and the users they mention directly; `@everyone` inside a thread reaches followers only.
+            // Never members who cannot view the channel (PROTOCOL.md §6), whatever they follow or are mentioned in.
             let followers: Option<Vec<String>> = match &message.thread_id {
                 Some(t) => Some(store::threads::follower_ids(&state.db, t).await?),
                 None => None,
@@ -222,16 +223,16 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
                 || message.mentions_everyone
                 || !message.mentions.is_empty()
             {
-                for id in store::rooms::remote_member_ids(&state.db, &access.room.id, own).await? {
-                    if let Some(u) = store::users::by_id(&state.db, &id).await? {
-                        let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &u.id).await?;
-                        let wanted = match &followers {
-                            Some(f) => f.contains(&u.id) || direct_mention(message, &u, &roles),
-                            None => message.mentions_everyone || direct_mention(message, &u, &roles),
-                        };
-                        if wanted {
-                            users.push((u, roles));
-                        }
+                let Some(view) = crate::visibility::room(state, &access.room.id).await? else { return Ok(()) };
+                let viewers = view.viewers(&conv.id);
+                for member in view.members().filter(|m| m.user.domain != *own && viewers.contains(&m.user.id)) {
+                    let (u, roles) = (&member.user, &member.role_ids);
+                    let wanted = match &followers {
+                        Some(f) => f.contains(&u.id) || direct_mention(message, u, roles),
+                        None => message.mentions_everyone || direct_mention(message, u, roles),
+                    };
+                    if wanted {
+                        users.push((u.clone(), roles.clone()));
                     }
                 }
             }
@@ -497,6 +498,9 @@ pub async fn handle(
 ) -> Result<&'static str, ApiError> {
     match incoming {
         Incoming::RoomInvite { room, room_id, invite_code, expires_at } => {
+            if !vouches(state, iss, from).await? {
+                return Err(not_vouched("inviter"));
+            }
             if inviter_blocked(state, to, from).await? {
                 return Ok("blocked");
             }
@@ -513,6 +517,9 @@ pub async fn handle(
             // A DM lives on its initiator's home node (§6.1); only group members of other nodes may invite.
             if kind == "dm" && util::parse_address(from).is_none_or(|(_, d)| d != iss) {
                 return Err(invalid("only the inviter's node invites to direct messages"));
+            }
+            if !vouches(state, iss, from).await? {
+                return Err(not_vouched("inviter"));
             }
             if inviter_blocked(state, to, from).await? {
                 return Ok("blocked");
@@ -555,6 +562,15 @@ pub async fn handle(
         Incoming::FriendAccept => friend_accept(state, from, to, at).await,
         Incoming::FriendRemove { request_id } => friend_remove(state, from, to, at, request_id.as_deref()).await,
         Incoming::Notify { conversation_id, call: Some(call), .. } => {
+            if let CallHint::Ring { from, .. } = &call
+                && !vouches(state, iss, from).await?
+            {
+                return Err(not_vouched("caller"));
+            }
+            // Hints only from a node the user signed in on (a member of something there).
+            if !present_on(state, Some(to), iss).await? {
+                return Ok("not_member");
+            }
             // Ring hints are forwarded live only (a ring that arrives after the ring time is dropped).
             match call {
                 CallHint::Ring { from, started_at, group } => {
@@ -597,6 +613,10 @@ pub async fn handle(
             Ok("handled")
         }
         Incoming::Notify { conversation_id, room_id, mention, everyone, call: None } => {
+            // Hints only from a node the user signed in on (a member of something there).
+            if !present_on(state, Some(to), iss).await? {
+                return Ok("not_member");
+            }
             // The user's notification settings decide (muted, mode, suppress @everyone): a hint they do not
             // want is neither stored nor forwarded.
             let settings = crate::notifications::load(&state.db, &to.id).await?;
@@ -621,6 +641,28 @@ pub async fn handle(
             Ok("handled")
         }
     }
+}
+
+/// May node `iss` speak for `address` (an inviter, caller or claim requester it names)? Users of `iss` itself and
+/// of third nodes: yes (they act there through federated sessions, which this node cannot see). Users of this node:
+/// only if they signed in on `iss` (federation targets, §2.4) — otherwise `iss` claims something about them that
+/// cannot have happened.
+pub async fn vouches(state: &AppState, iss: &str, address: &str) -> Result<bool, ApiError> {
+    let Some((name, domain)) = util::parse_address(address) else { return Ok(false) };
+    if domain != state.config.domain {
+        return Ok(true);
+    }
+    present_on(state, store::users::by_username(&state.db, name, domain).await?.as_ref(), iss).await
+}
+
+/// Has the local user signed in on `node` (a member of something there)?
+async fn present_on(state: &AppState, user: Option<&UserRow>, node: &str) -> Result<bool, ApiError> {
+    let Some(user) = user else { return Ok(false) };
+    Ok(store::federation::target_domains(&state.db, &user.id).await?.iter().any(|t| t == node))
+}
+
+fn not_vouched(what: &str) -> ApiError {
+    invalid(&format!("the {what} has no session on the sending node"))
 }
 
 /// The user row of an address this node already knows (no network).

@@ -602,15 +602,44 @@ async fn announce(state: &AppState, row: &ReportRow) {
     match audience(state, row).await {
         Ok(ids) => {
             state.hub.users(
-                ids,
+                ids.clone(),
                 "report.create",
                 json!({ "report": { "id": row.id, "scope": row.scope, "source": row.source, "kind": row.kind,
                     "room_id": row.room_id, "room_name": room_name, "conversation_id": row.conversation_id,
                     "category": row.category, "created_at": row.created_at } }),
             );
+            push_report(state, row, room_name, ids);
         }
         Err(e) => tracing::warn!(error = %e, "report.create not sent"),
     }
+}
+
+/// Web push of a new report (PROTOCOL.md §6d) to the audience's local users with a subscription and the notification
+/// setting `reports` on; the push module skips those with an open connection and applies the limits. In the
+/// background: the report is answered first.
+fn push_report(state: &AppState, row: &ReportRow, room_name: Option<String>, audience: Vec<String>) {
+    if !state.push.enabled() || audience.is_empty() {
+        return;
+    }
+    // Room reports name their room; node reports (also those about a room or its owner) name none: the client opens
+    // the room's Reports tab or the admin inbox accordingly.
+    let room_id = row.room_id.clone().filter(|_| row.scope == "room");
+    let room_name = room_name.filter(|_| room_id.is_some());
+    let (state, kind) = (state.clone(), row.kind.clone());
+    tokio::spawn(async move {
+        let result: Result<(), ApiError> = async {
+            for user_id in store::push::users_with_subscriptions(&state.db, &audience).await? {
+                if crate::notifications::load(&state.db, &user_id).await?.global.reports {
+                    crate::push::report(&state, &user_id, room_id.as_deref(), room_name.as_deref(), &kind);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "report push not queued");
+        }
+    });
 }
 
 /// `report.update` after a change, an action or a deletion.

@@ -84,7 +84,12 @@ pub async fn create_group(
     ApiJson(req): ApiJson<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<EpochResponse>), ApiError> {
     let conv = entitled_conv(&state, &auth, &conversation_id).await?;
-    conv.require(p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    // Files channels have no messages: whoever may upload creates their group (FILES.md §8.1).
+    if matches!(&conv.kind, access::ConvKind::Channel { channel, .. } if channel.kind == "files") {
+        conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
+    } else {
+        conv.require(p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    }
     if !conv.encrypted {
         return Err(bad("mls.not_encrypted", "This conversation is not end-to-end encrypted"));
     }

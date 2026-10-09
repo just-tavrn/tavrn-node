@@ -162,6 +162,17 @@ impl FedNode {
     }
 }
 
+impl FedNode {
+    /// One node served on a loopback port (WebSocket tests), without peers.
+    pub async fn serve_one(domain: &str) -> FedNode {
+        let listener = bind(0);
+        let port = listener.local_addr().unwrap().port();
+        let node = FedNode { node: super::test_node(domain).await, port, server: Mutex::new(None) };
+        node.serve(listener);
+        node
+    }
+}
+
 /// A federated session on a target node.
 pub struct RemoteSession {
     pub token: String,

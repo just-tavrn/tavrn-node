@@ -100,6 +100,10 @@ async fn recovery_entry_roundtrip_crud_and_validation() {
     for (body, status, code) in cases {
         let (s, j) = node.put("/api/v1/users/me/secret-storage/recovery", &alice.token, body.clone()).await;
         assert_eq!((s, j["code"].as_str()), (status, Some(code)), "{body}: {j}");
+        if code == "secret_storage.invalid" {
+            // API texts are English (the client localizes by code).
+            assert_eq!(j["detail"], "wrapped: expected 61 bytes of base64url with version 1", "{j}");
+        }
     }
     let (s, j) = node
         .put(

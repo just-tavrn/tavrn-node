@@ -61,8 +61,12 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     // Reports and content auto-moderation (MODERATION.md).
     caps.push("reports.v1");
     caps.push("automod.v1");
+    // History restore after a key reset by request and approval (ENCRYPTION.md §7b).
+    caps.push("history.restore");
+    // End-to-end encrypted files channels (FILES.md §8).
+    caps.push("files.e2ee");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
-    caps.extend(["threads", "forum", "announcement"]);
+    caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
         caps.push("voice");
         caps.push("soundboard");
@@ -70,6 +74,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
             caps.push("screenshare");
         }
     }
+    // Date of birth, private age status and age gates (PROTOCOL.md §5e).
+    caps.push(crate::age::CAPABILITY);
     caps
 }
 
@@ -121,6 +127,9 @@ pub struct AppState {
     pub federation_login_limiter: Arc<SharedLimiter>,
     /// Inbox messages per remote domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_INBOX` per minute).
     pub federation_inbox_limiter: Arc<SharedLimiter>,
+    /// Node-token requests (inbox, KeyPackage claims) per client address, before the signature check
+    /// (`ip:<address>`).
+    pub federation_ip_limiter: Arc<SharedLimiter>,
     /// Federation tokens per device (`token:<device id>`, 30 per minute).
     pub federation_token_limiter: Arc<SharedLimiter>,
     /// API requests of remote users per home domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_API` per minute).
@@ -166,8 +175,17 @@ pub struct AppState {
     pub media_limiter: Arc<RateLimiter>,
     /// Presence of the users with a session on this node (`presence.rs`).
     pub presence: Arc<crate::presence::Registry>,
-    /// Presence and activity updates per device (`presence:<device id>`).
+    /// Presence and activity updates per device (`presence:<device id>`) and room presence toggles per user
+    /// (`presence-room:<user id>`).
     pub presence_limiter: Arc<RateLimiter>,
+    /// API requests per user and minute (`TAVRN_RATE_USER_PER_MINUTE`, `None` when off).
+    pub user_api_limiter: Option<Arc<RateLimiter>>,
+    /// Files channels: listings and searches (`files:<user id>`), uploads (`files-upload:<user id>`).
+    pub files_limiter: Arc<RateLimiter>,
+    /// Purge previews per moderator (`purge:<user id>`).
+    pub purge_limiter: Arc<RateLimiter>,
+    /// The unauthenticated emoji and sound proxy (`?host=`, remote fetches) per address (`ip:<address>`).
+    pub media_proxy_limiter: Arc<RateLimiter>,
     /// Whiteboard sessions and ephemeral audiences (`whiteboard.rs`).
     pub whiteboards: Arc<crate::whiteboard::Whiteboards>,
     /// Ephemeral events per sender (`eph:<user id>`, 30 per second, also in development).
@@ -275,6 +293,7 @@ impl AppState {
         state.hooks = hooks;
         crate::cache::start(&state);
         crate::push::start(&state);
+        crate::voice::spawn_access_watcher(&state);
         Ok(state)
     }
 
@@ -316,6 +335,7 @@ impl AppState {
             federation,
             federation_login_limiter: shared("fed-login", config.federation_rate_logins, 60),
             federation_inbox_limiter: shared("fed-inbox", config.federation_rate_inbox, 60),
+            federation_ip_limiter: shared("fed-ip", if config.dev { 10_000 } else { 600 }, 60),
             federation_token_limiter: shared("fed-token", token_max, 60),
             federation_api_limiter: limiter(config.federation_rate_api, 60),
             federation_claim_limiter: limiter(config.federation_rate_claims, 60),
@@ -338,6 +358,10 @@ impl AppState {
             media_limiter: limiter(if config.dev { 1000 } else { 30 }, 3600),
             presence: Arc::new(crate::presence::Registry::new(&cluster)),
             presence_limiter: limiter(if config.dev { 1000 } else { 60 }, 60),
+            user_api_limiter: (config.rate_user_per_minute > 0).then(|| limiter(config.rate_user_per_minute, 60)),
+            files_limiter: limiter(if config.dev { 1000 } else { 120 }, 60),
+            purge_limiter: limiter(if config.dev { 1000 } else { 10 }, 60),
+            media_proxy_limiter: limiter(if config.dev { 10_000 } else { 600 }, 60),
             whiteboards: Arc::new(crate::whiteboard::Whiteboards::default()),
             ephemeral_limiter: limiter(crate::whiteboard::EVENTS_PER_SECOND, 1),
             // Autosave every 30 s plus manual saves, thumbnails and renames.
@@ -716,6 +740,17 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(routes::history::ack_share),
         )
         .route("/conversations/{conversation_id}/history-pending", get(routes::history::list_pending))
+        .route(
+            "/rooms/{room_id}/history-requests",
+            get(routes::history_requests::list).post(routes::history_requests::create),
+        )
+        .route("/rooms/{room_id}/history-requests/mine", get(routes::history_requests::mine))
+        .route(
+            "/rooms/{room_id}/history-requests/{request_id}",
+            axum::routing::delete(routes::history_requests::cancel),
+        )
+        .route("/rooms/{room_id}/history-requests/{request_id}/approve", post(routes::history_requests::approve))
+        .route("/rooms/{room_id}/history-requests/{request_id}/deny", post(routes::history_requests::deny))
         .route("/conversations/{conversation_id}/mls/pending-removals", get(routes::mls::pending_removals))
         .route("/mls/pending-removals", get(routes::mls::own_pending_removals))
         .route("/mls/welcomes", get(routes::mls::welcomes))
@@ -938,7 +973,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::commands::routes())
                 .merge(routes::legal::routes())
                 .merge(routes::push::routes())
-                .merge(routes::moderation::routes()),
+                .merge(routes::moderation::routes())
+                .merge(routes::age::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
         .merge(routes::legal::page_routes())

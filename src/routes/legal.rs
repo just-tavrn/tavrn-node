@@ -280,6 +280,7 @@ pub async fn accept_terms(
 pub async fn submit_notice(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     ApiJson(req): ApiJson<NoticeRequest>,
 ) -> Result<(StatusCode, Json<NoticeCreated>), ApiError> {
     if !state.config.legal_notices.on() {
@@ -289,7 +290,10 @@ pub async fn submit_notice(
     let captcha = state.config.captcha_provider != crate::config::CaptchaProvider::None;
     state.captcha.check(captcha, req.captcha_token.as_deref(), &ip).await?;
     let valid = notices::validate(&req)?;
-    let (row, mailed) = notices::create(&state, &valid, None).await?;
+    // Reporters have no account: their browser's language picks the mails' language.
+    let locale =
+        crate::mail_templates::from_accept_language(headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()));
+    let (row, mailed) = notices::create(&state, &valid, None, locale.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(NoticeCreated { case_id: row.id, state: row.state, mailed })))
 }
 
@@ -644,6 +648,7 @@ pub async fn admin_template(
     let contact = legal::contact(&state).await?.unwrap_or_default();
     let domain = state.config.domain.clone();
     let date = crate::util::now().chars().take(10).collect::<String>();
+    let minimum_age = state.config.minimum_age.to_string();
     let markdown = documents::fill_template(
         text,
         &[
@@ -653,6 +658,7 @@ pub async fn admin_template(
             ("operator_address", &contact.address),
             ("contact_email", &contact.email),
             ("effective_date", &date),
+            ("minimum_age", &minimum_age),
         ],
     );
     Ok(Json(LegalTemplate { kind: kind.into(), locale: locale.into(), markdown }))

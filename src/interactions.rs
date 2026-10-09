@@ -3,17 +3,23 @@
 //! application (one WebSocket connection of the bot, round robin over its devices, or the interactions URL),
 //! waiting at most 3 seconds for the first response, and the callbacks, follow-ups and ephemeral replies.
 //!
-//! Interactions live in memory only, until they expire (15 minutes): the invocation is not a message and is
-//! never stored. All deadlines are read from an injectable [`Clock`], so tests can move time forward.
-//! Only the first response counts; a callback first *claims* the interaction, is then validated and either
-//! completes it or gives it back, so two concurrent callbacks can never both post an answer.
+//! Interactions live until they expire (15 minutes): the invocation is not a message and is never stored in the
+//! database. All deadlines are read from an injectable [`Clock`], so tests can move time forward. Only the first
+//! response counts; a callback first *claims* the interaction, is then validated and either completes it or gives it
+//! back, so two concurrent callbacks can never both post an answer. Follow-ups take one of their ten places only
+//! once they passed every check.
 //!
-//! Several instances (`TAVRN_CACHE_URL`, docs/SCALING.md): the instance that received the invocation owns the
-//! pending interaction (in its memory, as standalone). Each instance registers its receiving bot connections in the
-//! cache (`cmdrecv:<bot user id>`, field `<instance>/<connection>`); without a local receiver the owner publishes the
+//! Standalone the pending interactions live in memory. With a shared cache (`TAVRN_CACHE_URL`, docs/SCALING.md) they
+//! live in the cache as well, sealed like connect codes ([`crate::cache::Cluster::put_sealed`], TTL = the lifetime):
+//! `interaction-state:<id>` holds the facts, the lease `interaction-claim:<id>` the first response (a claim, or
+//! `dropped` after the deadline) and the counter `interaction-followups:<id>` the follow-ups. Any instance, also one
+//! restarted in between, takes callbacks and follow-ups; only the invoker's waiting request stays with the instance
+//! that received the invocation (its memory). Each instance registers its receiving bot connections in the cache
+//! (`cmdrecv:<bot user id>`, field `<instance>/<connection>`); without a local receiver the owner publishes the
 //! invocation on the bus for one instance that has one ([`crate::cache::Message::Invoke`]), which delivers it to its
-//! connection. The owner records itself under `interaction:<id>` (TTL = the lifetime), and callbacks and follow-ups
-//! that reach another instance are relayed to the owner over HTTP (`cache::relay`).
+//! connection. The owner records itself under `interaction:<id>`, and callbacks and follow-ups that reach another
+//! instance are relayed to the owner over HTTP while it lives (`cache::relay`), so the invoker gets the answer at
+//! once.
 
 use std::{
     collections::HashMap,
@@ -162,6 +168,9 @@ impl Clock for ManualClock {
 pub struct EphemeralReply {
     pub interaction_id: String,
     pub conversation_id: String,
+    /// The thread the reply belongs to (null in the conversation itself).
+    #[serde(default)]
+    pub thread_id: Option<String>,
     pub application: PaletteApplication,
     /// The bot device that produced it (encrypted content is signed by it).
     pub device_id: Option<String>,
@@ -187,6 +196,9 @@ pub struct InvokeResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InvokeRequest {
+    /// The thread of the channel the command is invoked in (PROTOCOL.md §7e); answers go there.
+    #[serde(default)]
+    pub thread_id: Option<String>,
     /// `<application ref>/<command id>`
     pub command: String,
     /// Unencrypted conversations: the arguments; null in encrypted ones.
@@ -224,6 +236,9 @@ pub struct Callback {
     /// `error`: at most 200 characters, shown to the invoker only.
     #[serde(default)]
     pub message: Option<String>,
+    /// `reply`: a thread of the conversation to answer in; defaults to the interaction's thread.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// `POST /interactions/{interaction_id}/messages`.
@@ -241,6 +256,9 @@ pub struct FollowUp {
     pub ephemeral: bool,
     #[serde(default)]
     pub mentions: Vec<String>,
+    /// A thread of the conversation to write in; defaults to the interaction's thread.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// A follow-up: a stored message or an ephemeral reply.
@@ -253,7 +271,7 @@ pub struct FollowUpResponse {
 // ---------------------------------------------------------------- registry
 
 /// The immutable facts of an interaction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Info {
     pub id: String,
     pub application_ref: String,
@@ -265,6 +283,9 @@ pub struct Info {
     pub command_id: String,
     pub command_name: String,
     pub conversation_id: String,
+    /// The thread the command was invoked in (PROTOCOL.md §7e): answers go there unless they name another one.
+    #[serde(default)]
+    pub thread_id: Option<String>,
     pub encrypted: bool,
     pub user_id: String,
     pub user_address: String,
@@ -296,7 +317,7 @@ impl Info {
 #[derive(Debug, Clone)]
 pub enum Ack {
     Reply(Box<Message>),
-    Ephemeral(EphemeralReply),
+    Ephemeral(Box<EphemeralReply>),
     Defer,
     Error(String),
 }
@@ -312,7 +333,7 @@ impl Ack {
         };
         match self {
             Self::Reply(m) => r.message = Some((**m).clone()),
-            Self::Ephemeral(e) => r.ephemeral = Some(e.clone()),
+            Self::Ephemeral(e) => r.ephemeral = Some((**e).clone()),
             Self::Defer => r.outcome = "defer".into(),
             Self::Error(e) => {
                 r.outcome = "error".into();
@@ -341,6 +362,33 @@ struct Entry {
     followups: u32,
 }
 
+/// A claimed first response: given back with [`Interactions::release`] when it turns out invalid.
+pub struct Claim {
+    pub info: Arc<Info>,
+    /// The holder of the claim lease (shared cache only).
+    holder: Option<String>,
+}
+
+/// The holder of the claim lease of an interaction nobody answered in time.
+const DROPPED: &str = "dropped";
+
+fn state_key(id: &str) -> String {
+    format!("interaction-state:{id}")
+}
+
+fn claim_key(id: &str) -> String {
+    format!("interaction-claim:{id}")
+}
+
+fn followups_key(id: &str) -> String {
+    format!("interaction-followups:{id}")
+}
+
+/// How long the cache keeps an interaction: its lifetime and a minute.
+fn shared_ttl() -> Duration {
+    Duration::from_secs(LIFETIME_SECS as u64 + 60)
+}
+
 /// Live connections of one bot that may receive `command.invoke` (token with the `commands` scope).
 #[derive(Default)]
 struct BotReceivers {
@@ -355,7 +403,7 @@ pub struct Interactions {
     entries: Mutex<HashMap<String, Entry>>,
     receivers: Mutex<HashMap<String, BotReceivers>>,
     next_connection: AtomicU64,
-    /// Several instances: receivers are registered in the shared cache as well.
+    /// Several instances: interactions and receivers are kept in the shared cache as well.
     cluster: Option<Arc<crate::cache::Cluster>>,
     /// Round robin over the other instances holding a receiver.
     remote_turn: AtomicU64,
@@ -416,7 +464,8 @@ impl Drop for ReceiverGuard {
 }
 
 impl Interactions {
-    /// The registry of one instance; with several instances it shares its receivers through the cache.
+    /// The registry of one instance; with several instances it shares its interactions and receivers through the
+    /// cache.
     pub fn new(cluster: &Arc<crate::cache::Cluster>) -> Self {
         Self { cluster: cluster.is_shared().then(|| cluster.clone()), ..Self::default() }
     }
@@ -502,7 +551,7 @@ impl Interactions {
         self.receivers.lock().unwrap_or_else(|e| e.into_inner()).get(bot_user_id).map_or(0, |r| r.connections.len())
     }
 
-    /// Live (not yet swept) interactions.
+    /// Live (not yet swept) interactions in this instance's memory.
     pub fn len(&self) -> usize {
         self.entries().len()
     }
@@ -511,9 +560,12 @@ impl Interactions {
         self.len() == 0
     }
 
-    /// Adds an interaction; its first response arrives on the returned receiver.
-    fn create(&self, info: Info) -> Result<oneshot::Receiver<Ack>, ApiError> {
+    /// Adds an interaction (with a shared cache also there); its first response arrives on the returned receiver.
+    async fn create(&self, info: Info) -> Result<oneshot::Receiver<Ack>, ApiError> {
         let now = self.clock().now();
+        if let Some(cluster) = &self.cluster {
+            cluster.put_sealed(&state_key(&info.id), &info, shared_ttl()).await.map_err(crate::cache::unavailable)?;
+        }
         let mut entries = self.entries();
         if entries.len() > 256 {
             entries.retain(|_, e| e.info.expires_at > now);
@@ -527,41 +579,78 @@ impl Interactions {
         Ok(rx)
     }
 
-    /// The interaction `id` for the bot `bot_user_id`: `404 interaction.not_found`, `403 interaction.not_owner`.
-    fn owned<'a>(
-        entries: &'a mut HashMap<String, Entry>,
-        id: &str,
-        bot_user_id: &str,
-    ) -> Result<&'a mut Entry, ApiError> {
-        let entry = entries.get_mut(id).ok_or_else(not_found)?;
-        if entry.info.bot_user_id != bot_user_id {
+    /// The facts of interaction `id` for the bot `bot_user_id`, from memory or the shared cache:
+    /// `404 interaction.not_found`, `403 interaction.not_owner`.
+    async fn info(&self, id: &str, bot_user_id: &str) -> Result<Arc<Info>, ApiError> {
+        let local = self.entries().get(id).map(|e| e.info.clone());
+        let info = match (local, &self.cluster) {
+            (Some(info), _) => info,
+            (None, Some(cluster)) if util::is_ulid(id) => Arc::new(
+                cluster
+                    .get_sealed::<Info>(&state_key(id))
+                    .await
+                    .map_err(crate::cache::unavailable)?
+                    .filter(|i| i.id == id)
+                    .ok_or_else(not_found)?,
+            ),
+            _ => return Err(not_found()),
+        };
+        if info.bot_user_id != bot_user_id {
             return Err(not_owner());
         }
-        Ok(entry)
+        Ok(info)
     }
 
     /// Claims the first response (`409 interaction.already_acked`, `410 interaction.expired`).
-    pub fn claim(&self, id: &str, bot_user_id: &str) -> Result<Arc<Info>, ApiError> {
+    pub async fn claim(&self, id: &str, bot_user_id: &str) -> Result<Claim, ApiError> {
         let now = self.clock().now();
-        let mut entries = self.entries();
-        let entry = Self::owned(&mut entries, id, bot_user_id)?;
-        match entry.phase {
-            Phase::Acked | Phase::Claimed => Err(already_acked()),
-            Phase::Dropped => Err(expired()),
-            Phase::Pending if now > entry.info.ack_deadline => {
-                entry.phase = Phase::Dropped;
-                entry.waiter = None;
-                Err(expired())
+        let Some(cluster) = &self.cluster else {
+            let mut entries = self.entries();
+            let entry = entries.get_mut(id).ok_or_else(not_found)?;
+            if entry.info.bot_user_id != bot_user_id {
+                return Err(not_owner());
             }
-            Phase::Pending => {
-                entry.phase = Phase::Claimed;
-                Ok(entry.info.clone())
-            }
+            return match entry.phase {
+                Phase::Acked | Phase::Claimed => Err(already_acked()),
+                Phase::Dropped => Err(expired()),
+                Phase::Pending if now > entry.info.ack_deadline => {
+                    entry.phase = Phase::Dropped;
+                    entry.waiter = None;
+                    Err(expired())
+                }
+                Phase::Pending => {
+                    entry.phase = Phase::Claimed;
+                    Ok(Claim { info: entry.info.clone(), holder: None })
+                }
+            };
+        };
+        let info = self.info(id, bot_user_id).await?;
+        let key = cluster.key(&claim_key(id));
+        let holder = util::ulid();
+        if now > info.ack_deadline {
+            // Nobody answered in time: the claim lease says so for every instance.
+            let _ = cluster.cache().lease(&key, DROPPED, shared_ttl()).await;
+            return Err(match cluster.cache().get(&key).await.ok().flatten().as_deref() {
+                Some(DROPPED) | None => expired(),
+                Some(_) => already_acked(),
+            });
         }
+        if !cluster.cache().lease(&key, &holder, shared_ttl()).await.map_err(crate::cache::unavailable)? {
+            return Err(match cluster.cache().get(&key).await.ok().flatten().as_deref() {
+                Some(DROPPED) => expired(),
+                _ => already_acked(),
+            });
+        }
+        Ok(Claim { info, holder: Some(holder) })
     }
 
     /// A claimed response was invalid: the interaction waits again (or is dropped after its deadline).
-    pub fn release(&self, id: &str) {
+    pub async fn release(&self, claim: &Claim) {
+        let id = claim.info.id.as_str();
+        if let (Some(cluster), Some(holder)) = (&self.cluster, &claim.holder) {
+            let _ = cluster.cache().release(&cluster.key(&claim_key(id)), holder).await;
+            return;
+        }
         let now = self.clock().now();
         if let Some(entry) = self.entries().get_mut(id)
             && entry.phase == Phase::Claimed
@@ -575,7 +664,8 @@ impl Interactions {
         }
     }
 
-    /// The claimed response was accepted: the invoker gets it.
+    /// The claimed response was accepted: the invoker gets it (when it waits on this instance). With a shared cache
+    /// the claim lease stays until the interaction expires and keeps every later response out.
     pub fn complete(&self, id: &str, ack: Ack) {
         if let Some(entry) = self.entries().get_mut(id) {
             entry.phase = Phase::Acked;
@@ -586,7 +676,19 @@ impl Interactions {
     }
 
     /// The deadline passed: drops a pending interaction (`true`); a claimed one keeps waiting (`false`).
-    fn timeout(&self, id: &str) -> bool {
+    async fn timeout(&self, id: &str) -> bool {
+        if let Some(cluster) = &self.cluster {
+            let key = cluster.key(&claim_key(id));
+            if cluster.cache().lease(&key, DROPPED, shared_ttl()).await.unwrap_or(true) {
+                if let Some(entry) = self.entries().get_mut(id) {
+                    entry.phase = Phase::Dropped;
+                    entry.waiter = None;
+                }
+                return true;
+            }
+            // Claimed (or answered) somewhere: the response may still come within the grace.
+            return matches!(cluster.cache().get(&key).await.ok().flatten().as_deref(), Some(DROPPED));
+        }
         match self.entries().get_mut(id) {
             Some(entry) if entry.phase == Phase::Pending => {
                 entry.phase = Phase::Dropped;
@@ -598,30 +700,51 @@ impl Interactions {
         }
     }
 
-    /// Reserves a follow-up (`410 interaction.expired`, `409 interaction.followup_limit`).
-    pub fn reserve_followup(&self, id: &str, bot_user_id: &str) -> Result<Arc<Info>, ApiError> {
+    /// A follow-up may be sent: the interaction is the bot's and neither expired nor dropped
+    /// (`404 interaction.not_found`, `403 interaction.not_owner`, `410 interaction.expired`). The place among the
+    /// ten is taken with [`Interactions::take_followup`] once the follow-up passed its checks.
+    pub async fn followup_allowed(&self, id: &str, bot_user_id: &str) -> Result<Arc<Info>, ApiError> {
         let now = self.clock().now();
-        let mut entries = self.entries();
-        let entry = Self::owned(&mut entries, id, bot_user_id)?;
-        if entry.phase == Phase::Dropped || now > entry.info.expires_at {
+        let info = self.info(id, bot_user_id).await?;
+        if now > info.expires_at {
             return Err(expired());
         }
-        if entry.followups >= MAX_FOLLOWUPS {
-            return Err(ApiError::Conflict {
-                code: "interaction.followup_limit",
-                detail: format!("At most {MAX_FOLLOWUPS} follow-ups per interaction"),
-                meta: json!({ "max": MAX_FOLLOWUPS }),
-            });
+        let dropped = match &self.cluster {
+            Some(cluster) => {
+                let claim =
+                    cluster.cache().get(&cluster.key(&claim_key(id))).await.map_err(crate::cache::unavailable)?;
+                claim.as_deref() == Some(DROPPED) || (claim.is_none() && now > info.ack_deadline)
+            }
+            None => self.entries().get(id).is_none_or(|e| e.phase == Phase::Dropped),
+        };
+        if dropped {
+            return Err(expired());
         }
-        entry.followups += 1;
-        Ok(entry.info.clone())
+        Ok(info)
     }
 
-    /// Gives a reserved follow-up back (it was invalid).
-    pub fn unreserve_followup(&self, id: &str) {
-        if let Some(entry) = self.entries().get_mut(id) {
-            entry.followups = entry.followups.saturating_sub(1);
+    /// Takes one of the ten follow-up places (`409 interaction.followup_limit`).
+    pub async fn take_followup(&self, id: &str) -> Result<(), ApiError> {
+        let limit = || ApiError::Conflict {
+            code: "interaction.followup_limit",
+            detail: format!("At most {MAX_FOLLOWUPS} follow-ups per interaction"),
+            meta: json!({ "max": MAX_FOLLOWUPS }),
+        };
+        if let Some(cluster) = &self.cluster {
+            let (n, _) = cluster
+                .cache()
+                .hit(&cluster.key(&followups_key(id)), shared_ttl())
+                .await
+                .map_err(crate::cache::unavailable)?;
+            return if n > u64::from(MAX_FOLLOWUPS) { Err(limit()) } else { Ok(()) };
         }
+        let mut entries = self.entries();
+        let entry = entries.get_mut(id).ok_or_else(expired)?;
+        if entry.followups >= MAX_FOLLOWUPS {
+            return Err(limit());
+        }
+        entry.followups += 1;
+        Ok(())
     }
 }
 
@@ -698,6 +821,15 @@ pub async fn invoke(
         (commands::validate_args(&def, req.args.as_ref())?, None, None)
     };
 
+    // A thread of the channel (PROTOCOL.md §7e): the invoker must be able to write there, answers go there.
+    let thread = match &req.thread_id {
+        Some(t) => {
+            let row = crate::threads::of_conversation(state, conv, t).await?;
+            crate::threads::check_write(conv, Some(&row))?;
+            Some(row.id)
+        }
+        None => None,
+    };
     // Delivery: the interactions URL of a local application, else one WebSocket connection of the bot.
     let url =
         offer.local.as_ref().and_then(|a| a.interactions_url.as_deref()).and_then(|u| state.hooks.check_url(u).ok());
@@ -725,6 +857,7 @@ pub async fn invoke(
         command_id: row.id.clone(),
         command_name: def.name.clone(),
         conversation_id: conv.id.clone(),
+        thread_id: thread,
         encrypted: conv.encrypted,
         user_id: auth.user.id.clone(),
         user_address: auth.user.address(),
@@ -736,7 +869,8 @@ pub async fn invoke(
         "interaction_id": info.id,
         "application_id": offer.local.as_ref().map_or_else(|| offer.reference.rsplit('/').next().unwrap_or("").to_string(), |a| a.id.clone()),
         "command": { "id": row.id, "name": def.name },
-        "conversation_id": conv.id, "room_id": room_id, "channel_id": channel_id, "encrypted": conv.encrypted,
+        "conversation_id": conv.id, "room_id": room_id, "channel_id": channel_id, "thread_id": info.thread_id,
+        "encrypted": conv.encrypted,
         "user": info.user_address, "user_id": auth.user.id, "device_id": auth.public_device_id(),
         "permissions": conv.perms.to_string(),
         "args": if conv.encrypted { Value::Null } else { args },
@@ -746,7 +880,7 @@ pub async fn invoke(
     let id = info.id.clone();
     let deadline = info.ack_deadline;
     let started = std::time::Instant::now();
-    let mut rx = state.interactions.create(info)?;
+    let mut rx = state.interactions.create(info).await?;
     // Several instances: callbacks and follow-ups may reach any instance; they find this one through the cache.
     if state.cluster.is_shared() {
         let ttl = Duration::from_secs(LIFETIME_SECS as u64 + 60);
@@ -824,7 +958,7 @@ async fn wait(
         ack = &mut *rx => return ack.map_err(|_| no_ack()),
         () = deadline => {}
     }
-    if state.interactions.timeout(id) {
+    if state.interactions.timeout(id).await {
         return Err(no_ack());
     }
     match tokio::time::timeout(CLAIM_GRACE, rx).await {
@@ -899,7 +1033,8 @@ pub async fn respond(
     id: &str,
     callback: Callback,
 ) -> Result<InvokeResponse, ApiError> {
-    let info = state.interactions.claim(id, &auth.user.id)?;
+    let claim = state.interactions.claim(id, &auth.user.id).await?;
+    let info = claim.info.clone();
     match acknowledge(state, auth, &info, callback).await {
         Ok(ack) => {
             if let Ack::Ephemeral(reply) = &ack {
@@ -916,7 +1051,7 @@ pub async fn respond(
             Ok(response)
         }
         Err(e) => {
-            state.interactions.release(id);
+            state.interactions.release(&claim).await;
             Err(e)
         }
     }
@@ -945,11 +1080,15 @@ async fn acknowledge(state: &AppState, auth: &AuthUser, info: &Info, callback: C
                 state,
                 auth,
                 info,
-                content,
-                callback.epoch,
-                callback.device_id.as_deref(),
-                callback.ephemeral,
-                &callback.mentions,
+                Answer {
+                    content,
+                    epoch: callback.epoch,
+                    device_id: callback.device_id.as_deref(),
+                    ephemeral: callback.ephemeral,
+                    mentions: &callback.mentions,
+                    thread_id: callback.thread_id.as_deref(),
+                    followup: false,
+                },
             )
             .await
         }
@@ -957,18 +1096,23 @@ async fn acknowledge(state: &AppState, auth: &AuthUser, info: &Info, callback: C
     }
 }
 
-/// A reply or follow-up: a message of the bot with the envelope field `interaction`, or an ephemeral reply.
-#[allow(clippy::too_many_arguments)]
-async fn answer(
-    state: &AppState,
-    auth: &AuthUser,
-    info: &Info,
+/// What a reply or follow-up carries.
+struct Answer<'a> {
     content: Value,
     epoch: Option<i64>,
-    device_id: Option<&str>,
+    device_id: Option<&'a str>,
     ephemeral: bool,
-    mentions: &[String],
-) -> Result<Ack, ApiError> {
+    mentions: &'a [String],
+    /// A thread of the conversation; the interaction's thread when absent.
+    thread_id: Option<&'a str>,
+    /// A follow-up takes one of its ten places once every check passed.
+    followup: bool,
+}
+
+/// A reply or follow-up: a message of the bot with the envelope field `interaction` (in the interaction's thread
+/// unless it names another one), or an ephemeral reply.
+async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -> Result<Ack, ApiError> {
+    let Answer { content, epoch, device_id, ephemeral, mentions, thread_id, followup } = a;
     // A token's (or federated session's) device is fixed; an interactions URL answer named its device already.
     if let Some(d) = device_id
         && !auth.device_id.is_empty()
@@ -986,6 +1130,14 @@ async fn answer(
         return Err(ApiError::Forbidden { code: "room.not_member", detail: "The bot is not a member here".into() });
     }
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    let thread = match thread_id.or(info.thread_id.as_deref()) {
+        Some(t) => {
+            let row = crate::threads::of_conversation(state, &conv, t).await?;
+            crate::threads::check_write(&conv, Some(&row))?;
+            Some(row)
+        }
+        None => None,
+    };
     let v = msgs::validate_content(msgs::gif_hosts(state), conv.encrypted, &content, mentions)
         .map_err(as_interaction_error)?;
     if conv.encrypted && auth.device_id.is_empty() {
@@ -1000,19 +1152,25 @@ async fn answer(
         None
     };
     let device = (!auth.device_id.is_empty()).then(|| auth.public_device_id().to_string());
+    if !ephemeral {
+        state.bot_message_limiter.check_all(&[format!("bot-msg:{}:{}", auth.user.id, conv.id)])?;
+    }
+    if followup {
+        state.interactions.take_followup(&info.id).await?;
+    }
     if ephemeral {
         let stored: Value = if conv.encrypted { Value::String(v.content.clone()) } else { content };
-        return Ok(Ack::Ephemeral(EphemeralReply {
+        return Ok(Ack::Ephemeral(Box::new(EphemeralReply {
             interaction_id: info.id.clone(),
             conversation_id: info.conversation_id.clone(),
+            thread_id: thread.as_ref().map(|t| t.id.clone()),
             application: info.application(),
             device_id: device,
             content: stored,
             epoch,
             created_at: util::now(),
-        }));
+        })));
     }
-    state.bot_message_limiter.check_all(&[format!("bot-msg:{}:{}", auth.user.id, conv.id)])?;
     let id = util::ulid();
     store::messages::insert(
         &state.db,
@@ -1026,7 +1184,7 @@ async fn answer(
             epoch,
             content: &v.content,
             reply_to_id: None,
-            thread_id: None,
+            thread_id: thread.as_ref().map(|t| t.id.as_str()),
             mentions: &v.mentions,
             mentions_everyone: false,
             signature: None,
@@ -1036,6 +1194,9 @@ async fn answer(
     let envelope = serde_json::to_string(&info.envelope()).map_err(|e| ApiError::Internal(e.into()))?;
     store::messages::set_interaction(&state.db, &id, &envelope).await?;
     let message = msgs::enrich_one(state, &auth.user.id, &id).await?;
+    if let Some(t) = &thread {
+        crate::threads::after_message(state, &t.id, &message).await?;
+    }
     conv.publish_recorded(state, "message.create", &message).await;
     crate::federation::social::notify_members(state, &conv, &message, &auth.user.id).await;
     Ok(Ack::Reply(Box::new(message)))
@@ -1048,20 +1209,24 @@ pub async fn follow_up(
     id: &str,
     req: FollowUp,
 ) -> Result<FollowUpResponse, ApiError> {
-    let info = state.interactions.reserve_followup(id, &auth.user.id)?;
-    match answer(state, auth, &info, req.content, req.epoch, req.device_id.as_deref(), req.ephemeral, &req.mentions)
-        .await
-    {
+    let info = state.interactions.followup_allowed(id, &auth.user.id).await?;
+    let a = Answer {
+        content: req.content,
+        epoch: req.epoch,
+        device_id: req.device_id.as_deref(),
+        ephemeral: req.ephemeral,
+        mentions: &req.mentions,
+        thread_id: req.thread_id.as_deref(),
+        followup: true,
+    };
+    match answer(state, auth, &info, a).await {
         Ok(Ack::Ephemeral(reply)) => {
             state.hub.users(vec![info.user_id.clone()], "interaction.reply", &reply);
-            Ok(FollowUpResponse { message: None, ephemeral: Some(reply) })
+            Ok(FollowUpResponse { message: None, ephemeral: Some(*reply) })
         }
         Ok(Ack::Reply(message)) => Ok(FollowUpResponse { message: Some(*message), ephemeral: None }),
         Ok(_) => Ok(FollowUpResponse { message: None, ephemeral: None }),
-        Err(e) => {
-            state.interactions.unreserve_followup(id);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1081,6 +1246,7 @@ mod tests {
             command_id: "C".into(),
             command_name: "weather".into(),
             conversation_id: "conv".into(),
+            thread_id: None,
             encrypted: false,
             user_id: "u".into(),
             user_address: "u@a.test".into(),
@@ -1121,34 +1287,96 @@ mod tests {
         let clock = Arc::new(ManualClock::new(start));
         let i = Interactions::default();
         i.set_clock(clock.clone());
-        let mut rx = i.create(info("i1", "bot", start)).unwrap();
-        assert_eq!(i.claim("i1", "other").unwrap_err().code(), "interaction.not_owner");
-        assert_eq!(i.claim("nope", "bot").unwrap_err().code(), "interaction.not_found");
-        i.claim("i1", "bot").unwrap();
-        assert_eq!(i.claim("i1", "bot").unwrap_err().code(), "interaction.already_acked", "claimed");
-        i.release("i1");
-        i.claim("i1", "bot").unwrap();
+        let mut rx = i.create(info("i1", "bot", start)).await.unwrap();
+        assert_eq!(i.claim("i1", "other").await.err().unwrap().code(), "interaction.not_owner");
+        assert_eq!(i.claim("nope", "bot").await.err().unwrap().code(), "interaction.not_found");
+        let claim = i.claim("i1", "bot").await.unwrap();
+        assert_eq!(i.claim("i1", "bot").await.err().unwrap().code(), "interaction.already_acked", "claimed");
+        i.release(&claim).await;
+        i.claim("i1", "bot").await.unwrap();
         i.complete("i1", Ack::Defer);
         assert!(matches!(rx.try_recv().unwrap(), Ack::Defer));
-        assert_eq!(i.claim("i1", "bot").unwrap_err().code(), "interaction.already_acked");
+        assert_eq!(i.claim("i1", "bot").await.err().unwrap().code(), "interaction.already_acked");
 
         // No response before the deadline: dropped, 410 afterwards.
-        let _rx2 = i.create(info("i2", "bot", start)).unwrap();
+        let _rx2 = i.create(info("i2", "bot", start)).await.unwrap();
         let sleeper = clock.sleep_until(start + chrono::Duration::seconds(ACK_TIMEOUT_SECS));
         clock.advance(chrono::Duration::seconds(ACK_TIMEOUT_SECS) + chrono::Duration::milliseconds(1));
         tokio::time::timeout(Duration::from_secs(1), sleeper).await.unwrap();
-        assert_eq!(i.claim("i2", "bot").unwrap_err().code(), "interaction.expired");
-        assert_eq!(i.reserve_followup("i2", "bot").unwrap_err().code(), "interaction.expired");
+        assert_eq!(i.claim("i2", "bot").await.err().unwrap().code(), "interaction.expired");
+        assert_eq!(i.followup_allowed("i2", "bot").await.unwrap_err().code(), "interaction.expired");
 
         // Follow-ups: at most ten, until the interaction expires.
         for _ in 0..MAX_FOLLOWUPS {
-            i.reserve_followup("i1", "bot").unwrap();
+            i.followup_allowed("i1", "bot").await.unwrap();
+            i.take_followup("i1").await.unwrap();
         }
-        assert_eq!(i.reserve_followup("i1", "bot").unwrap_err().code(), "interaction.followup_limit");
-        i.unreserve_followup("i1");
-        i.reserve_followup("i1", "bot").unwrap();
+        assert_eq!(i.take_followup("i1").await.unwrap_err().code(), "interaction.followup_limit");
         clock.advance(chrono::Duration::seconds(LIFETIME_SECS));
-        i.unreserve_followup("i1");
-        assert_eq!(i.reserve_followup("i1", "bot").unwrap_err().code(), "interaction.expired");
+        assert_eq!(i.followup_allowed("i1", "bot").await.unwrap_err().code(), "interaction.expired");
+    }
+
+    fn shared(cache: &Arc<crate::cache::memory::InProcess>, instance: &str) -> Arc<crate::cache::Cluster> {
+        let cache: Arc<dyn crate::cache::Cache> = cache.clone();
+        Arc::new(crate::cache::Cluster::shared_with("a.test", instance, cache, &[7u8; 32], "http://127.0.0.1:1"))
+    }
+
+    use crate::cache::Cache as _;
+
+    /// With a shared cache a pending interaction survives its instance (tavrn-node #14): a restarted or another
+    /// instance takes the callback and the follow-ups, and the first response still counts once.
+    #[tokio::test]
+    async fn interactions_in_the_shared_cache_survive_a_restart() {
+        let start = Utc::now();
+        let clock = Arc::new(ManualClock::new(start));
+        let cache = Arc::new(crate::cache::memory::InProcess::default());
+        let before = Interactions::new(&shared(&cache, "one"));
+        before.set_clock(clock.clone());
+        let mut with_thread = info(&util::ulid(), "bot", start);
+        with_thread.thread_id = Some("T".into());
+        let id = with_thread.id.clone();
+        let _rx = before.create(with_thread).await.unwrap();
+        drop(before);
+
+        // "Restart": a new registry on the same cache knows the interaction, sealed in the cache.
+        let after = Interactions::new(&shared(&cache, "one"));
+        after.set_clock(clock.clone());
+        assert!(!after.contains(&id), "not in the new instance's memory");
+        assert_eq!(after.claim(&id, "other").await.err().unwrap().code(), "interaction.not_owner");
+        assert_eq!(after.claim(&util::ulid(), "bot").await.err().unwrap().code(), "interaction.not_found");
+        let claim = after.claim(&id, "bot").await.unwrap();
+        assert_eq!(claim.info.thread_id.as_deref(), Some("T"));
+        // A second instance sees the claim; given back, it may claim itself; answered, nobody else.
+        let other = Interactions::new(&shared(&cache, "two"));
+        other.set_clock(clock.clone());
+        assert_eq!(other.claim(&id, "bot").await.err().unwrap().code(), "interaction.already_acked");
+        after.release(&claim).await;
+        let claim = other.claim(&id, "bot").await.unwrap();
+        other.complete(&id, Ack::Defer);
+        assert_eq!(after.claim(&id, "bot").await.err().unwrap().code(), "interaction.already_acked");
+        drop(claim);
+
+        // Follow-ups from any instance share the ten places.
+        for n in 0..MAX_FOLLOWUPS {
+            let registry = if n % 2 == 0 { &after } else { &other };
+            registry.followup_allowed(&id, "bot").await.unwrap();
+            registry.take_followup(&id).await.unwrap();
+        }
+        assert_eq!(after.take_followup(&id).await.unwrap_err().code(), "interaction.followup_limit");
+        clock.advance(chrono::Duration::seconds(LIFETIME_SECS + 1));
+        assert_eq!(other.followup_allowed(&id, "bot").await.unwrap_err().code(), "interaction.expired");
+
+        // Unanswered past the deadline: dropped for every instance, follow-ups refused.
+        let late = info(&util::ulid(), "bot", clock.now());
+        let late_id = late.id.clone();
+        let _rx = after.create(late).await.unwrap();
+        clock.advance(chrono::Duration::seconds(ACK_TIMEOUT_SECS + 1));
+        assert!(after.timeout(&late_id).await, "nobody claimed it");
+        assert_eq!(other.claim(&late_id, "bot").await.err().unwrap().code(), "interaction.expired");
+        assert_eq!(other.followup_allowed(&late_id, "bot").await.unwrap_err().code(), "interaction.expired");
+
+        // The cache holds the facts sealed: no plaintext of the interaction in it.
+        let raw = cache.get(&shared(&cache, "x").key(&state_key(&id))).await.unwrap().unwrap();
+        assert!(!raw.contains("weather") && !raw.contains("u@a.test"), "{raw}");
     }
 }

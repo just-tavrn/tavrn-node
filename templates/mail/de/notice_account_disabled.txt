@@ -1,0 +1,5 @@
+Subject: Konto gesperrt ({case})
+
+Das Konto wurde gesperrt. Vorgang: {case}
+
+{reason}

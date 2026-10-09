@@ -71,7 +71,7 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<
 /// Checks format and size; returns the wrapped bytes and the serialized params.
 fn validate(state: &AppState, auth: &AuthUser, req: &PutSecretStorage) -> Result<(Vec<u8>, String), ApiError> {
     state.secret_storage_limiter.check_all(&[format!("secret-storage:{}", auth.user.id)])?;
-    let invalid = || bad("secret_storage.invalid", "wrapped: 61 Bytes Base64url, Version 1 erwartet");
+    let invalid = || bad("secret_storage.invalid", "wrapped: expected 61 bytes of base64url with version 1");
     if req.wrapped.len() > 128 {
         return Err(invalid());
     }

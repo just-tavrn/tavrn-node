@@ -408,13 +408,13 @@ async fn tampered_expired_revoked_reset_and_rotated_tokens() {
         &b.token_id,
     )
     .await;
-    assert_eq!(me(fresh).await.0, StatusCode::UNAUTHORIZED, "rotated secret after 24 h");
+    assert_eq!(me(fresh.clone()).await.0, StatusCode::UNAUTHORIZED, "rotated secret after 24 h");
     assert_eq!(me(rotated.clone()).await.0, StatusCode::OK);
 
     // Revoked: the token and its device are gone.
     let (s, _) = node.delete(&format!("/api/v1/applications/{}/tokens/{}", b.app_id, b.token_id), &alice.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    assert_eq!(me(rotated).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(rotated.clone()).await.0, StatusCode::UNAUTHORIZED);
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE id = $1")
         .bind(&b.device_id)
         .fetch_one(&node.state.db)
@@ -428,11 +428,16 @@ async fn tampered_expired_revoked_reset_and_rotated_tokens() {
     .await
     .unwrap();
     assert_eq!(audit, 3);
-    let leaked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE meta LIKE '%eyJ%'")
-        .fetch_one(&node.state.db)
-        .await
-        .unwrap();
-    assert_eq!(leaked, 0, "secrets never reach the audit log");
+    // Look for the exact secrets the test handed out (and their signatures), compared in Rust: a pattern like
+    // LIKE '%eyJ%' is case-insensitive on SQLite and matched random ULIDs in the rows (tavrn-node #18).
+    let metas: Vec<String> = sqlx::query_scalar("SELECT meta FROM audit_log").fetch_all(&node.state.db).await.unwrap();
+    for secret in [&b.secret, &fresh, &rotated] {
+        let signature = secret.rsplit('.').next().unwrap();
+        for meta in &metas {
+            assert!(!meta.contains(secret.as_str()), "secrets never reach the audit log: {meta}");
+            assert!(!meta.contains(signature), "token signatures never reach the audit log: {meta}");
+        }
+    }
 }
 
 fn base64_url(bytes: &[u8]) -> String {
@@ -492,7 +497,7 @@ async fn bots_are_refused_on_never_allowed_routes() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": b.username, "password": "whatever-123" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "whatever-123" })),
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::UNAUTHORIZED, "auth.invalid_credentials"));
@@ -594,7 +599,8 @@ async fn every_scope_boundary_and_administrator_masking() {
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &reader.secret).await;
     assert_eq!(detail["my_permissions"], (p::BOT_ALWAYS | p::READ_HISTORY).to_string());
-    // With every scope the administrator role gives every bit except administrator itself.
+    // With every scope the administrator role gives every bit except administrator itself and restore_history, which
+    // no scope covers (ENCRYPTION.md §7b).
     let full = bot(&node, &alice, "Full", None).await;
     joined(&node, &alice, &room_id, &full).await;
     node.patch(
@@ -604,8 +610,8 @@ async fn every_scope_boundary_and_administrator_masking() {
     )
     .await;
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &full.secret).await;
-    assert_eq!(detail["my_permissions"], (p::ALL & !p::ADMINISTRATOR).to_string());
-    // A role cannot be granted beyond the bot's own capped permissions through overrides either.
+    assert_eq!(detail["my_permissions"], (p::ALL & !(p::ADMINISTRATOR | p::RESTORE_HISTORY)).to_string());
+    // Nor through overrides: `administrator` is room-wide and never part of an override (channel-scoped bits only).
     let (s, j) = node
         .put(
             &format!("/api/v1/rooms/{room_id}/overrides"),
@@ -614,7 +620,7 @@ async fn every_scope_boundary_and_administrator_masking() {
                     "allow": p::ADMINISTRATOR.to_string(), "deny": "0" }),
         )
         .await;
-    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "{j}");
+    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "permissions.not_channel_scoped"), "{j}");
     // Whiteboard ephemeral events need the whiteboard scope on top of messages:write.
     let writer = bot(&node, &alice, "Writer", Some(&["messages:write"])).await;
     joined(&node, &alice, &room_id, &writer).await;
@@ -755,12 +761,12 @@ async fn no_bots_at_room_category_and_channel_level() {
     node.patch(&path, &alice.token, json!({ "no_bots": false })).await;
     assert_eq!(node.get_auth(&msgs, &b.secret).await.0, StatusCode::OK);
 
-    // Category level: every channel in it, synced or not.
+    // Category level: every channel in it.
     let (s, cat) =
         node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "Humans" })).await;
     assert_eq!(s, StatusCode::CREATED);
     let cat_id = cat["id"].as_str().unwrap();
-    node.patch(&path, &alice.token, json!({ "category_id": cat_id, "sync_with_category": false })).await;
+    node.patch(&path, &alice.token, json!({ "category_id": cat_id })).await;
     let (s, j) = node
         .patch(&format!("/api/v1/rooms/{room_id}/categories/{cat_id}"), &bob.token, json!({ "no_bots": true }))
         .await;
@@ -1038,7 +1044,7 @@ async fn delete_application_leaves_a_tombstone() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": b.username, "password": "a-long-password-1", "device_name": "x" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "a-long-password-1", "device_name": "x" })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT);
@@ -1199,4 +1205,24 @@ async fn bots_refused_in_both_directions() {
     assert_eq!(s, StatusCode::OK, "{j}");
     let (s, j) = b.federated_login(j["token"].as_str().unwrap()).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "federation.bots_refused"));
+}
+
+/// Authorization audit (2026-10-09): a node ban of a bot's owner refuses the bot's federated login; a session the
+/// bot already holds ends with it as well (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
+#[tokio::test]
+async fn authz_owner_node_ban_ends_a_remote_bots_session() {
+    let (a, b) = federation::two_nodes().await;
+    let admin = b.register("admin").await;
+    let alice = a.register("alice").await;
+    let bot_a = bot(&a, &alice, "Lingerer", None).await;
+    let (s, j) = a.post("/api/v1/federation/token", &bot_a.secret, json!({ "target": federation::B })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, login) = b.federated_login(j["token"].as_str().unwrap()).await;
+    assert_eq!(s, StatusCode::OK, "{login}");
+    let remote = login["access_token"].as_str().unwrap().to_string();
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::OK);
+    let (s, j) =
+        b.post("/api/v1/admin/bans", &admin.token, json!({ "subject": format!("alice@{}", federation::A) })).await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::UNAUTHORIZED);
 }

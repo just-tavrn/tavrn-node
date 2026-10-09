@@ -1,0 +1,8 @@
+Subject: Bestätige deine E-Mail-Adresse
+
+Hallo {name},
+
+bitte bestätige die E-Mail-Adresse deines tavrn-Kontos:
+{link}
+
+Der Link ist 24 Stunden gültig. Wenn du kein Konto angelegt hast, ignoriere diese Mail.
