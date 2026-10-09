@@ -622,3 +622,43 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
     assert_eq!(p["conversation_id"], own.as_str());
     let _ = thread_id;
 }
+
+/// Web push of a private channel reaches only the members who may view it (roles and overrides at delivery time,
+/// the same check as the WebSocket fan-out and the `notify` hints), thread follows and `@everyone` included.
+#[tokio::test]
+async fn private_channels_push_only_to_members_who_can_view_them() {
+    let s = setup().await;
+    let browser = Browser::new(&s.fake, "ok/bob");
+    subscribe(&s.node, &s.bob, &browser).await;
+    let secret = plaintext_channel(&s, "secret").await;
+    // Bob follows a thread of the channel while he may still view it.
+    let threads = format!("/api/v1/rooms/{}/channels/{secret}/threads", s.room_id);
+    let (st, thread) = s.node.post(&threads, &s.bob.token, json!({ "title": "mine", "message": text("hi") })).await;
+    assert_eq!(st, StatusCode::CREATED, "{thread}");
+    let (_, room) = s.node.get_auth(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"].clone();
+    let deny = |deny: u64| {
+        json!({ "target_type": "channel", "target_id": secret, "subject_type": "role", "subject_id": everyone,
+                "allow": "0", "deny": deny.to_string() })
+    };
+    let overrides = format!("/api/v1/rooms/{}/overrides", s.room_id);
+    let (st, j) = s.node.put(&overrides, &s.alice.token, deny(tavrn_node::permissions::VIEW_CHANNEL)).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+
+    let everyone_msg = json!({ "content": { "type": "text", "body": "@everyone" }, "mentions_everyone": true });
+    send(&s, &secret, everyone_msg.clone()).await;
+    let mut followed = json!({ "content": { "type": "text", "body": "news" }, "thread_id": thread["id"] });
+    followed["mentions"] = json!([format!("bob@{DOMAIN}")]);
+    send(&s, &secret, followed).await;
+    s.fake.settle(&browser.path, 0).await;
+    // The open channel still pushes (the subscription works).
+    send(&s, &s.channel, text("open")).await;
+    s.fake.wait(&browser.path, 1).await;
+
+    // The deny is lifted: the channel pushes again.
+    let (st, j) = s.node.put(&overrides, &s.alice.token, deny(0)).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    send(&s, &secret, everyone_msg).await;
+    let got = s.fake.wait(&browser.path, 2).await;
+    assert_eq!(browser.open(&got[1])["conversation_id"], secret.as_str());
+}

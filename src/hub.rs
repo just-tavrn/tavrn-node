@@ -77,6 +77,8 @@ pub struct Hub {
     online: Arc<Mutex<HashMap<String, usize>>>,
     /// The cache bus of a node with several instances (`None` standalone).
     bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>,
+    /// Who may view which room channel (`crate::visibility`), dropped per room by the events that change it.
+    visibility: Arc<crate::visibility::Cache>,
 }
 
 /// Counts one open WebSocket of a user while it lives.
@@ -111,7 +113,22 @@ impl Hub {
     /// A hub that also hands every event to the cache bus (several instances).
     pub fn with_bus(bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>) -> Self {
         let (tx, _) = broadcast::channel(4096);
-        Self { tx, online: Arc::default(), bus }
+        Self { tx, online: Arc::default(), bus, visibility: Arc::default() }
+    }
+
+    /// The channel visibility snapshots of this instance (`crate::visibility`).
+    pub fn visibility(&self) -> &crate::visibility::Cache {
+        &self.visibility
+    }
+
+    /// A room event that changes roles, overrides, channels or membership drops the room's visibility snapshot
+    /// before any connection receives it: the events after it are checked against the new state.
+    fn invalidate(&self, kind: &str, scope: &Scope) {
+        if let Scope::Room(room_id) = scope
+            && crate::visibility::changes_visibility(kind)
+        {
+            self.visibility.invalidate(room_id);
+        }
     }
 
     /// Registers an open WebSocket of `user_id` until the returned guard is dropped.
@@ -137,6 +154,7 @@ impl Hub {
     pub fn publish(&self, kind: &str, scope: Scope, data: impl Serialize) -> String {
         let id = ulid();
         let event = Arc::new(Event::new(id.clone(), kind, serde_json::to_value(data).unwrap_or(Value::Null), scope));
+        self.invalidate(kind, &event.scope);
         // Connection ids are per instance: a single-connection event never travels over the bus.
         if let Some(bus) = &self.bus
             && !matches!(event.scope, Scope::Connection(_))
@@ -159,6 +177,7 @@ impl Hub {
             data: Value,
         }
         let data = serde_json::from_str::<Data>(&frame).map(|d| d.data).unwrap_or(Value::Null);
+        self.invalidate(&kind, &scope);
         let _ = self.tx.send(Arc::new(Event { id, kind, data, scope, frame: frame.into() }));
     }
 

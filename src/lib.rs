@@ -62,6 +62,7 @@ pub mod unfurl;
 pub mod uploads;
 pub mod util;
 pub mod validate;
+pub mod visibility;
 pub mod voice;
 pub mod webapp;
 pub mod webhooks;

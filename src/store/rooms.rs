@@ -836,18 +836,6 @@ pub async fn members_of_domain(db: &Pool, room_id: &str, domain: &str) -> Result
     rows.iter().map(|r| r.try_get::<String, _>("id").map_err(Into::into)).collect()
 }
 
-/// Members of a room whose home domain is not `own_domain`.
-pub async fn remote_member_ids(db: &Pool, room_id: &str, own_domain: &str) -> Result<Vec<String>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT m.user_id AS id FROM room_members m JOIN users u ON u.id = m.user_id WHERE m.room_id = $1 AND u.domain <> $2",
-    )
-    .bind(room_id)
-    .bind(own_domain)
-    .fetch_all(db)
-    .await?;
-    rows.iter().map(|r| r.try_get::<String, _>("id").map_err(Into::into)).collect()
-}
-
 /// All members of a room with their role ids (without @everyone), in two queries (e.g. to compute who may
 /// view a channel without one query per member).
 pub async fn members_with_roles(db: &Pool, room_id: &str) -> Result<Vec<(MemberRow, Vec<String>)>, ApiError> {

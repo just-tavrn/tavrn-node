@@ -88,6 +88,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
         Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
     };
+    let mut visible = crate::visibility::Filter::default();
     let mut rx = state.hub.subscribe();
     let _presence = state.hub.connect(&auth.user.id);
     let _status = crate::presence::Registry::connect(&state, &auth.user.id, &auth.device_id);
@@ -175,6 +176,11 @@ async fn run(state: AppState, mut socket: WebSocket) {
                     }
                     Ok(ev) => {
                         track_membership(&ev.kind, &ev.data, &auth, &mut rooms);
+                        if let Scope::Room(r) = &ev.scope
+                            && !rooms.contains(r)
+                        {
+                            visible.forget(r);
+                        }
                         if let Some(s) = &scopes
                             && !crate::applications::event_allowed(&ev.kind, &ev.data, s)
                         {
@@ -195,6 +201,13 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             let frame = axum::extract::ws::CloseFrame { code: CLOSE_AUTH, reason: "session revoked".into() };
                             let _ = sink.send(WsMessage::Close(Some(frame))).await;
                             break;
+                        }
+                        // A room channel's events only to the members who may view it (PROTOCOL.md §6).
+                        if relevant
+                            && let Scope::Room(room_id) = &ev.scope
+                            && !visible.delivers(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await
+                        {
+                            continue;
                         }
                         // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                         if relevant && sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
@@ -235,8 +248,9 @@ fn may_write(scopes: Option<&[String]>) -> bool {
     scopes.is_none_or(|s| s.iter().any(|x| x == "messages:write"))
 }
 
-/// Forwards a typing notice: room channels to the room members (the connection must be a member),
-/// DMs and group DMs to their members (the sender must be one).
+/// Forwards a typing notice: room channels to the room members (the connection must be a member who may view the
+/// channel; the fan-out reaches only the channel's viewers), DMs and group DMs to their members (the sender must be
+/// one).
 async fn typing(
     state: &AppState,
     auth: &AuthUser,
@@ -247,6 +261,9 @@ async fn typing(
 ) {
     match (room_id, channel_id, conversation_id) {
         (Some(room_id), Some(channel_id), _) if rooms.contains(&room_id) => {
+            if !crate::visibility::can_view(state, &room_id, &channel_id, &auth.user.id).await {
+                return;
+            }
             state.hub.room(
                 &room_id,
                 "typing",
