@@ -434,7 +434,7 @@ pub async fn update_permission(state: &AppState, key: &ChannelKey, identity: &st
 
 /// On an instance that is not the leader (several instances, `cache.rs`) a voice side effect goes to the leader,
 /// which holds the participants; `true` if it was handed over.
-fn hand_to_leader(state: &AppState, effect: impl FnOnce() -> crate::cache::VoiceEffect) -> bool {
+pub(crate) fn hand_to_leader(state: &AppState, effect: impl FnOnce() -> crate::cache::VoiceEffect) -> bool {
     if state.cluster.is_leader() {
         return false;
     }
@@ -449,6 +449,7 @@ pub async fn run_effect(state: &AppState, effect: crate::cache::VoiceEffect) {
         E::DisconnectUser { room_id, user_id } => disconnect_user(state, &room_id, &user_id).await,
         E::CloseChannel { room_id, channel_id } => close_channel(state, &room_id, &channel_id).await,
         E::CloseRoom { room_id } => close_room(state, &room_id).await,
+        E::LeaveCall { conversation_id, user_id } => crate::calls::drop_member(state, &conversation_id, &user_id).await,
     }
 }
 

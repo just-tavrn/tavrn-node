@@ -266,6 +266,7 @@ async fn end_memberships(state: &AppState, user: &UserRow) -> Result<(Vec<String
                     json!({ "conversation_id": conv.id, "user_id": user.id }),
                 );
                 crate::e2ee::user_left_conversation(state, &conv.id, user).await?;
+                crate::calls::drop_member(state, &conv.id, &user.id).await;
                 people.extend(others);
             }
         }

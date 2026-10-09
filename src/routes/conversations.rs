@@ -554,6 +554,7 @@ pub async fn decline(
         state.hub.users(remaining, "conversation.update", json!({ "conversation": conversation }));
     }
     e2ee::user_left_conversation(&state, &conv.id, &auth.user).await?;
+    crate::calls::drop_member(&state, &conv.id, &auth.user.id).await;
     let sender = match &current.creator_id {
         Some(id) => store::users::by_id(&state.db, id).await?,
         None => None,
@@ -597,5 +598,6 @@ pub async fn remove_member(
         state.hub.users(remaining, "conversation.update", json!({ "conversation": conversation }));
     }
     e2ee::user_left_conversation(&state, &conv.id, &user).await?;
+    crate::calls::drop_member(&state, &conv.id, &user.id).await;
     Ok(StatusCode::NO_CONTENT)
 }
