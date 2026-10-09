@@ -980,6 +980,22 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
     })
     .await;
     assert!(closed.is_ok(), "the proxied connection ends after the disconnect");
+
+    let (_, j) = v.join(&v.bob).await;
+    let token = j["token"].as_str().unwrap().to_string();
+    // LiveKit's Rust SDK (the desktop app's native voice engine) sends the token as `Authorization: Bearer`: the node
+    // checks it and hands it on to LiveKit, over HTTP and on the WebSocket.
+    let resp = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/rtc/validate")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}/rtc?protocol=16&sdk=rust&version=0.0.1&auto_subscribe=1").into_client_request().unwrap();
+        req.headers_mut().insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("proxied WebSocket with a bearer token");
+        let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(first, Message::Binary(ref b) if !b.is_empty()), "{first:?}");
+        ws.close(None).await.unwrap();
+    }
     supervisor.stop().await;
 }
 
