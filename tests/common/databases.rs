@@ -30,7 +30,7 @@ pub fn now_ms() -> u64 {
 
 /// A test database name created at `ms` (milliseconds since the epoch).
 pub fn name_at(ms: u64) -> String {
-    let ulid = ulid::Ulid::from_parts(ms, ulid::Ulid::new().random());
+    let ulid = ulid::Ulid::from_parts(ms, ulid::Ulid::generate().random());
     format!("{PREFIX}{}", ulid.to_string().to_lowercase())
 }
 

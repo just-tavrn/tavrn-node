@@ -5,7 +5,7 @@
 //! are not hashed (`UNSIGNED-PAYLOAD`, streams of unknown content); everything else follows the AWS
 //! specification and is tested against the examples of the AWS documentation.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 
@@ -22,7 +22,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     // HMAC accepts keys of any length.
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap_or_else(|_| unreachable!("HMAC takes any key"));
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).unwrap_or_else(|_| unreachable!("HMAC takes any key"));
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

@@ -155,9 +155,8 @@ pub async fn status_for_owner(db: &Pool, id: &str, token: &str) -> Result<Accoun
 }
 
 fn tombstone_username() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    crate::util::fill_random(&mut bytes);
     format!("deleted-{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 

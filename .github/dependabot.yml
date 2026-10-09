@@ -7,6 +7,13 @@ updates:
     groups:
       rust:
         patterns: ["*"]
+    ignore:
+      # Deliberately held back (reasons in Cargo.toml): utoipa 6 changes the generated OpenAPI document,
+      # ed25519-dalek moves together with tavrn-crypto and the MLS provider.
+      - dependency-name: utoipa
+        update-types: ["version-update:semver-major"]
+      - dependency-name: ed25519-dalek
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker
     directory: /deploy
     schedule: { interval: weekly }

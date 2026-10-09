@@ -105,6 +105,7 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     // E2EE (§3): identity, the token's device, KeyPackages, claims, the MLS delivery service, backups
     ("PUT", "/api/v1/users/me/identity", Always),
     ("PUT", "/api/v1/users/me/devices/{device_id}/key", Always),
+    ("PUT", "/api/v1/users/me/devices/{device_id}/share-key", Always),
     ("GET", "/api/v1/users/me/devices/{device_id}/key-packages", Always),
     ("POST", "/api/v1/users/me/devices/{device_id}/key-packages", Always),
     ("POST", "/api/v1/users/{username}/key-packages/claim", Always),

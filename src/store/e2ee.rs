@@ -166,6 +166,9 @@ pub struct DeviceKeyRow {
     pub created_at: String,
     /// Current identity key of the user (joined).
     pub identity_pubkey: Option<String>,
+    /// The device's X25519 share key and the device key's signature over it (ENCRYPTION.md §3.1), base64url.
+    pub share_public_key: Option<String>,
+    pub share_key_signature: Option<String>,
 }
 
 impl DeviceKeyRow {
@@ -178,8 +181,8 @@ impl DeviceKeyRow {
     }
 }
 
-const DEVICE_KEY_COLS: &str =
-    "d.id, d.user_id, d.public_key, d.identity_signature, d.attested_identity_key, d.created_at, u.identity_pubkey";
+const DEVICE_KEY_COLS: &str = "d.id, d.user_id, d.public_key, d.identity_signature, d.attested_identity_key, d.created_at, \
+     u.identity_pubkey, d.share_public_key, d.share_key_signature";
 
 pub async fn device_key(db: &Pool, device_id: &str) -> Result<Option<DeviceKeyRow>, ApiError> {
     Ok(sqlx::query_as(&format!(
@@ -228,6 +231,64 @@ pub async fn set_device_key(
     .execute(db)
     .await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// What [`set_share_key`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareKeyOutcome {
+    /// The device had no share key; this one is stored.
+    Stored,
+    /// The device already has exactly this share key.
+    Unchanged,
+    /// The device has another share key (share keys are immutable), or the device is not the user's.
+    Conflict,
+}
+
+/// Stores the share key of a local device once (ENCRYPTION.md §3.1); the signature was checked by the caller.
+pub async fn set_share_key(
+    db: &Pool,
+    user_id: &str,
+    device_id: &str,
+    public_key: &str,
+    signature: &str,
+) -> Result<ShareKeyOutcome, ApiError> {
+    let r = sqlx::query(
+        "UPDATE devices SET share_public_key = $1, share_key_signature = $2
+         WHERE id = $3 AND user_id = $4 AND share_public_key IS NULL",
+    )
+    .bind(public_key)
+    .bind(signature)
+    .bind(device_id)
+    .bind(user_id)
+    .execute(db)
+    .await?;
+    if r.rows_affected() > 0 {
+        return Ok(ShareKeyOutcome::Stored);
+    }
+    let existing: Option<Option<String>> =
+        sqlx::query_scalar("SELECT share_public_key FROM devices WHERE id = $1 AND user_id = $2")
+            .bind(device_id)
+            .bind(user_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(match existing.flatten() {
+        Some(k) if k == public_key => ShareKeyOutcome::Unchanged,
+        _ => ShareKeyOutcome::Conflict,
+    })
+}
+
+/// Public device ids (the id in the MLS identity: the home device id of a remote user's device) of `user_id`'s devices
+/// that are attested under the current identity key and have a share key: the devices a v2 history share may carry
+/// boxes for (ENCRYPTION.md §7b).
+pub async fn share_key_devices(db: &Pool, user_id: &str) -> Result<Vec<String>, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(d.home_device_id, d.id) FROM devices d JOIN users u ON u.id = d.user_id
+         WHERE d.user_id = $1 AND d.identity_signature IS NOT NULL AND d.attested_identity_key = u.identity_pubkey
+           AND d.share_public_key IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?)
 }
 
 // ---------------------------------------------------------------- KeyPackages

@@ -168,7 +168,7 @@ mod tests {
 
     /// Signs arbitrary claims the way LiveKit does (HS256 with the API secret).
     fn sign_hs256(secret: &str, claims: &Claims) -> String {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
         let input = format!("{}.{}", b64(br#"{"alg":"HS256","typ":"JWT"}"#), b64(&serde_json::to_vec(claims).unwrap()));
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(input.as_bytes());
