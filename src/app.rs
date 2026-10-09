@@ -281,6 +281,7 @@ impl AppState {
         state.hooks = hooks;
         crate::cache::start(&state);
         crate::push::start(&state);
+        crate::voice::spawn_access_watcher(&state);
         Ok(state)
     }
 
