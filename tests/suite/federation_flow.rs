@@ -604,6 +604,7 @@ const LOCAL_ONLY_REQUESTS: &[(&str, &str, &str)] = &[
     ("*", "/api/v1/users/me/identity/rotate", "POST /api/v1/users/me/identity/rotate"),
     ("*", "/api/v1/users/me/identity/blob", "GET /api/v1/users/me/identity/blob"),
     ("*", "/api/v1/users/me/devices/{device_id}/key", "PUT /api/v1/users/me/devices/DEVICE/key"),
+    ("*", "/api/v1/users/me/devices/{device_id}/share-key", "PUT /api/v1/users/me/devices/DEVICE/share-key"),
     ("*", "/api/v1/users/me/devices/{device_id}/key-packages", "POST /api/v1/users/me/devices/DEVICE/key-packages"),
     ("*", "/api/v1/users/me/backups", "GET /api/v1/users/me/backups"),
     (
