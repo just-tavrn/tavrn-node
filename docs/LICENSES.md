@@ -55,6 +55,13 @@ and `livekit-api`; no fixed version exists; the node uses RSA only to verify ID-
 providers with public keys, where the timing side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
 `openmls_rust_crypto` → `hpke-rs` → `libcrux`).
 
+`cargo audit` scans every entry of `Cargo.lock` rather than the build graph and additionally reports
+RUSTSEC-2026-0330 and RUSTSEC-2026-0331 (`libcrux-kem` 0.0.9). That crate is a lockfile entry only and is never
+compiled: `hpke-rs` 0.7 declares its libcrux backend as an optional dependency named by a weak feature, which
+Cargo records in the lockfile, but nothing enables it (`cargo tree --target all -i libcrux-kem` prints nothing;
+`cargo deny` does not see it). `.cargo/audit.toml` ignores both, with the same reasoning, until a released
+`openmls_rust_crypto` accepts `hpke-rs` 0.8 (which brings the fixed `libcrux-kem` 0.0.10).
+
 ## 3. Direct dependencies
 
 `tavrn-node` (AGPL-3.0-only):
