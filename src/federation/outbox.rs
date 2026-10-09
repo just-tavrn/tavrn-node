@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -175,7 +175,7 @@ async fn deliver_target(
                 let retry_in = if status == Some(401) {
                     (row.last_status != Some(401)).then_some(UNAUTHORIZED_RETRY_SECS)
                 } else if e.retryable() {
-                    let jitter = rand::thread_rng().gen_range(-JITTER..=JITTER);
+                    let jitter = rand::rng().random_range(-JITTER..=JITTER);
                     Some(next_delay_secs(row.attempts + 1, e.retry_after(), jitter))
                 } else {
                     None

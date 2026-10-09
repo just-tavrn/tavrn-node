@@ -116,8 +116,8 @@ fn parse_key(text: &str) -> Option<ApiKey> {
 }
 
 fn random_alnum(n: usize) -> String {
-    use rand::{Rng, distributions::Alphanumeric};
-    rand::rngs::OsRng.sample_iter(&Alphanumeric).take(n).map(char::from).collect()
+    use rand::{RngExt, distr::Alphanumeric};
+    crate::util::os_rng().sample_iter(&Alphanumeric).take(n).map(char::from).collect()
 }
 
 /// Which addresses LiveKit announces to clients (its ICE host candidates), derived from

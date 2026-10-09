@@ -21,7 +21,10 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{Session, TestNode, test_node};
-use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+use p256::{
+    SecretKey,
+    elliptic_curve::{Generate, sec1::ToSec1Point},
+};
 use serde_json::{Value, json};
 use tavrn_node::{federation::social::Incoming, push::crypto, store};
 
@@ -102,9 +105,9 @@ struct Browser {
 impl Browser {
     fn new(fake: &FakePushService, path: &str) -> Self {
         let mut auth = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut auth);
+        tavrn_node::util::fill_random(&mut auth);
         Self {
-            secret: SecretKey::random(&mut rand::rngs::OsRng),
+            secret: SecretKey::generate_from_rng(&mut tavrn_node::util::os_rng()),
             auth,
             endpoint: format!("{}/{path}", fake.base),
             path: path.to_string(),
@@ -115,7 +118,7 @@ impl Browser {
         json!({
             "endpoint": self.endpoint,
             "keys": {
-                "p256dh": URL_SAFE_NO_PAD.encode(self.secret.public_key().to_encoded_point(false).as_bytes()),
+                "p256dh": URL_SAFE_NO_PAD.encode(self.secret.public_key().to_sec1_point(false).as_bytes()),
                 "auth": URL_SAFE_NO_PAD.encode(self.auth),
             },
             "expirationTime": null,

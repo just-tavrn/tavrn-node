@@ -18,7 +18,7 @@ use hkdf::Hkdf;
 use p256::{
     PublicKey, SecretKey,
     ecdsa::{Signature, SigningKey, signature::Signer},
-    elliptic_curve::sec1::ToEncodedPoint,
+    elliptic_curve::{Generate, sec1::ToSec1Point},
     pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
 };
 use sha2::Sha256;
@@ -48,11 +48,11 @@ impl std::fmt::Debug for VapidKey {
 
 impl VapidKey {
     pub fn generate() -> Self {
-        Self::from_secret(SecretKey::random(&mut rand::rngs::OsRng))
+        Self::from_secret(SecretKey::generate_from_rng(&mut crate::util::os_rng()))
     }
 
     fn from_secret(secret: SecretKey) -> Self {
-        let public = URL_SAFE_NO_PAD.encode(secret.public_key().to_encoded_point(false).as_bytes());
+        let public = URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes());
         Self { signing: SigningKey::from(secret), public }
     }
 
@@ -155,9 +155,9 @@ fn derive(
 /// Encrypts `plaintext` for a subscription (`p256dh`, `auth` as base64url) with a fresh sender key and salt.
 /// Returns the request body (`Content-Encoding: aes128gcm`).
 pub fn encrypt(p256dh: &str, auth: &str, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let as_secret = SecretKey::random(&mut rand::rngs::OsRng);
+    let as_secret = SecretKey::generate_from_rng(&mut crate::util::os_rng());
     let mut salt = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    crate::util::fill_random(&mut salt);
     encrypt_with(p256dh, auth, plaintext, &as_secret, &salt)
 }
 
@@ -174,7 +174,7 @@ fn encrypt_with(
     let ua_public_bytes = URL_SAFE_NO_PAD.decode(p256dh.trim_end_matches('=')).context("p256dh")?;
     let auth = URL_SAFE_NO_PAD.decode(auth.trim_end_matches('=')).context("auth")?;
     let ua_public = PublicKey::from_sec1_bytes(&ua_public_bytes).map_err(|_| anyhow!("p256dh is not a P-256 point"))?;
-    let as_public = as_secret.public_key().to_encoded_point(false);
+    let as_public = as_secret.public_key().to_sec1_point(false);
     let shared = p256::ecdh::diffie_hellman(as_secret.to_nonzero_scalar(), ua_public.as_affine());
     let (cek, nonce) = derive(shared.raw_secret_bytes(), &auth, salt, &ua_public_bytes, as_public.as_bytes())?;
     // One record: the plaintext and the delimiter 0x02 of the last record, no padding.
@@ -204,7 +204,7 @@ pub fn decrypt(ua_secret: &SecretKey, auth: &[u8], body: &[u8]) -> anyhow::Resul
     let key_end = 21 + id_len;
     let as_public_bytes = body.get(21..key_end).ok_or_else(|| anyhow!("key id missing"))?;
     let as_public = PublicKey::from_sec1_bytes(as_public_bytes).map_err(|_| anyhow!("key id is not a P-256 point"))?;
-    let ua_public = ua_secret.public_key().to_encoded_point(false);
+    let ua_public = ua_secret.public_key().to_sec1_point(false);
     let shared = p256::ecdh::diffie_hellman(ua_secret.to_nonzero_scalar(), as_public.as_affine());
     let (cek, nonce) = derive(shared.raw_secret_bytes(), auth, salt, ua_public.as_bytes(), as_public_bytes)?;
     let cipher = Aes128Gcm::new_from_slice(&cek).map_err(|_| anyhow!("key length"))?;
@@ -269,7 +269,7 @@ mod tests {
     fn rfc8291_example() {
         let as_secret = SecretKey::from_slice(&b64("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw")).unwrap();
         assert_eq!(
-            URL_SAFE_NO_PAD.encode(as_secret.public_key().to_encoded_point(false).as_bytes()),
+            URL_SAFE_NO_PAD.encode(as_secret.public_key().to_sec1_point(false).as_bytes()),
             "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
         );
         let ua_secret = SecretKey::from_slice(&b64("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94")).unwrap();
@@ -287,8 +287,8 @@ mod tests {
 
     #[test]
     fn roundtrip_with_fresh_keys_and_limits() {
-        let ua = SecretKey::random(&mut rand::rngs::OsRng);
-        let ua_public = URL_SAFE_NO_PAD.encode(ua.public_key().to_encoded_point(false).as_bytes());
+        let ua = SecretKey::generate_from_rng(&mut crate::util::os_rng());
+        let ua_public = URL_SAFE_NO_PAD.encode(ua.public_key().to_sec1_point(false).as_bytes());
         let auth = [7u8; 16];
         let auth_b64 = URL_SAFE_NO_PAD.encode(auth);
         check_keys(&ua_public, &auth_b64).unwrap();
@@ -304,6 +304,27 @@ mod tests {
         off_curve.extend_from_slice(&[1u8; 64]);
         assert_eq!(check_keys(&URL_SAFE_NO_PAD.encode(&off_curve), &auth_b64), Err(KeyError::P256dh));
         assert_eq!(check_keys(&ua_public, "c2hvcnQ"), Err(KeyError::Auth));
+    }
+
+    /// A key file in the standard PKCS#8 form (RFC 5208 + RFC 5915, the public key included) that earlier releases
+    /// wrote, here for the RFC 8291 sender key: it must keep loading, and a new file must be written the same way.
+    #[test]
+    fn vapid_key_file_format_is_stable() {
+        const PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyfWPiYE+n46HLnH0
+KqZOF1fJJU3MYrct3AELtAQ+oRyhRANCAAT+M/SrDepxkU21WCP3O1SUj0EwbZIH
+Mtu5pZpTKGSCIA5Zent7wmC6HCJ5mFgJkuk5cwAvMBKiiujwa7t45ewP
+-----END PRIVATE KEY-----
+";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(VAPID_KEY_FILE), PEM).unwrap();
+        let key = VapidKey::load_or_create(dir.path()).unwrap();
+        assert_eq!(
+            key.public_key(),
+            "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+        );
+        let written = SecretKey::from(&key.signing).to_pkcs8_pem(LineEnding::LF).unwrap();
+        assert_eq!(written.as_str(), PEM);
     }
 
     #[test]

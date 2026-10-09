@@ -656,7 +656,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 if let Err(e) = sync(&state, Utc::now()).await {
                     tracing::warn!(error = %e, "directory sync failed");
                 }
-                let jitter: i64 = rand::Rng::gen_range(&mut rand::thread_rng(), -600..=600);
+                let jitter: i64 = rand::RngExt::random_range(&mut rand::rng(), -600..=600);
                 let secs = (ANNOUNCE_EVERY.as_secs() as i64 + jitter).max(60) as u64;
                 next_sync = tokio::time::Instant::now() + Duration::from_secs(secs);
             }

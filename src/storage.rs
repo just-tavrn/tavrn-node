@@ -37,7 +37,6 @@ use anyhow::{Context, anyhow, bail};
 use axum::body::Bytes;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::Stream;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zeroize::Zeroizing;
@@ -83,7 +82,7 @@ impl StorageKey {
 
     pub fn generate() -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(key.as_mut());
+        crate::util::fill_random(key.as_mut());
         Self::from_bytes(key)
     }
 
@@ -99,7 +98,7 @@ impl StorageKey {
     /// Wraps a file key, bound to its storage id (a wrapped key copied to another row does not unwrap).
     pub fn wrap(&self, storage_id: &str, file_key: &[u8; 32]) -> anyhow::Result<WrappedKey> {
         let mut nonce = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        crate::util::fill_random(&mut nonce);
         let wrapped = self
             .cipher()
             .encrypt((&nonce).into(), Payload { msg: file_key, aad: storage_id.as_bytes() })
@@ -646,7 +645,7 @@ impl BlobStorage {
         let mut f = tokio::fs::File::create(tmp).await.with_context(|| format!("{} not writable", tmp.display()))?;
         let row = if self.encrypt {
             let mut file_key = Zeroizing::new([0u8; 32]);
-            rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+            crate::util::fill_random(file_key.as_mut());
             let wrapped = self.keys.current.wrap(id, &file_key)?;
             let mut out = tokio::io::BufWriter::with_capacity(CHUNK + TAG, &mut f);
             encrypt_stream(&file_key, len, input, &mut out).await?;
@@ -714,7 +713,7 @@ impl BlobStorage {
             let mut len = 0u64;
             let row = if self.encrypt {
                 let mut file_key = Zeroizing::new([0u8; 32]);
-                rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+                crate::util::fill_random(file_key.as_mut());
                 let wrapped = self.keys.current.wrap(id, &file_key)?;
                 let mut sealer = ChunkSealer::new(&file_key);
                 while let Some(chunk) = stream.next().await {
@@ -790,7 +789,7 @@ impl BlobStorage {
     /// channels), wrapped with the storage key and kept in `blob_keys` like the node's own files.
     pub async fn new_external_key(&self, id: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
         let mut file_key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+        crate::util::fill_random(file_key.as_mut());
         let wrapped = self.keys.current.wrap(id, &file_key)?;
         keys_store::put_blob_key(&self.db, id, &encode_wrap(&wrapped, self.keys.current.id(), ENC_VERSION)).await?;
         Ok(file_key)

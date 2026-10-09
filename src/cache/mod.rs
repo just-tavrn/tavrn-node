@@ -35,7 +35,6 @@ use aes_gcm::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
-use rand::RngCore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::{Notify, mpsc};
 use zeroize::Zeroizing;
@@ -453,7 +452,7 @@ impl Cluster {
 
     fn seal(&self, aad: &str, plain: &[u8]) -> CacheResult<String> {
         let mut nonce = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        crate::util::fill_random(&mut nonce);
         let cipher = Aes256Gcm::new((&*self.seal).into());
         let ct = cipher
             .encrypt((&nonce).into(), Payload { msg: plain, aad: aad.as_bytes() })
