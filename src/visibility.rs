@@ -97,6 +97,8 @@ pub struct Member {
     /// Role ids without @everyone.
     pub role_ids: Vec<String>,
     pub user: UserRow,
+    /// Passes `adults_only` gates (`age::is_adult`): below a channel's gate the member cannot view it (§5e).
+    pub adult: bool,
 }
 
 /// A snapshot of one room: everything the permission evaluation needs, and the viewers per channel, each computed
@@ -160,6 +162,7 @@ impl RoomView {
                 Some(m.member.clone()),
                 &m.role_ids,
                 &m.user,
+                m.adult,
             ) {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -182,14 +185,12 @@ async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, 
     let overrides = store::rooms::overrides_of_room(db, room_id).await?;
     let mut users: HashMap<String, UserRow> =
         store::users::members_of_room(db, room_id).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
-    let members = store::rooms::members_with_roles(db, room_id)
-        .await?
-        .into_iter()
-        .filter_map(|(member, role_ids)| {
-            let user = users.remove(&member.user_id)?;
-            Some((member.user_id.clone(), Member { member, role_ids, user }))
-        })
-        .collect();
+    let mut members = HashMap::new();
+    for (member, role_ids) in store::rooms::members_with_roles(db, room_id).await? {
+        let Some(user) = users.remove(&member.user_id) else { continue };
+        let adult = crate::age::is_adult(state, &user).await?;
+        members.insert(member.user_id.clone(), Member { member, role_ids, user, adult });
+    }
     let viewers = channels.keys().map(|id| (id.clone(), OnceLock::new())).collect();
     Ok(Some(Arc::new(RoomView { room, roles, channels, overrides, members, viewers })))
 }

@@ -202,7 +202,7 @@ async fn deleting_keeps_messages_as_deleted_user_and_the_admin_can_undo() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": password("alice") })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": password("alice") })),
         )
         .await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.account_deleted")));
@@ -213,7 +213,7 @@ async fn deleting_keeps_messages_as_deleted_user_and_the_admin_can_undo() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "alice", "password": password("alice") })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": password("alice") })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "username reserved: {j}");
@@ -222,7 +222,7 @@ async fn deleting_keeps_messages_as_deleted_user_and_the_admin_can_undo() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "deleted-abc", "password": password("x") })),
+            Some(json!({ "username": "deleted-abc", "date_of_birth": "1990-01-01", "password": password("x") })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "the tombstone prefix is reserved");

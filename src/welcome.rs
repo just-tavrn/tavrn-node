@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The welcome channel: a fixed system channel per room (`kind = "system"`,
 //! `system_name = "welcome"`) that is the room's security log. The node writes `system.join`, `system.leave`,
-//! `system.key_changed`, `system.bot_added` and `system.bot_removed` entries; clients render them localized. Nobody can write there (reactions are allowed),
+//! `system.key_changed`, `system.bot_added`, `system.bot_removed`, `system.history_restored` and
+//! `system.history_restore_denied` entries; clients render them localized. Nobody can write there (reactions are allowed),
 //! nobody can hide it (`view_channel` is forced, `permissions::SYSTEM_CHANNEL_FORCED`), it is never encrypted and
 //! its whole history is readable for every member, including new ones.
 
@@ -82,7 +83,22 @@ pub async fn membership_ended(
     {
         tracing::warn!(error = %e, "room avatar not deleted");
     }
+    if let Err(e) = store::history::membership_ended(&state.db, &room.id, &user.id).await {
+        tracing::warn!(error = %e, "history requests of the membership not closed");
+    }
     left(state, room, user, kind).await;
+}
+
+/// `system.history_restored { user, …, by }` or `system.history_restore_denied { user, …, by }`: a member with
+/// `restore_history` decided a member's request to restore the history after a key reset (ENCRYPTION.md §7b). The
+/// reason of a denial stays in the audit log. Failures are logged (the decision already happened).
+pub async fn history_restore_decided(state: &AppState, room: &Room, user: &UserRow, approved: bool, by: &str) {
+    let kind = if approved { "system.history_restored" } else { "system.history_restore_denied" };
+    let mut content = entry(kind, user);
+    content["by"] = json!(by);
+    if let Err(e) = write(state, room, user, content).await {
+        tracing::warn!(error = %e, room = room.id, "history restore entry not written");
+    }
 }
 
 /// `system.key_changed { user, display_name, avatar, avatar_still, at, rotated }` in the welcome channel of every room on this node that `user` is a
@@ -98,6 +114,10 @@ pub async fn key_changed(state: &AppState, user: &UserRow, rotated: bool) {
         }
     };
     let at = crate::util::now();
+    // A reset (not a rotation) starts the member's history window anew (ENCRYPTION.md §7b).
+    if !rotated {
+        crate::history::key_reset(state, user, &at).await;
+    }
     for room_id in rooms {
         let room = match store::rooms::room_by_id(&state.db, &room_id).await {
             Ok(Some(room)) => room,

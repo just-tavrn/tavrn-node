@@ -24,7 +24,7 @@ repository, which is the `protocol/` submodule of this repository.
 11. [Metrics and health](#metrics-and-health)
 12. [Scaling with Valkey](#scaling-with-valkey)
 13. [Webhooks and applications](#webhooks-and-applications)
-14. [Legal pages and GDPR](#legal-pages-and-gdpr)
+14. [Legal pages and GDPR](#legal-pages-and-gdpr) ([Age gates](#age-gates))
 15. [Moderation and auto-moderation](#moderation-and-auto-moderation)
 16. [Threads and forum channels](#threads-and-forum-channels)
 17. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
@@ -153,6 +153,7 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
 | `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. |
+| `TAVRN_MINIMUM_AGE` | `16` | Minimum age for registration (13–99). Every registration path asks for the date of birth and refuses younger people; see [Age gates](#age-gates). |
 | `TAVRN_DM_POLICY` | `everyone` | Upper bound of every user's "Who can message me": `friends`, `everyone_shared` (friends and shared rooms) or `everyone` (`open` is the old name). Users choose within it (their default is `everyone_shared`); non-friends land in the recipient's message requests; blocks always apply. |
 
 The second factor (TOTP or passkeys) is mandatory for every account and cannot be switched off.
@@ -1662,6 +1663,34 @@ Web push payloads carry no content of encrypted conversations. Retention you con
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
+
+### Age gates
+
+Since `age.v1` (protocol PROTOCOL.md §5e) every registration asks for the **date of birth**: the password and passkey
+registration, the registration on the connect page of the apps, and accounts created by single sign-on (they are
+asked right after their first login). People younger than `TAVRN_MINIMUM_AGE` (default 16, the GDPR consent age in
+Germany) cannot register. Accounts that existed before are asked once at their next sign-in; until they answer, the
+node refuses everything but the account itself, the legal pages and sign-out (`age.status_required`).
+
+- **Private.** The date of birth stays on this node. Nobody but the user sees it or the derived status (adult from
+  the 18th birthday on, minor before, unknown without a date; unknown counts as minor). Other nodes only learn the
+  signed "18 or older: yes/no/unknown" claim in the federated sign-in when the user acts there, and never show it.
+- **Gates.** Room managers can mark a room "adults only" (Room settings → Overview), channel managers a channel
+  (Channel settings). Users under 18 never see a gated room in Discover and cannot join it, not even with an invite;
+  a gated channel stays in the list but is locked for them: no messages, files, search, notifications, push or voice.
+  This applies to moderators and owners as well. Only adults can switch a gate on.
+- **Corrections.** Users enter the date once. To correct it on request: `PUT /api/v1/admin/users/{user_id}/date-of-birth`
+  with `{"date_of_birth": "YYYY-MM-DD"}` (or `null` to ask the user again); audited as `admin.date_of_birth` without
+  the date.
+- **Privacy policy.** The privacy templates (Admin → Legal → "Insert template") contain a paragraph that explains why
+  the date of birth is collected, where it is stored, what other nodes learn and how to correct it; the minimum age is
+  filled in from `TAVRN_MINIMUM_AGE`.
+- **What it is not.** The date of birth is self-declared. It is not age verification in the sense of the EU Digital
+  Services Act guidelines, the planned EU KIDS Act or the German JMStV (closed user groups need a KJM-approved age
+  verification system); pluggable verification providers are planned. The legal background and the full design are in
+  the umbrella issue [just-tavrn/tavrn#2](https://github.com/just-tavrn/tavrn/issues/2). You remain responsible for
+  the age rules of your jurisdiction.
+
 ## Moderation and auto-moderation
 
 ### Node administration
@@ -1719,6 +1748,21 @@ audited with the matched term, never the message text, and show up in the modera
 The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
+
+### History restore after a key reset
+
+A user who resets their security key (lost every device and the recovery key) keeps their rooms but not their
+encrypted history: the node stops serving the encrypted messages from before the reset to them, and other members'
+apps no longer hand those keys over automatically (protocol: ENCRYPTION.md §7b). The member can ask the room for the
+history; the owner, administrators and roles with **Restore history** (`restore_history`, never `@everyone`, never a
+bot) approve or deny it in room settings → History requests. The approving member's app sends the keys from its own
+device, so an approval restores only what that device can read. Requests, approvals and denials are in the room's
+audit log (`history.restore_requested`, `history.restore_approved`, `history.restore_denied` with the reason) and the
+decision is an entry in the welcome channel. Rooms switch requests off in room settings → Overview ("History after a
+key reset"); remote members' resets are learned through federation like the key change itself. There is nothing to
+configure and nothing an operator can restore: the node never holds the keys. Decided requests are deleted after 30
+days by the housekeeping; an approval stays valid for key shares for 30 days. Tell moderators to verify the person's
+identity on another channel before approving: a key reset is also what someone who took over the account would do.
 
 ## Threads and forum channels
 

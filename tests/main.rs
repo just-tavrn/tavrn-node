@@ -10,6 +10,7 @@ mod common;
 mod suite {
     mod account_deletion_flow;
     mod admin_flow;
+    mod age_flow;
     mod api_basics;
     mod app_install_flow;
     mod applications_flow;
@@ -45,6 +46,7 @@ mod suite {
     mod files_flow;
     mod friends_flow;
     mod history_flow;
+    mod history_restore_flow;
     mod housekeeping_flow;
     mod identity_rotation_flow;
     mod legal_flow;

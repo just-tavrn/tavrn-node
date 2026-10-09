@@ -82,6 +82,8 @@ pub struct WellKnown {
     pub federation: Option<FederationInfo>,
     /// WebAuthn relying party of this node's passkeys (PROTOCOL.md §5a.4).
     pub webauthn: WebauthnInfo,
+    /// Date of birth and age gates (`age.v1`, PROTOCOL.md §5e).
+    pub age: crate::age::AgeInfo,
 }
 
 /// The WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain). It may be a parent
@@ -143,6 +145,7 @@ pub fn build_from(c: &crate::config::Config, keys: &[crate::keys::NodeKey]) -> W
             preview_auto_max_bytes: c.preview_auto_max_bytes,
         },
         directory_listing: c.directory_listing,
+        age: crate::age::info(c),
         federation: c.federation_enabled.then_some(FederationInfo {
             version: 1,
             limits: FederationLimits {

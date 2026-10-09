@@ -497,7 +497,7 @@ async fn bots_are_refused_on_never_allowed_routes() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": b.username, "password": "whatever-123" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "whatever-123" })),
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::UNAUTHORIZED, "auth.invalid_credentials"));
@@ -599,7 +599,8 @@ async fn every_scope_boundary_and_administrator_masking() {
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &reader.secret).await;
     assert_eq!(detail["my_permissions"], (p::BOT_ALWAYS | p::READ_HISTORY).to_string());
-    // With every scope the administrator role gives every bit except administrator itself.
+    // With every scope the administrator role gives every bit except administrator itself and restore_history, which
+    // no scope covers (ENCRYPTION.md §7b).
     let full = bot(&node, &alice, "Full", None).await;
     joined(&node, &alice, &room_id, &full).await;
     node.patch(
@@ -609,7 +610,7 @@ async fn every_scope_boundary_and_administrator_masking() {
     )
     .await;
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &full.secret).await;
-    assert_eq!(detail["my_permissions"], (p::ALL & !p::ADMINISTRATOR).to_string());
+    assert_eq!(detail["my_permissions"], (p::ALL & !(p::ADMINISTRATOR | p::RESTORE_HISTORY)).to_string());
     // A role cannot be granted beyond the bot's own capped permissions through overrides either.
     let (s, j) = node
         .put(
@@ -1043,7 +1044,7 @@ async fn delete_application_leaves_a_tombstone() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": b.username, "password": "a-long-password-1", "device_name": "x" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "a-long-password-1", "device_name": "x" })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT);

@@ -50,6 +50,12 @@ pub struct UserRow {
     /// the grace period.
     #[sqlx(default)]
     pub deleted_at: Option<String>,
+    /// Local users: the self-declared date of birth `YYYY-MM-DD` (PROTOCOL.md §5e); never leaves the home node and is
+    /// never shown to others. NULL until given.
+    pub date_of_birth: Option<String>,
+    /// Remote users: the `age_over_18` claim of the home node's latest federation token (1, 0 or NULL = unknown;
+    /// FEDERATION.md §2.2). Never exposed.
+    pub age_over_18: Option<i64>,
     /// Effective scopes of the app token (or federated bot session) this row was authenticated with; `None`
     /// outside of a bot's own request (= all scopes). Never stored.
     #[sqlx(skip)]
@@ -119,6 +125,8 @@ impl UserRow {
             notification_settings: None,
             auto_preview: None,
             locale: None,
+            date_of_birth: None,
+            age_status: None,
         }
     }
 }
@@ -183,6 +191,13 @@ pub struct UserPrivate {
     /// tag such as `de`; null = English). Clients send theirs when it changes.
     #[serde(default)]
     pub locale: Option<String>,
+    /// `GET /users/me` of local users only: the own date of birth `YYYY-MM-DD` (null until given; PROTOCOL.md §5e).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub date_of_birth: Option<Option<String>>,
+    /// `GET /users/me` of local users only: the private age status. Never part of any other response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_status: Option<crate::age::AgeStatus>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -253,6 +268,11 @@ pub struct Room {
     /// Messages of the room's channels are deleted after this many days (null = the node's value; a room can only
     /// shorten it; pinned messages and the welcome channel are exempt, PROTOCOL.md §7f).
     pub message_retention_days: Option<i64>,
+    /// `none` or `adults_only` (PROTOCOL.md §5e): users below 18 never find the room in Discover and cannot join it;
+    /// every channel of the room is locked for them.
+    pub age_gate: String,
+    /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
+    pub history_restore: String,
 }
 
 impl Room {
@@ -385,9 +405,23 @@ pub struct ChannelRow {
     /// Forum channels: the tag list as JSON `[{ id, name, emoji }]`.
     #[sqlx(default)]
     pub forum_tags: String,
+    /// The channel's own age gate (`none` | `adults_only`, PROTOCOL.md §5e).
+    pub age_gate: String,
+    /// The room's age gate, read by the query (the channel's minimum).
+    pub room_age_gate: String,
 }
 
 impl ChannelRow {
+    /// The effective age gate: the stricter of the channel's and the room's (PROTOCOL.md §5e).
+    pub fn age_gate_effective(&self) -> &'static str {
+        crate::age::effective(&self.room_age_gate, &self.age_gate)
+    }
+
+    /// The channel is for adults only (its own gate or its room's).
+    pub fn adults_only(&self) -> bool {
+        self.age_gate_effective() == crate::age::GATE_ADULTS
+    }
+
     /// Effective "no bots" flag (APPLICATIONS.md §3.5, `permissions::no_bots_effective`).
     pub fn no_bots(&self) -> bool {
         crate::permissions::no_bots_effective(&crate::permissions::NoBotsInput {
@@ -422,6 +456,8 @@ impl ChannelRow {
             has_webhooks: b(self.has_webhooks),
             auto_archive_minutes: self.auto_archive_minutes,
             tags: self.tags(),
+            age_gate: self.age_gate.clone(),
+            age_gate_effective: self.age_gate_effective().to_string(),
         }
     }
 
@@ -488,6 +524,17 @@ pub struct Channel {
     /// Forum channels: the tags posts can carry (at most 20); empty for other kinds.
     #[serde(default)]
     pub tags: Vec<ForumTag>,
+    /// The channel's own age gate: `none` or `adults_only` (PROTOCOL.md §5e).
+    #[serde(default = "default_age_gate")]
+    pub age_gate: String,
+    /// The gate that applies: `adults_only` when the channel's or its room's gate says so. Users below it see the
+    /// channel locked: no messages, files, voice or events.
+    #[serde(default = "default_age_gate")]
+    pub age_gate_effective: String,
+}
+
+fn default_age_gate() -> String {
+    crate::age::GATE_NONE.into()
 }
 
 fn default_auto_archive() -> i64 {
@@ -569,6 +616,10 @@ pub struct MemberRow {
     pub avatar_animated: i64,
     /// Per-room bio ('' = none).
     pub bio: String,
+    /// The member's identity key was reset at this time (ENCRYPTION.md §7b "History after a key reset").
+    pub key_reset_at: Option<String>,
+    /// A member with `restore_history` approved restoring the history from before the reset.
+    pub history_restored_at: Option<String>,
 }
 
 impl MemberRow {

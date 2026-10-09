@@ -61,6 +61,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     // Reports and content auto-moderation (MODERATION.md).
     caps.push("reports.v1");
     caps.push("automod.v1");
+    // History restore after a key reset by request and approval (ENCRYPTION.md §7b).
+    caps.push("history.restore");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
@@ -70,6 +72,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
             caps.push("screenshare");
         }
     }
+    // Date of birth, private age status and age gates (PROTOCOL.md §5e).
+    caps.push(crate::age::CAPABILITY);
     caps
 }
 
@@ -716,6 +720,17 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(routes::history::ack_share),
         )
         .route("/conversations/{conversation_id}/history-pending", get(routes::history::list_pending))
+        .route(
+            "/rooms/{room_id}/history-requests",
+            get(routes::history_requests::list).post(routes::history_requests::create),
+        )
+        .route("/rooms/{room_id}/history-requests/mine", get(routes::history_requests::mine))
+        .route(
+            "/rooms/{room_id}/history-requests/{request_id}",
+            axum::routing::delete(routes::history_requests::cancel),
+        )
+        .route("/rooms/{room_id}/history-requests/{request_id}/approve", post(routes::history_requests::approve))
+        .route("/rooms/{room_id}/history-requests/{request_id}/deny", post(routes::history_requests::deny))
         .route("/conversations/{conversation_id}/mls/pending-removals", get(routes::mls::pending_removals))
         .route("/mls/pending-removals", get(routes::mls::own_pending_removals))
         .route("/mls/welcomes", get(routes::mls::welcomes))
@@ -938,7 +953,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(routes::commands::routes())
                 .merge(routes::legal::routes())
                 .merge(routes::push::routes())
-                .merge(routes::moderation::routes()),
+                .merge(routes::moderation::routes())
+                .merge(routes::age::routes()),
         )
         // Legal pages as standalone HTML; other `/legal/…` paths are the web client's.
         .merge(routes::legal::page_routes())

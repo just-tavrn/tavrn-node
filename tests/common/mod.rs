@@ -53,6 +53,9 @@ pub struct Session {
     pub recovery_codes: Vec<String>,
 }
 
+/// Date of birth the helpers register with (an adult, PROTOCOL.md §5e).
+pub const ADULT_DATE_OF_BIRTH: &str = "1990-01-01";
+
 /// Password the helpers use for `username`.
 pub fn password(username: &str) -> String {
     format!("password-{username}-123")
@@ -220,9 +223,15 @@ impl TestNode {
         self.req(Method::DELETE, path, Some(token), None).await
     }
 
-    /// Registers `username`, enrolls TOTP with the pre-auth token and returns the full session.
+    /// Registers `username` (an adult), enrolls TOTP with the pre-auth token and returns the full session.
     pub async fn register(&self, username: &str) -> Session {
-        let preauth = self.register_preauth(username).await;
+        self.register_born(username, ADULT_DATE_OF_BIRTH).await
+    }
+
+    /// Registers `username` with the date of birth `date_of_birth` (`YYYY-MM-DD`), enrolls TOTP and returns the
+    /// full session.
+    pub async fn register_born(&self, username: &str, date_of_birth: &str) -> Session {
+        let preauth = self.register_preauth_born(username, date_of_birth).await;
         let (secret, confirmed) = self.enroll_totp(&preauth).await;
         let session = &confirmed["session"];
         let codes: Vec<String> =
@@ -241,14 +250,13 @@ impl TestNode {
 
     /// Registers `username` without enrolling a factor; returns the pre-auth token (stage `enroll`).
     pub async fn register_preauth(&self, username: &str) -> String {
-        let (status, json) = self
-            .req(
-                Method::POST,
-                "/api/v1/auth/register",
-                None,
-                Some(json!({ "username": username, "password": password(username), "device_name": "test" })),
-            )
-            .await;
+        self.register_preauth_born(username, ADULT_DATE_OF_BIRTH).await
+    }
+
+    /// [`TestNode::register_preauth`] with the date of birth `date_of_birth`.
+    pub async fn register_preauth_born(&self, username: &str, date_of_birth: &str) -> String {
+        let body = json!({ "username": username, "password": password(username), "device_name": "test", "date_of_birth": date_of_birth });
+        let (status, json) = self.req(Method::POST, "/api/v1/auth/register", None, Some(body)).await;
         assert_eq!(status, StatusCode::CREATED, "registration of {username}: {json}");
         assert_eq!(json["status"], "enrollment_required", "{json}");
         assert!(json.get("access_token").is_none(), "no session before the second factor: {json}");

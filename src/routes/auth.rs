@@ -34,6 +34,10 @@ pub struct RegisterRequest {
     /// The version of the terms of service the user accepted (required when the node publishes terms,
     /// `GET /node` → `legal.pages.terms.version`).
     pub accept_terms: Option<i64>,
+    /// Required (`age.v1`, PROTOCOL.md §5e): the date of birth `YYYY-MM-DD`, between 1900-01-01 and today. Below the
+    /// node's minimum age (`GET /node` → `age.minimum_age`) the registration is refused with `age.below_minimum`.
+    /// Stored on this node only, never shown to others.
+    pub date_of_birth: Option<String>,
 }
 
 /// `ok`: the response carries a full session.
@@ -151,6 +155,10 @@ pub async fn register(
     if !auth::valid_password(&req.password) {
         return Err(bad("auth.password_weak", "Password: at least 10 characters"));
     }
+    // The date of birth (PROTOCOL.md §5e): plausible, and at least the node's minimum age.
+    let today = crate::age::today();
+    let date_of_birth = crate::age::parse(req.date_of_birth.as_deref().unwrap_or(""), today)?;
+    crate::age::check_minimum(date_of_birth, today, cfg.minimum_age)?;
     // Published terms must be accepted, in exactly the version shown.
     let terms = crate::legal::documents::terms_version(&state.db).await?;
     if let Some(version) = terms
@@ -190,6 +198,7 @@ pub async fn register(
             password_hash: &password_hash,
             email: email.as_deref(),
             is_node_admin: is_admin,
+            date_of_birth: Some(&date_of_birth.format("%Y-%m-%d").to_string()),
         },
     )
     .await?;
@@ -474,13 +483,23 @@ pub async fn reset_password(
 /// Own account.
 #[utoipa::path(get, path = "/api/v1/users/me", security(("bearer" = [])), responses((status = 200, body = UserPrivate), (status = 401, body = crate::error::ProblemDetails)))]
 pub async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<UserPrivate>, ApiError> {
+    Ok(Json(own_account(&state, &auth).await?))
+}
+
+/// `GET /users/me`: the own account with the settings and, for local users, the date of birth and the private age
+/// status (PROTOCOL.md §5e; nowhere else).
+pub(crate) async fn own_account(state: &AppState, auth: &AuthUser) -> Result<UserPrivate, ApiError> {
     let mut me = auth.user.to_private();
     if !auth.is_remote() && auth.user.domain == state.config.domain {
         me.notification_settings = Some(crate::notifications::load(&state.db, &auth.user.id).await?);
         me.auto_preview = Some(store::users::auto_preview(&state.db, &auth.user.id).await?);
         me.locale = store::users::locale(&state.db, &auth.user.id).await?;
+        if auth.user.kind == "user" {
+            me.date_of_birth = Some(auth.user.date_of_birth.clone());
+            me.age_status = Some(crate::age::status(&auth.user));
+        }
     }
-    Ok(Json(me))
+    Ok(me)
 }
 
 #[derive(Deserialize, ToSchema)]

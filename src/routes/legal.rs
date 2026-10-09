@@ -648,6 +648,7 @@ pub async fn admin_template(
     let contact = legal::contact(&state).await?.unwrap_or_default();
     let domain = state.config.domain.clone();
     let date = crate::util::now().chars().take(10).collect::<String>();
+    let minimum_age = state.config.minimum_age.to_string();
     let markdown = documents::fill_template(
         text,
         &[
@@ -657,6 +658,7 @@ pub async fn admin_template(
             ("operator_address", &contact.address),
             ("contact_email", &contact.email),
             ("effective_date", &date),
+            ("minimum_age", &minimum_age),
         ],
     );
     Ok(Json(LegalTemplate { kind: kind.into(), locale: locale.into(), markdown }))

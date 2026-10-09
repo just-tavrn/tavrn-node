@@ -646,6 +646,8 @@ mod tests {
             has_webhooks: 0,
             auto_archive_minutes: DEFAULT_AUTO_ARCHIVE_MINUTES,
             forum_tags: tags.into(),
+            age_gate: "none".into(),
+            room_age_gate: "none".into(),
         }
     }
 

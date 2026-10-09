@@ -658,6 +658,7 @@ const LOCAL_ONLY_REQUESTS: &[(&str, &str, &str)] = &[
     ("*", "/api/v1/unfurl", "GET /api/v1/unfurl?url=https%3A%2F%2Fexample.com%2F"),
     ("*", "/api/v1/federation/token", "POST /api/v1/federation/token"),
     ("*", "/api/v1/admin/*", "GET /api/v1/admin/users"),
+    ("*", "/api/v1/users/me/date-of-birth", "PUT /api/v1/users/me/date-of-birth"),
 ];
 
 #[tokio::test]

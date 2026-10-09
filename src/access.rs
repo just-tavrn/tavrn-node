@@ -23,6 +23,9 @@ pub struct RoomAccess {
     /// Kind of the account (`user`, `bot`, …) and, for a bot's own request, its effective scopes.
     pub kind: String,
     pub scopes: Option<Vec<String>>,
+    /// The user passes `adults_only` gates (PROTOCOL.md §5e, `age::is_adult`). Below a channel's gate every
+    /// permission in that channel is 0.
+    pub adult: bool,
 }
 
 impl RoomAccess {
@@ -99,11 +102,12 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
         None => Vec::new(),
     };
-    member_access(room, &roles, member, &role_ids, user)
+    let adult = crate::age::is_adult(state, user).await?;
+    member_access(room, &roles, member, &role_ids, user, adult)
 }
 
 /// The [`RoomAccess`] of `user` from already loaded room data: the room's `roles` (with @everyone), the user's
-/// membership and role ids. [`room_access`] uses it for one request, the channel visibility snapshot
+/// membership and role ids, and whether the user passes age gates (`age::is_adult`). [`room_access`] uses it for one request, the channel visibility snapshot
 /// (`visibility.rs`) for every member of a room at once.
 pub fn member_access(
     room: Room,
@@ -111,6 +115,7 @@ pub fn member_access(
     member: Option<MemberRow>,
     role_ids: &[String],
     user: &UserRow,
+    adult: bool,
 ) -> Result<RoomAccess, ApiError> {
     let is_node_admin = user.is_node_admin();
     let everyone = roles
@@ -138,7 +143,19 @@ pub fn member_access(
         room_perms,
         kind: user.kind.clone(),
         scopes: user.app_scopes.clone(),
+        adult,
     })
+}
+
+/// Does the user of `access` pass the channel's effective age gate?
+pub fn age_passes(access: &RoomAccess, channel: &ChannelRow) -> bool {
+    access.adult || !channel.adults_only()
+}
+
+/// `403 age.restricted` when the user of `access` is below the channel's effective age gate: the channel stays
+/// listed, its content (messages, files, voice, …) is refused (PROTOCOL.md §5e).
+pub fn require_age(access: &RoomAccess, channel: &ChannelRow) -> Result<(), ApiError> {
+    if age_passes(access, channel) { Ok(()) } else { Err(crate::age::restricted("channel")) }
 }
 
 /// Loads a channel of a room (404 if it does not belong to this room).
@@ -175,6 +192,10 @@ pub fn channel_perms_with(
     overrides: &[OverrideRow],
     user_id: &str,
 ) -> Perms {
+    // Age gates (PROTOCOL.md §5e) come before everything: below the gate nothing, owners and admins included.
+    if !age_passes(access, channel) {
+        return 0;
+    }
     let bot = |p: Perms| permissions::cap_bot(p, &access.kind, channel.no_bots(), access.scopes.as_deref());
     let system = channel.kind == "system";
     let restrict = |p: Perms| bot(if system { p & !SYSTEM_CHANNEL_DENIED } else { p });
@@ -369,6 +390,7 @@ async fn channel_conv(
     channel: ChannelRow,
     user: &UserRow,
 ) -> Result<Conv, ApiError> {
+    require_age(&access, &channel)?;
     let perms = channel_perms(state, &access, &channel, &user.id).await?;
     Ok(Conv {
         id: channel.id.clone(),

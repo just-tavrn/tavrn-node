@@ -41,7 +41,7 @@ async fn account_invites_gate_registration() {
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["note"], "For Bob");
 
-    let reg = |invite: Option<&str>, name: &str| json!({ "username": name, "password": "password-long-enough", "invite": invite });
+    let reg = |invite: Option<&str>, name: &str| json!({ "username": name, "date_of_birth": "1990-01-01", "password": "password-long-enough", "invite": invite });
     let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(reg(None, "bob"))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
     assert_eq!(j["code"], "auth.invite_required");
@@ -109,7 +109,7 @@ async fn admin_manages_users_bans_and_purges() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "bob", "password": "password-bob-123" })),
+            Some(json!({ "username": "bob", "date_of_birth": "1990-01-01", "password": "password-bob-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -138,7 +138,7 @@ async fn admin_manages_users_bans_and_purges() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "bob", "password": "password-bob-123" })),
+            Some(json!({ "username": "bob", "date_of_birth": "1990-01-01", "password": "password-bob-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -171,7 +171,7 @@ async fn password_reset_by_email() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "carol", "password": "password-long-enough", "email": "carol@example.org" })),
+            Some(json!({ "username": "carol", "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": "carol@example.org" })),
         )
         .await;
     assert_eq!(s, StatusCode::CREATED);
@@ -234,7 +234,7 @@ async fn password_reset_by_email() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "carol", "password": "new-password-123" })),
+            Some(json!({ "username": "carol", "date_of_birth": "1990-01-01", "password": "new-password-123" })),
         )
         .await;
     assert_eq!(s, StatusCode::OK);

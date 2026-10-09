@@ -381,9 +381,12 @@ async fn devices_changed(state: &AppState, user: &UserRow) -> Result<(), ApiErro
 async fn identity_changed(state: &AppState, user: &UserRow, key: &str, reset_at: &str) -> Result<(), ApiError> {
     let previous = store::users::by_id(&state.db, &user.id).await?.and_then(|u| u.identity_pubkey);
     store::federation::set_remote_identity(&state.db, &user.id, key, reset_at).await?;
-    // The security log of the rooms here: a reset is never a rotation.
-    if previous.as_deref().is_some_and(|p| p != key) {
-        crate::welcome::key_changed(state, user, false).await;
+    // The security log of the rooms here: a reset is never a rotation. The entry also records the reset on the
+    // user's memberships here (ENCRYPTION.md §7b); without a cached key there is no entry, but the reset still counts.
+    match previous.as_deref() {
+        Some(p) if p != key => crate::welcome::key_changed(state, user, false).await,
+        None => crate::history::key_reset(state, user, &util::now()).await,
+        Some(_) => {}
     }
     store::federation::invalidate_keys(&state.db, &user.id).await?;
     if let Err(e) = super::keys::refresh(state, user).await {

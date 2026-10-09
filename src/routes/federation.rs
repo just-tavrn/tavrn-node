@@ -93,6 +93,8 @@ pub async fn issue_token(
         target,
         profile_version,
         bot,
+        // `age.v1`: "18 or older: yes/no/unknown", the only age information that leaves this node (FEDERATION.md §2.2).
+        crate::age::claim(&state, &auth.user).await?,
     )?;
     store::federation::touch_target(&state.db, &auth.user.id, &auth.device_id, target).await?;
     tracing::info!(target, device = auth.device_id, "federation token issued");

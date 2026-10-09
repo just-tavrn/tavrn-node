@@ -92,6 +92,8 @@ pub const LOCAL_ONLY: &[(&str, &str)] = &[
     // Federation tokens and node administration
     ("*", "/api/v1/federation/token"),
     ("*", "/api/v1/admin/*"),
+    // The date of birth stays on the home node (PROTOCOL.md §5e)
+    ("*", "/api/v1/users/me/date-of-birth"),
 ];
 
 fn matches(rule: &(&str, &str), method: &Method, path: &str) -> bool {

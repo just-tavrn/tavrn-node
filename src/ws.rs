@@ -80,6 +80,10 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Err(ApiError::Unauthorized { code }) => return close(socket, CLOSE_AUTH, code).await,
         Err(_) => return close(socket, CLOSE_AUTH, "auth.token_invalid").await,
     };
+    // No date of birth yet (PROTOCOL.md §5e): no events; the client reconnects after adding it.
+    if crate::age::needs_date_of_birth(&state, &auth.user) {
+        return close(socket, CLOSE_PROTOCOL, "age.status_required").await;
+    }
     // Terms not accepted (`TAVRN_LEGAL_TERMS_MODE=require`): no events either; the client reconnects after accepting.
     if crate::legal::documents::check_required(&state, &auth.user, None).await.is_err() {
         return close(socket, CLOSE_PROTOCOL, "legal.terms_required").await;
@@ -337,6 +341,8 @@ mod tests {
                 owner_address: None,
                 application_id: None,
                 deleted_at: None,
+                date_of_birth: None,
+                age_over_18: None,
                 app_scopes: None,
             },
             device_id: "dev".into(),
