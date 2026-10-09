@@ -200,10 +200,13 @@ async fn a_private_channel_s_events_reach_only_its_viewers() {
     let alice_kinds = kinds(&until_marker(&mut alice_ws, "marker 1").await).len();
     assert!(alice_kinds >= carol_kinds.len() - 1, "the owner sees the channel too");
 
-    // Lifting the @everyone deny (override removed): bob gets the metadata event and then the channel's events.
+    // Lifting the @everyone deny (override removed): bob learns the channel, gets its overrides and then its events.
     let everyone = r.everyone.clone();
     r.set_override("role", &everyone, 0, 0).await;
-    assert_eq!(next_event(&mut bob_ws).await["type"], "override.update", "metadata reaches every member");
+    let ev = next_event(&mut bob_ws).await;
+    assert_eq!((ev["type"].as_str(), ev["data"]["id"].as_str()), (Some("channel.create"), Some(r.secret.as_str())));
+    assert_eq!(ev["data"]["name"], "secret");
+    assert_eq!(next_event(&mut bob_ws).await["type"], "override.update", "now listed to bob");
     r.post(&r.secret, "for everyone now").await;
     let ev = next_event(&mut bob_ws).await;
     assert_eq!(
@@ -211,10 +214,13 @@ async fn a_private_channel_s_events_reach_only_its_viewers() {
         (Some("message.create"), Some(r.secret.as_str()))
     );
 
-    // Denied again for bob only (member override): his socket stops at once.
+    // Denied again for bob only (member override): the channel disappears for him (hidden, not deleted), and his
+    // socket stops at once.
     let bob_id = r.bob.user_id.clone();
     r.set_override("member", &bob_id, 0, p::VIEW_CHANNEL).await;
-    assert_eq!(next_event(&mut bob_ws).await["type"], "override.update");
+    let ev = next_event(&mut bob_ws).await;
+    assert_eq!(ev["type"], "channel.delete", "{ev}");
+    assert_eq!(ev["data"], json!({ "room_id": r.room_id, "id": r.secret, "hidden": true }));
     r.post(&r.secret, "not for bob").await;
     r.post(&r.open, "marker 2").await;
     let bob_saw = until_marker(&mut bob_ws, "marker 2").await;
@@ -373,4 +379,89 @@ async fn notified(node: &common::federation::FedNode) -> Vec<String> {
         .collect();
     to.sort();
     to
+}
+
+/// PROTOCOL.md §6 "Audiences": the metadata of a private channel (`channel.*`, `override.update`) and of a category
+/// whose channels are all hidden (`category.*`) reach only the members to whom they are listed; a real deletion is
+/// not `hidden`. `GET /rooms/{id}` lists only the overrides of the listed channels and categories.
+#[tokio::test]
+async fn private_channel_and_category_metadata_reach_only_their_audience() {
+    let r = Room::new().await;
+    let url = serve(&r.node).await;
+    let mut bob_ws = hello(&url, &r.bob.token).await;
+    let mut carol_ws = hello(&url, &r.carol.token).await;
+    let room = format!("/api/v1/rooms/{}", r.room_id);
+    let secret = format!("{room}/channels/{}", r.secret);
+    let (s, j) = r.node.patch(&secret, &r.alice.token, json!({ "name": "renamed", "topic": "plans" })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let carol_id = r.carol.user_id.clone();
+    r.set_override("member", &carol_id, p::VIEW_CHANNEL | p::SEND_MESSAGES, 0).await;
+    let (_, detail) = r.node.get_auth(&room, &r.bob.token).await;
+    assert!(!detail.to_string().contains(&r.secret), "bob's room detail names the channel: {detail}");
+
+    // A category: listed to managers while empty, to bob once it holds a channel he can view.
+    let (s, cat) = r.node.post(&format!("{room}/categories"), &r.alice.token, json!({ "name": "staff" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{cat}");
+    let cat = cat["id"].as_str().unwrap().to_string();
+    let (s, ch) = r
+        .node
+        .post(
+            &format!("{room}/channels"),
+            &r.alice.token,
+            json!({ "kind": "text", "name": "notes", "encrypted": false, "category_id": cat }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{ch}");
+    let notes = ch["id"].as_str().unwrap().to_string();
+    // Hiding the category from @everyone: bob loses its channel and the category, both hidden.
+    let (s, j) = r
+        .node
+        .put(
+            &format!("{room}/overrides"),
+            &r.alice.token,
+            json!({ "target_type": "category", "target_id": cat, "subject_type": "role", "subject_id": r.everyone,
+                    "allow": "0", "deny": p::VIEW_CHANNEL.to_string() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = r.node.delete(&secret, &r.alice.token).await;
+    assert!(s.is_success(), "{j}");
+    r.post(&r.open, "marker").await;
+
+    let bob_saw = until_marker(&mut bob_ws, "marker").await;
+    assert_eq!(about(&bob_saw, &r.secret), Vec::<String>::new(), "bob saw: {bob_saw:?}");
+    let seen: Vec<(String, Value)> = bob_saw
+        .iter()
+        .filter(|e| {
+            e["type"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("channel.") || t.starts_with("category.") || t.starts_with("override."))
+        })
+        .map(|e| (e["type"].as_str().unwrap().to_string(), e["data"]["id"].clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("category.create".to_string(), json!(cat)),
+            ("channel.create".to_string(), json!(notes)),
+            ("channel.delete".to_string(), json!(notes)),
+            ("category.delete".to_string(), json!(cat)),
+        ],
+        "bob saw: {bob_saw:?}"
+    );
+    let hidden: Vec<&Value> = bob_saw
+        .iter()
+        .filter(|e| e["type"].as_str().is_some_and(|t| t.ends_with(".delete")))
+        .map(|e| &e["data"]["hidden"])
+        .collect();
+    assert_eq!(hidden, vec![&json!(true), &json!(true)]);
+
+    let carol_saw = until_marker(&mut carol_ws, "marker").await;
+    let kinds = kinds(&carol_saw);
+    for kind in ["channel.update", "override.update", "channel.delete"] {
+        assert!(kinds.contains(&kind), "carol misses {kind}: {kinds:?}");
+    }
+    let deleted =
+        carol_saw.iter().find(|e| e["type"] == "channel.delete" && e["data"]["id"] == r.secret.as_str()).unwrap();
+    assert!(deleted["data"].get("hidden").is_none(), "a real deletion: {deleted}");
 }

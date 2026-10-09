@@ -2,13 +2,21 @@
 //! Who may view a room channel, for everything the node fans out per room (PROTOCOL.md §6, FEDERATION.md §5.2,
 //! §6d): the WebSocket events of a channel (messages, reactions, pins, typing, threads, voice, files, MLS, …), the
 //! `notify` hints to other nodes, web push and the whiteboard's audience reach only the room members with
-//! `view_channel` in it at delivery time. The room's metadata events (`room.*`, `channel.*`, `category.*`,
-//! `role.*`, `member.*`, `override.*`, …) still reach every member.
+//! `view_channel` in it at delivery time.
+//!
+//! The metadata of a private channel follows the same audience (PROTOCOL.md §6 "Audiences"): `channel.*` and
+//! `override.update` of a channel reach the members to whom the channel is listed (`view_channel` without the age
+//! gate, as in `GET /rooms/{id}`), `category.*` and a category's `override.update` the members to whom the
+//! category is listed (one of its channels is, or they manage channels). The other metadata events (`room.*`,
+//! `role.*`, `member.*`, `emoji.*`, …) reach every member. Each connection remembers what its user knows of each
+//! room ([`Known`]); after an event that changes visibility it compares, and sends `channel.create` (with the
+//! `category.create` of a category the user did not know) for channels the user gained and `channel.delete` /
+//! `category.delete` with `hidden: true` for those they lost.
 //!
 //! The permissions are evaluated with [`access::channel_perms_with`], the same function the REST routes use, over a
-//! snapshot of the room (roles, overrides, channels, members) that is loaded once and shared by every connection:
-//! a channel's viewers are computed once (on the first event that needs them) and then only looked up. The
-//! [`Hub`](crate::hub::Hub) drops a room's snapshot synchronously when it publishes (or receives from another
+//! snapshot of the room (roles, overrides, channels, categories, members) that is loaded once and shared by every
+//! connection: a channel's viewers are computed once (on the first event that needs them) and then only looked up.
+//! The [`Hub`](crate::hub::Hub) drops a room's snapshot synchronously when it publishes (or receives from another
 //! instance) an event that can change who views what ([`changes_visibility`]), before any connection sees that
 //! event, so the next event of the room is checked against the new state. A snapshot also expires after [`TTL`]
 //! (changes without an event, e.g. the node admin flag).
@@ -28,7 +36,7 @@ use crate::{
     access,
     app::AppState,
     error::ApiError,
-    models::{ChannelRow, MemberRow, OverrideRow, RoleRow, Room, UserRow},
+    models::{Category, ChannelRow, MemberRow, OverrideRow, RoleRow, Room, UserRow},
     permissions, store,
 };
 
@@ -37,13 +45,13 @@ pub const TTL: Duration = Duration::from_secs(60);
 /// Rooms whose snapshot is kept at once (beyond, expired ones are dropped first, then all).
 const MAX_ROOMS: usize = 4096;
 
-/// Event kinds of the room itself: they reach every member, whatever channel they name.
+/// Event kinds of the room itself: not about a channel's content (their audience: [`Filter::deliver`]).
 const METADATA_PREFIXES: &[&str] =
     &["room.", "channel.", "category.", "role.", "member.", "override.", "emoji.", "soundboard.", "commands.", "user."];
 /// Event kinds after which the room's snapshot is stale (roles, overrides, channels, membership, room settings).
 const CHANGING_PREFIXES: &[&str] = &["room.", "channel.", "category.", "role.", "member.", "override."];
 
-/// Is `kind` a metadata event of the room (delivered to every member)?
+/// Is `kind` a metadata event of the room (not filtered by the channels its data names)?
 pub fn is_metadata(kind: &str) -> bool {
     METADATA_PREFIXES.iter().any(|p| kind.starts_with(p))
 }
@@ -107,9 +115,21 @@ pub struct RoomView {
     pub room: Room,
     roles: Vec<RoleRow>,
     channels: HashMap<String, ChannelRow>,
+    categories: HashMap<String, Category>,
     overrides: Vec<OverrideRow>,
     members: HashMap<String, Member>,
     viewers: HashMap<String, OnceLock<HashSet<String>>>,
+    /// Per channel the members to whom it is listed: viewers when the age gate is left aside (PROTOCOL.md §5e).
+    listers: HashMap<String, OnceLock<HashSet<String>>>,
+    /// Members with `manage_channels` room-wide: every category is listed to them.
+    managers: OnceLock<HashSet<String>>,
+}
+
+/// What a member knows of a room: the channels and categories listed to them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub channels: HashSet<String>,
+    pub categories: HashSet<String>,
 }
 
 impl RoomView {
@@ -129,9 +149,37 @@ impl RoomView {
     pub fn viewers(&self, channel_id: &str) -> &HashSet<String> {
         static NONE: OnceLock<HashSet<String>> = OnceLock::new();
         match (self.viewers.get(channel_id), self.channels.get(channel_id)) {
-            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel)),
+            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, false)),
             _ => NONE.get_or_init(HashSet::new),
         }
+    }
+
+    /// User ids of the members to whom the channel is listed (its viewers, age gate aside).
+    pub fn listers(&self, channel_id: &str) -> &HashSet<String> {
+        static NONE: OnceLock<HashSet<String>> = OnceLock::new();
+        match (self.listers.get(channel_id), self.channels.get(channel_id)) {
+            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, true)),
+            _ => NONE.get_or_init(HashSet::new),
+        }
+    }
+
+    /// The channels and categories listed to `user_id` (as in `GET /rooms/{id}`).
+    pub fn known_by(&self, user_id: &str) -> Known {
+        let channels: HashSet<String> =
+            self.channels.keys().filter(|c| self.listers(c).contains(user_id)).cloned().collect();
+        let manager = self.managers.get_or_init(|| {
+            self.members.keys().filter(|u| self.holds(u, permissions::MANAGE_CHANNELS)).cloned().collect()
+        });
+        let categories = if manager.contains(user_id) {
+            self.categories.keys().cloned().collect()
+        } else {
+            channels.iter().filter_map(|c| self.channels.get(c)?.category_id.clone()).collect()
+        };
+        Known { channels, categories }
+    }
+
+    pub fn category(&self, category_id: &str) -> Option<&Category> {
+        self.categories.get(category_id)
     }
 
     pub fn can_view(&self, channel_id: &str, user_id: &str) -> bool {
@@ -143,8 +191,69 @@ impl RoomView {
         may_see(refs, |c| self.can_view(c, user_id))
     }
 
-    fn compute(&self, channel: &ChannelRow) -> HashSet<String> {
+    /// The room's overrides (every target).
+    pub fn overrides(&self) -> &[OverrideRow] {
+        &self.overrides
+    }
+
+    /// The id of the room's `@everyone` role.
+    pub fn everyone_id(&self) -> Option<&str> {
+        self.roles.iter().find(|r| r.is_everyone != 0).map(|r| r.id.as_str())
+    }
+
+    /// The channels of the room.
+    pub fn channels(&self) -> impl Iterator<Item = &ChannelRow> {
+        self.channels.values()
+    }
+
+    /// Every member's permissions in `channel` as if the room's overrides were `overrides` (the channel's and its
+    /// category's take part): the evaluation of the REST routes, for a planned change (`routes::channels`).
+    pub fn perms_with(&self, channel: &ChannelRow, overrides: &[OverrideRow]) -> HashMap<String, permissions::Perms> {
         // Only this channel's and its category's overrides take part.
+        let overrides: Vec<OverrideRow> = overrides
+            .iter()
+            .filter(|o| {
+                (o.target_type == "channel" && o.target_id == channel.id)
+                    || (o.target_type == "category" && channel.category_id.as_deref() == Some(o.target_id.as_str()))
+            })
+            .cloned()
+            .collect();
+        self.members
+            .keys()
+            .filter_map(|user_id| Some((user_id.clone(), self.member_perms_with(channel, &overrides, user_id, false)?)))
+            .collect()
+    }
+
+    /// A member's permissions in a channel of the room (`None`: no member, or no such channel).
+    pub fn perms(&self, channel_id: &str, user_id: &str) -> Option<permissions::Perms> {
+        self.member_perms_with(self.channels.get(channel_id)?, &self.overrides, user_id, false)
+    }
+
+    /// Does the member hold `bits` room-wide (roles only, no channel)?
+    pub fn holds(&self, user_id: &str, bits: permissions::Perms) -> bool {
+        self.access(user_id).is_some_and(|a| permissions::has(a.room_perms, bits))
+    }
+
+    fn access(&self, user_id: &str) -> Option<access::RoomAccess> {
+        let m = self.members.get(user_id)?;
+        access::member_access(self.room.clone(), &self.roles, Some(m.member.clone()), &m.role_ids, &m.user, m.adult)
+            .ok()
+    }
+
+    /// `ignore_age`: as if the member passed every age gate (the channel is listed below the gate, §5e).
+    fn member_perms_with(
+        &self,
+        channel: &ChannelRow,
+        overrides: &[OverrideRow],
+        user_id: &str,
+        ignore_age: bool,
+    ) -> Option<permissions::Perms> {
+        let mut access = self.access(user_id)?;
+        access.adult |= ignore_age;
+        Some(access::channel_perms_with(&access, channel, overrides, user_id))
+    }
+
+    fn compute(&self, channel: &ChannelRow, ignore_age: bool) -> HashSet<String> {
         let overrides: Vec<OverrideRow> = self
             .overrides
             .iter()
@@ -154,29 +263,19 @@ impl RoomView {
             })
             .cloned()
             .collect();
-        let mut viewers = HashSet::new();
-        for (user_id, m) in &self.members {
-            let access = match access::member_access(
-                self.room.clone(),
-                &self.roles,
-                Some(m.member.clone()),
-                &m.role_ids,
-                &m.user,
-                m.adult,
-            ) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let perms = access::channel_perms_with(&access, channel, &overrides, user_id);
-            if permissions::has(perms, permissions::VIEW_CHANNEL) {
-                viewers.insert(user_id.clone());
-            }
-        }
-        viewers
+        self.members
+            .keys()
+            .filter(|user_id| {
+                self.member_perms_with(channel, &overrides, user_id, ignore_age)
+                    .is_some_and(|perms| permissions::has(perms, permissions::VIEW_CHANNEL))
+            })
+            .cloned()
+            .collect()
     }
 }
 
-async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, ApiError> {
+/// Loads the room's current state from the database (no cache).
+pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, ApiError> {
     let db = &state.db;
     let Some(room) = store::rooms::room_by_id(db, room_id).await? else { return Ok(None) };
     let roles = store::rooms::roles(db, room_id).await?;
@@ -191,8 +290,20 @@ async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, 
         let adult = crate::age::is_adult(state, &user).await?;
         members.insert(member.user_id.clone(), Member { member, role_ids, user, adult });
     }
+    let categories = store::rooms::categories(db, room_id).await?.into_iter().map(|c| (c.id.clone(), c)).collect();
     let viewers = channels.keys().map(|id| (id.clone(), OnceLock::new())).collect();
-    Ok(Some(Arc::new(RoomView { room, roles, channels, overrides, members, viewers })))
+    let listers = channels.keys().map(|id| (id.clone(), OnceLock::new())).collect();
+    Ok(Some(Arc::new(RoomView {
+        room,
+        roles,
+        channels,
+        categories,
+        overrides,
+        members,
+        viewers,
+        listers,
+        managers: OnceLock::new(),
+    })))
 }
 
 /// One loaded (or loading) snapshot of a room.
@@ -268,23 +379,100 @@ pub async fn can_view(state: &AppState, room_id: &str, channel_id: &str, user_id
 }
 
 /// The visibility check of one WebSocket connection: remembers the snapshot of each of its rooms, so a delivery
-/// takes no lock as long as the snapshot is current.
+/// takes no lock as long as the snapshot is current, and what its user knows of each room ([`Known`]).
 #[derive(Default)]
 pub struct Filter {
     slots: HashMap<String, Arc<Slot>>,
+    known: HashMap<String, Known>,
+}
+
+/// What a connection sends for one room event: first `before` (frames the connection makes itself: channels and
+/// categories the user gained or lost), then the event when `event`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Delivery {
+    pub before: Vec<String>,
+    pub event: bool,
+}
+
+impl Delivery {
+    fn event(event: bool) -> Self {
+        Self { before: Vec::new(), event }
+    }
+}
+
+/// The metadata events whose audience is a channel's or category's (`None`: every member).
+enum Target<'a> {
+    Channel(&'a str),
+    Category(&'a str),
+}
+
+fn target<'a>(kind: &str, data: &'a Value) -> Option<Target<'a>> {
+    let id = || data.get("id").and_then(Value::as_str);
+    match kind {
+        _ if kind.starts_with("channel.") => id().map(Target::Channel),
+        _ if kind.starts_with("category.") => id().map(Target::Category),
+        "override.update" => {
+            let id = data.get("target_id").and_then(Value::as_str)?;
+            match data.get("target_type").and_then(Value::as_str)? {
+                "category" => Some(Target::Category(id)),
+                _ => Some(Target::Channel(id)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A WebSocket frame made by the connection itself, shaped like the hub's (`{"op":"event",…}`).
+fn frame(kind: &str, data: Value) -> String {
+    serde_json::json!({ "op": "event", "id": crate::util::ulid(), "type": kind, "data": data }).to_string()
+}
+
+/// The frames that tell a member what they gained and lost between `old` and `new` (`skip`: the channel or
+/// category the event itself creates or deletes): `category.create` before the first channel of a category the
+/// member did not know, `channel.create` in channel order, then `channel.delete` and `category.delete` with
+/// `hidden: true`.
+fn changes(view: &RoomView, old: &Known, new: &Known, skip: Option<&str>) -> Vec<String> {
+    let room_id = view.room.id.as_str();
+    let not_skipped = |id: &&String| skip != Some(id.as_str());
+    let mut gained_categories: Vec<&String> = new.categories.difference(&old.categories).filter(not_skipped).collect();
+    gained_categories.sort();
+    let mut gained: Vec<&ChannelRow> =
+        new.channels.difference(&old.channels).filter(not_skipped).filter_map(|c| view.channel(c)).collect();
+    gained.sort_by(|a, b| (a.position, &a.id).cmp(&(b.position, &b.id)));
+    let mut frames = Vec::new();
+    let mut announced = HashSet::new();
+    let mut category = |id: &str, frames: &mut Vec<String>| {
+        if gained_categories.iter().any(|c| c.as_str() == id)
+            && announced.insert(id.to_string())
+            && let Some(category) = view.category(id)
+        {
+            frames.push(frame("category.create", serde_json::to_value(category).unwrap_or_default()));
+        }
+    };
+    for channel in gained {
+        if let Some(id) = channel.category_id.as_deref() {
+            category(id, &mut frames);
+        }
+        frames.push(frame("channel.create", serde_json::to_value(channel.to_api()).unwrap_or_default()));
+    }
+    for id in &gained_categories {
+        category(id, &mut frames);
+    }
+    let mut lost: Vec<&String> = old.channels.difference(&new.channels).filter(not_skipped).collect();
+    lost.sort();
+    for id in lost {
+        frames.push(frame("channel.delete", serde_json::json!({ "room_id": room_id, "id": id, "hidden": true })));
+    }
+    let mut lost: Vec<&String> = old.categories.difference(&new.categories).filter(not_skipped).collect();
+    lost.sort();
+    for id in lost {
+        frames.push(frame("category.delete", serde_json::json!({ "room_id": room_id, "id": id, "hidden": true })));
+    }
+    frames
 }
 
 impl Filter {
-    /// Is a room event of `kind` with `data` delivered to `user_id`? Metadata and events about no channel: always;
-    /// channel events: when the user may view the channel(s). Fails closed when the room cannot be loaded.
-    pub async fn delivers(&mut self, state: &AppState, room_id: &str, kind: &str, data: &Value, user_id: &str) -> bool {
-        if is_metadata(kind) {
-            return true;
-        }
-        let refs = refs(data);
-        if refs.is_empty() {
-            return true;
-        }
+    async fn view(&mut self, state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, ApiError> {
         let now = Instant::now();
         let slot = match self.slots.get(room_id) {
             Some(slot) if slot.current(now) => slot.clone(),
@@ -294,18 +482,84 @@ impl Filter {
                 slot
             }
         };
-        match view_of(state, &slot, room_id).await {
-            Ok(view) => view.is_some_and(|v| v.may_see(&refs, user_id)),
-            Err(e) => {
-                tracing::warn!(error = %e, room_id, "channel visibility could not be determined, event dropped");
-                false
+        view_of(state, &slot, room_id).await
+    }
+
+    /// Remembers what `user_id` knows of each room (at the start of a connection, before its first event).
+    pub async fn know(&mut self, state: &AppState, room_ids: impl IntoIterator<Item = &String>, user_id: &str) {
+        for room_id in room_ids {
+            match self.view(state, room_id).await {
+                Ok(Some(view)) => {
+                    self.known.insert(room_id.clone(), view.known_by(user_id));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, room_id, "channel visibility could not be determined"),
             }
         }
+    }
+
+    /// What a room event of `kind` with `data` becomes for `user_id`. Channel events: delivered when the user may
+    /// view the channel(s). Metadata of a channel or category: delivered when it is listed to the user (before the
+    /// event for a deletion). Other metadata and events about no channel: always. After an event that changes
+    /// visibility, the frames for what the user gained or lost come first. Fails closed when the room cannot be
+    /// loaded.
+    pub async fn deliver(
+        &mut self,
+        state: &AppState,
+        room_id: &str,
+        kind: &str,
+        data: &Value,
+        user_id: &str,
+    ) -> Delivery {
+        if !is_metadata(kind) {
+            let refs = refs(data);
+            if refs.is_empty() {
+                return Delivery::event(true);
+            }
+            return match self.view(state, room_id).await {
+                Ok(view) => Delivery::event(view.is_some_and(|v| v.may_see(&refs, user_id))),
+                Err(e) => {
+                    tracing::warn!(error = %e, room_id, "channel visibility could not be determined, event dropped");
+                    Delivery::event(false)
+                }
+            };
+        }
+        if !changes_visibility(kind) {
+            return Delivery::event(true);
+        }
+        let target = target(kind, data);
+        let view = match self.view(state, room_id).await {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                self.known.remove(room_id);
+                return Delivery::event(target.is_none() || kind.ends_with(".delete"));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, room_id, "channel visibility could not be determined, event dropped");
+                return Delivery::event(target.is_none());
+            }
+        };
+        let new = view.known_by(user_id);
+        let old = self.known.insert(room_id.to_string(), new.clone());
+        let deleted = kind.ends_with(".delete") && !kind.starts_with("override.");
+        let (skip, event) = match target {
+            None => (None, true),
+            Some(Target::Channel(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.channels.contains(id))),
+            Some(Target::Category(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.categories.contains(id))),
+            Some(Target::Channel(id)) => (kind.ends_with(".create").then_some(id), new.channels.contains(id)),
+            Some(Target::Category(id)) => (kind.ends_with(".create").then_some(id), new.categories.contains(id)),
+        };
+        let before = match &old {
+            Some(old) if *old != new => changes(&view, old, &new, skip),
+            _ => Vec::new(),
+        };
+        Delivery { before, event }
     }
 
     /// Forgets a room the connection left.
     pub fn forget(&mut self, room_id: &str) {
         self.slots.remove(room_id);
+        self.known.remove(room_id);
     }
 }
 

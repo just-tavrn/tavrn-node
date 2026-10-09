@@ -516,36 +516,139 @@ async fn room_detail_hides_channels_the_member_cannot_view() {
     assert!(!detail["channels"].as_array().unwrap().iter().any(|c| c["id"] == staff.as_str()), "{detail}");
 }
 
-/// Deleting a category (`manage_channels` only) leaves its synced channels without a category: their category
-/// overrides stop applying and a private channel becomes public. Likewise `sync_with_category` and moving a channel
-/// change the effective overrides without `manage_roles`. Needs a rule (copy the overrides, or require
-/// `manage_roles`), see the layered permissions work.
-#[tokio::test]
-#[ignore = "design: category delete/move/sync rewrites effective overrides with manage_channels alone"]
-async fn deleting_a_category_keeps_its_channels_private() {
+/// A room with a category `staff` that hides its channels from `@everyone` and a channel `plans` in it; returns
+/// (room, category, channel, @everyone role).
+async fn private_category(node: &TestNode, owner: &Session, members: &[&Session]) -> (String, String, String, String) {
     use tavrn_node::permissions as p;
-    let node = test_node(DOMAIN).await;
-    let alice = node.register("alice").await;
-    let bob = node.register("bob").await;
-    let (room_id, _) = room_with(&node, &alice, &[&bob]).await;
+    let (room_id, _) = room_with(node, owner, members).await;
     let (_, cat) =
-        node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "staff" })).await;
+        node.post(&format!("/api/v1/rooms/{room_id}/categories"), &owner.token, json!({ "name": "staff" })).await;
     let cat = cat["id"].as_str().unwrap().to_string();
     let (_, ch) = node
         .post(
             &format!("/api/v1/rooms/{room_id}/channels"),
-            &alice.token,
+            &owner.token,
             json!({ "kind": "text", "name": "plans", "encrypted": false, "category_id": cat }),
         )
         .await;
     let plans = ch["id"].as_str().unwrap().to_string();
-    let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &alice.token).await;
+    let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &owner.token).await;
     let everyone = detail["roles"][0]["id"].as_str().unwrap().to_string();
     let deny = json!({ "target_type": "category", "target_id": cat, "subject_type": "role", "subject_id": everyone, "allow": "0", "deny": common::perms(&[p::VIEW_CHANNEL]) });
-    assert_eq!(node.put(&format!("/api/v1/rooms/{room_id}/overrides"), &alice.token, deny).await.0, StatusCode::OK);
+    assert_eq!(node.put(&format!("/api/v1/rooms/{room_id}/overrides"), &owner.token, deny).await.0, StatusCode::OK);
+    (room_id, cat, plans, everyone)
+}
+
+/// Deleting a category (`manage_channels` only) left its channels without a category: their category overrides
+/// stopped applying and a private channel became public. The category's overrides are now copied into each of its
+/// channels first (permissions.md "Moving channels"), audited.
+#[tokio::test]
+async fn deleting_a_category_keeps_its_channels_private() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, cat, plans, _) = private_category(&node, &alice, &[&bob]).await;
     let path = format!("/api/v1/rooms/{room_id}/channels/{plans}/messages");
     assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN);
     let (s, _) = node.delete(&format!("/api/v1/rooms/{room_id}/categories/{cat}"), &alice.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN, "the channel became public");
+    assert_eq!(node.get_auth(&path, &alice.token).await.0, StatusCode::OK);
+    let (_, log) = node.get_auth(&format!("/api/v1/rooms/{room_id}/audit-log"), &alice.token).await;
+    assert!(log.to_string().contains("channel.overrides_copied"), "{log}");
+}
+
+/// The same for moving a channel out of its category, to no category or into another one.
+#[tokio::test]
+async fn moving_a_channel_out_of_a_private_category_keeps_it_private() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, _, plans, _) = private_category(&node, &alice, &[&bob]).await;
+    let (_, other) =
+        node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "open" })).await;
+    let other = other["id"].as_str().unwrap().to_string();
+    let channel = format!("/api/v1/rooms/{room_id}/channels/{plans}");
+    let path = format!("{channel}/messages");
+    let (s, j) = node.patch(&channel, &alice.token, json!({ "category_id": other })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN, "moved into another category");
+    let (s, j) = node.patch(&channel, &alice.token, json!({ "category_id": null })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN, "moved out of every category");
+}
+
+/// Copying is not enough when the channel's own overrides decide the same bits for other subjects: the category
+/// lets one role view, the channel hides itself from another role (the channel layer wins for members of both). In
+/// one layer the allow would win; the member who would gain gets a deny of their own.
+#[tokio::test]
+async fn moving_a_channel_never_grants_what_the_layers_denied() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let carol = node.register("carol").await;
+    let (room_id, cat, plans, _) = private_category(&node, &alice, &[&bob, &carol]).await;
+    let helpers = role(&node, &alice.token, &room_id, "Helpers", &[], 1).await;
+    let muted = role(&node, &alice.token, &room_id, "Muted", &[], 2).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&helpers, &muted]).await.0, StatusCode::OK);
+    assert_eq!(assign(&node, &alice.token, &room_id, &carol.user_id, &[&helpers]).await.0, StatusCode::OK);
+    let overrides = format!("/api/v1/rooms/{room_id}/overrides");
+    let allow = json!({ "target_type": "category", "target_id": cat, "subject_type": "role", "subject_id": helpers, "allow": common::perms(&[p::VIEW_CHANNEL]), "deny": "0" });
+    assert_eq!(node.put(&overrides, &alice.token, allow).await.0, StatusCode::OK);
+    let deny = json!({ "target_type": "channel", "target_id": plans, "subject_type": "role", "subject_id": muted, "allow": "0", "deny": common::perms(&[p::VIEW_CHANNEL]) });
+    assert_eq!(node.put(&overrides, &alice.token, deny).await.0, StatusCode::OK);
+    let path = format!("/api/v1/rooms/{room_id}/channels/{plans}/messages");
+    assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN, "the channel layer wins");
+    assert_eq!(node.get_auth(&path, &carol.token).await.0, StatusCode::OK, "carol keeps it");
+    let (s, _) = node.delete(&format!("/api/v1/rooms/{room_id}/categories/{cat}"), &alice.token).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(node.get_auth(&path, &bob.token).await.0, StatusCode::FORBIDDEN, "bob gained the channel");
+    assert_eq!(node.get_auth(&path, &carol.token).await.0, StatusCode::OK, "carol keeps it");
+}
+
+/// Moving a channel into a category whose overrides grant more needs `manage_roles` (in that category), like
+/// setting those overrides would.
+#[tokio::test]
+async fn moving_a_channel_into_a_granting_category_needs_manage_roles() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let carol = node.register("carol").await;
+    let (room_id, _) = room_with(&node, &alice, &[&bob, &carol]).await;
+    let mods = role(&node, &alice.token, &room_id, "Mod", &[p::MANAGE_CHANNELS], 2).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&mods]).await.0, StatusCode::OK);
+    let helpers = role(&node, &alice.token, &room_id, "Helpers", &[], 1).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &carol.user_id, &[&helpers]).await.0, StatusCode::OK);
+    let (_, cat) =
+        node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "helpers" })).await;
+    let cat = cat["id"].as_str().unwrap().to_string();
+    let (_, ch) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels"),
+            &alice.token,
+            json!({ "kind": "text", "name": "quiet", "encrypted": false }),
+        )
+        .await;
+    let quiet = ch["id"].as_str().unwrap().to_string();
+    // The category lets its helpers manage messages.
+    let grant = json!({ "target_type": "category", "target_id": cat, "subject_type": "role", "subject_id": helpers, "allow": common::perms(&[p::MANAGE_MESSAGES]), "deny": "0" });
+    assert_eq!(node.put(&format!("/api/v1/rooms/{room_id}/overrides"), &alice.token, grant).await.0, StatusCode::OK);
+    let channel = format!("/api/v1/rooms/{room_id}/channels/{quiet}");
+    let (s, j) = node.patch(&channel, &bob.token, json!({ "category_id": cat })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "role.manage_forbidden"), "{j}");
+    let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &alice.token).await;
+    let moved = detail["channels"].as_array().unwrap().iter().find(|c| c["id"] == quiet.as_str()).unwrap().clone();
+    assert_eq!(moved["category_id"], Value::Null, "{moved}");
+    // A category that grants nothing new: a move with manage_channels alone.
+    let (_, plain) =
+        node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "plain" })).await;
+    let (s, j) = node.patch(&channel, &bob.token, json!({ "category_id": plain["id"] })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    // The owner may move it into the granting one.
+    let (s, j) = node.patch(&channel, &alice.token, json!({ "category_id": null })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node.patch(&channel, &alice.token, json!({ "category_id": cat })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
 }

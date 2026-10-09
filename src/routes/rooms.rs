@@ -93,13 +93,22 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
         }
         None => Vec::new(),
     };
+    // Only the overrides of the listed channels and categories (PROTOCOL.md §6 "Audiences").
+    let overrides = overrides
+        .iter()
+        .filter(|o| match o.target_type.as_str() {
+            "category" => categories.iter().any(|c| c.id == o.target_id),
+            _ => channels.iter().any(|c| c.id == o.target_id),
+        })
+        .map(|o| o.to_api())
+        .collect();
     Ok(RoomDetail {
         room: access.room.clone(),
         member_count: store::rooms::member_count(db, id).await?,
         categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
         roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
-        overrides: overrides.iter().map(|o| o.to_api()).collect(),
+        overrides,
         my_roles: access.member_roles.iter().map(|r| r.id.clone()).collect(),
         my_permissions: access.room_perms.to_string(),
         is_owner: access.is_owner,
