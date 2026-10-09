@@ -606,10 +606,14 @@ pub async fn move_all(
         if participants.is_empty() {
             continue;
         }
-        let allowed = match voice_channel(&state, &room_id, &key.1, &auth.user).await {
-            Ok(vc) => vc.has(p::MOVE_MEMBERS),
-            Err(_) => false,
+        let (visible, allowed) = match voice_channel(&state, &room_id, &key.1, &auth.user).await {
+            Ok(vc) => (vc.has(p::VIEW_CHANNEL), vc.has(p::MOVE_MEMBERS)),
+            Err(_) => (false, false),
         };
+        // Who sits in a channel the mover cannot see stays hidden (like `GET /rooms/{id}/voice`).
+        if !visible {
+            continue;
+        }
         let mut seen = Vec::new();
         for participant in participants {
             if seen.contains(&participant.user_id) {

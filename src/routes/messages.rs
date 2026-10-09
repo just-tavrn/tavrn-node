@@ -532,6 +532,19 @@ pub(crate) async fn check_not_blocked(state: &AppState, auth: &AuthUser, conv: &
     Ok(())
 }
 
+/// Every write into a DM or group DM besides messages (reactions, pins, uploads, renaming, adding members) needs what
+/// a message needs there (PROTOCOL.md §8a): no block between the two people of a DM, and an accepted request.
+pub(crate) async fn check_direct_write(state: &AppState, auth: &AuthUser, conv: &Conv) -> Result<(), ApiError> {
+    check_not_blocked(state, auth, conv).await?;
+    if conv.is_request_for(&auth.user.id) {
+        return Err(ApiError::Forbidden {
+            code: "conversation.request_pending",
+            detail: "Accept the message request first, then reply".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Writes a message into `conv` or one of its threads.
 pub(crate) async fn create_in(
     state: &AppState,

@@ -688,13 +688,15 @@ pub async fn update_member(
     if let Some(role_ids) = req.roles {
         access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
         let roles = store::rooms::roles(&state.db, &room_id).await?;
+        // Own roles at or above the own top position may stay in the list (they are not assigned anew).
+        let current = store::rooms::member_role_ids(&state.db, &room_id, &user_id).await?;
         let mut clean = Vec::new();
         for id in role_ids {
             let role = roles
                 .iter()
                 .find(|r| r.id == id && r.is_everyone == 0)
                 .ok_or_else(|| bad("role.unknown", format!("Role {id} does not exist in this room")))?;
-            if !access.outranks(role.position) {
+            if !access.outranks(role.position) && !current.contains(&id) {
                 return Err(ApiError::Forbidden {
                     code: "role.hierarchy",
                     detail: format!("The role '{}' is above your highest role", role.name),
@@ -703,6 +705,11 @@ pub async fn update_member(
             if !clean.contains(&id) {
                 clean.push(id);
             }
+        }
+        // The list replaces the member's roles: only members below the actor (permissions.md "Hierarchy"), so none
+        // of their current roles is at or above the actor's top position either.
+        if user_id != auth.user.id {
+            moderation_target(&state, &access, &user_id).await?;
         }
         store::rooms::set_member_roles(&state.db, &room_id, &user_id, &clean).await?;
         store::rooms::audit(
@@ -924,6 +931,10 @@ pub async fn ban(
         let members = store::rooms::members_of_domain(&state.db, &room_id, &subject).await?;
         if members.contains(&access.room.owner_id) {
             return Err(ApiError::Forbidden { code: "member.is_owner", detail: "The owner cannot be banned".into() });
+        }
+        // Nobody of the domain may outrank the actor (permissions.md "Hierarchy"), checked before anyone leaves.
+        for user_id in &members {
+            moderation_target(&state, &access, user_id).await?;
         }
         for user_id in members {
             let Some(target) = store::users::by_id(&state.db, &user_id).await? else { continue };
@@ -1197,17 +1208,32 @@ pub async fn purge(
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
     let all_channels = store::rooms::channels(&state.db, &room_id).await?;
     let room_channels: Vec<String> = all_channels.iter().map(|c| c.id.clone()).collect();
+    // Only channels in which the actor holds `purge` (permissions.md step 4: nothing without `view_channel`).
+    let overrides = store::rooms::overrides_of_room(&state.db, &room_id).await?;
+    let may_purge = |c: &crate::models::ChannelRow| {
+        p::has(access::channel_perms_with(&access, c, &overrides, &auth.user.id), p::VIEW_CHANNEL | p::PURGE)
+    };
     let conversation_ids: Vec<String> = if req.channel_ids.is_empty() {
         // "All channels" are the members' channels; the welcome channel only when named.
-        all_channels.into_iter().filter(|c| c.kind != "system").map(|c| c.id).collect()
+        all_channels.iter().filter(|c| c.kind != "system" && may_purge(c)).map(|c| c.id.clone()).collect()
     } else {
         for id in &req.channel_ids {
             if !room_channels.contains(id) {
                 return Err(bad("channel.not_in_room", format!("Channel {id} does not belong to this room")));
             }
+            if !all_channels.iter().any(|c| &c.id == id && may_purge(c)) {
+                return Err(ApiError::Forbidden {
+                    code: "moderation.purge_forbidden",
+                    detail: format!("Missing permission in channel {id}: Purge"),
+                });
+            }
         }
         req.channel_ids.clone()
     };
+    // Never without a channel: the filter would otherwise reach every conversation of the node.
+    if conversation_ids.is_empty() {
+        return Err(bad("moderation.purge_no_channels", "There is no channel of this room you may purge"));
+    }
     if let Some(t) = req.from.as_deref().or(req.to.as_deref())
         && util::parse_time(t).is_none()
     {

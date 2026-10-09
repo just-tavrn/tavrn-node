@@ -309,6 +309,13 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
         if store::rooms::is_banned(&state.db, None, &user.address(), &user.domain).await? {
             return Err(invalid("auth.token_invalid"));
         }
+        // A bot whose owner is banned from the node goes too, as at the login (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
+        if let Some(owner) = user.owner_address.as_deref().filter(|_| user.is_bot())
+            && let Some((_, domain)) = crate::util::parse_address(owner)
+            && store::rooms::is_banned(&state.db, None, owner, domain).await?
+        {
+            return Err(invalid("auth.token_invalid"));
+        }
         state.federation_api_limiter.check_all(&[format!("domain:{}", user.domain)])?;
         let app = if user.is_bot() {
             Some(crate::applications::remote_principal(state, &mut user, &extra.dev).await?)

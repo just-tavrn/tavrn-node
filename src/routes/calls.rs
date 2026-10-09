@@ -168,6 +168,8 @@ pub async fn start(
     Path(conversation_id): Path<String>,
 ) -> Result<Json<CallJoin>, ApiError> {
     let (conv, group) = call_conversation(&state, &conversation_id, &auth).await?;
+    // A blocked person cannot call either: a missed call would leave a message in the DM (PROTOCOL.md §8a).
+    crate::routes::messages::check_not_blocked(&state, &auth, &conv).await?;
     state.voice_limiter.check_all(&[format!("voice:{}", auth.user.id)])?;
     if !state.calls.is_active(&conv.id) {
         state.calls.ring_limiter.check_all(&[format!("call:{}", auth.user.id)])?;

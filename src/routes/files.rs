@@ -1132,7 +1132,18 @@ fn requested_config(
         Some(r) if r.kind == kind.as_str() => stored_config(state, &conv.id, Some(r))?,
         _ => RemoteConfig::default(),
     };
-    let keep = |new: Option<String>, old: String| new.filter(|s| !s.is_empty()).unwrap_or(old);
+    // Stored secrets are reused only for the same server and account: otherwise anybody with the right to configure
+    // the backend could send the stored credentials to a host of their choice (FILES.md §5: secrets never leave).
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    let region = |s: &str| if s.trim().is_empty() { "us-east-1".to_string() } else { s.trim().to_string() };
+    let same_place = norm(req.url.as_deref().unwrap_or("")) == norm(&stored.url)
+        && req.username.as_deref().unwrap_or("") == stored.username
+        && req.access_key.as_deref().unwrap_or("") == stored.access_key
+        && req.bucket.as_deref().unwrap_or("") == stored.bucket
+        && (kind != Kind::S3 || region(req.region.as_deref().unwrap_or("")) == region(&stored.region));
+    let keep = |new: Option<String>, old: String| {
+        new.filter(|s| !s.is_empty()).unwrap_or(if same_place { old } else { String::new() })
+    };
     let config = RemoteConfig {
         url: req.url.unwrap_or_default(),
         username: req.username.unwrap_or_default(),
