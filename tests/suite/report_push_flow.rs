@@ -43,20 +43,6 @@ impl Fake {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         fake
     }
-
-    fn count(&self, path: &str) -> usize {
-        self.received.lock().unwrap().iter().filter(|(p, _)| p == path).count()
-    }
-
-    async fn wait(&self, path: &str, n: usize) {
-        for _ in 0..100 {
-            if self.count(path) >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("{path}: expected {n} pushes, got {}", self.count(path));
-    }
 }
 
 /// One browser subscription of a user.
@@ -83,10 +69,36 @@ impl Browser {
         b
     }
 
-    fn last(&self, fake: &Fake) -> Value {
+    /// The decrypted pushes of type `report` this browser received, oldest first. Other pushes are left out: the
+    /// push job of the reported message runs in the background and may still find the subscriptions made after it
+    /// was sent, so a late `message` push is no error here (report_push_flow covers reports only).
+    fn reports(&self, fake: &Fake) -> Vec<Value> {
         let got = fake.received.lock().unwrap();
-        let (_, body) = got.iter().rev().find(|(p, _)| *p == self.path).unwrap();
-        serde_json::from_slice(&crypto::decrypt(&self.secret, &self.auth, body).unwrap()).unwrap()
+        got.iter()
+            .filter(|(p, _)| *p == self.path)
+            .map(|(_, body)| {
+                serde_json::from_slice::<Value>(&crypto::decrypt(&self.secret, &self.auth, body).unwrap()).unwrap()
+            })
+            .filter(|p| p["type"] == "report")
+            .collect()
+    }
+
+    fn count(&self, fake: &Fake) -> usize {
+        self.reports(fake).len()
+    }
+
+    fn last(&self, fake: &Fake) -> Value {
+        self.reports(fake).pop().unwrap()
+    }
+
+    async fn wait(&self, fake: &Fake, n: usize) {
+        for _ in 0..100 {
+            if self.count(fake) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{}: expected {n} report pushes, got {}", self.path, self.count(fake));
     }
 }
 
@@ -133,9 +145,10 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
         .await;
     assert_eq!((s, j["global"]["reports"].as_bool()), (StatusCode::OK, Some(false)), "{j}");
 
-    // The reported message is sent before anyone subscribes (it would push to the room's members itself).
+    // The reported message is sent before anyone subscribes; its own push job may still reach the later
+    // subscriptions (it runs in the background), so only pushes of type `report` are counted below.
     let (_, msg) = node.send(&carl.token, &room_id, &channel, "coins for free").await;
-    let browsers = [
+    let [admin_b, alice_b, moder_b, quiet_b, bob_b] = [
         Browser::subscribe(&node, &fake, &admin).await,
         Browser::subscribe(&node, &fake, &alice).await,
         Browser::subscribe(&node, &fake, &moder).await,
@@ -151,8 +164,8 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
     };
     let (s, j) = node.post("/api/v1/reports", &bob.token, report("message")).await;
     assert_eq!(s, StatusCode::CREATED, "{j}");
-    for b in &browsers[..3] {
-        fake.wait(&b.path, 1).await;
+    for b in [&admin_b, &alice_b, &moder_b] {
+        b.wait(&fake, 1).await;
         let p = b.last(&fake);
         assert_eq!(
             p,
@@ -172,19 +185,19 @@ async fn new_reports_push_to_offline_moderators_and_admins_with_kind_and_room_on
         .await;
     assert_eq!(s, StatusCode::CREATED);
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!((fake.count("admin"), fake.count("moder")), (1, 1));
+    assert_eq!((admin_b.count(&fake), moder_b.count(&fake)), (1, 1));
     // Never the reporter, never someone who turned reports off.
-    assert_eq!((fake.count("bob"), fake.count("quiet")), (0, 0));
+    assert_eq!((bob_b.count(&fake), quiet_b.count(&fake)), (0, 0));
 
     // A report for the node admins only (a user without room context): no room in the payload.
     let (s, j) = node.post("/api/v1/reports", &bob.token, report("user")).await;
     assert_eq!(s, StatusCode::CREATED, "{j}");
-    fake.wait("admin", 2).await;
+    admin_b.wait(&fake, 2).await;
     assert_eq!(
-        browsers[0].last(&fake),
+        admin_b.last(&fake),
         json!({ "v": 1, "type": "report", "node": "t.local", "local": true,
         "report_kind": "user", "encrypted": false })
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(fake.count("alice"), 1, "node reports go to the node admins only");
+    assert_eq!(alice_b.count(&fake), 1, "node reports go to the node admins only");
 }
