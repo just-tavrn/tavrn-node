@@ -21,6 +21,7 @@ Datenschutzbeauftragter: [[OPERATOR: Datenschutzbeauftragter, falls vorhanden (N
 tavrn ist ein Ende-zu-Ende-verschlüsselter Chat. Ihre Geräte erzeugen und verwahren Ihre privaten Schlüssel; **private Schlüssel verlassen Ihre Geräte nie**. Der Knoten kann verschlüsselte Nachrichten, verschlüsselte Sprach- und Videoübertragungen und verschlüsselte Dateien daher nicht lesen. Er speichert folgende Daten:
 
 - **Konto:** Benutzername, E-Mail-Adresse (freiwillig, sofern dieser Knoten sie nicht verlangt), Passwort-Hash (nie das Passwort), zweite Faktoren, sofern eingerichtet (TOTP-Geheimnis verschlüsselt gespeichert, öffentliche Passkey-Schlüssel, gehashte Wiederherstellungscodes), akzeptierte Version der Nutzungsbedingungen mit Zeitstempel, Einstellungen.
+- **Geburtsdatum:** das Geburtsdatum, das Sie bei der Registrierung angeben (siehe „Geburtsdatum und Altersgrenzen“ unten).
 - **Profil:** Anzeigename, Avatar, Titelbild, Bio, Links, Status und eigener Statustext. Ihr Profil ist für andere Nutzer sichtbar.
 - **Geräte und Schlüssel:** Ihre Geräte und deren öffentliche Schlüssel (MLS-KeyPackages, Geräte-Attestierungen) sowie, falls Sie eines anlegen, ein verschlüsseltes Schlüssel-Backup, das der Knoten nicht öffnen kann.
 - **Sitzungen und IP-Adressen:** aktive Sitzungen (Gerät, Zeitpunkt der letzten Nutzung). IP-Adressen erscheinen in den Server-Logs und bei Registrierungen im Audit-Log.
@@ -51,6 +52,18 @@ tavrn ist föderiert: Nutzer verschiedener Knoten können miteinander kommunizie
 - Meldungen zu Inhalten, die auf einem anderen Knoten liegen; diese können wir mit den Falldaten an jenen Knoten weiterleiten.
 
 **Andere Knoten werden von eigenständigen, unabhängigen Verantwortlichen betrieben** und haben eigene Datenschutzerklärungen. Wir können Knoten sperren (Sperrliste). Wenn Sie Inhalte oder Ihr Konto löschen, leiten wir Löschanfragen an die beteiligten Knoten weiter; deren Umsetzung können wir nicht erzwingen, sondern nur anfordern und protokollieren.
+
+### Geburtsdatum und Altersgrenzen
+
+Wir fragen bei der Registrierung nach Ihrem Geburtsdatum (bereits bestehende Konten werden einmalig bei der nächsten Anmeldung gefragt). Wir verwenden es nur für zwei Zwecke: um das Mindestalter für diesen Knoten ({{minimum_age}} Jahre) zu prüfen und um Sie, solange Sie unter 18 sind, von Räumen und Kanälen fernzuhalten, die deren Verwalter als „nur für Erwachsene“ gekennzeichnet haben. Rechtsgrundlage ist Art. 6 Abs. 1 lit. b DSGVO (Erbringung des vereinbarten Dienstes einschließlich der Altersregeln unserer Nutzungsbedingungen) und, zum Schutz Minderjähriger, Art. 6 Abs. 1 lit. c und f DSGVO.
+
+- Ihr Geburtsdatum wird **nur auf diesem Knoten** gespeichert. Es wird anderen Nutzern, Raumverwaltern und Moderatoren nie angezeigt und ist nicht Teil Ihres Profils.
+- Daraus leitet der Knoten ab, ob Sie 18 Jahre oder älter sind. Diesen Status sehen nur Sie (in Ihrem Konto).
+- Wenn Sie einem Raum auf einem **anderen Knoten** beitreten, dort lesen oder telefonieren, teilt dieser Knoten jenem Knoten in der signierten Anmeldung nur „18 oder älter: ja oder nein“ mit (nie das Datum selbst), damit jener Knoten seine eigenen Regeln für Erwachsenenbereiche anwenden kann. Jener Knoten darf diese Angabe niemandem zeigen.
+- Ihr Geburtsdatum ist Teil Ihres Datenexports und wird mit Ihrem Konto gelöscht.
+- Sie geben es einmal ein. Ist es falsch, bitten Sie uns um eine Berichtigung (Kontakt oben); wir berichtigen es nach Prüfung Ihrer Anfrage, und die Berichtigung wird ohne das Datum selbst protokolliert.
+
+Das Geburtsdatum ist Ihre eigene Angabe; wir prüfen es nicht.
 
 ## 5. Dienstleister und optionale Funktionen
 
@@ -115,7 +128,7 @@ Wir verwenden keine Tracking-Cookies und keine Analysewerkzeuge. Die App speiche
 
 ## 10. Kinder
 
-Für die Nutzung dieses Knotens müssen Sie mindestens [[OPERATOR: Mindestalter, z. B. 16]] Jahre alt sein.
+Für die Nutzung dieses Knotens müssen Sie mindestens {{minimum_age}} Jahre alt sein; jüngere Personen können sich nicht registrieren (siehe „Geburtsdatum und Altersgrenzen“ oben). [[OPERATOR: Wenn Sie das Mindestalter in einem EU-Land unter 16 Jahre senken, beschreiben Sie hier die Einwilligung der Eltern, die Sie einholen (Art. 8 DSGVO).]]
 
 ## 11. Änderungen dieser Datenschutzerklärung
 
