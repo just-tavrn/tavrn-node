@@ -1206,3 +1206,23 @@ async fn bots_refused_in_both_directions() {
     let (s, j) = b.federated_login(j["token"].as_str().unwrap()).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "federation.bots_refused"));
 }
+
+/// Authorization audit (2026-10-09): a node ban of a bot's owner refuses the bot's federated login; a session the
+/// bot already holds ends with it as well (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
+#[tokio::test]
+async fn authz_owner_node_ban_ends_a_remote_bots_session() {
+    let (a, b) = federation::two_nodes().await;
+    let admin = b.register("admin").await;
+    let alice = a.register("alice").await;
+    let bot_a = bot(&a, &alice, "Lingerer", None).await;
+    let (s, j) = a.post("/api/v1/federation/token", &bot_a.secret, json!({ "target": federation::B })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, login) = b.federated_login(j["token"].as_str().unwrap()).await;
+    assert_eq!(s, StatusCode::OK, "{login}");
+    let remote = login["access_token"].as_str().unwrap().to_string();
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::OK);
+    let (s, j) =
+        b.post("/api/v1/admin/bans", &admin.token, json!({ "subject": format!("alice@{}", federation::A) })).await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::UNAUTHORIZED);
+}

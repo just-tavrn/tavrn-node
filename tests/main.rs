@@ -17,6 +17,7 @@ mod suite {
     mod attachment_retention_flow;
     mod attachments_flow;
     mod auth_flow;
+    mod authz_audit;
     mod automod_content_flow;
     mod backups_flow;
     mod blob_deletion_flow;

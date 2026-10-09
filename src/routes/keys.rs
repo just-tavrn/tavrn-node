@@ -465,7 +465,21 @@ pub async fn claim_key_packages(
     }
     let packages = match remote_user(&state, &username).await? {
         Some(target) => crate::federation::claims::proxy(&state, &auth.user, &target).await?,
-        None => crate::federation::claims::claim_local(&state, &local_user(&state, &username).await?).await?,
+        None => {
+            let target = local_user(&state, &username).await?;
+            // The same rules as for claims of other nodes (FEDERATION.md §3.5): nothing for people the user blocked,
+            // and a limit per requester and user, so nobody drains another user's KeyPackages.
+            if target.id != auth.user.id && store::social::has_blocked(&state.db, &target.id, &auth.user.id).await? {
+                return Err(ApiError::Forbidden {
+                    code: "federation.claim_refused",
+                    detail: "This user does not hand out key packages".into(),
+                });
+            }
+            if target.id != auth.user.id {
+                state.claim_pair_limiter.check_all(&[format!("{}|{}", auth.user.address(), target.address())]).await?;
+            }
+            crate::federation::claims::claim_local(&state, &target).await?
+        }
     };
     Ok(Json(ClaimedKeyPackages {
         key_packages: packages

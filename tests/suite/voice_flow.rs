@@ -1261,3 +1261,54 @@ async fn generated_livekit_configs_are_accepted_by_livekit_in_every_connectivity
     assert!(yaml.contains("turn:\n  enabled: false\n") && !yaml.contains("node_ip"), "{yaml}");
     supervisor.stop().await;
 }
+
+/// Authorization audit (2026-10-09): a mass move without `from_channel_id` walks every active voice channel; who sits
+/// in one the mover cannot view stays hidden (as in `GET /rooms/{id}/voice`), it is not reported as `move_forbidden`.
+#[tokio::test]
+async fn authz_mass_move_does_not_reveal_hidden_voice_channels() {
+    let v = setup().await;
+    let staff = voice_channel(&v, "Staff").await;
+    let target = voice_channel(&v, "Raid").await;
+    v.override_everyone(&staff, &[], &[p::VIEW_CHANNEL]).await;
+    connect_to(&v, &v.alice, &staff).await;
+    let dave = in_voice(&v, "dave", &v.voice_id).await;
+    let (s, role) = v
+        .node
+        .post(
+            &format!("/api/v1/rooms/{}/roles", v.room_id),
+            &v.alice.token,
+            json!({ "name": "Mover", "permissions": perms(&[p::MOVE_MEMBERS]), "position": 1 }),
+        )
+        .await;
+    assert!(s.is_success(), "{role}");
+    let (s, j) = v
+        .node
+        .patch(
+            &format!("/api/v1/rooms/{}/members/{}", v.room_id, dave.user_id),
+            &v.alice.token,
+            json!({ "roles": [role["id"]] }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = v
+        .node
+        .post(&format!("/api/v1/rooms/{}/voice/move-all", v.room_id), &dave.token, json!({ "to_channel_id": target }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(!j.to_string().contains("alice@t.local"), "the hidden channel's participant leaks: {j}");
+}
+
+/// Authorization audit (2026-10-09): losing `view_channel`/`connect` through a role or override change does not end
+/// a running voice session (only leave, kick, ban and timeout do); the member keeps hearing the channel until they
+/// reconnect. Needs a recomputation of connected participants after permission changes (ENCRYPTION.md §4.5 rule 4).
+#[tokio::test]
+#[ignore = "design: permission changes do not disconnect voice participants who lost access"]
+async fn authz_losing_access_ends_the_voice_session() {
+    let v = setup().await;
+    assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
+    v.connected(&v.bob).await;
+    assert_eq!(v.participants(&v.alice).await.len(), 1);
+    v.override_everyone(&v.voice_id, &[], &[p::VIEW_CHANNEL]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(v.participants(&v.alice).await.is_empty(), "bob still sits in the channel he cannot see");
+}

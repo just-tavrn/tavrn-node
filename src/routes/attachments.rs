@@ -112,6 +112,7 @@ async fn upload_in(
 ) -> Result<(StatusCode, Json<Attachment>), ApiError> {
     let cfg = &state.config;
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES | p::ATTACH_FILES, "upload.forbidden", "Attach files")?;
+    crate::routes::messages::check_direct_write(state, auth, conv).await?;
     let (max, quota) = upload_limits(state, &auth.user, conv).await?;
     // The body is read here with the effective limit (the route has no body limit of its own; the router's
     // global limit is `TAVRN_UPLOAD_MAX_BYTES_CEILING`).
@@ -395,6 +396,7 @@ async fn react(
             return Err(bad("reaction.invalid", "Invalid emoji"));
         }
         message_in_conv(state, conv, message_id, p::ADD_REACTIONS, "reaction.forbidden", "Add reactions").await?;
+        crate::routes::messages::check_direct_write(state, auth, conv).await?;
         if let Some(token) = crate::emoji::parse_token(emoji) {
             crate::emoji::check_external(state, conv, &[token]).await?;
         }
@@ -416,6 +418,7 @@ async fn set_pin(
     pinned: bool,
 ) -> Result<Json<Message>, ApiError> {
     message_in_conv(state, conv, message_id, p::PIN_MESSAGES, "pin.forbidden", "Pin messages").await?;
+    crate::routes::messages::check_direct_write(state, auth, conv).await?;
     if pinned {
         if store::blobs::pin_count(&state.db, &conv.id).await? >= 50 {
             return Err(bad("pin.limit", "At most 50 pinned messages per channel"));

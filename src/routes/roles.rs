@@ -162,6 +162,9 @@ pub async fn update_role(
     }
     let everyone = current.is_everyone != 0;
     let name = if everyone { None } else { req.name.as_deref().map(|n| validate::name("name", n, 100)).transpose()? };
+    if name.as_deref() == Some("@everyone") {
+        return Err(bad("role.name_reserved", "This name is reserved"));
+    }
     let color = if everyone {
         None
     } else {
