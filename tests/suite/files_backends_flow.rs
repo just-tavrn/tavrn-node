@@ -40,6 +40,8 @@ struct Store {
     refused: u32,
     /// S3 requests whose signature was verified.
     verified: u32,
+    /// Answer every DELETE with 503 (an unreachable or broken store).
+    fail_deletes: bool,
 }
 
 #[derive(Clone)]
@@ -134,6 +136,7 @@ async fn handle(State(m): State<Mock>, method: Method, uri: Uri, headers: Header
             Some(data) => ranged(data, &headers),
             None => StatusCode::NOT_FOUND.into_response(),
         },
+        "DELETE" if st.fail_deletes => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         "DELETE" => match st.objects.remove(&path) {
             Some(_) => StatusCode::NO_CONTENT.into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
@@ -208,7 +211,11 @@ async fn setup(external: Switch, private: Switch) -> Setup {
     let room = node.create_room(&alice.token, "R").await;
     let room_id = room["id"].as_str().unwrap().to_string();
     let (s, ch) = node
-        .post(&format!("/api/v1/rooms/{room_id}/channels"), &alice.token, json!({ "kind": "files", "name": "f" }))
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels"),
+            &alice.token,
+            json!({ "kind": "files", "name": "f", "encrypted": false }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{ch}");
     Setup { node, alice, room_id, channel: ch["id"].as_str().unwrap().to_string() }
@@ -434,4 +441,212 @@ async fn s3_store_signs_every_request() {
     gone["url"] = json!("http://127.0.0.1:9");
     let (st, j) = s.test(Some(gone)).await;
     assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("files.backend_unreachable")), "{j}");
+}
+
+// ---------------------------------------------------------------- Encrypted channels and deletion
+
+/// An external WebDAV store for `channel` of `room_id` (Alice manages it).
+async fn webdav_for(node: &TestNode, token: &str, room_id: &str, channel: &str, port: u16) -> Value {
+    let (st, info) = node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/channels/{channel}/files/backend"),
+            token,
+            json!({ "kind": "webdav", "url": format!("http://127.0.0.1:{port}/dav/"), "username": DAV_USER, "password": DAV_PASS }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{info}");
+    info
+}
+
+async fn plain_upload(node: &TestNode, token: &str, base: &str, name: &str, data: &[u8]) -> String {
+    let len = data.len().to_string();
+    let (st, _, body) = node
+        .raw(
+            Method::POST,
+            &format!("{base}/upload"),
+            token,
+            &[("tavrn-file-name", name), ("content-length", &len)],
+            data.to_vec(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string()
+}
+
+fn objects_under(m: &Mock, channel: &str) -> usize {
+    let prefix = format!("/dav/tavrn/{channel}/");
+    m.store.lock().unwrap().objects.keys().filter(|k| k.starts_with(&prefix)).count()
+}
+
+#[tokio::test]
+async fn encrypted_channels_keep_the_ciphertext_on_the_store() {
+    use common::e2ee::qualified;
+    let (m, port) = mock(Flavor::WebDav).await;
+    let node = test_node_with(DOMAIN, |c| {
+        c.files_external = Switch::On;
+        c.files_external_private = Switch::On;
+    })
+    .await;
+    let mut alice = node.crypto_user("alice").await;
+    let room = node.create_room(alice.token(), "R").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (_, ch) = node
+        .post(&format!("/api/v1/rooms/{room_id}/channels"), alice.token(), json!({ "kind": "files", "name": "v" }))
+        .await;
+    let channel = ch["id"].as_str().unwrap().to_string();
+    node.create_group(&mut alice, &channel).await;
+    let base = format!("/api/v1/rooms/{room_id}/channels/{channel}/files");
+    let (st, j) = node
+        .put(
+            &format!("{base}/backend"),
+            alice.token(),
+            json!({ "kind": "webdav", "url": format!("http://127.0.0.1:{port}/dav/"), "username": DAV_USER,
+                    "password": DAV_PASS, "encrypt_files": true }),
+        )
+        .await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("files.backend_invalid")), "{j}");
+    webdav_for(&node, alice.token(), &room_id, &channel, port).await;
+
+    let id = tavrn_node::util::ulid();
+    let q = qualified(&channel);
+    let record = alice
+        .client
+        .encrypt_content(
+            &q,
+            &json!({ "type": "files.entry", "v": 1, "entry": id, "kind": "file", "name": "n" }).to_string(),
+        )
+        .unwrap();
+    let epoch = alice.client.current_epoch(&q).unwrap().to_string();
+    let data = sample(90_000);
+    let len = data.len().to_string();
+    let (st, _, body) = node
+        .raw(
+            Method::POST,
+            &format!("{base}/upload"),
+            alice.token(),
+            &[
+                ("tavrn-entry-id", &id),
+                ("tavrn-record", &record),
+                ("tavrn-record-epoch", &epoch),
+                ("tavrn-upload-category", "other"),
+                ("content-length", &len),
+            ],
+            data.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+    let key = format!("/dav/tavrn/{channel}/{id}");
+    assert_eq!(m.store.lock().unwrap().objects.get(&key), Some(&data), "the client's ciphertext as it is");
+    let (st, _, part) = node
+        .raw(Method::GET, &format!("{base}/{id}/download"), alice.token(), &[("range", "bytes=100-199")], Vec::new())
+        .await;
+    assert_eq!((st, &part[..]), (StatusCode::PARTIAL_CONTENT, &data[100..200]));
+
+    // The channel goes, and its objects go with it even when keeping is asked for: they are unreadable anyway.
+    let (st, _) =
+        node.delete(&format!("/api/v1/rooms/{room_id}/channels/{channel}?keep_external=true"), alice.token()).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let store = m.store.clone();
+    eventually(|| !store.lock().unwrap().objects.contains_key(&key)).await;
+}
+
+#[tokio::test]
+async fn deleting_channels_and_rooms_cleans_the_external_store() {
+    let (m, port) = mock(Flavor::WebDav).await;
+    let s = setup(Switch::On, Switch::On).await;
+    let db = &s.node.state.db;
+    let channels = format!("/api/v1/rooms/{}/channels", s.room_id);
+    let new_channel = |name: &'static str| {
+        let (node, token, channels) = (&s.node, s.alice.token.clone(), channels.clone());
+        async move {
+            let (st, ch) =
+                node.post(&channels, &token, json!({ "kind": "files", "name": name, "encrypted": false })).await;
+            assert_eq!(st, StatusCode::CREATED, "{ch}");
+            ch["id"].as_str().unwrap().to_string()
+        }
+    };
+
+    // Kept on request: entries and configuration go, the objects stay; the audit log says so.
+    let kept = new_channel("kept").await;
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &kept, port).await;
+    let kbase = format!("{channels}/{kept}/files");
+    plain_upload(&s.node, &s.alice.token, &kbase, "a.txt", b"a").await;
+    plain_upload(&s.node, &s.alice.token, &kbase, "b.txt", b"b").await;
+    let (_, usage) = s.node.get_auth(&format!("{kbase}/usage"), &s.alice.token).await;
+    assert_eq!(usage["backend_host"], "127.0.0.1", "{usage}");
+    assert_eq!(usage["backend_prefix"], format!("tavrn/{kept}/").as_str(), "{usage}");
+    let (st, _) = s.node.delete(&format!("{channels}/{kept}?keep_external=true"), &s.alice.token).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(objects_under(&m, &kept), 2, "kept on the store");
+    let (_, log) = s.node.get_auth(&format!("/api/v1/rooms/{}/audit-log", s.room_id), &s.alice.token).await;
+    let entry = log.as_array().unwrap().iter().find(|e| e["action"] == "channel.delete").unwrap().clone();
+    assert_eq!(
+        (entry["meta"]["keep_external"].as_bool(), entry["meta"]["kept_objects"].as_u64()),
+        (Some(true), Some(2)),
+        "{entry}"
+    );
+
+    // A store that fails: the objects wait in the queue, housekeeping retries them later.
+    let flaky = new_channel("flaky").await;
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &flaky, port).await;
+    let fbase = format!("{channels}/{flaky}/files");
+    plain_upload(&s.node, &s.alice.token, &fbase, "c.txt", b"c").await;
+    m.store.lock().unwrap().fail_deletes = true;
+    let (st, _) = s.node.delete(&format!("{channels}/{flaky}"), &s.alice.token).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let queued = || async {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_pending_deletes").fetch_one(db).await.unwrap();
+        n
+    };
+    for _ in 0..100 {
+        let attempts: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(attempts) FROM file_pending_deletes").fetch_one(db).await.unwrap();
+        if attempts.unwrap_or(0) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(queued().await, 1);
+    assert_eq!(objects_under(&m, &flaky), 1);
+    let raw: String = sqlx::query_scalar("SELECT config FROM file_pending_deletes").fetch_one(db).await.unwrap();
+    assert!(!raw.contains(DAV_PASS) && !raw.contains("127.0.0.1"), "the queue keeps the configuration sealed");
+    let now = chrono::Utc::now();
+    let r = tavrn_node::housekeeping::retry_external_deletes(&s.node.state, now + chrono::Duration::hours(2))
+        .await
+        .unwrap();
+    assert_eq!((r.deleted, r.failed), (0, 1), "{r:?}");
+    m.store.lock().unwrap().fail_deletes = false;
+    // Not due yet right after a failure.
+    let r = tavrn_node::housekeeping::retry_external_deletes(&s.node.state, now + chrono::Duration::hours(2))
+        .await
+        .unwrap();
+    assert_eq!(r.deleted, 0, "{r:?}");
+    let r = tavrn_node::housekeeping::retry_external_deletes(&s.node.state, now + chrono::Duration::hours(5))
+        .await
+        .unwrap();
+    assert_eq!(r.deleted, 1, "{r:?}");
+    assert_eq!((queued().await, objects_under(&m, &flaky)), (0, 0));
+    // Objects whose store never comes back are given up after 7 days.
+    let lost = new_channel("lost").await;
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &lost, port).await;
+    plain_upload(&s.node, &s.alice.token, &format!("{channels}/{lost}/files"), "d.txt", b"d").await;
+    m.store.lock().unwrap().fail_deletes = true;
+    s.node.delete(&format!("{channels}/{lost}"), &s.alice.token).await;
+    let r =
+        tavrn_node::housekeeping::retry_external_deletes(&s.node.state, now + chrono::Duration::days(8)).await.unwrap();
+    assert_eq!(r.given_up, 1, "{r:?}");
+    assert_eq!(queued().await, 0);
+    m.store.lock().unwrap().fail_deletes = false;
+
+    // Deleting the room removes the objects of its external channels (the default).
+    let last = new_channel("last").await;
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &last, port).await;
+    plain_upload(&s.node, &s.alice.token, &format!("{channels}/{last}/files"), "e.txt", b"e").await;
+    let (st, j) = s.node.delete(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
+    assert!(st.is_success(), "{j}");
+    let store = m.store.clone();
+    let prefix = format!("/dav/tavrn/{last}/");
+    eventually(|| !store.lock().unwrap().objects.keys().any(|k| k.starts_with(&prefix))).await;
+    assert_eq!(objects_under(&m, &kept), 2, "the kept objects are not touched later");
 }

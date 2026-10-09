@@ -102,7 +102,7 @@ async fn setup_with(tweak: impl FnOnce(&mut tavrn_node::config::Config)) -> Setu
         .post(
             &format!("/api/v1/rooms/{room_id}/channels"),
             &alice.token,
-            json!({ "kind": "files", "name": "Shared Files" }),
+            json!({ "kind": "files", "name": "Shared Files", "encrypted": false }),
         )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{ch}");
@@ -122,7 +122,7 @@ fn id(v: &Value) -> String {
 }
 
 #[tokio::test]
-async fn files_channels_are_never_encrypted_and_have_no_messages() {
+async fn unencrypted_files_channels_stay_unencrypted_and_have_no_messages() {
     let s = setup().await;
     let (st, room) = s.node.get_auth(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
     assert_eq!(st, StatusCode::OK);
@@ -130,18 +130,9 @@ async fn files_channels_are_never_encrypted_and_have_no_messages() {
     assert_eq!((ch["kind"].as_str(), ch["encrypted"].as_bool()), (Some("files"), Some(false)));
     assert_eq!(ch["name"], "shared-files");
 
-    let (st, j) = s
-        .node
-        .post(
-            &format!("/api/v1/rooms/{}/channels", s.room_id),
-            &s.alice.token,
-            json!({ "kind": "files", "name": "x", "encrypted": true }),
-        )
-        .await;
-    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.files_unencrypted")), "{j}");
     let path = format!("/api/v1/rooms/{}/channels/{}", s.room_id, s.channel);
     let (st, j) = s.node.patch(&path, &s.alice.token, json!({ "encrypted": true })).await;
-    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.files_unencrypted")), "{j}");
+    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.encryption_fixed")), "{j}");
     let (st, j) = s.node.send(&s.alice.token, &s.room_id, &s.channel, "hello").await;
     assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("channel.no_text")), "{j}");
     // The usual channel settings keep working.
@@ -499,7 +490,9 @@ async fn the_room_owners_entitlement_switches_files_channels() {
     let room = node.create_room(&owner.token, "R").await;
     let room_id = room["id"].as_str().unwrap();
     let channels = format!("/api/v1/rooms/{room_id}/channels");
-    let create = |name: &'static str| node.post(&channels, &owner.token, json!({ "kind": "files", "name": name }));
+    let create = |name: &'static str| {
+        node.post(&channels, &owner.token, json!({ "kind": "files", "name": name, "encrypted": false }))
+    };
     let (st, j) = create("a").await;
     assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("files.disabled")), "{j}");
     let (st, grant) = node

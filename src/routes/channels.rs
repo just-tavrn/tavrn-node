@@ -3,11 +3,11 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::Deserialize;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     access,
@@ -144,7 +144,8 @@ pub struct CreateChannelRequest {
     pub topic: Option<String>,
     pub category_id: Option<String>,
     pub position: Option<i64>,
-    /// Can be switched off only for text/announcement/forum. DMs and voice are always encrypted.
+    /// Can be switched off only for text/announcement/forum. DMs and voice are always encrypted. Files channels:
+    /// chosen here (default `true`) and fixed afterwards (FILES.md §1).
     pub encrypted: Option<bool>,
     pub bitrate_kbps: Option<i64>,
     pub user_limit: Option<i64>,
@@ -153,8 +154,11 @@ pub struct CreateChannelRequest {
     pub age_gate: Option<String>,
 }
 
-fn files_never_encrypted() -> ApiError {
-    bad("channel.files_unencrypted", "Files channels are never end-to-end encrypted")
+fn encryption_fixed() -> ApiError {
+    bad(
+        "channel.encryption_fixed",
+        "The encryption of a files channel is chosen when it is created; create a new channel and upload the files again",
+    )
 }
 
 /// The welcome channel is fixed: no renaming, moving, deleting (only its topic and overrides change).
@@ -205,9 +209,8 @@ pub async fn create_channel(
         return Err(bad("category.not_found", "This category does not exist in this room"));
     }
     let encrypted = match (kind.as_str(), req.encrypted) {
-        // Files channels are never end-to-end encrypted: no MLS group, a banner instead.
-        ("files", Some(true)) => return Err(files_never_encrypted()),
-        ("files", _) => false,
+        // Files channels are end-to-end encrypted unless created without (FILES.md §1).
+        ("files", e) => e.unwrap_or(true),
         ("voice", Some(false)) => {
             return Err(bad("channel.voice_always_encrypted", "Voice channels are always encrypted"));
         }
@@ -250,6 +253,10 @@ pub async fn create_channel(
     .await?;
     if let Some(gate) = age_gate.as_deref().filter(|g| *g != crate::age::GATE_NONE) {
         store::rooms::set_channel_age_gate(&state.db, &id, gate).await?;
+    }
+    if kind == "files" {
+        // A file share shows new members everything by default (FILES.md §8.7).
+        store::history::set_policy(&state.db, &id, &crate::history::Policy::All.to_string()).await?;
     }
     let channel = store::rooms::channel_by_id(&state.db, &id)
         .await?
@@ -343,6 +350,10 @@ pub async fn update_channel(
         crate::age::require_adult_to_gate(&state, &auth.user, gate, "channel").await?;
     }
     let history_policy = req.history_for_new_members.as_deref().map(crate::history::validate).transpose()?;
+    if current.kind == "files" && matches!(history_policy, Some(crate::history::Policy::Days(_))) {
+        // A file share shows new members everything or nothing from before (FILES.md §8.7).
+        return Err(bad("channel.history_policy_invalid", "Files channels share their history with all or since_join"));
+    }
     let name = req.name.as_deref().map(|n| channel_name(&current.kind, n)).transpose()?;
     let topic = req.topic.as_deref().map(|t| validate::text("topic", t, 0, 1024)).transpose()?;
     if let Some(Some(cat)) = &req.category_id
@@ -363,8 +374,8 @@ pub async fn update_channel(
             (Some(b2), Some(u2))
         }
     };
-    if current.kind == "files" && req.encrypted == Some(true) {
-        return Err(files_never_encrypted());
+    if current.kind == "files" && req.encrypted.is_some_and(|e| e != (current.encrypted != 0)) {
+        return Err(encryption_fixed());
     }
     if current.kind == "voice" && req.encrypted == Some(false) {
         return Err(bad("channel.voice_always_encrypted", "Voice channels are always encrypted"));
@@ -501,12 +512,22 @@ pub async fn update_channel(
     Ok(Json(channel))
 }
 
-/// Permanently delete a channel with its entire history (`manage_channels`).
-#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), responses((status = 204)))]
+#[derive(Deserialize, IntoParams, Default)]
+pub struct DeleteFilesQuery {
+    /// Files channels on an external store that are not end-to-end encrypted: keep the objects on the store
+    /// (FILES.md §9; ignored for encrypted channels, whose objects are unreadable without the channel's keys).
+    #[serde(default)]
+    pub keep_external: bool,
+}
+
+/// Permanently delete a channel with its entire history (`manage_channels`). The files of a files channel go
+/// with it: stored on the node at once, on an external store in the background (FILES.md §9).
+#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path), DeleteFilesQuery), responses((status = 204)))]
 pub async fn delete_channel(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
+    Query(q): Query<DeleteFilesQuery>,
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
@@ -516,7 +537,8 @@ pub async fn delete_channel(
     }
     // The files of every upload in the channel go with it (rows cascade, files are deleted here).
     let blob_ids = store::blobs::ids_of_conversation(&state.db, &channel_id).await?;
-    let files = crate::routes::files::Cleanup::collect(&state, "channel_id", &channel_id).await?;
+    let files = crate::routes::files::Cleanup::collect(&state, "channel_id", &channel_id, q.keep_external).await?;
+    let kept = files.kept_objects();
     store::rooms::delete_channel(&state.db, &channel_id).await?;
     for id in &blob_ids {
         state.storage.delete(id).await;
@@ -529,7 +551,11 @@ pub async fn delete_channel(
         "channel.delete",
         &channel_id,
         "",
-        serde_json::json!({ "name": channel.name }),
+        if channel.kind == "files" {
+            serde_json::json!({ "name": channel.name, "keep_external": q.keep_external && kept > 0, "kept_objects": kept })
+        } else {
+            serde_json::json!({ "name": channel.name })
+        },
     )
     .await?;
     state.hub.room(&room_id, "channel.delete", serde_json::json!({ "room_id": room_id, "id": channel_id }));

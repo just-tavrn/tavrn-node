@@ -261,15 +261,21 @@ async fn mark_new_members(
             continue; // this membership (or this reset) was handled already
         }
         // The automatic window: from the policy's start up to the join, or after a reset everything since the
-        // reset (never earlier, ENCRYPTION.md §7b "History after a key reset").
-        let (until, from) = match reset.and_then(util::parse_time) {
-            Some(r) => (UNTIL_NOW.to_string(), Some(ulid_floor(r))),
+        // reset (never earlier, ENCRYPTION.md §7b "History after a key reset"). The same window as times for the
+        // entry records of a files channel.
+        let (until, from, until_time, from_time) = match reset.and_then(util::parse_time) {
+            Some(r) => (UNTIL_NOW.to_string(), Some(ulid_floor(r)), util::now(), Some(util::format_time(r))),
             None => {
                 let Some(joined) = util::parse_time(&member.joined_at) else { continue };
-                (ulid_floor(joined), cutoff(policy, true, joined).map(ulid_floor))
+                let start = cutoff(policy, true, joined);
+                (ulid_floor(joined), start.map(ulid_floor), member.joined_at.clone(), start.map(util::format_time))
             }
         };
-        let older = store::history::has_encrypted_before(&state.db, &conv.id, &until, from.as_deref()).await?;
+        let mut older = store::history::has_encrypted_before(&state.db, &conv.id, &until, from.as_deref()).await?;
+        // Files channels have entry records instead of messages (FILES.md §8.7).
+        if !older && channel.kind == "files" {
+            older = store::files::has_records_between(&state.db, &conv.id, from_time.as_deref(), &until_time).await?;
+        }
         store::history::set_pending(&state.db, &conv.id, &user.id, marker, older).await?;
         if older {
             let min_epoch = match reset {

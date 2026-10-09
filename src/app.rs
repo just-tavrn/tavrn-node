@@ -63,6 +63,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.push("automod.v1");
     // History restore after a key reset by request and approval (ENCRYPTION.md §7b).
     caps.push("history.restore");
+    // End-to-end encrypted files channels (FILES.md §8).
+    caps.push("files.e2ee");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {

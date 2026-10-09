@@ -228,7 +228,9 @@ pub async fn sweep_orphans(state: &AppState, now: DateTime<Utc>) -> Result<Orpha
            AND storage_id NOT IN (SELECT still_id FROM user_emojis WHERE still_id IS NOT NULL)
            AND storage_id NOT IN (SELECT id FROM user_sounds)
            AND storage_id NOT IN (SELECT id FROM remote_emoji_cache)
-           AND storage_id NOT IN (SELECT id FROM file_entries)",
+           AND storage_id NOT IN (SELECT id FROM file_entries)
+           AND storage_id NOT IN (SELECT storage_id FROM file_entries WHERE storage_id IS NOT NULL)
+           AND storage_id NOT IN (SELECT thumbnail_id FROM file_entries WHERE thumbnail_id IS NOT NULL)",
     )
     .bind(&cutoff_s)
     .execute(db)
@@ -265,6 +267,14 @@ async fn sweep_file_entries(state: &AppState, cutoff: &str) -> Result<u64, ApiEr
     Ok(deleted)
 }
 
+/// Retries the queued deletes of objects on external stores of files channels (FILES.md §6) that are due at `now`.
+pub async fn retry_external_deletes(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<crate::routes::files::PendingReport, ApiError> {
+    crate::routes::files::run_pending_deletes(state, None, now).await
+}
+
 /// Which of `ids` some row names as its file.
 async fn known_storage_ids(db: &Pool, ids: &[&str]) -> Result<std::collections::HashSet<String>, ApiError> {
     if ids.is_empty() {
@@ -282,7 +292,8 @@ async fn known_storage_ids(db: &Pool, ids: &[&str]) -> Result<std::collections::
          UNION SELECT still_id AS id FROM user_emojis WHERE still_id IN ({list})
          UNION SELECT id FROM user_sounds WHERE id IN ({list})
          UNION SELECT id FROM remote_emoji_cache WHERE id IN ({list})
-         UNION SELECT storage_id AS id FROM file_entries WHERE storage_id IN ({list})"
+         UNION SELECT storage_id AS id FROM file_entries WHERE storage_id IN ({list})
+         UNION SELECT thumbnail_id AS id FROM file_entries WHERE thumbnail_id IN ({list})"
     );
     let mut q = sqlx::query_as::<_, (String,)>(&sql);
     for id in ids {
@@ -522,6 +533,18 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "Orphan sweep failed"),
+            }
+            match retry_external_deletes(&state, Utc::now()).await {
+                Ok(r) if r != crate::routes::files::PendingReport::default() => {
+                    tracing::info!(
+                        deleted = r.deleted,
+                        failed = r.failed,
+                        given_up = r.given_up,
+                        "External objects of files channels deleted"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "External deletes failed"),
             }
             match expire_attachments(&state, Utc::now(), RETENTION_BUDGET).await {
                 Ok(r) if r != RetentionReport::default() => {
