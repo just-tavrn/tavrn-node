@@ -463,6 +463,8 @@ async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     let browser = Browser::new(&fake, "ok/bob");
     subscribe(&node, &bob_session, &browser).await;
     let bob = store::users::by_id(&node.state.db, &bob_session.user_id).await.unwrap().unwrap();
+    // Hints come only from nodes bob signed in on (FEDERATION.md §5.2).
+    store::federation::touch_target(&node.state.db, &bob.id, &bob_session.device_id, "b.test").await.unwrap();
     let handle = |incoming: Incoming| {
         let (state, bob) = (node.state.clone(), bob.clone());
         async move {

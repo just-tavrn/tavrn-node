@@ -457,6 +457,8 @@ pub async fn ensure_probe(state: &AppState) -> Result<Probe, ApiError> {
 /// A valid federation token of probe device `index` for `target` (also used by tests).
 pub async fn probe_token(state: &AppState, probe: &Probe, index: usize, target: &str) -> Result<String, ApiError> {
     let (pv, ..) = store::federation::profile_info(&state.db, &probe.user.id).await?;
+    // Recorded like every federation token (§2.4): the peer then claims KeyPackages in the probe's name (§3.5).
+    store::federation::touch_target(&state.db, &probe.user.id, &probe.device_ids[index], target).await?;
     tokens::issue_federation_token(state, probe.address(), "user", &probe.device_ids[index], target, pv, None, None)
 }
 

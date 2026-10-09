@@ -127,6 +127,9 @@ pub struct AppState {
     pub federation_login_limiter: Arc<SharedLimiter>,
     /// Inbox messages per remote domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_INBOX` per minute).
     pub federation_inbox_limiter: Arc<SharedLimiter>,
+    /// Node-token requests (inbox, KeyPackage claims) per client address, before the signature check
+    /// (`ip:<address>`).
+    pub federation_ip_limiter: Arc<SharedLimiter>,
     /// Federation tokens per device (`token:<device id>`, 30 per minute).
     pub federation_token_limiter: Arc<SharedLimiter>,
     /// API requests of remote users per home domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_API` per minute).
@@ -332,6 +335,7 @@ impl AppState {
             federation,
             federation_login_limiter: shared("fed-login", config.federation_rate_logins, 60),
             federation_inbox_limiter: shared("fed-inbox", config.federation_rate_inbox, 60),
+            federation_ip_limiter: shared("fed-ip", if config.dev { 10_000 } else { 600 }, 60),
             federation_token_limiter: shared("fed-token", token_max, 60),
             federation_api_limiter: limiter(config.federation_rate_api, 60),
             federation_claim_limiter: limiter(config.federation_rate_claims, 60),
