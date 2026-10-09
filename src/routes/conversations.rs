@@ -432,6 +432,7 @@ pub async fn update(
 ) -> Result<Json<Conversation>, ApiError> {
     let conv = access::direct(&state, &conversation_id, &auth.user.id).await?;
     require_group(row(&conv)?)?;
+    crate::routes::messages::check_direct_write(&state, &auth, &conv).await?;
     let name = clean_name(req.name.as_deref())?;
     store::social::set_name(&state.db, &conv.id, name.as_deref()).await?;
     let updated = store::social::conversation(&state.db, &conv.id)
@@ -454,6 +455,7 @@ pub async fn add_member(
     let conv = access::direct(&state, &conversation_id, &auth.user.id).await?;
     let current = row(&conv)?;
     require_group(current)?;
+    crate::routes::messages::check_direct_write(&state, &auth, &conv).await?;
     let user = resolve(&state, &req.user).await?;
     if user.is_bot() {
         return Err(bad("app.bot_forbidden", "Bots cannot be in group DMs"));

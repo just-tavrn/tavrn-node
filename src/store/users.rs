@@ -33,6 +33,16 @@ pub async fn by_ids(db: &Pool, ids: &[String]) -> Result<Vec<UserRow>, ApiError>
     Ok(out)
 }
 
+/// The user rows of a room's members, in one query (the channel visibility snapshot, `visibility.rs`).
+pub async fn members_of_room(db: &Pool, room_id: &str) -> Result<Vec<UserRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {USER_COLS} FROM users WHERE id IN (SELECT user_id FROM room_members WHERE room_id = $1) ORDER BY id"
+    ))
+    .bind(room_id)
+    .fetch_all(db)
+    .await?)
+}
+
 pub async fn count_local(db: &Pool, domain: &str) -> Result<i64, ApiError> {
     // The conformance probe (FEDERATION.md §9.1) is a system account, not a user.
     let row = sqlx::query("SELECT COUNT(*) AS n FROM users WHERE domain = $1 AND kind = 'user' AND username <> $2")
@@ -575,4 +585,46 @@ pub async fn device_id_in_use(db: &Pool, device_id: &str) -> Result<bool, ApiErr
         .fetch_optional(db)
         .await?
         .is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[tokio::test]
+    async fn members_of_room_returns_the_members_only() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let t = crate::util::now();
+        for id in ["u1", "u2", "u3"] {
+            sqlx::query(
+                "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $1, 'd', $1, $2)",
+            )
+            .bind(id)
+            .bind(&t)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        for room in ["r", "other"] {
+            sqlx::query("INSERT INTO rooms (id, name, owner_id, created_at) VALUES ($1, $1, 'u1', $2)")
+                .bind(room)
+                .bind(&t)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        for (room, user) in [("r", "u1"), ("r", "u3"), ("other", "u2")] {
+            sqlx::query("INSERT INTO room_members (room_id, user_id, joined_at) VALUES ($1, $2, $3)")
+                .bind(room)
+                .bind(user)
+                .bind(&t)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = members_of_room(&db, "r").await.unwrap().into_iter().map(|u| u.id).collect();
+        assert_eq!(ids, ["u1", "u3"]);
+        assert!(members_of_room(&db, "nope").await.unwrap().is_empty());
+    }
 }

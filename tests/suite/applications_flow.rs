@@ -611,7 +611,7 @@ async fn every_scope_boundary_and_administrator_masking() {
     .await;
     let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &full.secret).await;
     assert_eq!(detail["my_permissions"], (p::ALL & !(p::ADMINISTRATOR | p::RESTORE_HISTORY)).to_string());
-    // A role cannot be granted beyond the bot's own capped permissions through overrides either.
+    // Nor through overrides: `administrator` is room-wide and never part of an override (channel-scoped bits only).
     let (s, j) = node
         .put(
             &format!("/api/v1/rooms/{room_id}/overrides"),
@@ -620,7 +620,7 @@ async fn every_scope_boundary_and_administrator_masking() {
                     "allow": p::ADMINISTRATOR.to_string(), "deny": "0" }),
         )
         .await;
-    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "{j}");
+    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "permissions.not_channel_scoped"), "{j}");
     // Whiteboard ephemeral events need the whiteboard scope on top of messages:write.
     let writer = bot(&node, &alice, "Writer", Some(&["messages:write"])).await;
     joined(&node, &alice, &room_id, &writer).await;
@@ -761,12 +761,12 @@ async fn no_bots_at_room_category_and_channel_level() {
     node.patch(&path, &alice.token, json!({ "no_bots": false })).await;
     assert_eq!(node.get_auth(&msgs, &b.secret).await.0, StatusCode::OK);
 
-    // Category level: every channel in it, synced or not.
+    // Category level: every channel in it.
     let (s, cat) =
         node.post(&format!("/api/v1/rooms/{room_id}/categories"), &alice.token, json!({ "name": "Humans" })).await;
     assert_eq!(s, StatusCode::CREATED);
     let cat_id = cat["id"].as_str().unwrap();
-    node.patch(&path, &alice.token, json!({ "category_id": cat_id, "sync_with_category": false })).await;
+    node.patch(&path, &alice.token, json!({ "category_id": cat_id })).await;
     let (s, j) = node
         .patch(&format!("/api/v1/rooms/{room_id}/categories/{cat_id}"), &bob.token, json!({ "no_bots": true }))
         .await;
@@ -1205,4 +1205,24 @@ async fn bots_refused_in_both_directions() {
     assert_eq!(s, StatusCode::OK, "{j}");
     let (s, j) = b.federated_login(j["token"].as_str().unwrap()).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "federation.bots_refused"));
+}
+
+/// Authorization audit (2026-10-09): a node ban of a bot's owner refuses the bot's federated login; a session the
+/// bot already holds ends with it as well (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
+#[tokio::test]
+async fn authz_owner_node_ban_ends_a_remote_bots_session() {
+    let (a, b) = federation::two_nodes().await;
+    let admin = b.register("admin").await;
+    let alice = a.register("alice").await;
+    let bot_a = bot(&a, &alice, "Lingerer", None).await;
+    let (s, j) = a.post("/api/v1/federation/token", &bot_a.secret, json!({ "target": federation::B })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, login) = b.federated_login(j["token"].as_str().unwrap()).await;
+    assert_eq!(s, StatusCode::OK, "{login}");
+    let remote = login["access_token"].as_str().unwrap().to_string();
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::OK);
+    let (s, j) =
+        b.post("/api/v1/admin/bans", &admin.token, json!({ "subject": format!("alice@{}", federation::A) })).await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(b.get_auth("/api/v1/rooms", &remote).await.0, StatusCode::UNAUTHORIZED);
 }

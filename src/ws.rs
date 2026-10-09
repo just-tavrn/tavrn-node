@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! WebSocket `/api/v1/ws`: hello with a token, then events filtered by membership.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
     extract::{
@@ -96,10 +92,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
         Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
     };
-    let mut ages = match crate::age::is_adult(&state, &auth.user).await {
-        Ok(adult) => AgeFilter::new(adult),
-        Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
-    };
+    let mut visible = crate::visibility::Filter::default();
     let mut rx = state.hub.subscribe();
     let _presence = state.hub.connect(&auth.user.id);
     let _status = crate::presence::Registry::connect(&state, &auth.user.id, &auth.device_id);
@@ -187,6 +180,11 @@ async fn run(state: AppState, mut socket: WebSocket) {
                     }
                     Ok(ev) => {
                         track_membership(&ev.kind, &ev.data, &auth, &mut rooms);
+                        if let Scope::Room(r) = &ev.scope
+                            && !rooms.contains(r)
+                        {
+                            visible.forget(r);
+                        }
                         if let Some(s) = &scopes
                             && !crate::applications::event_allowed(&ev.kind, &ev.data, s)
                         {
@@ -208,8 +206,11 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             let _ = sink.send(WsMessage::Close(Some(frame))).await;
                             break;
                         }
-                        // Age gates (PROTOCOL.md §5e): nothing of a gated channel below the gate.
-                        if relevant && ages.blocks(&state, &ev.scope, &ev.kind, &ev.data).await {
+                        // A room channel's events only to the members who may view it (PROTOCOL.md §6).
+                        if relevant
+                            && let Scope::Room(room_id) = &ev.scope
+                            && !visible.delivers(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await
+                        {
                             continue;
                         }
                         // Serialized once in `Hub::publish`; this clone only bumps a reference count.
@@ -246,68 +247,14 @@ async fn run(state: AppState, mut socket: WebSocket) {
     }
 }
 
-/// Age gates of the connection's user (PROTOCOL.md §5e): below 18, room events that concern a gated channel are
-/// dropped; channel and room metadata (`channel.*`, `room.*`) still arrive, so the channel stays listed. The gated
-/// channels of a room are loaded on first use and reloaded after any channel or room change of that room.
-struct AgeFilter {
-    adult: bool,
-    gated: HashMap<String, HashSet<String>>,
-}
-
-impl AgeFilter {
-    fn new(adult: bool) -> Self {
-        Self { adult, gated: HashMap::new() }
-    }
-
-    async fn blocks(&mut self, state: &AppState, scope: &Scope, kind: &str, data: &Value) -> bool {
-        let Scope::Room(room_id) = scope else { return false };
-        if self.adult {
-            return false;
-        }
-        if kind.starts_with("channel.") || kind.starts_with("room.") || kind.starts_with("category.") {
-            self.gated.remove(room_id);
-            return false;
-        }
-        let ids = referenced_channels(data);
-        if ids.is_empty() {
-            return false;
-        }
-        if !self.gated.contains_key(room_id) {
-            // Fail closed: a database error hides the room's channel events until the next change.
-            let gated = match store::rooms::channels(&state.db, room_id).await {
-                Ok(channels) => channels.iter().filter(|c| c.adults_only()).map(|c| c.id.clone()).collect(),
-                Err(_) => return true,
-            };
-            self.gated.insert(room_id.clone(), gated);
-        }
-        self.gated.get(room_id).is_some_and(|gated| ids.iter().any(|id| gated.contains(*id)))
-    }
-}
-
-/// The channel ids an event's data refers to: `conversation_id`, `channel_id`, `conversation_ids` and those of an
-/// embedded `thread` or `message`.
-fn referenced_channels(data: &Value) -> Vec<&str> {
-    let mut ids = Vec::new();
-    for object in [Some(data), data.get("thread"), data.get("message")].into_iter().flatten() {
-        for key in ["conversation_id", "channel_id"] {
-            if let Some(id) = object.get(key).and_then(Value::as_str) {
-                ids.push(id);
-            }
-        }
-    }
-    if let Some(list) = data.get("conversation_ids").and_then(Value::as_array) {
-        ids.extend(list.iter().filter_map(Value::as_str));
-    }
-    ids
-}
-
 /// Typing and read markers need `messages:write` for bots (APPLICATIONS.md §2.4); users always may.
 fn may_write(scopes: Option<&[String]>) -> bool {
     scopes.is_none_or(|s| s.iter().any(|x| x == "messages:write"))
 }
 
-/// Forwards a typing notice: room channels to the room members (the connection must be a member),
-/// DMs and group DMs to their members (the sender must be one).
+/// Forwards a typing notice: room channels to the room members (the connection must be a member who may view the
+/// channel; the fan-out reaches only the channel's viewers), DMs and group DMs to their members (the sender must be
+/// one).
 async fn typing(
     state: &AppState,
     auth: &AuthUser,
@@ -318,6 +265,9 @@ async fn typing(
 ) {
     match (room_id, channel_id, conversation_id) {
         (Some(room_id), Some(channel_id), _) if rooms.contains(&room_id) => {
+            if !crate::visibility::can_view(state, &room_id, &channel_id, &auth.user.id).await {
+                return;
+            }
             state.hub.room(
                 &room_id,
                 "typing",
@@ -399,16 +349,6 @@ mod tests {
             home_device_id: None,
             app: None,
         }
-    }
-
-    #[test]
-    fn events_name_their_channels() {
-        let ids = |v: Value| referenced_channels(&v).into_iter().map(String::from).collect::<Vec<_>>();
-        assert_eq!(ids(json!({ "conversation_id": "c1", "id": "m1" })), ["c1"]);
-        assert_eq!(ids(json!({ "room_id": "r", "channel_id": "c2", "user_id": "u" })), ["c2"]);
-        assert_eq!(ids(json!({ "room_id": "r", "thread": { "channel_id": "c3" } })), ["c3"]);
-        assert_eq!(ids(json!({ "room_id": "r", "conversation_ids": ["c4", "c5"] })), ["c4", "c5"]);
-        assert!(ids(json!({ "room_id": "r", "user": {} })).is_empty());
     }
 
     #[test]

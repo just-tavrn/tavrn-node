@@ -650,3 +650,24 @@ async fn deleting_channels_and_rooms_cleans_the_external_store() {
     eventually(|| !store.lock().unwrap().objects.keys().any(|k| k.starts_with(&prefix))).await;
     assert_eq!(objects_under(&m, &kept), 2, "the kept objects are not touched later");
 }
+
+/// Authorization audit (2026-10-09): "empty secrets use the stored ones" only for the same server and account.
+/// Otherwise anybody allowed to configure the backend could test it against a host of their choice and receive the
+/// stored password there.
+#[tokio::test]
+async fn authz_stored_secrets_never_go_to_another_server() {
+    let (_, port) = mock(Flavor::WebDav).await;
+    let (other, other_port) = mock(Flavor::WebDav).await;
+    let s = setup(Switch::On, Switch::On).await;
+    let url = format!("http://127.0.0.1:{port}/dav/");
+    let (st, info) =
+        s.backend(json!({ "kind": "webdav", "url": url, "username": DAV_USER, "password": DAV_PASS })).await;
+    assert_eq!(st, StatusCode::OK, "{info}");
+    let elsewhere = format!("http://127.0.0.1:{other_port}/dav/");
+    let (_, j) =
+        s.test(Some(json!({ "kind": "webdav", "url": elsewhere, "username": DAV_USER, "password": "" }))).await;
+    assert_ne!(j["ok"].as_bool(), Some(true), "the stored password authenticated at another server: {j}");
+    let (_, j) = s.backend(json!({ "kind": "webdav", "url": elsewhere, "username": DAV_USER, "password": "" })).await;
+    assert_ne!(j["kind"].as_str(), Some("webdav"), "moved with the stored password: {j}");
+    assert!(other.store.lock().unwrap().collections.is_empty(), "nothing was created with the stored password");
+}

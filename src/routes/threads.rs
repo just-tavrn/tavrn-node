@@ -353,6 +353,10 @@ pub async fn update_thread(
             detail: "Only the thread's creator or members with manage_threads change it".into(),
         });
     }
+    // The creator changes the thread like an own message: with `send_messages` (gone in a timeout).
+    if !p::has(t.conv.perms, p::MANAGE_THREADS) {
+        t.conv.require(p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    }
     let title = match &req.title {
         Some(title) => Some(th::check_title(&state, &auth, &t.conv, title, req.title_epoch).await?),
         None => None,

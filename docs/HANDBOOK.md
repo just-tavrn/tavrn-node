@@ -1380,6 +1380,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 |---|---|---|
 | Hub broadcast (`hub.rs`) | **shared** | Bus fan-out, see [How the instances act as one node](#how-the-instances-act-as-one-node). |
 | Hub online map (WebSockets per user) | per instance + replica | The local count stays; `presence::is_online` adds the replicated connections of the other instances (calls ringing, presence audiences, `notify` hints to remote members in `federation/social.rs`). |
+| Channel visibility snapshots (`visibility.rs`): per room the roles, overrides, channels and members, and per channel the members who may view it | per instance | Used by the WebSocket fan-out, web push, `notify` hints and the whiteboard audience (PROTOCOL.md §6: a channel's events only to its viewers). Each instance drops a room's snapshot when its hub publishes *or injects from the bus* a `room.*`, `channel.*`, `category.*`, `role.*`, `member.*` or `override.*` event, before any connection sees it; at the latest after 60 s. Between instances the change applies once its event arrived over the bus (the same ordering as every other event). |
 | `last_event_id` replay | — | No ring buffer exists; always `resync` ([Realtime resync](#realtime-resync)). |
 | Presence registry (`presence.rs`): connections, idle flag, activity per device | **shared** (bus replica) | REST calls (`PUT /users/me/presence`, activity) and the WebSocket of the same device usually hit different instances. |
 | Presence batching (`last_sent`, `pending`, `last_public`) | per instance | Only throttles the updates an instance sends; a duplicate update after a change on another instance is harmless (clients apply the latest). |
@@ -1723,6 +1724,11 @@ room-creation grants, delete all content, reset a locked-out user's second facto
 `TAVRN_REGISTRATION=invite`, node-wide bans, other nodes with their conformance results (block, unblock, check),
 entitlements, legal pages and notices, and the node audit log. Room moderation (kicks, bans, timeouts, roles and
 permissions) is done by each room's owners and moderators.
+
+Room permissions are layered (protocol `permissions.md`): roles give the base, a category's overrides apply to all
+of its channels, and a channel's own overrides win over the category's. Overrides only hold channel-scoped
+permissions; at start the node removes room-wide permissions from overrides created by older versions and records
+each change in the room's audit log (`role.override_restricted`). Nothing needs to be done by the operator.
 
 ### Spam bursts
 

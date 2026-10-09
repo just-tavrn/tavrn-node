@@ -17,11 +17,13 @@ mod suite {
     mod attachment_retention_flow;
     mod attachments_flow;
     mod auth_flow;
+    mod authz_audit;
     mod automod_content_flow;
     mod backups_flow;
     mod blob_deletion_flow;
     mod bots_encrypted_flow;
     mod calls_flow;
+    mod channel_visibility_flow;
     mod cluster_flow;
     mod cluster_outage_flow;
     mod commands_flow;
@@ -58,6 +60,7 @@ mod suite {
     mod notifications_flow;
     mod pending_removals_flow;
     mod permissions_flow;
+    mod permissions_layered_flow;
     mod presence_flow;
     mod profiles_flow;
     mod push_flow;

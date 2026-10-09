@@ -9,6 +9,7 @@ use crate::{
     store,
 };
 
+#[derive(Clone)]
 pub struct RoomAccess {
     pub room: Room,
     /// `None` only for node admins who are not members.
@@ -98,16 +99,33 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         });
     }
     let roles = store::rooms::roles(&state.db, room_id).await?;
+    let role_ids = match &member {
+        Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
+        None => Vec::new(),
+    };
+    let adult = crate::age::is_adult(state, user).await?;
+    member_access(room, &roles, member, &role_ids, user, adult)
+}
+
+/// The [`RoomAccess`] of `user` from already loaded room data: the room's `roles` (with @everyone), the user's
+/// membership and role ids, and whether the user passes age gates (`age::is_adult`). [`room_access`] uses it for one request, the channel visibility snapshot
+/// (`visibility.rs`) for every member of a room at once.
+pub fn member_access(
+    room: Room,
+    roles: &[RoleRow],
+    member: Option<MemberRow>,
+    role_ids: &[String],
+    user: &UserRow,
+    adult: bool,
+) -> Result<RoomAccess, ApiError> {
+    let is_node_admin = user.is_node_admin();
     let everyone = roles
         .iter()
         .find(|r| r.is_everyone != 0)
         .cloned()
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("room without an @everyone role")))?;
-    let role_ids = match &member {
-        Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
-        None => Vec::new(),
-    };
-    let member_roles: Vec<RoleRow> = roles.into_iter().filter(|r| role_ids.contains(&r.id)).collect();
+    let member_roles: Vec<RoleRow> =
+        roles.iter().filter(|r| r.is_everyone == 0 && role_ids.contains(&r.id)).cloned().collect();
     let is_owner = room.owner_id == user.id;
     let eval_roles: Vec<(String, Perms)> = member_roles.iter().map(|r| (r.id.clone(), r.perms())).collect();
     let mut room_perms = permissions::room_level(is_owner || is_node_admin, everyone.perms(), &eval_roles);
@@ -126,7 +144,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         room_perms,
         kind: user.kind.clone(),
         scopes: user.app_scopes.clone(),
-        adult: crate::age::is_adult(state, user).await?,
+        adult,
     })
 }
 
@@ -200,8 +218,6 @@ pub fn channel_perms_with(
         member_roles: access.member_roles_eval(),
         category_overrides: of("category", channel.category_id.as_deref()),
         channel_overrides: of("channel", Some(&channel.id)),
-        // Without a category there is nothing to inherit: the channel's own overrides apply.
-        sync_with_category: channel.sync_with_category != 0 && channel.category_id.is_some(),
         timed_out: access.member.as_ref().is_some_and(MemberRow::is_timed_out),
         kind: access.kind.clone(),
         no_bots: channel.no_bots(),
@@ -212,7 +228,7 @@ pub fn channel_perms_with(
 }
 
 /// Upload categories (`uploads.rs`) of the member in a channel: the highest role with a setting (else
-/// `@everyone`), then the channel's overrides (or the category's when synced) on top.
+/// `@everyone`), then the category's overrides and the channel's own on top (the same layers as the permissions).
 pub fn channel_upload_categories_with(
     access: &RoomAccess,
     channel: &ChannelRow,
@@ -220,17 +236,19 @@ pub fn channel_upload_categories_with(
     user_id: &str,
 ) -> crate::uploads::Categories {
     use crate::uploads;
-    let synced = channel.sync_with_category != 0 && channel.category_id.is_some();
-    let (target_type, target_id) =
-        if synced { ("category", channel.category_id.as_deref()) } else { ("channel", Some(channel.id.as_str())) };
-    let chosen: Vec<&OverrideRow> =
-        overrides.iter().filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id).collect();
-    let evals: Vec<permissions::Override> = chosen.iter().map(|o| o.to_eval()).collect();
-    let upload_overrides: Vec<uploads::UploadOverride<'_>> = evals
-        .iter()
-        .zip(&chosen)
-        .map(|(e, o)| uploads::UploadOverride::of(e, o.upload_allow as u64, o.upload_deny as u64))
-        .collect();
+    let layer = |target_type: &str, target_id: Option<&str>| -> Vec<(permissions::Override, u64, u64)> {
+        overrides
+            .iter()
+            .filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id)
+            .map(|o| (o.to_eval(), o.upload_allow as u64, o.upload_deny as u64))
+            .collect()
+    };
+    let (category_layer, own_layer) =
+        (layer("category", channel.category_id.as_deref()), layer("channel", Some(&channel.id)));
+    fn to_upload(l: &[(permissions::Override, u64, u64)]) -> Vec<crate::uploads::UploadOverride<'_>> {
+        l.iter().map(|(e, allow, deny)| crate::uploads::UploadOverride::of(e, *allow, *deny)).collect()
+    }
+    let (category, own) = (to_upload(&category_layer), to_upload(&own_layer));
     let roles: Vec<uploads::RoleCategories<'_>> = access
         .member_roles
         .iter()
@@ -241,7 +259,7 @@ pub fn channel_upload_categories_with(
         &access.everyone.id,
         access.everyone.upload_categories().unwrap_or(uploads::DEFAULT_EVERYONE),
         &roles,
-        &upload_overrides,
+        &[&category, &own],
         user_id,
     )
 }

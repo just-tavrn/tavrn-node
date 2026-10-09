@@ -120,6 +120,35 @@ async fn no_bots_changed(
     Ok(())
 }
 
+/// The actor's permissions in a category: the layered evaluation (permissions.md) with the category's overrides on top of
+/// the role base and no channel layer.
+async fn category_perms(
+    state: &AppState,
+    access: &access::RoomAccess,
+    category: &Category,
+) -> Result<p::Perms, ApiError> {
+    let no_bots = category.no_bots != 0 || access.room.no_bots != 0;
+    if access.is_owner || access.is_node_admin {
+        return Ok(p::cap_bot(p::ALL, &access.kind, no_bots, access.scopes.as_deref()));
+    }
+    let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
+    let overrides = store::rooms::overrides_for(&state.db, "category", &category.id).await?;
+    Ok(p::compute(&p::Input {
+        user_id,
+        is_owner: false,
+        everyone_role_id: access.everyone.id.clone(),
+        everyone_permissions: access.everyone.perms(),
+        member_roles: access.member_roles_eval(),
+        category_overrides: overrides.iter().map(|o| o.to_eval()).collect(),
+        channel_overrides: Vec::new(),
+        timed_out: access.member.as_ref().is_some_and(crate::models::MemberRow::is_timed_out),
+        kind: access.kind.clone(),
+        no_bots,
+        scopes: access.scopes.clone(),
+        system_channel: false,
+    }))
+}
+
 /// Delete a category; its channels remain, without a category.
 #[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/categories/{category_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("category_id" = String, Path)), responses((status = 204)))]
 pub async fn delete_category(
@@ -129,6 +158,11 @@ pub async fn delete_category(
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    // Its channels lose the category's "no bots" flag: bots never decide that (APPLICATIONS.md §3.5).
+    let category = store::rooms::categories(&state.db, &room_id).await?.into_iter().find(|c| c.id == category_id);
+    if category.as_ref().is_some_and(|c| c.no_bots != 0) {
+        crate::bot_channels::refuse_bots(&auth.user)?;
+    }
     if !store::rooms::delete_category(&state.db, &room_id, &category_id).await? {
         return Err(access::not_found("Category", "category.not_found"));
     }
@@ -283,6 +317,9 @@ pub struct UpdateChannelRequest {
     #[serde(default, with = "crate::serde_with_double_option")]
     pub category_id: Option<Option<String>>,
     pub position: Option<i64>,
+    /// Deprecated and ignored (protocol permissions.md "Changes", 2026-10-09): overrides are layered, a channel
+    /// always inherits its category's overrides underneath its own. Accepted for one release, then unknown.
+    #[schema(deprecated)]
     pub sync_with_category: Option<bool>,
     pub slowmode_secs: Option<i64>,
     pub bitrate_kbps: Option<i64>,
@@ -317,11 +354,14 @@ pub async fn update_channel(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let current = access::channel_in_room(&state, &room_id, &channel_id).await?;
+    // In the channel itself (permissions.md step 4; bots get nothing in "no bots" channels, APPLICATIONS.md §3.5).
+    let perms = access::channel_perms(&state, &access, &current, &auth.user.id).await?;
+    access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    let before = store::rooms::channels(&state.db, &room_id).await?;
     if current.kind == "system"
         && (req.name.is_some()
             || req.category_id.is_some()
             || req.position.is_some()
-            || req.sync_with_category.is_some()
             || req.slowmode_secs.is_some()
             || req.bitrate_kbps.is_some()
             || req.user_limit.is_some()
@@ -393,7 +433,6 @@ pub async fn update_channel(
             topic: topic.as_deref(),
             category_id: req.category_id.as_ref().map(|c| c.as_deref()),
             position: req.position,
-            sync_with_category: req.sync_with_category,
             slowmode_secs: slowmode,
             bitrate_kbps: bitrate,
             user_limit,
@@ -413,6 +452,11 @@ pub async fn update_channel(
     }
     if let Some(value) = req.bots_allowed {
         crate::bot_channels::set_channel_setting(&state, &room_id, &auth.user, &current, value).await?;
+    }
+    // A move into a "no bots" category closes the channel to bots like the flag itself (APPLICATIONS.md §3.5).
+    if req.category_id.is_some() {
+        let moved: Vec<_> = before.iter().filter(|c| c.id == channel_id).cloned().collect();
+        crate::bot_channels::effective_changed(&state, &room_id, &moved, Some(&channel_id)).await?;
     }
     if let Some(minutes) = auto_archive {
         store::threads::set_auto_archive(&state.db, &channel_id, minutes).await?;
@@ -532,6 +576,8 @@ pub async fn delete_channel(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let channel = access::channel_in_room(&state, &room_id, &channel_id).await?;
+    let perms = access::channel_perms(&state, &access, &channel, &auth.user.id).await?;
+    access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     if channel.kind == "system" {
         return Err(system_protected());
     }
@@ -582,8 +628,29 @@ pub struct SetOverrideRequest {
     pub upload_deny: Option<Vec<String>>,
 }
 
+/// Overrides carry channel-scoped bits only (protocol permissions.md "Channel-scoped bits"): room-level bits are
+/// granted through roles. `400 permissions.not_channel_scoped` with the refused names in `meta.names`.
+fn check_channel_scoped(bits: u64) -> Result<(), ApiError> {
+    let refused = bits & !p::CHANNEL_SCOPED;
+    if refused == 0 {
+        return Ok(());
+    }
+    Err(ApiError::BadRequestMeta {
+        code: "permissions.not_channel_scoped",
+        detail: format!(
+            "These permissions are room-wide and cannot be set per channel: {}",
+            p::names(refused).join(", ")
+        ),
+        meta: serde_json::json!({ "names": p::names(refused) }),
+    })
+}
+
 /// Set an override, or remove it when allow = deny = 0 (`manage_roles`).
-#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>)))]
+///
+/// Overrides are layered (protocol permissions.md "Evaluation"): a category's overrides apply to the role base of
+/// every channel in it, the channel's own on top; a bit an override neither allows nor denies inherits from the
+/// layer below. Only channel-scoped bits are accepted (`400 permissions.not_channel_scoped`).
+#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn set_override(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -594,13 +661,27 @@ pub async fn set_override(
     access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
     let target_type = validate::one_of("target_type", &req.target_type, &["category", "channel"])?;
     let subject_type = validate::one_of("subject_type", &req.subject_type, &["role", "member"])?;
-    let exists = match target_type.as_str() {
-        "category" => store::rooms::category_exists(&state.db, &room_id, &req.target_id).await?,
-        _ => access::channel_in_room(&state, &room_id, &req.target_id).await.is_ok(),
+    // The actor's permissions where the override applies: an override can only be set with `manage_roles` there,
+    // and grants only what the actor holds there (permissions.md step 4 and "Hierarchy").
+    let held = match target_type.as_str() {
+        "category" => {
+            match store::rooms::categories(&state.db, &room_id).await?.into_iter().find(|c| c.id == req.target_id) {
+                Some(category) => Some(category_perms(&state, &access, &category).await?),
+                None => None,
+            }
+        }
+        _ => match access::channel_in_room(&state, &room_id, &req.target_id).await {
+            Ok(channel) => Some(access::channel_perms(&state, &access, &channel, &auth.user.id).await?),
+            Err(_) => None,
+        },
     };
-    if !exists {
+    let Some(held) = held else {
         return Err(access::not_found("Target", "override.target_not_found"));
-    }
+    };
+    access::require(held, p::VIEW_CHANNEL | p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
+    let allow = validate::permissions("allow", &req.allow)?;
+    let deny = validate::permissions("deny", &req.deny)?;
+    check_channel_scoped(allow | deny)?;
     match subject_type.as_str() {
         "role" => {
             let role = store::rooms::role_by_id(&state.db, &room_id, &req.subject_id)
@@ -613,17 +694,19 @@ pub async fn set_override(
                 });
             }
             if role.is_everyone != 0 {
-                crate::routes::roles::check_everyone(validate::permissions("allow", &req.allow)?)?;
+                crate::routes::roles::check_everyone(allow)?;
             }
         }
         _ => {
             if store::rooms::member(&state.db, &room_id, &req.subject_id).await?.is_none() {
                 return Err(access::not_found("Member", "member.not_found"));
             }
+            // Like roles: only members below the actor (or the actor themselves, within what they hold).
+            if req.subject_id != auth.user.id {
+                crate::routes::rooms::moderation_target(&state, &access, &req.subject_id).await?;
+            }
         }
     }
-    let allow = validate::permissions("allow", &req.allow)?;
-    let deny = validate::permissions("deny", &req.deny)?;
     if allow & deny != 0 {
         return Err(bad("override.conflict", "A permission cannot be allowed and denied at once"));
     }
@@ -633,7 +716,7 @@ pub async fn set_override(
         return Err(bad("override.conflict", "An upload category cannot be allowed and denied at once"));
     }
     // Nobody can grant themselves more permissions through an override than they have.
-    if !access.is_owner && !access.is_node_admin && allow & !access.room_perms != 0 {
+    if !access.is_owner && !access.is_node_admin && allow & !held != 0 {
         return Err(ApiError::Forbidden {
             code: "override.escalation",
             detail: "You can only grant permissions you have yourself".into(),

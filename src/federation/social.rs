@@ -210,10 +210,11 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
             let active: Vec<String> = member_ids.iter().filter(|m| !requested.contains(m)).cloned().collect();
             (store::users::by_ids(&state.db, &active).await?.into_iter().map(|u| (u, Vec::new())).collect(), None)
         }
-        ConvKind::Channel { access, channel } => {
+        ConvKind::Channel { access, .. } => {
             let mut users = Vec::new();
             // Thread messages (PROTOCOL.md §7e) reach the thread's followers (every message; their home node applies
             // their settings) and the users they mention directly; `@everyone` inside a thread reaches followers only.
+            // Never members who cannot view the channel (PROTOCOL.md §6), whatever they follow or are mentioned in.
             let followers: Option<Vec<String>> = match &message.thread_id {
                 Some(t) => Some(store::threads::follower_ids(&state.db, t).await?),
                 None => None,
@@ -222,20 +223,16 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
                 || message.mentions_everyone
                 || !message.mentions.is_empty()
             {
-                for id in store::rooms::remote_member_ids(&state.db, &access.room.id, own).await? {
-                    if let Some(u) = store::users::by_id(&state.db, &id).await? {
-                        // Age gates (PROTOCOL.md §5e): no hints about a gated channel below the gate.
-                        if channel.adults_only() && !crate::age::is_adult(state, &u).await? {
-                            continue;
-                        }
-                        let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &u.id).await?;
-                        let wanted = match &followers {
-                            Some(f) => f.contains(&u.id) || direct_mention(message, &u, &roles),
-                            None => message.mentions_everyone || direct_mention(message, &u, &roles),
-                        };
-                        if wanted {
-                            users.push((u, roles));
-                        }
+                let Some(view) = crate::visibility::room(state, &access.room.id).await? else { return Ok(()) };
+                let viewers = view.viewers(&conv.id);
+                for member in view.members().filter(|m| m.user.domain != *own && viewers.contains(&m.user.id)) {
+                    let (u, roles) = (&member.user, &member.role_ids);
+                    let wanted = match &followers {
+                        Some(f) => f.contains(&u.id) || direct_mention(message, u, roles),
+                        None => message.mentions_everyone || direct_mention(message, u, roles),
+                    };
+                    if wanted {
+                        users.push((u.clone(), roles.clone()));
                     }
                 }
             }
