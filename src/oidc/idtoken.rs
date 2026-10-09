@@ -76,7 +76,14 @@ pub fn allowed_alg(name: &str) -> Option<Algorithm> {
 pub fn parse_jwks(doc: &Value) -> Vec<Jwk> {
     doc.get("keys")
         .and_then(Value::as_array)
-        .map(|keys| keys.iter().take(100).filter_map(|k| serde_json::from_value::<Jwk>(k.clone()).ok()).collect())
+        .map(|keys| {
+            keys.iter()
+                .take(100)
+                .filter_map(|k| serde_json::from_value::<Jwk>(k.clone()).ok())
+                // jsonwebtoken 11 also parses unknown key types (`Other`); such a key can never verify, drop it.
+                .filter(|k| !matches!(k.algorithm, AlgorithmParameters::Other(_)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

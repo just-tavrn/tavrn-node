@@ -97,7 +97,8 @@ livekit-protocol = "0.8"
 # provider's ID tokens. Only the RustCrypto verifiers are used, called explicitly (never jsonwebtoken's
 # process-global provider, which livekit-token installs HMAC-only). The small OIDC code flow itself is
 # implemented in `oidc.rs` on reqwest (no `openidconnect`/`oauth2` stack).
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# livekit-token still depends on jsonwebtoken 10, so both majors are in the tree; they share nothing.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 
 # Web push (protocol PROTOCOL.md §6d): RFC 8291 payload encryption and RFC 8292 VAPID need P-256 ECDH and ES256;
 # the RustCrypto crate is already in the tree (jsonwebtoken), AES-128-GCM and HKDF come from aes-gcm and hkdf.
