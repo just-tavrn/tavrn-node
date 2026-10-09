@@ -8,7 +8,7 @@ use crate::{
     util::{in_seconds, now, ulid},
 };
 
-pub(crate) const USER_COLS: &str = "id, username, domain, display_name, kind, owner_id, password_hash, email, email_verified_at, identity_pubkey, identity_reset_at, is_node_admin, avatar_blob_id, avatar_animated, header_blob_id, header_animated, dm_policy, presence_status, custom_status, hide_activity, created_at, disabled_at, owner_address, application_id, deleted_at";
+pub(crate) const USER_COLS: &str = "id, username, domain, display_name, kind, owner_id, password_hash, email, email_verified_at, identity_pubkey, identity_reset_at, is_node_admin, avatar_blob_id, avatar_animated, header_blob_id, header_animated, dm_policy, presence_status, custom_status, hide_activity, created_at, disabled_at, owner_address, application_id, deleted_at, date_of_birth, age_over_18";
 
 pub async fn by_id(db: &Pool, id: &str) -> Result<Option<UserRow>, ApiError> {
     Ok(sqlx::query_as(&format!("SELECT {USER_COLS} FROM users WHERE id = $1")).bind(id).fetch_optional(db).await?)
@@ -50,14 +50,16 @@ pub struct NewLocalUser<'a> {
     pub password_hash: &'a str,
     pub email: Option<&'a str>,
     pub is_node_admin: bool,
+    /// `YYYY-MM-DD` (PROTOCOL.md §5e), validated by the caller.
+    pub date_of_birth: Option<&'a str>,
 }
 
 /// Creates a local account. `Err(Conflict)` if the name is already taken.
 pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, ApiError> {
     let id = ulid();
     let result = sqlx::query(
-        "INSERT INTO users (id, username, domain, display_name, kind, password_hash, email, is_node_admin, created_at)
-         VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8)",
+        "INSERT INTO users (id, username, domain, display_name, kind, password_hash, email, is_node_admin, created_at, date_of_birth)
+         VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9)",
     )
     .bind(&id)
     .bind(u.username)
@@ -67,6 +69,7 @@ pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, Api
     .bind(u.email)
     .bind(u.is_node_admin as i64)
     .bind(now())
+    .bind(u.date_of_birth)
     .execute(db)
     .await;
     match result {
@@ -77,6 +80,26 @@ pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, Api
         Err(e) => return Err(e.into()),
     }
     by_id(db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("user not found after INSERT")))
+}
+
+/// Sets (or with `None` removes) the date of birth of a local user (PROTOCOL.md §5e).
+pub async fn set_date_of_birth(db: &Pool, user_id: &str, date_of_birth: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET date_of_birth = $1 WHERE id = $2")
+        .bind(date_of_birth)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Stores the `age_over_18` claim of a remote user's latest federation token (FEDERATION.md §2.2).
+pub async fn set_age_claim(db: &Pool, user_id: &str, age_over_18: Option<bool>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET age_over_18 = $1 WHERE id = $2")
+        .bind(age_over_18.map(i64::from))
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_email_verified(db: &Pool, user_id: &str) -> Result<(), ApiError> {

@@ -18,7 +18,7 @@ async fn register(node: &TestNode, username: &str, accept_language: Option<&str>
     if let Some(l) = accept_language {
         req = req.header(header::ACCEPT_LANGUAGE, l);
     }
-    let body = json!({ "username": username, "password": common::password(username), "email": format!("{username}@example.org") });
+    let body = json!({ "username": username, "password": common::password(username), "email": format!("{username}@example.org"), "date_of_birth": common::ADULT_DATE_OF_BIRTH });
     let resp = node.router.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let j: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();

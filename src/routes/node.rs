@@ -43,6 +43,8 @@ pub struct NodeInfo {
     /// WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain): clients pass it
     /// as `rpId` on the assertions they build themselves (PROTOCOL.md §5a.4).
     pub webauthn: crate::routes::wellknown::WebauthnInfo,
+    /// Date of birth and age gates (`age.v1`, PROTOCOL.md §5e).
+    pub age: crate::age::AgeInfo,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -61,6 +63,7 @@ pub async fn get_node(State(state): State<AppState>) -> Result<Json<NodeInfo>, c
     let legal = crate::legal::info(&state).await?;
     Ok(Json(NodeInfo {
         legal,
+        age: crate::age::info(c),
         domain: c.domain.clone(),
         name: c.name.clone(),
         description: c.description.clone(),

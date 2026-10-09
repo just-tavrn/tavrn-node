@@ -183,6 +183,8 @@ pub fn spec() -> utoipa::openapi::OpenApi {
     doc.merge(crate::routes::push::PushApi::openapi());
     // Reports, auto-moderation and ownership transfer (protocol/MODERATION.md).
     doc.merge(crate::routes::moderation::ModerationApi::openapi());
+    // Date of birth and age status (PROTOCOL.md §5e).
+    doc.merge(crate::routes::age::AgeApi::openapi());
     doc
 }
 

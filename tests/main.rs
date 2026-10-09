@@ -10,6 +10,7 @@ mod common;
 mod suite {
     mod account_deletion_flow;
     mod admin_flow;
+    mod age_flow;
     mod api_basics;
     mod app_install_flow;
     mod applications_flow;

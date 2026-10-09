@@ -438,7 +438,7 @@ async fn oidc_only_disables_password_logins_except_break_glass() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "newbie", "password": "password-new-1234" })),
+            Some(json!({ "username": "newbie", "date_of_birth": "1990-01-01", "password": "password-new-1234" })),
         )
         .await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.password_login_disabled")));
@@ -452,6 +452,7 @@ async fn oidc_only_disables_password_logins_except_break_glass() {
             password_hash: &hash,
             email: None,
             is_node_admin: false,
+            date_of_birth: Some(common::ADULT_DATE_OF_BIRTH),
         },
     )
     .await
@@ -461,7 +462,7 @@ async fn oidc_only_disables_password_logins_except_break_glass() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "ulla", "password": common::password("ulla") })),
+            Some(json!({ "username": "ulla", "date_of_birth": "1990-01-01", "password": common::password("ulla") })),
         )
         .await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.password_login_disabled")));

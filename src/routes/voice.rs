@@ -75,6 +75,7 @@ async fn voice_channel(
     if channel.kind != "voice" {
         return Err(bad("voice.not_voice_channel", "This is not a voice channel"));
     }
+    access::require_age(&access, &channel)?;
     let perms = access::channel_perms(state, &access, &channel, &user.id).await?;
     Ok(VoiceChannel { access, channel, perms })
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pub mod admin;
+pub mod age;
 pub mod applications;
 pub mod attachments;
 pub mod auth;

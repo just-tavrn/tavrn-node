@@ -497,7 +497,7 @@ async fn bots_are_refused_on_never_allowed_routes() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": b.username, "password": "whatever-123" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "whatever-123" })),
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::UNAUTHORIZED, "auth.invalid_credentials"));
@@ -1043,7 +1043,7 @@ async fn delete_application_leaves_a_tombstone() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": b.username, "password": "a-long-password-1", "device_name": "x" })),
+            Some(json!({ "username": b.username, "date_of_birth": "1990-01-01", "password": "a-long-password-1", "device_name": "x" })),
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT);

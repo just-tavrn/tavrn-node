@@ -210,7 +210,7 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
             let active: Vec<String> = member_ids.iter().filter(|m| !requested.contains(m)).cloned().collect();
             (store::users::by_ids(&state.db, &active).await?.into_iter().map(|u| (u, Vec::new())).collect(), None)
         }
-        ConvKind::Channel { access, .. } => {
+        ConvKind::Channel { access, channel } => {
             let mut users = Vec::new();
             // Thread messages (PROTOCOL.md §7e) reach the thread's followers (every message; their home node applies
             // their settings) and the users they mention directly; `@everyone` inside a thread reaches followers only.
@@ -224,6 +224,10 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
             {
                 for id in store::rooms::remote_member_ids(&state.db, &access.room.id, own).await? {
                     if let Some(u) = store::users::by_id(&state.db, &id).await? {
+                        // Age gates (PROTOCOL.md §5e): no hints about a gated channel below the gate.
+                        if channel.adults_only() && !crate::age::is_adult(state, &u).await? {
+                            continue;
+                        }
                         let roles = store::rooms::member_role_ids(&state.db, &access.room.id, &u.id).await?;
                         let wanted = match &followers {
                             Some(f) => f.contains(&u.id) || direct_mention(message, &u, &roles),

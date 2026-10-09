@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! WebSocket `/api/v1/ws`: hello with a token, then events filtered by membership.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     extract::{
@@ -80,12 +84,20 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Err(ApiError::Unauthorized { code }) => return close(socket, CLOSE_AUTH, code).await,
         Err(_) => return close(socket, CLOSE_AUTH, "auth.token_invalid").await,
     };
+    // No date of birth yet (PROTOCOL.md §5e): no events; the client reconnects after adding it.
+    if crate::age::needs_date_of_birth(&state, &auth.user) {
+        return close(socket, CLOSE_PROTOCOL, "age.status_required").await;
+    }
     // Terms not accepted (`TAVRN_LEGAL_TERMS_MODE=require`): no events either; the client reconnects after accepting.
     if crate::legal::documents::check_required(&state, &auth.user, None).await.is_err() {
         return close(socket, CLOSE_PROTOCOL, "legal.terms_required").await;
     }
     let mut rooms: HashSet<String> = match store::rooms::rooms_of_user(&state.db, &auth.user.id).await {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
+        Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
+    };
+    let mut ages = match crate::age::is_adult(&state, &auth.user).await {
+        Ok(adult) => AgeFilter::new(adult),
         Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
     };
     let mut rx = state.hub.subscribe();
@@ -196,6 +208,10 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             let _ = sink.send(WsMessage::Close(Some(frame))).await;
                             break;
                         }
+                        // Age gates (PROTOCOL.md §5e): nothing of a gated channel below the gate.
+                        if relevant && ages.blocks(&state, &ev.scope, &ev.kind, &ev.data).await {
+                            continue;
+                        }
                         // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                         if relevant && sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
                             break;
@@ -228,6 +244,61 @@ async fn run(state: AppState, mut socket: WebSocket) {
             }
         }
     }
+}
+
+/// Age gates of the connection's user (PROTOCOL.md §5e): below 18, room events that concern a gated channel are
+/// dropped; channel and room metadata (`channel.*`, `room.*`) still arrive, so the channel stays listed. The gated
+/// channels of a room are loaded on first use and reloaded after any channel or room change of that room.
+struct AgeFilter {
+    adult: bool,
+    gated: HashMap<String, HashSet<String>>,
+}
+
+impl AgeFilter {
+    fn new(adult: bool) -> Self {
+        Self { adult, gated: HashMap::new() }
+    }
+
+    async fn blocks(&mut self, state: &AppState, scope: &Scope, kind: &str, data: &Value) -> bool {
+        let Scope::Room(room_id) = scope else { return false };
+        if self.adult {
+            return false;
+        }
+        if kind.starts_with("channel.") || kind.starts_with("room.") || kind.starts_with("category.") {
+            self.gated.remove(room_id);
+            return false;
+        }
+        let ids = referenced_channels(data);
+        if ids.is_empty() {
+            return false;
+        }
+        if !self.gated.contains_key(room_id) {
+            // Fail closed: a database error hides the room's channel events until the next change.
+            let gated = match store::rooms::channels(&state.db, room_id).await {
+                Ok(channels) => channels.iter().filter(|c| c.adults_only()).map(|c| c.id.clone()).collect(),
+                Err(_) => return true,
+            };
+            self.gated.insert(room_id.clone(), gated);
+        }
+        self.gated.get(room_id).is_some_and(|gated| ids.iter().any(|id| gated.contains(*id)))
+    }
+}
+
+/// The channel ids an event's data refers to: `conversation_id`, `channel_id`, `conversation_ids` and those of an
+/// embedded `thread` or `message`.
+fn referenced_channels(data: &Value) -> Vec<&str> {
+    let mut ids = Vec::new();
+    for object in [Some(data), data.get("thread"), data.get("message")].into_iter().flatten() {
+        for key in ["conversation_id", "channel_id"] {
+            if let Some(id) = object.get(key).and_then(Value::as_str) {
+                ids.push(id);
+            }
+        }
+    }
+    if let Some(list) = data.get("conversation_ids").and_then(Value::as_array) {
+        ids.extend(list.iter().filter_map(Value::as_str));
+    }
+    ids
 }
 
 /// Typing and read markers need `messages:write` for bots (APPLICATIONS.md §2.4); users always may.
@@ -320,12 +391,24 @@ mod tests {
                 owner_address: None,
                 application_id: None,
                 deleted_at: None,
+                date_of_birth: None,
+                age_over_18: None,
                 app_scopes: None,
             },
             device_id: "dev".into(),
             home_device_id: None,
             app: None,
         }
+    }
+
+    #[test]
+    fn events_name_their_channels() {
+        let ids = |v: Value| referenced_channels(&v).into_iter().map(String::from).collect::<Vec<_>>();
+        assert_eq!(ids(json!({ "conversation_id": "c1", "id": "m1" })), ["c1"]);
+        assert_eq!(ids(json!({ "room_id": "r", "channel_id": "c2", "user_id": "u" })), ["c2"]);
+        assert_eq!(ids(json!({ "room_id": "r", "thread": { "channel_id": "c3" } })), ["c3"]);
+        assert_eq!(ids(json!({ "room_id": "r", "conversation_ids": ["c4", "c5"] })), ["c4", "c5"]);
+        assert!(ids(json!({ "room_id": "r", "user": {} })).is_empty());
     }
 
     #[test]

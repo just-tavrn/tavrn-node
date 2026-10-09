@@ -9,9 +9,9 @@ use crate::{
     util::{now, ulid},
 };
 
-const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days";
+const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
-const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.sync_with_category, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags";
+const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.sync_with_category, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
 const OVERRIDE_COLS: &str =
     "id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny";
 const MEMBER_COLS: &str =
@@ -160,14 +160,29 @@ pub async fn rooms_of_user(db: &Pool, user_id: &str) -> Result<Vec<Room>, ApiErr
 }
 
 /// Public rooms their owners listed in the directory (FEDERATION.md §7.3), newest first.
-pub async fn public_rooms(db: &Pool, limit: i64) -> Result<Vec<Room>, ApiError> {
+/// Discoverable public rooms; rooms with an age gate only when `include_gated` (an adult asks, PROTOCOL.md §5e).
+pub async fn public_rooms(db: &Pool, limit: i64, include_gated: bool) -> Result<Vec<Room>, ApiError> {
     let rooms: Vec<Room> = sqlx::query_as(&format!(
-        "SELECT {ROOM_COLS} FROM rooms WHERE join_mode = 'public' AND discoverable = 1 ORDER BY created_at DESC LIMIT $1"
+        "SELECT {ROOM_COLS} FROM rooms WHERE join_mode = 'public' AND discoverable = 1 AND ($2 = 1 OR age_gate = 'none')
+         ORDER BY created_at DESC LIMIT $1"
     ))
     .bind(limit)
+    .bind(i64::from(include_gated))
     .fetch_all(db)
     .await?;
     Ok(rooms.into_iter().map(Room::with_icon).collect())
+}
+
+/// Sets a room's age gate (`none` | `adults_only`, validated by the caller).
+pub async fn set_room_age_gate(db: &Pool, room_id: &str, gate: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE rooms SET age_gate = $1 WHERE id = $2").bind(gate).bind(room_id).execute(db).await?;
+    Ok(())
+}
+
+/// Sets a channel's own age gate (`none` | `adults_only`, validated by the caller).
+pub async fn set_channel_age_gate(db: &Pool, channel_id: &str, gate: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE channels SET age_gate = $1 WHERE id = $2").bind(gate).bind(channel_id).execute(db).await?;
+    Ok(())
 }
 
 pub async fn rooms_owned_count(db: &Pool, user_id: &str) -> Result<i64, ApiError> {

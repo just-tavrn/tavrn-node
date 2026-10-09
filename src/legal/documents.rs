@@ -186,7 +186,14 @@ pub async fn status(state: &AppState, user_id: &str) -> Result<TermsStatus, ApiE
 /// `/api/v1/legal/`), the terms status, logout and the own account basics the client needs to show the dialog.
 pub fn exempt_route(path: &str) -> bool {
     path.starts_with("/api/v1/legal/")
-        || matches!(path, "/api/v1/auth/logout" | "/api/v1/users/me/terms" | "/api/v1/users/me/terms/accept")
+        || matches!(
+            path,
+            "/api/v1/auth/logout"
+                | "/api/v1/users/me/terms"
+                | "/api/v1/users/me/terms/accept"
+                // The date of birth dialog may come first (PROTOCOL.md §5e).
+                | "/api/v1/users/me/date-of-birth"
+        )
 }
 
 /// `403 legal.terms_required` for a local person whose acceptance of the current terms is missing, when the node
