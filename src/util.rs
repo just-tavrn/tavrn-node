@@ -3,7 +3,7 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rand::RngCore;
+use rand::Rng as _;
 
 /// Now as RFC 3339 in UTC with milliseconds, e.g. `2026-10-04T12:00:00.000Z`.
 /// Always the same format, so TEXT timestamps in the database sort lexicographically.
@@ -30,17 +30,28 @@ pub fn ulid() -> String {
     static GEN: Mutex<Option<ulid::Generator>> = Mutex::new(None);
     let mut guard = GEN.lock().unwrap_or_else(|e| e.into_inner());
     let generator = guard.get_or_insert_with(ulid::Generator::new);
-    generator.generate().unwrap_or_else(|_| ulid::Ulid::new()).to_string()
+    generator.generate().unwrap_or_else(|_| ulid::Ulid::generate()).to_string()
 }
 
 pub fn is_ulid(s: &str) -> bool {
     s.len() == 26 && ulid::Ulid::from_string(s).is_ok()
 }
 
+/// The operating system's CSPRNG (getrandom) as an infallible generator. Like rand 0.8's `OsRng` it
+/// panics if the system RNG fails, instead of ever yielding weak randomness.
+pub fn os_rng() -> rand::rand_core::UnwrapErr<rand::rngs::SysRng> {
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng)
+}
+
+/// Fills `buf` from the operating system's CSPRNG (keys, nonces, secrets).
+pub fn fill_random(buf: &mut [u8]) {
+    os_rng().fill_bytes(buf);
+}
+
 /// 32 random bytes, Base64url without padding (for refresh tokens, invite codes, etc.).
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    fill_random(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
 }
 
@@ -84,6 +95,17 @@ pub fn parse_address(s: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_randomness_fills_every_byte_freshly() {
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        fill_random(&mut a);
+        fill_random(&mut b);
+        assert_ne!(a, [0u8; 32]);
+        assert_ne!(a, b);
+        assert_ne!(random_token(32), random_token(32));
+        assert_eq!(random_token(32).len(), 43);
+    }
 
     #[test]
     fn now_is_sortable_rfc3339() {

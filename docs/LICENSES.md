@@ -55,39 +55,46 @@ and `livekit-api`; no fixed version exists; the node uses RSA only to verify ID-
 providers with public keys, where the timing side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
 `openmls_rust_crypto` → `hpke-rs` → `libcrux`).
 
+`cargo audit` scans every entry of `Cargo.lock` rather than the build graph and additionally reports
+RUSTSEC-2026-0330 and RUSTSEC-2026-0331 (`libcrux-kem` 0.0.9). That crate is a lockfile entry only and is never
+compiled: `hpke-rs` 0.7 declares its libcrux backend as an optional dependency named by a weak feature, which
+Cargo records in the lockfile, but nothing enables it (`cargo tree --target all -i libcrux-kem` prints nothing;
+`cargo deny` does not see it). `.cargo/audit.toml` ignores both, with the same reasoning, until a released
+`openmls_rust_crypto` accepts `hpke-rs` 0.8 (which brings the fixed `libcrux-kem` 0.0.10).
+
 ## 3. Direct dependencies
 
 `tavrn-node` (AGPL-3.0-only):
 
 | Crate | Version | License | Kind |
 |---|---|---|---|
-| `aes-gcm` | 0.10.3 | Apache-2.0 OR MIT | runtime |
+| `aes-gcm` | 0.11.1 | Apache-2.0 OR MIT | runtime |
 | `anyhow` | 1.0.104 | MIT OR Apache-2.0 | runtime |
 | `argon2` | 0.5.3 | MIT OR Apache-2.0 | runtime |
 | `axum` | 0.8.9 | MIT | runtime |
-| `base64` | 0.22.1 | MIT OR Apache-2.0 | runtime |
+| `base64` | 0.23.1 | MIT OR Apache-2.0 | runtime |
 | `chrono` | 0.4.45 | MIT OR Apache-2.0 | runtime |
 | `clap` | 4.6.7 | MIT OR Apache-2.0 | runtime |
 | `ed25519-dalek` | 2.2.0 | BSD-3-Clause | runtime |
 | `figment` | 0.10.19 | MIT OR Apache-2.0 | runtime, dev |
 | `futures` | 0.3.34 | MIT OR Apache-2.0 | runtime |
-| `hkdf` | 0.12.4 | MIT OR Apache-2.0 | runtime |
-| `hmac` | 0.12.1 | MIT OR Apache-2.0 | runtime |
+| `hkdf` | 0.13.0 | MIT OR Apache-2.0 | runtime |
+| `hmac` | 0.13.0 | MIT OR Apache-2.0 | runtime |
 | `image-webp` | 0.2.4 | MIT OR Apache-2.0 | runtime |
 | `ipnet` | 2.12.2 | MIT OR Apache-2.0 | runtime |
-| `jsonwebtoken` | 10.4.0 | MIT | runtime |
+| `jsonwebtoken` | 11.1.0 | MIT | runtime |
 | `lettre` | 0.11.23 | MIT | runtime |
-| `livekit-api` | 0.8.1 | Apache-2.0 | runtime |
+| `livekit-api` | 0.8.2 | Apache-2.0 | runtime |
 | `livekit-protocol` | 0.8.0 | Apache-2.0 | runtime |
 | `mime_guess` | 2.0.5 | MIT | runtime |
 | `nix` | 0.31.3 | MIT | runtime (unix) |
 | `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | runtime |
-| `rand` | 0.8.8 | MIT OR Apache-2.0 | runtime |
+| `rand` | 0.10.3 | MIT OR Apache-2.0 | runtime |
 | `reqwest` | 0.12.28 | MIT OR Apache-2.0 | runtime |
-| `rust-embed` | 8.12.0 | MIT | runtime |
+| `rust-embed` | 8.13.0 | MIT | runtime |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | runtime |
 | `serde_json` | 1.0.151 | MIT OR Apache-2.0 | runtime |
-| `sha2` | 0.10.9 | MIT OR Apache-2.0 | runtime |
+| `sha2` | 0.11.0 | MIT OR Apache-2.0 | runtime |
 | `sqlx` | 0.8.6 | MIT OR Apache-2.0 | runtime |
 | `subtle` | 2.6.1 | BSD-3-Clause | runtime |
 | `tavrn-crypto` | 0.1.0 | MPL-2.0 | runtime (git dependency, [tavrn-crypto](https://github.com/just-tavrn/tavrn-crypto)) |
@@ -95,14 +102,14 @@ providers with public keys, where the timing side channel on private-key operati
 | `tokio` | 1.53.2 | MIT | runtime |
 | `tokio-tungstenite` | 0.29.0 | MIT | runtime |
 | `totp-rs` | 6.0.0 | MIT | runtime |
-| `tower-http` | 0.6.11 | MIT | runtime |
+| `tower-http` | 0.7.1 | MIT | runtime |
 | `tracing` | 0.1.44 | MIT | runtime |
 | `tracing-subscriber` | 0.3.23 | MIT | runtime |
-| `ulid` | 1.2.1 | MIT | runtime |
+| `ulid` | 3.0.0 | MIT | runtime |
 | `unicode-normalization` | 0.1.25 | MIT OR Apache-2.0 | runtime |
 | `utoipa` | 5.5.0 | MIT OR Apache-2.0 | runtime |
 | `webauthn-rs` | 0.5.5 | MPL-2.0 | runtime |
-| `zeroize` | 1.9.0 | Apache-2.0 OR MIT | runtime |
+| `zeroize` | 1.9.1 | Apache-2.0 OR MIT | runtime |
 | `http-body-util` | 0.1.5 | MIT | dev |
 | `tempfile` | 3.27.0 | MIT OR Apache-2.0 | dev |
 | `tower` | 0.5.3 | MIT | dev |
@@ -115,7 +122,7 @@ never compiled for our targets), `libloading` (ISC), `ryu-js` (`Apache-2.0 OR BS
 `unicode-ident` (`(MIT OR Apache-2.0) AND Unicode-3.0`). Everything else is MIT and/or Apache-2.0.
 
 `tavrn-perf-loadgen` (`perf/loadgen/`, AGPL-3.0-only): `anyhow`, `chrono`, `clap`, `futures`, `libc`,
-`reqwest`, `serde`, `serde_json`, `sqlx` (all MIT OR Apache-2.0), `tokio`, `tokio-tungstenite` 0.26,
+`reqwest`, `serde`, `serde_json`, `sqlx` (all MIT OR Apache-2.0), `tokio`, `tokio-tungstenite` 0.29,
 `totp-rs`, `ulid` (MIT), `tavrn-crypto` (MPL-2.0).
 
 ## 4. Special cases

@@ -19,7 +19,7 @@ use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use utoipa::ToSchema;
@@ -380,7 +380,7 @@ async fn deliver_one(state: &AppState, row: OutboxRow, now: DateTime<Utc>) -> Re
             Ok(Outcome::Delivered)
         }
         Err(e) if e.retryable() => {
-            let jitter = rand::thread_rng().gen_range(-JITTER..=JITTER);
+            let jitter = rand::rng().random_range(-JITTER..=JITTER);
             let delay = next_delay_secs(row.attempts + 1, e.retry_after(), jitter);
             let next_at = util::format_time(now + chrono::Duration::seconds(delay));
             store::subscriptions::reschedule(&state.db, &row.id, row.attempts + 1, &next_at, &e.label()).await?;

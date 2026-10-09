@@ -37,7 +37,6 @@ use anyhow::{Context, anyhow, bail};
 use axum::body::Bytes;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::Stream;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zeroize::Zeroizing;
@@ -83,7 +82,7 @@ impl StorageKey {
 
     pub fn generate() -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(key.as_mut());
+        crate::util::fill_random(key.as_mut());
         Self::from_bytes(key)
     }
 
@@ -93,27 +92,25 @@ impl StorageKey {
     }
 
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(self.key.as_slice().into())
+        Aes256Gcm::new((&*self.key).into())
     }
 
     /// Wraps a file key, bound to its storage id (a wrapped key copied to another row does not unwrap).
     pub fn wrap(&self, storage_id: &str, file_key: &[u8; 32]) -> anyhow::Result<WrappedKey> {
         let mut nonce = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        crate::util::fill_random(&mut nonce);
         let wrapped = self
             .cipher()
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: file_key, aad: storage_id.as_bytes() })
+            .encrypt((&nonce).into(), Payload { msg: file_key, aad: storage_id.as_bytes() })
             .map_err(|_| anyhow!("file key could not be wrapped"))?;
         Ok(WrappedKey { wrapped, nonce })
     }
 
     pub fn unwrap(&self, storage_id: &str, wrapped: &[u8], nonce: &[u8]) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-        if nonce.len() != 12 {
-            bail!("wrap nonce of {storage_id} is damaged");
-        }
+        let nonce: &Nonce<_> = nonce.try_into().map_err(|_| anyhow!("wrap nonce of {storage_id} is damaged"))?;
         let plain = Zeroizing::new(
             self.cipher()
-                .decrypt(Nonce::from_slice(nonce), Payload { msg: wrapped, aad: storage_id.as_bytes() })
+                .decrypt(nonce, Payload { msg: wrapped, aad: storage_id.as_bytes() })
                 .map_err(|_| anyhow!("the file key of {storage_id} does not unwrap with storage key {}", self.id))?,
         );
         let key: [u8; 32] =
@@ -331,7 +328,7 @@ where
         remaining -= n as u64;
         let last = index + 1 == chunks;
         let ct = cipher
-            .encrypt(Nonce::from_slice(&chunk_nonce(index, last)), &buf[..n])
+            .encrypt((&chunk_nonce(index, last)).into(), &buf[..n])
             .map_err(|_| anyhow!("chunk could not be encrypted"))?;
         out.write_all(&ct).await?;
     }
@@ -374,7 +371,7 @@ impl ChunkSealer {
     fn seal(&mut self, plain: &[u8], last: bool, out: &mut Vec<u8>) -> anyhow::Result<()> {
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&chunk_nonce(self.index, last)), plain)
+            .encrypt((&chunk_nonce(self.index, last)).into(), plain)
             .map_err(|_| anyhow!("chunk could not be encrypted"))?;
         self.index += 1;
         out.extend_from_slice(&ct);
@@ -464,7 +461,7 @@ impl ChunkOpener {
             let last = self.index + 1 == self.chunks;
             let plain = self
                 .cipher
-                .decrypt(Nonce::from_slice(&chunk_nonce(self.index, last)), &self.pending[start..start + size])
+                .decrypt((&chunk_nonce(self.index, last)).into(), &self.pending[start..start + size])
                 .map_err(|_| anyhow!("stored file failed authentication (damaged or tampered)"))?;
             out.extend_from_slice(&plain);
             self.index += 1;
@@ -545,9 +542,9 @@ impl BlobReader {
                     let mut buf = vec![0u8; size];
                     file.read_exact(&mut buf).await?;
                     *remaining -= size as u64;
-                    let plain = cipher.decrypt(Nonce::from_slice(&chunk_nonce(*index, last)), buf.as_slice()).map_err(
-                        |_| std::io::Error::other("stored file failed authentication (damaged or tampered)"),
-                    )?;
+                    let plain = cipher.decrypt((&chunk_nonce(*index, last)).into(), buf.as_slice()).map_err(|_| {
+                        std::io::Error::other("stored file failed authentication (damaged or tampered)")
+                    })?;
                     *index += 1;
                     Ok(Some((Bytes::from(plain), source)))
                 }
@@ -648,7 +645,7 @@ impl BlobStorage {
         let mut f = tokio::fs::File::create(tmp).await.with_context(|| format!("{} not writable", tmp.display()))?;
         let row = if self.encrypt {
             let mut file_key = Zeroizing::new([0u8; 32]);
-            rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+            crate::util::fill_random(file_key.as_mut());
             let wrapped = self.keys.current.wrap(id, &file_key)?;
             let mut out = tokio::io::BufWriter::with_capacity(CHUNK + TAG, &mut f);
             encrypt_stream(&file_key, len, input, &mut out).await?;
@@ -716,7 +713,7 @@ impl BlobStorage {
             let mut len = 0u64;
             let row = if self.encrypt {
                 let mut file_key = Zeroizing::new([0u8; 32]);
-                rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+                crate::util::fill_random(file_key.as_mut());
                 let wrapped = self.keys.current.wrap(id, &file_key)?;
                 let mut sealer = ChunkSealer::new(&file_key);
                 while let Some(chunk) = stream.next().await {
@@ -792,7 +789,7 @@ impl BlobStorage {
     /// channels), wrapped with the storage key and kept in `blob_keys` like the node's own files.
     pub async fn new_external_key(&self, id: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
         let mut file_key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(file_key.as_mut());
+        crate::util::fill_random(file_key.as_mut());
         let wrapped = self.keys.current.wrap(id, &file_key)?;
         keys_store::put_blob_key(&self.db, id, &encode_wrap(&wrapped, self.keys.current.id(), ENC_VERSION)).await?;
         Ok(file_key)
@@ -847,7 +844,7 @@ impl BlobStorage {
             let file_key = key.unwrap(id, &wrapped, &nonce)?;
             let (chunks, len) =
                 encrypted_layout(file_len).ok_or_else(|| anyhow!("stored file {id} is damaged (impossible length)"))?;
-            let cipher = Box::new(Aes256Gcm::new(file_key.as_slice().into()));
+            let cipher = Box::new(Aes256Gcm::new((&*file_key).into()));
             return Ok(Some(BlobReader {
                 len,
                 encrypted: true,

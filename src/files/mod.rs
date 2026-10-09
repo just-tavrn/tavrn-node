@@ -16,14 +16,13 @@ use std::{
 };
 
 use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
+    Aes256Gcm, KeyInit,
     aead::{Aead, Payload},
 };
 use axum::body::Bytes;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Stream, StreamExt};
 use hkdf::Hkdf;
-use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -142,9 +141,9 @@ fn config_key(state: &AppState) -> Zeroizing<[u8; 32]> {
 pub fn seal_config(state: &AppState, channel_id: &str, config: &remote::RemoteConfig) -> Result<String, ApiError> {
     let json = Zeroizing::new(serde_json::to_vec(config).map_err(|e| ApiError::Internal(e.into()))?);
     let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let ct = Aes256Gcm::new(config_key(state).as_ref().into())
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &json, aad: channel_id.as_bytes() })
+    crate::util::fill_random(&mut nonce);
+    let ct = Aes256Gcm::new((&*config_key(state)).into())
+        .encrypt((&nonce).into(), Payload { msg: &json, aad: channel_id.as_bytes() })
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("backend configuration could not be encrypted")))?;
     Ok(URL_SAFE_NO_PAD.encode([nonce.as_slice(), &ct].concat()))
 }
@@ -160,8 +159,8 @@ pub fn open_config(state: &AppState, channel_id: &str, sealed: &str) -> Result<r
         return Err(fail());
     }
     let plain = Zeroizing::new(
-        Aes256Gcm::new(config_key(state).as_ref().into())
-            .decrypt(Nonce::from_slice(&raw[..12]), Payload { msg: &raw[12..], aad: channel_id.as_bytes() })
+        Aes256Gcm::new((&*config_key(state)).into())
+            .decrypt(raw[..12].try_into().map_err(|_| fail())?, Payload { msg: &raw[12..], aad: channel_id.as_bytes() })
             .map_err(|_| fail())?,
     );
     serde_json::from_slice(&plain).map_err(|_| fail())

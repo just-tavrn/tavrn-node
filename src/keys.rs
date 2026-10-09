@@ -31,7 +31,10 @@ pub struct PublicKeyInfo {
 
 impl NodeKey {
     pub fn generate(kid: impl Into<String>) -> Self {
-        Self { kid: kid.into(), signing: SigningKey::generate(&mut rand::rngs::OsRng) }
+        // What SigningKey::generate does, from the system CSPRNG (ed25519-dalek 2 takes a rand_core 0.6 RNG).
+        let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+        crate::util::fill_random(secret.as_mut());
+        Self { kid: kid.into(), signing: SigningKey::from_bytes(&secret) }
     }
 
     pub fn verifying(&self) -> VerifyingKey {
@@ -121,7 +124,7 @@ pub fn create_key_file(path: &Path) -> anyhow::Result<Option<zeroize::Zeroizing<
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create key directory {}", dir.display()))?;
     }
     let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, secret.as_mut());
+    crate::util::fill_random(secret.as_mut());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

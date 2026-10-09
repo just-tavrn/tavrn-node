@@ -278,7 +278,7 @@ async fn bench(args: &Args, url: &str, pid: Option<u32>) -> Result<(Report, Vec<
     }
 
     eprintln!("[2/7] {} users with TOTP", args.clients);
-    let run = ulid::Ulid::new().to_string().to_lowercase();
+    let run = ulid::Ulid::generate().to_string().to_lowercase();
     let prefix = format!("p{}", &run[run.len() - 6..]);
     let started = Instant::now();
     let users = concurrently((0..args.clients).collect(), 16, |i| {

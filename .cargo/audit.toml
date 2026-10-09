@@ -1,0 +1,18 @@
+# cargo audit configuration. The CI gate is cargo deny (deny.toml, where the accepted advisories carry their
+# reasons); this file keeps `cargo audit`, which scans every entry of Cargo.lock, in line with it. Review on
+# every dependency update.
+
+[advisories]
+ignore = [
+    # rsa (Marvin timing attack, no fixed release): the same accepted entry as in deny.toml. RSA is used only
+    # to verify ID-token signatures of SSO providers with their public keys.
+    "RUSTSEC-2023-0071",
+    # libcrux-kem 0.0.9 (panics on short hybrid keys / short seeds) is a Cargo.lock entry only, never
+    # compiled: hpke-rs 0.7 (via tavrn-crypto -> openmls_rust_crypto) declares its libcrux backend as an
+    # optional dependency that its weak `std` feature names, so Cargo records it in the lockfile, but nothing
+    # enables the `libcrux` feature. Proof: `cargo tree --target all -i libcrux-kem` prints nothing, and cargo
+    # deny does not see the crate. The fixed 0.0.10 needs hpke-rs 0.8, which no released openmls_rust_crypto
+    # accepts yet; drop this entry then.
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+]

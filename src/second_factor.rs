@@ -7,13 +7,13 @@
 //! answers `401 auth.second_factor_required`. The token is spent when the session is issued.
 
 use aes_gcm::{
-    Aes256Gcm, Nonce,
+    Aes256Gcm,
     aead::{Aead, KeyInit, Payload},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -303,10 +303,10 @@ fn totp_key(state: &AppState) -> Zeroizing<[u8; 32]> {
 /// `nonce(12) || AES-256-GCM(secret)`, bound to the user id.
 pub fn encrypt_totp_secret(state: &AppState, user_id: &str, secret: &[u8]) -> Result<Vec<u8>, ApiError> {
     let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let cipher = Aes256Gcm::new(totp_key(state).as_ref().into());
+    crate::util::fill_random(&mut nonce);
+    let cipher = Aes256Gcm::new((&*totp_key(state)).into());
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: secret, aad: user_id.as_bytes() })
+        .encrypt((&nonce).into(), Payload { msg: secret, aad: user_id.as_bytes() })
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("TOTP secret not encryptable")))?;
     Ok([nonce.as_slice(), &ct].concat())
 }
@@ -316,9 +316,9 @@ pub fn decrypt_totp_secret(state: &AppState, user_id: &str, blob: &[u8]) -> Resu
     if blob.len() < 12 + 16 {
         return Err(fail());
     }
-    let cipher = Aes256Gcm::new(totp_key(state).as_ref().into());
+    let cipher = Aes256Gcm::new((&*totp_key(state)).into());
     cipher
-        .decrypt(Nonce::from_slice(&blob[..12]), Payload { msg: &blob[12..], aad: user_id.as_bytes() })
+        .decrypt(blob[..12].try_into().map_err(|_| fail())?, Payload { msg: &blob[12..], aad: user_id.as_bytes() })
         .map(Zeroizing::new)
         .map_err(|_| fail())
 }
@@ -339,7 +339,7 @@ pub fn totp(secret: &[u8], issuer: &str, account: &str) -> Result<totp_rs::Totp,
 /// A fresh random secret (160 bits, RFC 4226 recommendation).
 pub fn new_totp_secret() -> Zeroizing<Vec<u8>> {
     let mut secret = Zeroizing::new(vec![0u8; TOTP_SECRET_BYTES]);
-    rand::rngs::OsRng.fill_bytes(&mut secret);
+    crate::util::fill_random(&mut secret);
     secret
 }
 
@@ -376,7 +376,7 @@ fn normalize_recovery_code(code: &str) -> Option<String> {
 
 /// Ten new codes `xxxx-xxxx-xxxx` (60 random bits each); replaces the previous set.
 pub async fn new_recovery_codes(state: &AppState, user_id: &str) -> Result<Vec<String>, ApiError> {
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = util::os_rng();
     let codes: Vec<String> = (0..RECOVERY_CODE_COUNT)
         .map(|_| {
             let chars: Vec<char> =

@@ -13,7 +13,10 @@ use std::{
 use axum::{Router, body::Bytes, extract::Path, extract::State, http::StatusCode, routing::post};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{Session, TestNode, test_node};
-use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+use p256::{
+    SecretKey,
+    elliptic_curve::{Generate, sec1::ToSec1Point},
+};
 use serde_json::{Value, json};
 use tavrn_node::push::crypto;
 
@@ -66,10 +69,14 @@ struct Browser {
 impl Browser {
     async fn subscribe(node: &TestNode, fake: &Fake, s: &Session) -> Self {
         let mut auth = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut auth);
-        let b = Self { secret: SecretKey::random(&mut rand::rngs::OsRng), auth, path: s.username.clone() };
+        tavrn_node::util::fill_random(&mut auth);
+        let b = Self {
+            secret: SecretKey::generate_from_rng(&mut tavrn_node::util::os_rng()),
+            auth,
+            path: s.username.clone(),
+        };
         let body = json!({ "endpoint": format!("{}/{}", fake.base, b.path), "keys": {
-            "p256dh": URL_SAFE_NO_PAD.encode(b.secret.public_key().to_encoded_point(false).as_bytes()),
+            "p256dh": URL_SAFE_NO_PAD.encode(b.secret.public_key().to_sec1_point(false).as_bytes()),
             "auth": URL_SAFE_NO_PAD.encode(b.auth) } });
         let (st, j) = node.put("/api/v1/users/me/push-subscriptions", &s.token, body).await;
         assert_eq!(st, StatusCode::CREATED, "{j}");

@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = crate::keys::NodeKey::generate("t").signing;
         let token = sign(&key, "k1", &claims(60)).unwrap();
         assert_eq!(peek_kid(&token).unwrap(), "k1");
         let (std, extra): (StandardClaims, Device) = verify(&token, &key.verifying_key(), &expected()).unwrap();
@@ -177,8 +177,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_key_tampering_and_expiry() {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = crate::keys::NodeKey::generate("t").signing;
+        let other = crate::keys::NodeKey::generate("t").signing;
         let token = sign(&key, "k1", &claims(60)).unwrap();
         assert_eq!(verify::<Device>(&token, &other.verifying_key(), &expected()).unwrap_err(), JwtError::BadSignature);
 
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn rejects_alg_none_and_foreign_headers() {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = crate::keys::NodeKey::generate("t").signing;
         let token = sign(&key, "k1", &claims(60)).unwrap();
         let payload = token.split('.').nth(1).unwrap();
         let none_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT","kid":"k1"}"#);
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn skew_is_a_parameter() {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = crate::keys::NodeKey::generate("t").signing;
         let mut c = claims(600);
         c.std.iat = now_unix() + 200;
         let token = sign(&key, "k1", &c).unwrap();
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_aud_iss_typ() {
-        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = crate::keys::NodeKey::generate("t").signing;
         let token = sign(&key, "k1", &claims(60)).unwrap();
         let vk = key.verifying_key();
         let e = Expected { aud: "b.example".into(), ..expected() };
