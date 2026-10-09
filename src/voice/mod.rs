@@ -434,7 +434,7 @@ pub async fn update_permission(state: &AppState, key: &ChannelKey, identity: &st
 
 /// On an instance that is not the leader (several instances, `cache.rs`) a voice side effect goes to the leader,
 /// which holds the participants; `true` if it was handed over.
-fn hand_to_leader(state: &AppState, effect: impl FnOnce() -> crate::cache::VoiceEffect) -> bool {
+pub(crate) fn hand_to_leader(state: &AppState, effect: impl FnOnce() -> crate::cache::VoiceEffect) -> bool {
     if state.cluster.is_leader() {
         return false;
     }
@@ -449,6 +449,7 @@ pub async fn run_effect(state: &AppState, effect: crate::cache::VoiceEffect) {
         E::DisconnectUser { room_id, user_id } => disconnect_user(state, &room_id, &user_id).await,
         E::CloseChannel { room_id, channel_id } => close_channel(state, &room_id, &channel_id).await,
         E::CloseRoom { room_id } => close_room(state, &room_id).await,
+        E::LeaveCall { conversation_id, user_id } => crate::calls::drop_member(state, &conversation_id, &user_id).await,
     }
 }
 
@@ -506,6 +507,91 @@ pub async fn close_room(state: &AppState, room_id: &str) {
             }
         }
     }
+}
+
+/// Disconnects the participants of a room's voice channels who no longer hold `view_channel` and `connect` there
+/// (a role, override, membership or age change), against the current visibility snapshot (VOICE.md §4). Runs on
+/// the leader, which holds the participants.
+pub async fn check_access(state: &AppState, room_id: &str) {
+    if !state.cluster.is_leader() {
+        return;
+    }
+    let keys = state.voice.participants().active_channels(room_id);
+    if keys.is_empty() {
+        return;
+    }
+    let view = match crate::visibility::room(state, room_id).await {
+        Ok(Some(view)) => view,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, room_id, "voice access could not be checked");
+            return;
+        }
+    };
+    let needed = crate::permissions::VIEW_CHANNEL | crate::permissions::CONNECT;
+    let mut changed = Vec::new();
+    for key in keys {
+        let users = state.voice.participants().users_in(&key);
+        for user_id in users {
+            if view.perms(&key.1, &user_id).is_some_and(|p| crate::permissions::has(p, needed)) {
+                continue;
+            }
+            let identities = state.voice.participants().identities_of(&key, &user_id);
+            let mut visible = false;
+            for identity in &identities {
+                visible |= state.voice.participants().remove(&key, identity);
+                remove_from_livekit(state, &key, identity).await;
+            }
+            if visible && !changed.contains(&key) {
+                changed.push(key.clone());
+            }
+        }
+    }
+    publish(state, &changed).await;
+}
+
+/// How often every room with voice participants is checked even without an event (changes that come without one,
+/// e.g. an age status or the node admin flag; the visibility snapshot's lifetime).
+const ACCESS_SWEEP: Duration = crate::visibility::TTL;
+
+/// Watches the events that change who may view what (`visibility::changes_visibility`) and checks the voice
+/// participants of the room ([`check_access`]); every [`ACCESS_SWEEP`] all rooms with participants.
+pub fn spawn_access_watcher(state: &AppState) {
+    if !state.config.voice_enabled {
+        return;
+    }
+    let mut events = state.hub.subscribe();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut sweep = tokio::time::interval(ACCESS_SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sweep.tick().await;
+        loop {
+            let rooms: Vec<String> = tokio::select! {
+                event = events.recv() => match event {
+                    Ok(ev) => match &ev.scope {
+                        crate::hub::Scope::Room(room_id) if crate::visibility::changes_visibility(&ev.kind) => {
+                            vec![room_id.clone()]
+                        }
+                        _ => continue,
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => all_voice_rooms(&state),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = sweep.tick() => all_voice_rooms(&state),
+            };
+            for room_id in rooms {
+                check_access(&state, &room_id).await;
+            }
+        }
+    });
+}
+
+fn all_voice_rooms(state: &AppState) -> Vec<String> {
+    let mut rooms: Vec<String> = state.voice.participants().keys().into_iter().map(|k| k.0).collect();
+    rooms.sort();
+    rooms.dedup();
+    rooms
 }
 
 /// Runs a voice side effect after the response (kick, ban, … must not wait for LiveKit).

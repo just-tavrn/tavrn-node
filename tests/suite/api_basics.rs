@@ -90,3 +90,25 @@ async fn signing_key_persists_across_restarts() {
     let again = tavrn_node::app::AppState::init(config).await.unwrap();
     assert_eq!(again.signing_key().public_info(), first);
 }
+
+#[tokio::test]
+async fn node_info_and_well_known_publish_the_webauthn_relying_party_id() {
+    // Default: the identity domain.
+    let node = test_node("test.local").await;
+    let info = body_json(node.get("/api/v1/node").await).await;
+    assert_eq!(info["webauthn"]["rp_id"], "test.local");
+    let wk = body_json(node.get("/.well-known/tavrn").await).await;
+    assert_eq!(wk["webauthn"]["rp_id"], "test.local");
+
+    // Delegation: the web client runs on a subdomain, passkeys belong to the parent domain
+    // (TAVRN_WEBAUTHN_RP_ID); clients pass it as `rpId` on their own assertions.
+    let node = test_node_with("app.tavrn.test", |c| {
+        c.public_url = Some("http://app.tavrn.test:8080".into());
+        c.webauthn_rp_id = Some("tavrn.test".into());
+    })
+    .await;
+    let info = body_json(node.get("/api/v1/node").await).await;
+    assert_eq!(info["webauthn"]["rp_id"], "tavrn.test");
+    let wk = body_json(node.get("/.well-known/tavrn").await).await;
+    assert_eq!(wk["webauthn"]["rp_id"], "tavrn.test");
+}

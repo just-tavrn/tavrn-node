@@ -309,6 +309,13 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
         if store::rooms::is_banned(&state.db, None, &user.address(), &user.domain).await? {
             return Err(invalid("auth.token_invalid"));
         }
+        // A bot whose owner is banned from the node goes too, as at the login (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
+        if let Some(owner) = user.owner_address.as_deref().filter(|_| user.is_bot())
+            && let Some((_, domain)) = crate::util::parse_address(owner)
+            && store::rooms::is_banned(&state.db, None, owner, domain).await?
+        {
+            return Err(invalid("auth.token_invalid"));
+        }
         state.federation_api_limiter.check_all(&[format!("domain:{}", user.domain)])?;
         let app = if user.is_bot() {
             Some(crate::applications::remote_principal(state, &mut user, &extra.dev).await?)
@@ -338,9 +345,16 @@ impl FromRequestParts<AppState> for AuthUser {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         let token = bearer(&parts.headers).ok_or(ApiError::Unauthorized { code: "auth.required" })?;
         let auth = authenticate(state, token).await?;
+        // The general per-user limit (`TAVRN_RATE_USER_PER_MINUTE`); route limits come on top.
+        if let Some(limiter) = &state.user_api_limiter {
+            limiter.check_all(&[format!("user:{}", auth.user.id)])?;
+        }
         check_route(state, &auth, parts)?;
         // `TAVRN_LEGAL_TERMS_MODE=require`: nothing but the legal flow until the current terms are accepted.
         let path = parts.extensions.get::<axum::extract::MatchedPath>().map(axum::extract::MatchedPath::as_str);
+        // `age.v1`: accounts without a date of birth complete it first (PROTOCOL.md §5e). Checked before the terms, so
+        // the terms dialog stays reachable while the date of birth is missing (and the other way round).
+        crate::age::check_required(state, &auth.user, path)?;
         crate::legal::documents::check_required(state, &auth.user, path).await?;
         Ok(auth)
     }

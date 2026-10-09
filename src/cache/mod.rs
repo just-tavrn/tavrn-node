@@ -115,9 +115,22 @@ pub enum Job {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VoiceEffect {
-    DisconnectUser { room_id: String, user_id: String },
-    CloseChannel { room_id: String, channel_id: String },
-    CloseRoom { room_id: String },
+    DisconnectUser {
+        room_id: String,
+        user_id: String,
+    },
+    CloseChannel {
+        room_id: String,
+        channel_id: String,
+    },
+    CloseRoom {
+        room_id: String,
+    },
+    /// A member left a DM or group DM: their devices leave its running call.
+    LeaveCall {
+        conversation_id: String,
+        user_id: String,
+    },
 }
 
 /// Open connections and idle/activity of one device of a user (part of a presence sync).

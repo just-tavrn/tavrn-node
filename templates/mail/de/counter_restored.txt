@@ -1,0 +1,5 @@
+Subject: Über die Gegendarstellung entschieden ({case})
+
+Entscheidung über die Gegendarstellung im Vorgang {case}: wiederhergestellt
+
+{reason}

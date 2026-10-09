@@ -53,6 +53,7 @@ perms! {
     READ_HISTORY = 34, "read_history";
     MANAGE_APPLICATIONS = 35, "manage_applications";
     MANAGE_THREADS = 36, "manage_threads";
+    RESTORE_HISTORY = 37, "restore_history";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -105,7 +106,40 @@ pub const EVERYONE_RESTRICTED: Perms = ADMINISTRATOR
     | MANAGE_NICKNAMES
     | MANAGE_APPLICATIONS
     | MANAGE_THREADS
+    | RESTORE_HISTORY
     | PURGE;
+
+/// The bits an override (category or channel) may carry: everything that means something inside a channel.
+/// Room-level bits (administrator, room management, invites, kick/ban/timeout, purge, audit log, emojis,
+/// nicknames, applications) are granted through roles only. `PUT /overrides` refuses other bits with
+/// `permissions.not_channel_scoped`, the start-up fixup strips them from old data, and the evaluation ignores
+/// them (protocol/permissions.md "Channel-scoped bits").
+pub const CHANNEL_SCOPED: Perms = VIEW_CHANNEL
+    | SEND_MESSAGES
+    | MANAGE_MESSAGES
+    | ATTACH_FILES
+    | ADD_REACTIONS
+    | MENTION_EVERYONE
+    | CREATE_THREADS
+    | MANAGE_CHANNELS
+    | MANAGE_ROLES
+    | CONNECT
+    | SPEAK
+    | STREAM
+    | MUTE_MEMBERS
+    | MOVE_MEMBERS
+    | USE_SOUNDBOARD
+    | PIN_MESSAGES
+    | USE_CAMERA
+    | USE_WHITEBOARD
+    | MANAGE_WHITEBOARD
+    | MANAGE_WEBHOOKS
+    | PRIORITY_SPEAKER
+    | USE_EXTERNAL_EMOJIS
+    | USE_EXTERNAL_SOUNDS
+    | MANAGE_FILES
+    | READ_HISTORY
+    | MANAGE_THREADS;
 
 /// Permissions a member keeps while timed out.
 pub const TIMEOUT_KEEPS: Perms = VIEW_CHANNEL | READ_HISTORY;
@@ -290,10 +324,8 @@ pub struct Input {
     pub member_roles: Vec<(String, Perms)>,
     /// Overrides of the channel's category (empty if there is no category).
     pub category_overrides: Vec<Override>,
-    /// The channel's own overrides.
+    /// The channel's own overrides, applied on top of the category's.
     pub channel_overrides: Vec<Override>,
-    /// The channel inherits the category's overrides (its own are ignored).
-    pub sync_with_category: bool,
     pub timed_out: bool,
     /// Account kind (`user`, `bot`, …); every kind except `user` gets the bot branch (APPLICATIONS.md §2.4).
     #[serde(default = "user_kind")]
@@ -323,7 +355,8 @@ pub fn room_level(is_owner: bool, everyone_permissions: Perms, member_roles: &[(
     if has(base, ADMINISTRATOR) { ALL } else { base }
 }
 
-/// Effective permissions in a channel. Order as in PROTOCOL.md §10; for bots the result is
+/// Effective permissions in a channel (protocol/permissions.md "Evaluation"): the role base, then the
+/// category's overrides, then the channel's own on top, a neutral bit inheriting from the layer below. For bots the result is
 /// capped afterwards ([`cap_bot`]): administrator and owner expand to all bits first, then the scope mask.
 pub fn compute(input: &Input) -> Perms {
     let mut perms = compute_member(input);
@@ -342,8 +375,8 @@ fn compute_member(input: &Input) -> Perms {
     if has(base, ADMINISTRATOR) {
         return ALL;
     }
-    let overrides = if input.sync_with_category { &input.category_overrides } else { &input.channel_overrides };
-    let mut perms = apply_overrides(base, overrides, input);
+    let category = apply_overrides(base, &input.category_overrides, input);
+    let mut perms = apply_overrides(category, &input.channel_overrides, input);
     // No override can hide a system channel: as if view_channel and read_history were never denied.
     if input.system_channel {
         perms |= SYSTEM_CHANNEL_FORCED;
@@ -357,12 +390,15 @@ fn compute_member(input: &Input) -> Perms {
     perms
 }
 
+/// One layer (the category's or the channel's overrides) on top of `perms`. Only [`CHANNEL_SCOPED`] bits of an
+/// override take part; bits it neither allows nor denies keep the value of the layer below.
 fn apply_overrides(mut perms: Perms, overrides: &[Override], input: &Input) -> Perms {
+    let apply = |perms: Perms, allow: Perms, deny: Perms| (perms & !(deny & CHANNEL_SCOPED)) | (allow & CHANNEL_SCOPED);
     // 1. @everyone override
     if let Some(o) =
         overrides.iter().find(|o| o.subject_type == SubjectType::Role && o.subject_id == input.everyone_role_id)
     {
-        perms = (perms & !o.deny) | o.allow;
+        perms = apply(perms, o.allow, o.deny);
     }
     // 2. Role overrides: all denies first, then all allows
     let (mut allow, mut deny) = (0u64, 0u64);
@@ -372,10 +408,10 @@ fn apply_overrides(mut perms: Perms, overrides: &[Override], input: &Input) -> P
             deny |= o.deny;
         }
     }
-    perms = (perms & !deny) | allow;
+    perms = apply(perms, allow, deny);
     // 3. Member override
     if let Some(o) = overrides.iter().find(|o| o.subject_type == SubjectType::Member && o.subject_id == input.user_id) {
-        perms = (perms & !o.deny) | o.allow;
+        perms = apply(perms, o.allow, o.deny);
     }
     perms
 }
@@ -425,7 +461,7 @@ mod tests {
     fn everyone_defaults_contain_nothing_restricted() {
         assert_eq!(DEFAULT_EVERYONE & EVERYONE_RESTRICTED, 0);
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_130_924_452_740);
+        assert_eq!(EVERYONE_RESTRICTED, 4_611_686_268_363_406_212);
         assert!(has(DEFAULT_EVERYONE, USE_WHITEBOARD));
         assert!(!has(DEFAULT_EVERYONE, MANAGE_WHITEBOARD));
         assert_eq!(names(USE_WHITEBOARD | MANAGE_WHITEBOARD), vec!["use_whiteboard", "manage_whiteboard"]);
@@ -444,7 +480,11 @@ mod tests {
         assert!(!has(write, MANAGE_MESSAGES));
         assert_eq!(scope_mask(&["nonsense".to_string()]), BOT_ALWAYS, "unknown scopes add nothing");
         assert!(!has(scope_mask(&all_scopes()), ADMINISTRATOR), "administrator is never unlocked by a scope");
-        assert_eq!(scope_mask(&all_scopes()) | ADMINISTRATOR, ALL, "every other bit is reachable through a scope");
+        assert_eq!(
+            scope_mask(&all_scopes()) | ADMINISTRATOR | RESTORE_HISTORY,
+            ALL,
+            "every other bit is reachable through a scope (restore_history never is)"
+        );
         assert!(is_scope("dms") && !is_scope("admin"));
     }
 
@@ -459,7 +499,7 @@ mod tests {
             BOT_ALWAYS | READ_HISTORY,
             "unknown kinds fail closed"
         );
-        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !ADMINISTRATOR);
+        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !(ADMINISTRATOR | RESTORE_HISTORY));
     }
 
     #[test]
@@ -488,6 +528,17 @@ mod tests {
         assert_eq!(parse(&MANAGE_THREADS.to_string()), Some(MANAGE_THREADS));
     }
 
+    #[test]
+    fn restore_history_is_management_class_and_never_a_bot_scope() {
+        assert_eq!(RESTORE_HISTORY, 1 << 37);
+        assert!(has(EVERYONE_RESTRICTED, RESTORE_HISTORY), "never on @everyone");
+        assert!(!has(DEFAULT_EVERYONE, RESTORE_HISTORY));
+        let every_scope: Vec<String> = SCOPES.iter().map(|(s, _)| s.to_string()).collect();
+        assert!(!has(scope_mask(&every_scope), RESTORE_HISTORY), "no app-token scope covers it");
+        assert!(has(ALL, RESTORE_HISTORY), "owners and administrators hold it");
+        assert_eq!(names(RESTORE_HISTORY), vec!["restore_history"]);
+    }
+
     #[derive(Deserialize)]
     struct NoBotsVector {
         name: String,
@@ -503,6 +554,28 @@ mod tests {
         for v in vectors {
             assert_eq!(no_bots_effective(&v.input), v.expected, "vector '{}'", v.name);
         }
+    }
+
+    #[test]
+    fn channel_scoped_matches_the_protocol_table() {
+        // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
+        assert_eq!(CHANNEL_SCOPED, 103_049_789_951);
+        let doc = include_str!("../protocol/permissions.md");
+        let section = doc.split("## Channel-scoped bits").nth(1).unwrap().split("\n## ").next().unwrap();
+        let from_doc = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| ")?.split(" | `").next()?.parse::<u32>().ok())
+            .fold(0u64, |acc, bit| acc | (1 << bit));
+        assert_eq!(from_doc, CHANNEL_SCOPED);
+        for room_level in
+            [ADMINISTRATOR, MANAGE_ROOM, CREATE_INVITES, KICK_MEMBERS, BAN_MEMBERS, MODERATE_MEMBERS, PURGE]
+        {
+            assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
+        }
+        for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
+            assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
+        }
+        assert_eq!(names(CHANNEL_SCOPED).len(), 26);
     }
 
     #[test]

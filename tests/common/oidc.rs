@@ -412,8 +412,23 @@ pub async fn until_callback(
     Ok(target.query_pairs().into_owned().collect())
 }
 
-/// A whole flow as a browser runs it; `token` = the session for `link`/`reauth` (also sent at the exchange).
+/// A whole flow as a browser runs it; `token` = the session for `link`/`reauth` (also sent at the exchange). A
+/// login that provisioned an account completes its date of birth right away, as the client's dialog does
+/// (PROTOCOL.md §5e; [`exchange`] leaves it out).
 pub async fn flow(node: &super::TestNode, purpose: &str, token: Option<&str>) -> Outcome {
+    let outcome = exchange(node, purpose, token).await;
+    if let Outcome::Exchange(StatusCode::OK, session) = &outcome
+        && let Some(access) = session["access_token"].as_str()
+    {
+        let body = json!({ "date_of_birth": super::ADULT_DATE_OF_BIRTH });
+        let (status, json) = node.put("/api/v1/users/me/date-of-birth", access, body).await;
+        assert!(status == StatusCode::OK || json["code"] == "age.date_of_birth_set", "{json}");
+    }
+    outcome
+}
+
+/// [`flow`] without completing the date of birth of a provisioned account.
+pub async fn exchange(node: &super::TestNode, purpose: &str, token: Option<&str>) -> Outcome {
     let (verifier, challenge) = pkce();
     let query = match until_callback(node, purpose, token, &challenge).await {
         Ok(q) => q,

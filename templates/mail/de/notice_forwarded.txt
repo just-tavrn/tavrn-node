@@ -1,0 +1,3 @@
+Subject: Meldung weitergeleitet ({case})
+
+Die gemeldeten Inhalte liegen auf einem anderen Node. Ihre Meldung (Vorgang {case}) wurde weitergeleitet an: {nodes}. Der Betreiber dieses Nodes entscheidet darüber.

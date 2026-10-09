@@ -224,9 +224,26 @@ async fn vapid_key_and_subscriptions_are_validated() {
     assert!(created.get("keys").is_none() && created.get("endpoint").is_none(), "keys and endpoint stay private");
     let (st, again) = s.node.put(SUBS, &s.bob.token, good.clone()).await;
     assert_eq!((st, &again["id"]), (StatusCode::OK, &created["id"]), "same endpoint: updated");
-    // Another account on the same browser takes the endpoint over.
+    // Another account cannot take over the endpoint of a live subscription (tavrn-node #9).
+    let (st, j) = s.node.put(SUBS, &s.alice.token, good.clone()).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::CONFLICT, Some("push.endpoint_taken")), "{j}");
+    let (_, mine) = s.node.get_auth(SUBS, &s.bob.token).await;
+    assert_eq!(mine.as_array().unwrap().len(), 1, "the owner keeps it: {mine}");
+    // The same account moves it to another of its devices.
+    let laptop = s.node.login("bob").await;
+    let (st, moved) = s.node.put(SUBS, &laptop.token, good.clone()).await;
+    assert_eq!(
+        (st, &moved["id"], moved["device_id"].as_str()),
+        (StatusCode::OK, &created["id"], Some(laptop.device_id.as_str()))
+    );
+    // Once the owner's device has no live session, the endpoint is stale and another account takes it over.
+    sqlx::query("UPDATE sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE device_id = $1")
+        .bind(&laptop.device_id)
+        .execute(&s.node.state.db)
+        .await
+        .unwrap();
     let (st, taken) = s.node.put(SUBS, &s.alice.token, good.clone()).await;
-    assert_eq!((st, &taken["id"]), (StatusCode::OK, &created["id"]));
+    assert_eq!((st, &taken["id"]), (StatusCode::OK, &created["id"]), "{taken}");
     let (_, mine) = s.node.get_auth(SUBS, &s.bob.token).await;
     assert_eq!(mine, json!([]));
     let (_, theirs) = s.node.get_auth(SUBS, &s.alice.token).await;
@@ -296,8 +313,16 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     assert_eq!(r.headers["ttl"], "21600");
     assert_eq!(r.headers["urgency"], "normal");
     assert_eq!(r.headers["topic"].len(), 22);
-    let row = &store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0];
-    assert!(row.last_used_at.is_some());
+    // The sender records the delivery after the push service answered: wait for it (tavrn-node #21).
+    let mut used = None;
+    for _ in 0..100 {
+        used = store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0].last_used_at.clone();
+        if used.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(used.is_some(), "a delivered push sets last_used_at");
 
     // Coalescing: the next message of the same conversation within 30 seconds does not push.
     send(&s, &s.channel, text("again")).await;
@@ -438,6 +463,8 @@ async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     let browser = Browser::new(&fake, "ok/bob");
     subscribe(&node, &bob_session, &browser).await;
     let bob = store::users::by_id(&node.state.db, &bob_session.user_id).await.unwrap().unwrap();
+    // Hints come only from nodes bob signed in on (FEDERATION.md §5.2).
+    store::federation::touch_target(&node.state.db, &bob.id, &bob_session.device_id, "b.test").await.unwrap();
     let handle = |incoming: Incoming| {
         let (state, bob) = (node.state.clone(), bob.clone());
         async move {
@@ -596,4 +623,76 @@ async fn thread_messages_push_to_followers_and_direct_mentions_only() {
     assert_eq!(p["type"], "message", "{p}");
     assert_eq!(p["conversation_id"], own.as_str());
     let _ = thread_id;
+}
+
+/// Web push of a private channel reaches only the members who may view it (roles and overrides at delivery time,
+/// the same check as the WebSocket fan-out and the `notify` hints), thread follows and `@everyone` included.
+#[tokio::test]
+async fn private_channels_push_only_to_members_who_can_view_them() {
+    let s = setup().await;
+    let browser = Browser::new(&s.fake, "ok/bob");
+    subscribe(&s.node, &s.bob, &browser).await;
+    let secret = plaintext_channel(&s, "secret").await;
+    // Bob follows a thread of the channel while he may still view it.
+    let threads = format!("/api/v1/rooms/{}/channels/{secret}/threads", s.room_id);
+    let (st, thread) = s.node.post(&threads, &s.bob.token, json!({ "title": "mine", "message": text("hi") })).await;
+    assert_eq!(st, StatusCode::CREATED, "{thread}");
+    let (_, room) = s.node.get_auth(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"].clone();
+    let deny = |deny: u64| {
+        json!({ "target_type": "channel", "target_id": secret, "subject_type": "role", "subject_id": everyone,
+                "allow": "0", "deny": deny.to_string() })
+    };
+    let overrides = format!("/api/v1/rooms/{}/overrides", s.room_id);
+    let (st, j) = s.node.put(&overrides, &s.alice.token, deny(tavrn_node::permissions::VIEW_CHANNEL)).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+
+    let everyone_msg = json!({ "content": { "type": "text", "body": "@everyone" }, "mentions_everyone": true });
+    send(&s, &secret, everyone_msg.clone()).await;
+    let mut followed = json!({ "content": { "type": "text", "body": "news" }, "thread_id": thread["id"] });
+    followed["mentions"] = json!([format!("bob@{DOMAIN}")]);
+    send(&s, &secret, followed).await;
+    s.fake.settle(&browser.path, 0).await;
+    // The open channel still pushes (the subscription works).
+    send(&s, &s.channel, text("open")).await;
+    s.fake.wait(&browser.path, 1).await;
+
+    // The deny is lifted: the channel pushes again.
+    let (st, j) = s.node.put(&overrides, &s.alice.token, deny(0)).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    send(&s, &secret, everyone_msg).await;
+    let got = s.fake.wait(&browser.path, 2).await;
+    assert_eq!(browser.open(&got[1])["conversation_id"], secret.as_str());
+}
+
+#[tokio::test]
+async fn gated_channels_push_nothing_to_minors() {
+    let node = test_node(DOMAIN).await;
+    let fake = FakePushService::start().await;
+    let alice = node.register("alice").await;
+    let sixteen = chrono::Utc::now().date_naive().checked_sub_months(chrono::Months::new(16 * 12)).unwrap();
+    let bob = node.register_born("bob", &sixteen.format("%Y-%m-%d").to_string()).await;
+    let room = node.plaintext_room(&alice.token, "Tavern").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let open = TestNode::text_channel(&room);
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    let (st, gated) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels"),
+            &alice.token,
+            json!({ "name": "late", "kind": "text", "encrypted": false, "age_gate": "adults_only" }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{gated}");
+    let browser = Browser::new(&fake, "ok/bob");
+    subscribe(&node, &bob, &browser).await;
+    let body = json!({ "content": { "type": "text", "body": "@everyone late", "mentions_everyone": true } });
+    let gated = gated["id"].as_str().unwrap();
+    let (st, m) = node.post(&format!("/api/v1/conversations/{gated}/messages"), &alice.token, body).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    fake.settle(&browser.path, 0).await;
+    let (st, m) = node.post(&format!("/api/v1/conversations/{open}/messages"), &alice.token, text("early")).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    fake.wait(&browser.path, 1).await;
 }

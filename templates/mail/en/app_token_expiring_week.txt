@@ -1,0 +1,10 @@
+Subject: An app token expires in 7 days
+
+Hello {name},
+
+a token of your application "{application}" expires on {expires_at}. After that the application can no longer sign in with it.
+
+Reset the token with a new lifetime or create a new one in the settings of the application:
+{link}
+
+You get this mail 7 days and 1 day before a token of one of your applications expires.

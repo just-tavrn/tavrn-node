@@ -93,6 +93,8 @@ pub async fn issue_token(
         target,
         profile_version,
         bot,
+        // `age.v1`: "18 or older: yes/no/unknown", the only age information that leaves this node (FEDERATION.md §2.2).
+        crate::age::claim(&state, &auth.user).await?,
     )?;
     store::federation::touch_target(&state.db, &auth.user.id, &auth.device_id, target).await?;
     tracing::info!(target, device = auth.device_id, "federation token issued");
@@ -135,7 +137,7 @@ pub async fn federated_login(
         state.login_limiter.check_all(&[format!("federated-ip:{ip}")]).await?;
     }
     let name = device_name(req.device_name.as_deref(), "Device of another node");
-    let login = remote::federated_login(&state, &req.token, &name, &client_header(&headers)).await?;
+    let login = remote::federated_login(&state, &ip, &req.token, &name, &client_header(&headers)).await?;
     Ok(Json(FederatedSessionResponse {
         status: SessionStatus::Ok,
         user: login.user.to_private(),
@@ -150,8 +152,13 @@ pub async fn federated_login(
 #[utoipa::path(post, path = "/api/v1/federation/inbox", security(("bearer" = [])),
     responses((status = 202), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails), (status = 403, body = ProblemDetails),
         (status = 404, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
-pub async fn inbox(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Result<StatusCode, ApiError> {
-    federation::inbox::receive(&state, &headers, body).await
+pub async fn inbox(
+    State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    federation::inbox::receive(&state, &ip, &headers, body).await
 }
 
 /// KeyPackage claim of another node on behalf of one of its users (FEDERATION.md §3.5), authenticated
@@ -161,10 +168,11 @@ pub async fn inbox(State(state): State<AppState>, headers: HeaderMap, body: Body
         (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn claim(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(federation::claims::serve(&state, &headers, body).await?))
+    Ok(Json(federation::claims::serve(&state, &ip, &headers, body).await?))
 }
 
 fn avatar_not_found() -> ApiError {

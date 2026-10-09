@@ -700,6 +700,7 @@ pub async fn create(
     state: &AppState,
     n: &ValidNotice,
     origin: Option<(&str, &str)>,
+    locale: Option<&str>,
 ) -> Result<(NoticeRow, bool), ApiError> {
     let locations = resolve(state, &n.locations).await?;
     let target = locations.iter().find(|l| l.local && l.author_id.is_some());
@@ -740,19 +741,20 @@ pub async fn create(
         None => json!({}),
     };
     event(&state.db, &id, None, if origin.is_some() { "forwarded_in" } else { "received" }, detail).await?;
+    if locale.is_some() {
+        sqlx::query("UPDATE legal_notices SET reporter_locale = $1 WHERE id = $2")
+            .bind(locale)
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+    }
     // The status link is only in the mail: the case id alone never opens the status page.
     let link = format!("{}/legal/notice/{id}?token={token}", state.mailer.public_url());
-    let body = match origin {
-        None => format!(
-            "We received your notice. Case: {id}\n\nYou can follow the case here:\n{link}\n\nKeep this link private: it is the only way to open the status page.\n\nThis mail was sent because this address was given in a notice on {}.",
-            state.config.domain
-        ),
-        Some((node, _)) => format!(
-            "The node {node} forwarded your notice to {}, where the reported content is hosted. Case on this node: {id}\n\nThe operator of {} will review it and inform you of the decision.",
-            state.config.domain, state.config.domain
-        ),
+    let (template, vars) = match origin {
+        None => ("notice_received", [("case", id.as_str()), ("link", link.as_str())]),
+        Some((node, _)) => ("notice_forwarded_in", [("case", id.as_str()), ("origin", node)]),
     };
-    state.mailer.send(&n.reporter_email, &format!("Notice received ({id})"), &body).await;
+    state.mailer.send_template(&n.reporter_email, locale, template, &vars).await;
     event(&state.db, &id, None, "mail.reporter", json!({ "kind": "confirmation" })).await?;
     let row = by_id(&state.db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("case missing")))?;
     Ok((row, true))
@@ -1011,18 +1013,10 @@ pub async fn clear_profile(state: &AppState, user: &UserRow) -> Result<(), ApiEr
     crate::profile::announce_user(state, &user.id).await
 }
 
-/// The redress text appended to every statement of reasons (DSA Art. 17(3)(f)).
-fn redress(state: &AppState, case_id: &str, deadline: &str) -> String {
-    format!(
-        "This decision was taken by a person, not by automated means.\n\nYou can answer with a counter-notice until {deadline} \
-         in the app (Settings → Legal & privacy) or at {}/settings/legal. You may also use an out-of-court dispute settlement \
-         body or the courts. Case: {case_id}",
-        state.mailer.public_url()
-    )
-}
-
 /// Sends the statement of reasons to an uploader: stored with the case, an in-app notification (`legal.statement`)
 /// and an e-mail when the account has one.
+/// The statement names the decision, the legal basis, the reasons and the redress (DSA Art. 17(3)(f)) in the uploader's
+/// language (`statement_content_removed`, `statement_account_disabled`).
 async fn send_statement(
     state: &AppState,
     row: &NoticeRow,
@@ -1032,11 +1026,13 @@ async fn send_statement(
     deadline: &str,
     actor: &str,
 ) -> Result<(), ApiError> {
-    let text = format!(
-        "Decision: {decision}\nLegal basis of the notice: {}\n\n{statement}\n\n{}",
-        row.basis,
-        redress(state, &row.id, deadline)
-    );
+    let template =
+        if decision == "account disabled" { "statement_account_disabled" } else { "statement_content_removed" };
+    let locale = store::users::locale(&state.db, uploader_id).await?;
+    let vars =
+        [("case", row.id.as_str()), ("basis", row.basis.as_str()), ("statement", statement), ("deadline", deadline)];
+    let mail = state.mailer.render(locale.as_deref(), template, &vars);
+    let text = mail.body.clone();
     sqlx::query("UPDATE legal_notices SET statement = $1, statement_at = $2 WHERE id = $3")
         .bind(&text)
         .bind(util::now())
@@ -1053,21 +1049,35 @@ async fn send_statement(
     if let Some(user) = store::users::by_id(&state.db, uploader_id).await?
         && let Some(email) = user.email.as_deref().filter(|_| user.domain == state.config.domain)
     {
-        state.mailer.send(email, &format!("Statement of reasons ({})", row.id), &text).await;
+        state.mailer.send_rendered(email, &mail).await;
         event(&state.db, &row.id, Some(actor), "mail.uploader", json!({ "user_id": uploader_id })).await?;
     }
     Ok(())
 }
 
+/// The language of a case's reporter (`None` = English).
+async fn reporter_locale(state: &AppState, case_id: &str) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_scalar::<_, Option<String>>("SELECT reporter_locale FROM legal_notices WHERE id = $1")
+        .bind(case_id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten())
+}
+
+/// Mails the reporter the template `template` (the case id is added as `case`) and records it on the case.
 async fn mail_reporter(
     state: &AppState,
     row: &NoticeRow,
     actor: &str,
-    subject: &str,
-    body: &str,
+    template: &str,
+    vars: &[(&str, &str)],
 ) -> Result<(), ApiError> {
-    state.mailer.send(&row.reporter_email, &format!("{subject} ({})", row.id), body).await;
-    event(&state.db, &row.id, Some(actor), "mail.reporter", json!({ "subject": subject })).await
+    let locale = reporter_locale(state, &row.id).await?;
+    let mut all = vec![("case", row.id.as_str())];
+    all.extend_from_slice(vars);
+    let mail = state.mailer.send_template(&row.reporter_email, locale.as_deref(), template, &all).await;
+    event(&state.db, &row.id, Some(actor), "mail.reporter", json!({ "subject": mail.subject, "template": template }))
+        .await
 }
 
 /// Runs an admin action on a case.
@@ -1184,14 +1194,7 @@ pub async fn act(
             for u in &uploaders {
                 send_statement(state, &row, u, "content removed", &statement, &deadline, actor).await?;
             }
-            mail_reporter(
-                state,
-                &row,
-                actor,
-                "Content removed",
-                &format!("The reported content was removed. Case: {}\n\n{reason}", row.id),
-            )
-            .await?;
+            mail_reporter(state, &row, actor, "notice_content_removed", &[("reason", &reason)]).await?;
         }
         "disable_account" => {
             let user_id = a
@@ -1239,14 +1242,7 @@ pub async fn act(
             )
             .await?;
             send_statement(state, &row, &target.id, "account disabled", &statement, &deadline, actor).await?;
-            mail_reporter(
-                state,
-                &row,
-                actor,
-                "Account disabled",
-                &format!("The account was disabled. Case: {}\n\n{reason}", row.id),
-            )
-            .await?;
+            mail_reporter(state, &row, actor, "notice_account_disabled", &[("reason", &reason)]).await?;
             done.push(target.address());
         }
         "reject" => {
@@ -1255,14 +1251,7 @@ pub async fn act(
             }
             update(state, &row.id, "rejected", Some(&reason), true).await?;
             event(&state.db, &row.id, Some(actor), "reject", json!({ "reason": reason })).await?;
-            mail_reporter(
-                state,
-                &row,
-                actor,
-                "Notice rejected",
-                &format!("Your notice was rejected. Case: {}\n\nReason: {reason}", row.id),
-            )
-            .await?;
+            mail_reporter(state, &row, actor, "notice_rejected", &[("reason", &reason)]).await?;
         }
         "forward" => {
             if !state.config.federation_enabled {
@@ -1332,18 +1321,7 @@ pub async fn act(
                 let next = if row.state == "received" { "in_review" } else { row.state.as_str() };
                 update(state, &row.id, next, None, false).await?;
                 event(&state.db, &row.id, Some(actor), "forward", json!({ "nodes": done, "skipped": skipped })).await?;
-                mail_reporter(
-                    state,
-                    &row,
-                    actor,
-                    "Notice forwarded",
-                    &format!(
-                        "The reported content is hosted on another node. Your notice (case {}) was forwarded to: {}. That node's operator decides on it.",
-                        row.id,
-                        done.join(", ")
-                    ),
-                )
-                .await?;
+                mail_reporter(state, &row, actor, "notice_forwarded", &[("nodes", &done.join(", "))]).await?;
             }
         }
         "set_state" => {
@@ -1491,11 +1469,8 @@ pub async fn submit_counter(
         state,
         &row,
         &user.id,
-        "Counter-notice received",
-        &format!(
-            "The uploader answered your notice (case {}) with a counter-notice:\n\n{statement}\n\nSigned: {signature}\n\nThe operator of {} will decide.",
-            row.id, state.config.domain
-        ),
+        "counter_notice_received",
+        &[("statement", statement.as_str()), ("signature", signature.as_str())],
     )
     .await?;
     of_uploader(state, &user.id).await?.into_iter().find(|n| n.case_id == row.id).ok_or_else(not_found)
@@ -1556,12 +1531,14 @@ pub async fn decide_counter(
         json!({ "decision": decision }),
     )
     .await?;
-    let text = format!("Decision on the counter-notice of case {}: {decision}\n\n{reason}", row.id);
-    mail_reporter(state, &row, &admin.id, "Counter-notice decided", &text).await?;
+    let template = if decision == "restore" { "counter_restored" } else { "counter_upheld" };
+    mail_reporter(state, &row, &admin.id, template, &[("reason", &reason)]).await?;
     if let Some(user) = store::users::by_id(&state.db, &counter.user_id).await? {
         state.hub.users(vec![user.id.clone()], "legal.statement", json!({ "case_id": row.id, "decision": decision }));
         if let Some(email) = user.email.as_deref() {
-            state.mailer.send(email, &format!("Counter-notice decided ({})", row.id), &text).await;
+            let locale = store::users::locale(&state.db, &user.id).await?;
+            let vars = [("case", row.id.as_str()), ("reason", reason.as_str())];
+            state.mailer.send_template(email, locale.as_deref(), template, &vars).await;
             event(&state.db, &row.id, Some(&admin.id), "mail.uploader", json!({ "user_id": user.id })).await?;
         }
     }
@@ -1616,7 +1593,7 @@ pub async fn receive(state: &AppState, iss: &str, payload: &Value) -> Result<&'s
         captcha_token: None,
     };
     let valid = validate(&req).map_err(|e| invalid(&e.to_string()))?;
-    let (row, _) = create(state, &valid, Some((iss, &origin_case))).await?;
+    let (row, _) = create(state, &valid, Some((iss, &origin_case)), None).await?;
     store::rooms::audit(
         &state.db,
         None,

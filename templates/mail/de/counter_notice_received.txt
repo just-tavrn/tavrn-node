@@ -1,0 +1,9 @@
+Subject: Gegendarstellung erhalten ({case})
+
+Die hochladende Person hat auf Ihre Meldung (Vorgang {case}) mit einer Gegendarstellung geantwortet:
+
+{statement}
+
+Unterzeichnet: {signature}
+
+Der Betreiber von {domain} entscheidet darüber.

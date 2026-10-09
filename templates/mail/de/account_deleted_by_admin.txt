@@ -1,0 +1,5 @@
+Subject: Konto gelöscht
+
+Das Konto {address} auf {domain} wurde von einem Node-Admin gelöscht.
+
+Ein Node-Admin kann die Löschung bis {purge_after} rückgängig machen; danach wird das Konto endgültig entfernt und der Benutzername wird frei.

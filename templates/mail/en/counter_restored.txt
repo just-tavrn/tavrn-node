@@ -1,0 +1,5 @@
+Subject: Counter-notice decided ({case})
+
+Decision on the counter-notice of case {case}: restore
+
+{reason}

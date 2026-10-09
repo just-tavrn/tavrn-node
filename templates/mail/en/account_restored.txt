@@ -1,0 +1,3 @@
+Subject: Account restored
+
+A node admin restored the account {address}. Sign in again to use it.

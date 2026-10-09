@@ -52,7 +52,7 @@ async fn registration_requires_enrollment_before_the_account_is_usable() {
             Method::POST,
             "/api/v1/auth/register",
             None,
-            Some(json!({ "username": "alice", "password": password("alice") })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": password("alice") })),
         )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{reg}");
@@ -130,7 +130,7 @@ async fn accounts_without_factor_land_in_enrollment_at_login() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "username": "alice", "password": "wrong-wrong-wrong" })),
+            Some(json!({ "username": "alice", "date_of_birth": "1990-01-01", "password": "wrong-wrong-wrong" })),
         )
         .await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.invalid_credentials")));

@@ -1,0 +1,10 @@
+Subject: Begründung der Entscheidung ({case})
+
+Entscheidung: Konto gesperrt
+Rechtsgrundlage der Meldung: {basis}
+
+{statement}
+
+Diese Entscheidung hat ein Mensch getroffen, nicht ein automatisiertes Verfahren.
+
+Du kannst bis {deadline} mit einer Gegendarstellung antworten, in der App (Einstellungen → Rechtliches & Datenschutz) oder unter {public_url}/settings/legal. Du kannst dich auch an eine außergerichtliche Streitbeilegungsstelle oder an die Gerichte wenden. Vorgang: {case}

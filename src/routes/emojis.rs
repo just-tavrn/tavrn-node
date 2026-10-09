@@ -286,13 +286,20 @@ pub async fn image(
     Ok(file_response(data, image_type(mime), false))
 }
 
+/// The proxy for emojis and sounds of other nodes (`?host=`) answers without authentication and may fetch from
+/// other nodes: limited per client address (`429`).
+pub(crate) fn proxy_limit(state: &AppState, ip: &str) -> Result<(), ApiError> {
+    state.media_proxy_limiter.check_all(&[format!("ip:{ip}")])
+}
+
 /// The image of any emoji of this node, room or personal, without authentication: content of
 /// every conversation references emojis by id (`<:name:ID@host>`), and readers on every node load them from
 /// here. Ids are random; nothing about rooms or owners is revealed. `?still=1`: the still variant.
 #[utoipa::path(get, path = "/api/v1/emojis/{emoji_id}/image", params(("emoji_id" = String, Path), ImageQuery),
-    responses((status = 200, description = "WebP (or PNG/GIF/JPEG of emojis uploaded before conversion)"), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, description = "WebP (or PNG/GIF/JPEG of emojis uploaded before conversion)"), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn public_image(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     Path(emoji_id): Path<String>,
     Query(q): Query<ImageQuery>,
     headers: HeaderMap,
@@ -305,6 +312,7 @@ pub async fn public_image(
         if let Some(r) = not_modified(&headers, &tag) {
             return Ok(r);
         }
+        proxy_limit(&state, &ip)?;
         let cached = crate::emoji_cache::get(&state, kind, host, &emoji_id).await?;
         return Ok(file_response_tagged(cached.data, image_type(&cached.mime), true, Some(&tag)));
     }

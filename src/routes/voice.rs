@@ -75,6 +75,7 @@ async fn voice_channel(
     if channel.kind != "voice" {
         return Err(bad("voice.not_voice_channel", "This is not a voice channel"));
     }
+    access::require_age(&access, &channel)?;
     let perms = access::channel_perms(state, &access, &channel, &user.id).await?;
     Ok(VoiceChannel { access, channel, perms })
 }
@@ -606,10 +607,14 @@ pub async fn move_all(
         if participants.is_empty() {
             continue;
         }
-        let allowed = match voice_channel(&state, &room_id, &key.1, &auth.user).await {
-            Ok(vc) => vc.has(p::MOVE_MEMBERS),
-            Err(_) => false,
+        let (visible, allowed) = match voice_channel(&state, &room_id, &key.1, &auth.user).await {
+            Ok(vc) => (vc.has(p::VIEW_CHANNEL), vc.has(p::MOVE_MEMBERS)),
+            Err(_) => (false, false),
         };
+        // Who sits in a channel the mover cannot see stays hidden (like `GET /rooms/{id}/voice`).
+        if !visible {
+            continue;
+        }
         let mut seen = Vec::new();
         for participant in participants {
             if seen.contains(&participant.user_id) {
@@ -1051,9 +1056,10 @@ pub async fn update_sound(
 /// The audio of any clip of this node, room or personal, without authentication: players of
 /// every node fetch clips they are allowed to play from here. Ids are random; nothing else is revealed.
 #[utoipa::path(get, path = "/api/v1/sounds/{sound_id}/audio", params(("sound_id" = String, Path), SoundQuery),
-    responses((status = 200, description = "Audio file"), (status = 304), (status = 404, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
+    responses((status = 200, description = "Audio file"), (status = 304), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
 pub async fn public_sound_audio(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     Path(sound_id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<SoundQuery>,
     headers: HeaderMap,
@@ -1071,6 +1077,7 @@ pub async fn public_sound_audio(
         if let Some(r) = crate::routes::emojis::not_modified(&headers, &tag) {
             return Ok(r);
         }
+        crate::routes::emojis::proxy_limit(&state, &ip)?;
         let cached = crate::emoji_cache::get(&state, crate::emoji_cache::CacheKind::Sound, host, &sound_id).await?;
         return Ok(crate::routes::emojis::file_response_tagged(
             cached.data,

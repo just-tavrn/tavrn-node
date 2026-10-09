@@ -115,3 +115,40 @@ pub async fn verify_opt(
         None => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::Value;
+
+    /// The protocol's reference values (`testvectors/encryption.json`): the login proof the node checks here, and the
+    /// content the node's ciphertext checks (ENCRYPTION.md §5.3) must accept in every form, with and without the signed
+    /// context of §5.2, and history shares.
+    #[test]
+    fn published_vectors() {
+        let v: Value =
+            serde_json::from_str(include_str!("../protocol/testvectors/encryption.json")).expect("vectors JSON");
+        let s = |a: &str, b: &str| v[a][b].as_str().expect("string").to_owned();
+        let d = |a: &str, b: &str| URL_SAFE_NO_PAD.decode(s(a, b)).expect("base64url");
+        let key: [u8; 32] = d("device_attestation", "device_public_key").try_into().expect("32 bytes");
+        let proof = d("device_login", "proof");
+        let (device, user, nonce) =
+            (s("device_login", "device_id"), s("device_login", "user_address"), s("device_login", "nonce"));
+        assert_eq!(
+            tavrn_crypto::device::login_proof_message(&device, &user, &nonce).unwrap(),
+            d("device_login", "message")
+        );
+        tavrn_crypto::device::verify_login_proof(&key, &device, &user, &nonce, &proof).expect("valid proof");
+        assert!(tavrn_crypto::device::verify_login_proof(&key, &device, &user, "other-nonce", &proof).is_err());
+        assert!(
+            tavrn_crypto::device::verify_login_proof(&key, &device, "mallory@node.example", &nonce, &proof).is_err()
+        );
+        for (section, field) in
+            [("content", "content"), ("content_context", "content"), ("history_share", "ciphertext")]
+        {
+            let header = tavrn_crypto::content_header(&s(section, field)).expect(section);
+            assert_eq!(Some(header.epoch), v[section]["epoch"].as_u64(), "{section}");
+        }
+    }
+}

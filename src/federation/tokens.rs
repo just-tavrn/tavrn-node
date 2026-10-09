@@ -63,6 +63,9 @@ pub struct FederationClaims {
     /// Bots only: the effective scopes of the app token; absent (older home node) = all scopes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+    /// `age.v1` (§2.2): 18 or older by the home node's date of birth; null = unknown (bots: their owner's value).
+    /// Always sent; the hosting node treats null and absent as "below 18".
+    pub age_over_18: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +79,9 @@ struct FederationExtra {
     app: Option<String>,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    /// A type other than boolean or null makes the token invalid.
+    #[serde(default)]
+    age_over_18: Option<bool>,
 }
 
 /// The bot claims of a federation token: owner address, application ULID and effective scopes.
@@ -126,6 +132,7 @@ fn std_claims(state: &AppState, sub: String, aud: &str, typ: &str, ttl: i64) -> 
 }
 
 /// Signs a federation token of a local user for `target`.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_federation_token(
     state: &AppState,
     address: String,
@@ -134,6 +141,7 @@ pub fn issue_federation_token(
     target: &str,
     profile_version: i64,
     bot: Option<BotClaims<'_>>,
+    age_over_18: Option<bool>,
 ) -> Result<String, ApiError> {
     let claims = FederationClaims {
         std: std_claims(state, address, target, "federation", FEDERATION_TTL_SECS),
@@ -143,6 +151,7 @@ pub fn issue_federation_token(
         pv: profile_version,
         app: bot.as_ref().map(|b| b.app.to_string()),
         scopes: bot.as_ref().map(|b| b.scopes.to_vec()),
+        age_over_18,
     };
     sign(state, &claims)
 }
@@ -255,6 +264,8 @@ pub struct FederationToken {
     pub app: Option<String>,
     /// Bots: the known scopes of the token (unknown strings dropped); `None` = all scopes.
     pub scopes: Option<Vec<String>>,
+    /// The signed age claim (§2.2); `None` = unknown or absent.
+    pub age_over_18: Option<bool>,
 }
 
 /// Verifies a federation token of `iss` (§2.5): §2.1, `typ`, `sub` domain = `iss`, `kind`/`owner`.
@@ -300,6 +311,7 @@ pub async fn verify_federation_token(state: &AppState, token: &str, iss: &str) -
         pv: extra.pv,
         app: extra.app,
         scopes,
+        age_over_18: extra.age_over_18,
     })
 }
 

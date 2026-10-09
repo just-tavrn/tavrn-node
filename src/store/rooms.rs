@@ -9,13 +9,12 @@ use crate::{
     util::{now, ulid},
 };
 
-const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days";
+const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate, history_restore";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
-const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.sync_with_category, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags";
+const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
 const OVERRIDE_COLS: &str =
     "id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny";
-const MEMBER_COLS: &str =
-    "room_id, user_id, nickname, joined_at, rules_accepted_at, timeout_until, avatar_media_id, avatar_animated, bio";
+const MEMBER_COLS: &str = "room_id, user_id, nickname, joined_at, rules_accepted_at, timeout_until, avatar_media_id, avatar_animated, bio, key_reset_at, history_restored_at";
 
 /// `system_name` of the welcome channel (`kind = 'system'`).
 pub const WELCOME: &str = "welcome";
@@ -160,14 +159,29 @@ pub async fn rooms_of_user(db: &Pool, user_id: &str) -> Result<Vec<Room>, ApiErr
 }
 
 /// Public rooms their owners listed in the directory (FEDERATION.md §7.3), newest first.
-pub async fn public_rooms(db: &Pool, limit: i64) -> Result<Vec<Room>, ApiError> {
+/// Discoverable public rooms; rooms with an age gate only when `include_gated` (an adult asks, PROTOCOL.md §5e).
+pub async fn public_rooms(db: &Pool, limit: i64, include_gated: bool) -> Result<Vec<Room>, ApiError> {
     let rooms: Vec<Room> = sqlx::query_as(&format!(
-        "SELECT {ROOM_COLS} FROM rooms WHERE join_mode = 'public' AND discoverable = 1 ORDER BY created_at DESC LIMIT $1"
+        "SELECT {ROOM_COLS} FROM rooms WHERE join_mode = 'public' AND discoverable = 1 AND ($2 = 1 OR age_gate = 'none')
+         ORDER BY created_at DESC LIMIT $1"
     ))
     .bind(limit)
+    .bind(i64::from(include_gated))
     .fetch_all(db)
     .await?;
     Ok(rooms.into_iter().map(Room::with_icon).collect())
+}
+
+/// Sets a room's age gate (`none` | `adults_only`, validated by the caller).
+pub async fn set_room_age_gate(db: &Pool, room_id: &str, gate: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE rooms SET age_gate = $1 WHERE id = $2").bind(gate).bind(room_id).execute(db).await?;
+    Ok(())
+}
+
+/// Sets a channel's own age gate (`none` | `adults_only`, validated by the caller).
+pub async fn set_channel_age_gate(db: &Pool, channel_id: &str, gate: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE channels SET age_gate = $1 WHERE id = $2").bind(gate).bind(channel_id).execute(db).await?;
+    Ok(())
 }
 
 pub async fn rooms_owned_count(db: &Pool, user_id: &str) -> Result<i64, ApiError> {
@@ -633,7 +647,6 @@ pub struct ChannelUpdate<'a> {
     pub topic: Option<&'a str>,
     pub category_id: Option<Option<&'a str>>,
     pub position: Option<i64>,
-    pub sync_with_category: Option<bool>,
     pub slowmode_secs: Option<i64>,
     pub bitrate_kbps: Option<i64>,
     pub user_limit: Option<i64>,
@@ -645,13 +658,12 @@ pub async fn update_channel(db: &Pool, channel_id: &str, u: ChannelUpdate<'_>) -
     sqlx::query(
         "UPDATE channels SET system_name = CASE WHEN $1 IS NOT NULL AND $1 <> name THEN NULL ELSE system_name END,
          name = COALESCE($1, name), topic = COALESCE($2, topic), position = COALESCE($3, position),
-         sync_with_category = COALESCE($4, sync_with_category), slowmode_secs = COALESCE($5, slowmode_secs),
-         bitrate_kbps = COALESCE($6, bitrate_kbps), user_limit = COALESCE($7, user_limit) WHERE id = $8",
+         slowmode_secs = COALESCE($4, slowmode_secs),
+         bitrate_kbps = COALESCE($5, bitrate_kbps), user_limit = COALESCE($6, user_limit) WHERE id = $7",
     )
     .bind(u.name)
     .bind(u.topic)
     .bind(u.position)
-    .bind(u.sync_with_category.map(|b| b as i64))
     .bind(u.slowmode_secs)
     .bind(u.bitrate_kbps)
     .bind(u.user_limit)
@@ -732,13 +744,6 @@ pub async fn set_override(db: &Pool, o: SetOverride<'_>) -> Result<(), ApiError>
         .bind(o.subject_id)
         .execute(&mut *tx)
         .await?;
-    if o.target_type == "channel" {
-        // Overrides of its own mean the channel no longer follows its category.
-        sqlx::query("UPDATE channels SET sync_with_category = 0 WHERE id = $1")
-            .bind(o.target_id)
-            .execute(&mut *tx)
-            .await?;
-    }
     if o.allow != 0 || o.deny != 0 || upload_allow != 0 || upload_deny != 0 {
         sqlx::query("INSERT INTO permission_overrides (id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
             .bind(ulid())
@@ -831,18 +836,6 @@ pub async fn members_of_domain(db: &Pool, room_id: &str, domain: &str) -> Result
     )
     .bind(room_id)
     .bind(domain)
-    .fetch_all(db)
-    .await?;
-    rows.iter().map(|r| r.try_get::<String, _>("id").map_err(Into::into)).collect()
-}
-
-/// Members of a room whose home domain is not `own_domain`.
-pub async fn remote_member_ids(db: &Pool, room_id: &str, own_domain: &str) -> Result<Vec<String>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT m.user_id AS id FROM room_members m JOIN users u ON u.id = m.user_id WHERE m.room_id = $1 AND u.domain <> $2",
-    )
-    .bind(room_id)
-    .bind(own_domain)
     .fetch_all(db)
     .await?;
     rows.iter().map(|r| r.try_get::<String, _>("id").map_err(Into::into)).collect()
@@ -1004,6 +997,23 @@ pub async fn bans(db: &Pool, room_id: Option<&str>) -> Result<Vec<Ban>, ApiError
 }
 
 // ---------------------------------------------------------------- Audit-Log
+
+/// Sets a room's message retention (`None` = the node's value, PROTOCOL.md §7f).
+pub async fn set_message_retention(db: &Pool, room_id: &str, days: Option<i64>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE rooms SET message_retention_days = $1 WHERE id = $2")
+        .bind(days)
+        .bind(room_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Rooms with an own message retention: (room id, days).
+pub async fn message_retention_rooms(db: &Pool) -> Result<Vec<(String, i64)>, ApiError> {
+    Ok(sqlx::query_as("SELECT id, message_retention_days FROM rooms WHERE message_retention_days > 0 ORDER BY id")
+        .fetch_all(db)
+        .await?)
+}
 
 pub async fn audit(
     db: &Pool,

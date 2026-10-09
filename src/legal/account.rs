@@ -266,6 +266,7 @@ async fn end_memberships(state: &AppState, user: &UserRow) -> Result<(Vec<String
                     json!({ "conversation_id": conv.id, "user_id": user.id }),
                 );
                 crate::e2ee::user_left_conversation(state, &conv.id, user).await?;
+                crate::calls::drop_member(state, &conv.id, &user.id).await;
                 people.extend(others);
             }
         }
@@ -467,13 +468,11 @@ pub async fn delete_local(
     )
     .await?;
     if let Some(email) = user.email.as_deref() {
-        let body = format!(
-            "The account {} on {} was deleted{}.\n\nA node admin can undo the deletion until {purge_after}; after that the account is erased and the username becomes free.",
-            user.address(),
-            state.config.domain,
-            if admin.is_some() { " by a node admin" } else { "" }
-        );
-        state.mailer.send(email, "Account deleted", &body).await;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        let template = if admin.is_some() { "account_deleted_by_admin" } else { "account_deleted" };
+        let address = user.address();
+        let vars = [("address", address.as_str()), ("purge_after", purge_after.as_str())];
+        state.mailer.send_template(email, locale.as_deref(), template, &vars).await;
     }
     let row = by_id(&state.db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("deletion missing")))?;
     if delete_messages {
@@ -611,12 +610,14 @@ pub async fn receive_remote(
     // The stub goes now: nothing refers to it any more (a later federated login creates a new one).
     if let Err(e) = sqlx::query("DELETE FROM users WHERE id = $1").bind(&user.id).execute(&state.db).await {
         tracing::warn!(error = %e, user = user.address(), "remote stub not deletable, renamed");
-        sqlx::query("UPDATE users SET username = $1, deleted_at = $2, disabled_at = $2 WHERE id = $3")
-            .bind(tombstone_username())
-            .bind(util::now())
-            .bind(&user.id)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET username = $1, deleted_at = $2, disabled_at = $2, age_over_18 = NULL WHERE id = $3",
+        )
+        .bind(tombstone_username())
+        .bind(util::now())
+        .bind(&user.id)
+        .execute(&state.db)
+        .await?;
     }
     if delete_messages {
         spawn_redaction(state, id);
@@ -663,14 +664,9 @@ pub async fn undelete(state: &AppState, admin: &UserRow, user_id: &str) -> Resul
     )
     .await?;
     if let Some(email) = user.email.as_deref() {
-        state
-            .mailer
-            .send(
-                email,
-                "Account restored",
-                &format!("A node admin restored the account {}. Sign in again to use it.", user.address()),
-            )
-            .await;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        let address = user.address();
+        state.mailer.send_template(email, locale.as_deref(), "account_restored", &[("address", &address)]).await;
     }
     Ok(by_id(&state.db, &row.id).await?.unwrap_or(row).to_api(true))
 }
@@ -794,11 +790,13 @@ async fn purge(state: &AppState, d: &DeletionRow) -> Result<(), ApiError> {
     {
         // Something still refers to the row: free the username at least, the rest stays disabled.
         tracing::warn!(error = %e, user = d.user_id, "deleted account not erasable, username released");
-        sqlx::query("UPDATE users SET username = $1, email = NULL, password_hash = NULL WHERE id = $2")
-            .bind(tombstone_username())
-            .bind(&d.user_id)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET username = $1, email = NULL, password_hash = NULL, date_of_birth = NULL WHERE id = $2",
+        )
+        .bind(tombstone_username())
+        .bind(&d.user_id)
+        .execute(&state.db)
+        .await?;
         sqlx::query("DELETE FROM external_identities WHERE user_id = $1").bind(&d.user_id).execute(&state.db).await?;
     }
     sqlx::query(

@@ -432,6 +432,7 @@ pub async fn update(
 ) -> Result<Json<Conversation>, ApiError> {
     let conv = access::direct(&state, &conversation_id, &auth.user.id).await?;
     require_group(row(&conv)?)?;
+    crate::routes::messages::check_direct_write(&state, &auth, &conv).await?;
     let name = clean_name(req.name.as_deref())?;
     store::social::set_name(&state.db, &conv.id, name.as_deref()).await?;
     let updated = store::social::conversation(&state.db, &conv.id)
@@ -454,6 +455,7 @@ pub async fn add_member(
     let conv = access::direct(&state, &conversation_id, &auth.user.id).await?;
     let current = row(&conv)?;
     require_group(current)?;
+    crate::routes::messages::check_direct_write(&state, &auth, &conv).await?;
     let user = resolve(&state, &req.user).await?;
     if user.is_bot() {
         return Err(bad("app.bot_forbidden", "Bots cannot be in group DMs"));
@@ -552,6 +554,7 @@ pub async fn decline(
         state.hub.users(remaining, "conversation.update", json!({ "conversation": conversation }));
     }
     e2ee::user_left_conversation(&state, &conv.id, &auth.user).await?;
+    crate::calls::drop_member(&state, &conv.id, &auth.user.id).await;
     let sender = match &current.creator_id {
         Some(id) => store::users::by_id(&state.db, id).await?,
         None => None,
@@ -595,5 +598,6 @@ pub async fn remove_member(
         state.hub.users(remaining, "conversation.update", json!({ "conversation": conversation }));
     }
     e2ee::user_left_conversation(&state, &conv.id, &user).await?;
+    crate::calls::drop_member(&state, &conv.id, &user.id).await;
     Ok(StatusCode::NO_CONTENT)
 }

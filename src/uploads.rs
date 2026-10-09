@@ -377,15 +377,17 @@ impl<'a> UploadOverride<'a> {
     }
 }
 
-/// Effective categories of a member: the highest role with a setting wins (else `@everyone`), then
-/// the (already chosen) overrides on top: `@everyone` override, all role overrides (deny, then allow),
-/// the member's own override. Owners, node admins and administrators may upload every category.
+/// Effective categories of a member: the highest role with a setting wins (else `@everyone`), then the
+/// override layers on top in order (the category's, then the channel's own; protocol permissions.md "Upload
+/// categories"), each as `@everyone` override, all role overrides (deny, then allow), the member's own override.
+/// A category a layer neither allows nor denies keeps the value of the layer below. Owners, node admins and
+/// administrators may upload every category.
 pub fn effective(
     privileged: bool,
     everyone_id: &str,
     everyone: Categories,
     member_roles: &[RoleCategories<'_>],
-    overrides: &[UploadOverride<'_>],
+    layers: &[&[UploadOverride<'_>]],
     user_id: &str,
 ) -> Categories {
     if privileged {
@@ -396,19 +398,21 @@ pub fn effective(
         .filter_map(|r| r.categories.map(|c| (r.position, r.id, c)))
         .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
         .map_or(everyone, |(_, _, c)| c);
-    if let Some(o) = overrides.iter().find(|o| o.subject_type == SubjectType::Role && o.subject_id == everyone_id) {
-        cats = (cats & !o.deny) | o.allow;
-    }
-    let (mut allow, mut deny) = (0, 0);
-    for o in overrides.iter().filter(|o| o.subject_type == SubjectType::Role) {
-        if member_roles.iter().any(|r| r.id == o.subject_id) {
-            allow |= o.allow;
-            deny |= o.deny;
+    for overrides in layers {
+        if let Some(o) = overrides.iter().find(|o| o.subject_type == SubjectType::Role && o.subject_id == everyone_id) {
+            cats = (cats & !o.deny) | o.allow;
         }
-    }
-    cats = (cats & !deny) | allow;
-    if let Some(o) = overrides.iter().find(|o| o.subject_type == SubjectType::Member && o.subject_id == user_id) {
-        cats = (cats & !o.deny) | o.allow;
+        let (mut allow, mut deny) = (0, 0);
+        for o in overrides.iter().filter(|o| o.subject_type == SubjectType::Role) {
+            if member_roles.iter().any(|r| r.id == o.subject_id) {
+                allow |= o.allow;
+                deny |= o.deny;
+            }
+        }
+        cats = (cats & !deny) | allow;
+        if let Some(o) = overrides.iter().find(|o| o.subject_type == SubjectType::Member && o.subject_id == user_id) {
+            cats = (cats & !o.deny) | o.allow;
+        }
     }
     cats & ALL
 }
@@ -500,9 +504,25 @@ mod tests {
             UploadOverride { subject_type: SubjectType::Role, subject_id: "high", allow: AUDIO, deny: 0 },
             UploadOverride { subject_type: SubjectType::Role, subject_id: "other-role", allow: OTHER, deny: 0 },
         ];
-        assert_eq!(effective(false, "e", DOCUMENTS, &roles, &overrides, "u"), VIDEO | AUDIO);
+        assert_eq!(effective(false, "e", DOCUMENTS, &roles, &[&overrides], "u"), VIDEO | AUDIO);
         let member = [UploadOverride { subject_type: SubjectType::Member, subject_id: "u", allow: 0, deny: VIDEO }];
-        assert_eq!(effective(false, "e", VIDEO | AUDIO, &[], &member, "u"), AUDIO);
-        assert_eq!(effective(false, "e", VIDEO | AUDIO, &[], &member, "someone-else"), VIDEO | AUDIO);
+        assert_eq!(effective(false, "e", VIDEO | AUDIO, &[], &[&member], "u"), AUDIO);
+        assert_eq!(effective(false, "e", VIDEO | AUDIO, &[], &[&member], "someone-else"), VIDEO | AUDIO);
+    }
+
+    #[test]
+    fn override_layers_category_then_channel() {
+        // The category denies video to everyone and allows audio to a member; the channel allows video back and
+        // says nothing about audio, which the member keeps from the category.
+        let category = [
+            UploadOverride { subject_type: SubjectType::Role, subject_id: "e", allow: 0, deny: VIDEO },
+            UploadOverride { subject_type: SubjectType::Member, subject_id: "u", allow: AUDIO, deny: 0 },
+        ];
+        let channel = [UploadOverride { subject_type: SubjectType::Role, subject_id: "e", allow: VIDEO, deny: 0 }];
+        assert_eq!(effective(false, "e", IMAGES | VIDEO, &[], &[&category], "u"), IMAGES | AUDIO);
+        assert_eq!(effective(false, "e", IMAGES | VIDEO, &[], &[&category, &channel], "u"), IMAGES | AUDIO | VIDEO);
+        // A channel deny wins over a category member allow.
+        let deny = [UploadOverride { subject_type: SubjectType::Role, subject_id: "e", allow: 0, deny: AUDIO }];
+        assert_eq!(effective(false, "e", IMAGES, &[], &[&category, &deny], "u"), IMAGES);
     }
 }

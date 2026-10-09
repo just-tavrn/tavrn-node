@@ -92,7 +92,7 @@ impl Api {
     /// Registers `username` and enrolls TOTP (the second factor is mandatory); returns the session.
     pub async fn register(&self, username: &str, ip: &str) -> Result<User> {
         let password = format!("perf-{username}-password");
-        let body = json!({ "username": username, "password": password, "device_name": "loadgen" });
+        let body = json!({ "username": username, "password": password, "device_name": "loadgen", "date_of_birth": "1990-01-01" });
         let (status, pre, _) = self.call(Method::POST, "/auth/register", None, Some(ip), Some(&body)).await?;
         if status != StatusCode::CREATED {
             bail!("register {username}: {status} {pre}");

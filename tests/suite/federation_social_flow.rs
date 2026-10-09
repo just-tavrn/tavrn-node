@@ -506,3 +506,107 @@ async fn key_changes_and_revocations_reach_the_home_nodes_of_contacts() {
     assert_eq!(changed["user"], "alice@a.test");
     let _ = C;
 }
+
+// ---------------------------------------------------------------- authorization audit, round 2
+
+/// A node token request to `path` on `to_node`, signed by `from_node` (or by a stranger's key in its name).
+async fn s2s(from_node: &FedNode, to_node: &FedNode, path: &str, body: Value, forged: bool) -> (StatusCode, String) {
+    let body = body.to_string().into_bytes();
+    let n = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "iss": from_node.domain(), "sub": from_node.domain(), "aud": to_node.domain(), "iat": n, "exp": n + 300,
+        "jti": tavrn_node::util::ulid(), "typ": "s2s", "htm": "POST", "htu": path,
+        "body_sha256": tavrn_node::federation::tokens::body_sha256(&body),
+    });
+    let token = if forged {
+        let stranger = tavrn_node::keys::NodeKey::generate(&from_node.state.signing_key().kid);
+        tavrn_node::jwt::sign(&stranger.signing, &stranger.kid, &claims).unwrap()
+    } else {
+        from_node.sign(&claims)
+    };
+    let (st, _, raw) =
+        to_node.raw(axum::http::Method::POST, path, &token, &[("content-type", "application/json")], body).await;
+    let code = serde_json::from_slice::<Value>(&raw).ok().and_then(|v| v["code"].as_str().map(String::from));
+    (st, code.unwrap_or_default())
+}
+
+fn notify_payload() -> Value {
+    json!({ "node": A, "conversation_id": tavrn_node::util::ulid(), "room_id": null, "mention": false })
+}
+
+fn envelope(kind: &str, from: &str, to: &str, payload: Value) -> Value {
+    json!({ "id": tavrn_node::util::ulid(), "type": kind, "from": from, "to": to, "at": tavrn_node::util::now(),
+            "payload": payload })
+}
+
+/// FEDERATION.md §5.1: the per-domain inbox limit counts only requests whose signature verified, so requests forged
+/// in a peer's name cannot use up its budget; a limit per client address comes before the check.
+#[tokio::test]
+async fn forged_inbox_requests_do_not_use_up_a_peer_s_budget() {
+    let (a, b) = two_nodes_with(|_| {}, |c| c.federation_rate_inbox = 2).await;
+    b.register("bob").await;
+    let path = "/api/v1/federation/inbox";
+    for _ in 0..4 {
+        let env = envelope("notify", A, "bob@b.test", notify_payload());
+        let (st, code) = s2s(&a, &b, path, env, true).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{code}");
+    }
+    for _ in 0..2 {
+        let (st, code) = s2s(&a, &b, path, envelope("notify", A, "bob@b.test", notify_payload()), false).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{code}");
+    }
+    let (st, _) = s2s(&a, &b, path, envelope("notify", A, "bob@b.test", notify_payload()), false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "the domain limit still applies after the check");
+    // Before any signature check: the client address.
+    let (a, b) = two_nodes().await;
+    b.register("bob").await;
+    while b.state.federation_ip_limiter.check("ip:unknown").await.is_ok() {}
+    let (st, _) = s2s(&a, &b, path, envelope("notify", A, "bob@b.test", notify_payload()), false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    let claim = json!({ "user": "bob@b.test", "requester": "alice@a.test" });
+    let (st, _) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// FEDERATION.md §5.2: a user of the receiving node named as inviter, caller or claim requester must have signed in
+/// on the sending node (its federation targets, §2.4); `notify` hints and rings reach only users who did.
+#[tokio::test]
+async fn claims_about_local_users_need_their_session_on_the_sending_node() {
+    let (a, b) = two_nodes().await;
+    let bob = b.register("bob").await;
+    b.register("carol").await;
+    let inbox = "/api/v1/federation/inbox";
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT CAST(COUNT(*) AS BIGINT) FROM push_hints")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap()
+    };
+    // bob never signed in on A: no hint, no ring, no claim in his name, no invitation from him.
+    let (st, code) = s2s(&a, &b, inbox, envelope("notify", A, "bob@b.test", notify_payload()), false).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{code}");
+    assert_eq!(count().await, 0, "a hint for a user who is no member on A");
+    let claim = json!({ "user": "carol@b.test", "requester": "bob@b.test" });
+    let (st, code) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim.clone(), false).await;
+    assert_eq!((st, code.as_str()), (StatusCode::FORBIDDEN, "federation.claim_refused"));
+    let room = json!({ "room": { "node": A, "id": tavrn_node::util::ulid(), "name": "Room" },
+                       "invite_code": "abcdefgh", "expires_at": tavrn_node::util::in_seconds(3600) });
+    let (st, code) =
+        s2s(&a, &b, inbox, envelope("room.invite", "bob@b.test", "carol@b.test", room.clone()), false).await;
+    assert_eq!((st, code.as_str()), (StatusCode::BAD_REQUEST, "federation.envelope_invalid"));
+    let ring = json!({ "node": A, "conversation_id": tavrn_node::util::ulid(), "room_id": null, "mention": false,
+                       "call": { "state": "ring", "from": "bob@b.test", "started_at": tavrn_node::util::now(), "group": true } });
+    let (st, code) = s2s(&a, &b, inbox, envelope("notify", A, "carol@b.test", ring), false).await;
+    assert_eq!((st, code.as_str()), (StatusCode::BAD_REQUEST, "federation.envelope_invalid"));
+
+    // Once bob signed in on A, all of it is accepted.
+    a.sign_in_from(&b, &bob).await;
+    let (st, _) = s2s(&a, &b, inbox, envelope("notify", A, "bob@b.test", notify_payload()), false).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert_eq!(count().await, 1);
+    let (st, code) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
+    // Users of the sending node itself need nothing more.
+    let (st, code) = s2s(&a, &b, inbox, envelope("room.invite", "alice@a.test", "bob@b.test", room), false).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{code}");
+}

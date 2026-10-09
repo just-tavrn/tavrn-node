@@ -252,6 +252,8 @@ pub struct RoomEntryRow {
     pub description: String,
     pub member_count: i64,
     pub listing: String,
+    /// `none` or `adults_only` (PROTOCOL.md §5e); rooms of other nodes are never gated (gated rooms do not federate).
+    pub age_gate: String,
 }
 
 /// Position after which a page continues (order: member count descending, node, room id).
@@ -274,17 +276,20 @@ pub struct RoomQuery<'a> {
     pub after: Option<&'a RoomCursor>,
     pub now: &'a str,
     pub limit: i64,
+    /// Include rooms with an age gate (the requester is an adult, PROTOCOL.md §5e).
+    pub include_gated: bool,
 }
 
 /// Own discoverable public rooms plus unexpired rooms of listed nodes, without delisted rooms.
 pub async fn rooms_page(db: &Pool, q: RoomQuery<'_>) -> Result<Vec<RoomEntryRow>, ApiError> {
     let sql = format!(
-        "SELECT node, room_id, name, description, member_count, listing FROM (
+        "SELECT node, room_id, name, description, member_count, listing, age_gate FROM (
              SELECT CAST($1 AS TEXT) AS node, r.id AS room_id, r.name AS name, r.description AS description,
-                    (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count, '' AS listing
-             FROM rooms r WHERE r.discoverable = 1 AND r.join_mode = 'public'
+                    (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count, '' AS listing,
+                    r.age_gate AS age_gate
+             FROM rooms r WHERE r.discoverable = 1 AND r.join_mode = 'public' AND ($12 = 1 OR r.age_gate = 'none')
              UNION ALL
-             SELECT d.node, d.room_id, d.name, d.description, d.member_count, d.listing
+             SELECT d.node, d.room_id, d.name, d.description, d.member_count, d.listing, 'none' AS age_gate
              FROM directory_rooms d JOIN directory_nodes n ON n.domain = d.node
              WHERE $2 = 0 AND d.expires_at > $3
          ) x
@@ -314,6 +319,7 @@ pub async fn rooms_page(db: &Pool, q: RoomQuery<'_>) -> Result<Vec<RoomEntryRow>
         .bind(node)
         .bind(room)
         .bind(q.limit)
+        .bind(i64::from(q.include_gated))
         .fetch_all(db)
         .await?)
 }

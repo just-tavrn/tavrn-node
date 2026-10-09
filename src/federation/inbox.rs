@@ -2,7 +2,7 @@
 //! `POST /api/v1/federation/inbox` (FEDERATION.md §5.1, §5.2): signed notifications of other nodes.
 //!
 //! Order of checks: federation enabled; `Content-Length` within 64 KiB; node token (§2.3: unverified
-//! `iss`, domain policy, per-domain rate limit, key from `iss`'s own document, §2.1 claims, `htm`/`htu`,
+//! `iss`, domain policy, key from `iss`'s own document (a limit per address before, per domain after), §2.1 claims, `htm`/`htu`,
 //! `TAVRN_FEDERATION_REQUIRE_CONFORMANCE` (§9.4));
 //! body read with a hard cap of 64 KiB; body hash **before** parsing; `jti` spent; envelope; message age;
 //! the authority rules of §5.2 (`federation.type_forbidden`); recipient; payload; dedupe by `(iss, id)`
@@ -207,7 +207,7 @@ fn parse_action(kind: &str, iss: &str, payload: &Value) -> Result<Action, ApiErr
 }
 
 /// Handles one inbox request. Returns `202` for stored, handled and duplicate messages.
-pub async fn receive(state: &AppState, headers: &HeaderMap, body: Body) -> Result<StatusCode, ApiError> {
+pub async fn receive(state: &AppState, ip: &str, headers: &HeaderMap, body: Body) -> Result<StatusCode, ApiError> {
     let started = Instant::now();
     if !state.config.federation_enabled {
         return Err(super::disabled());
@@ -216,11 +216,14 @@ pub async fn receive(state: &AppState, headers: &HeaderMap, body: Body) -> Resul
     if length.is_some_and(|n| n > MAX_BODY_BYTES as u64) {
         return Err(too_large());
     }
+    // Per address before the signature check (which may fetch the claimed sender's keys); per domain only after
+    // it, so requests forged in a peer's name cannot use up its budget.
+    state.federation_ip_limiter.check_all(&[format!("ip:{ip}")]).await?;
     let token = auth::bearer(headers).ok_or_else(tokens::token_invalid)?;
     let iss = tokens::peek_issuer(state, token)?;
     super::check_policy(state, &iss).await?;
-    state.federation_inbox_limiter.check_all(&[format!("domain:{iss}")]).await?;
     let claims = tokens::verify_node_token(state, token, &iss, "POST", INBOX_PATH).await?;
+    state.federation_inbox_limiter.check_all(&[format!("domain:{iss}")]).await?;
     // After the signature check: only real peers can start a conformance run.
     super::conformance::require(state, &iss).await?;
     let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| too_large())?;
@@ -381,9 +384,12 @@ async fn devices_changed(state: &AppState, user: &UserRow) -> Result<(), ApiErro
 async fn identity_changed(state: &AppState, user: &UserRow, key: &str, reset_at: &str) -> Result<(), ApiError> {
     let previous = store::users::by_id(&state.db, &user.id).await?.and_then(|u| u.identity_pubkey);
     store::federation::set_remote_identity(&state.db, &user.id, key, reset_at).await?;
-    // The security log of the rooms here: a reset is never a rotation.
-    if previous.as_deref().is_some_and(|p| p != key) {
-        crate::welcome::key_changed(state, user, false).await;
+    // The security log of the rooms here: a reset is never a rotation. The entry also records the reset on the
+    // user's memberships here (ENCRYPTION.md §7b); without a cached key there is no entry, but the reset still counts.
+    match previous.as_deref() {
+        Some(p) if p != key => crate::welcome::key_changed(state, user, false).await,
+        None => crate::history::key_reset(state, user, &util::now()).await,
+        Some(_) => {}
     }
     store::federation::invalidate_keys(&state.db, &user.id).await?;
     if let Err(e) = super::keys::refresh(state, user).await {

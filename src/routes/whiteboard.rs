@@ -174,6 +174,17 @@ pub async fn post_ephemeral(
         });
     }
     crate::routes::messages::check_not_blocked(&state, &auth, &conv).await?;
+    // A timeout limits writing (permissions.md step 5): cursors and strokes are writing too.
+    if let ConvKind::Channel { access, .. } = &conv.kind
+        && !access.is_owner
+        && !access.is_node_admin
+        && access.member.as_ref().is_some_and(crate::models::MemberRow::is_timed_out)
+    {
+        return Err(ApiError::Forbidden {
+            code: "member.timed_out",
+            detail: "Members in timeout send no ephemeral events".into(),
+        });
+    }
     check_content(&state, &auth, &conv, &req.content).await?;
 
     let now = Instant::now();

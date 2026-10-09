@@ -55,7 +55,7 @@ pub async fn claim_local(state: &AppState, user: &UserRow) -> Result<Vec<(String
 }
 
 /// The home node's S2S claim route.
-pub async fn serve(state: &AppState, headers: &HeaderMap, body: Body) -> Result<Value, ApiError> {
+pub async fn serve(state: &AppState, ip: &str, headers: &HeaderMap, body: Body) -> Result<Value, ApiError> {
     let started = Instant::now();
     if !state.config.federation_enabled {
         return Err(super::disabled());
@@ -69,11 +69,14 @@ pub async fn serve(state: &AppState, headers: &HeaderMap, body: Body) -> Result<
     if length.is_some_and(|n| n > MAX_BODY_BYTES as u64) {
         return Err(too_large());
     }
+    // Per address before the signature check, per requesting node after it (forged requests in a peer's name
+    // must not use up its budget).
+    state.federation_ip_limiter.check_all(&[format!("ip:{ip}")]).await?;
     let token = auth::bearer(headers).ok_or_else(tokens::token_invalid)?;
     let iss = tokens::peek_issuer(state, token)?;
     super::check_policy(state, &iss).await?;
-    state.federation_claim_limiter.check_all(&[format!("domain:{iss}")])?;
     let claims = tokens::verify_node_token(state, token, &iss, "POST", CLAIM_PATH).await?;
+    state.federation_claim_limiter.check_all(&[format!("domain:{iss}")])?;
     let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| too_large())?;
     tokens::check_body(&claims, &bytes)?;
     tokens::spend_jti(state, &claims.std).await?;
@@ -89,6 +92,13 @@ pub async fn serve(state: &AppState, headers: &HeaderMap, body: Body) -> Result<
         .await?
         .filter(|u| u.disabled_at.is_none())
         .ok_or_else(not_found)?;
+    // A requester of this node must have signed in on the sending node (§3.5): it claims in their name.
+    if !super::social::vouches(state, &iss, &req.requester).await? {
+        return Err(ApiError::Forbidden {
+            code: "federation.claim_refused",
+            detail: "The requester has no session on the requesting node".into(),
+        });
+    }
     if let Some(requester) = store::federation::user_by_address(&state.db, requester_name, requester_domain).await?
         && store::social::has_blocked(&state.db, &user.id, &requester.id).await?
     {

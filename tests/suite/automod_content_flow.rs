@@ -369,6 +369,33 @@ async fn node_lists_block_everywhere_without_exemptions() {
     assert_eq!(s, StatusCode::CREATED);
 }
 
+#[tokio::test]
+async fn node_lists_reload_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let words = dir.path().join("words.txt");
+    std::fs::write(&words, "forbidden\n").unwrap();
+    let w_path = words.to_string_lossy().to_string();
+    let node = test_node_with(DOMAIN, move |c| c.automod_words_file = Some(w_path)).await;
+    let w = world_on(node).await;
+    let (s, _) = w.send(&w.alice.token, "a newword here").await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // The operator edits the list; the hourly housekeeping (or SIGHUP) reads it again.
+    std::fs::write(&words, "newword\n").unwrap();
+    let changes = tavrn_node::automod::reload_node_lists(&w.node.state).await.unwrap();
+    assert_eq!((changes.words_added, changes.words_removed), (1, 1));
+    let (s, j) = w.send(&w.alice.token, "a newword here").await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("automod.blocked")), "{j}");
+    let (s, _) = w.send(&w.alice.token, "forbidden is fine now").await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // An invalid file keeps the lists in force.
+    std::fs::write(&words, "x*x*x*x*x*x*x\n").unwrap();
+    assert!(tavrn_node::automod::reload_node_lists(&w.node.state).await.is_err());
+    let (s, _) = w.send(&w.alice.token, "a newword here").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
 #[test]
 fn unreadable_node_lists_are_configuration_errors() {
     let mut c = common::dev_config(DOMAIN, "/tmp", "sqlite::memory:");

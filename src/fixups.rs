@@ -25,6 +25,9 @@
 //! - `manage_threads` (bit 36) is added once to every role that holds `manage_messages` (marker
 //!   [`MANAGE_THREADS_MARKER`]), so moderators keep moderating threads; rooms narrow it later. `create_threads`
 //!   (bit 6) has been part of `@everyone`'s defaults since the first release and needs no fixup.
+//! - Overrides carry channel-scoped bits only (`permissions::CHANNEL_SCOPED`, layered overrides of 2026-10-09):
+//!   other bits are removed from the `allow` and `deny` masks of every override, an override left with nothing at
+//!   all is deleted, and each change is audited in the room as `role.override_restricted`.
 
 use sqlx::Row;
 
@@ -45,6 +48,8 @@ pub struct FixupReport {
     pub bots_encrypted_rooms: u64,
     /// Roles holding `manage_messages` that got `manage_threads`.
     pub manage_threads_roles: u64,
+    /// Overrides whose bits outside `CHANNEL_SCOPED` were removed (or that were deleted for it).
+    pub override_restricted: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -129,6 +134,7 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.manage_applications_roles = grant_manage_applications(db).await?;
     report.bots_encrypted_rooms = record_bots_in_encrypted(db).await?;
     report.manage_threads_roles = grant_manage_threads(db).await?;
+    report.override_restricted = strip_unscoped_overrides(db).await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }
@@ -183,6 +189,54 @@ async fn audit_strip(db: &Pool, room_id: &str, target: &str, removed: u64, kind:
     )
     .await?;
     Ok(())
+}
+
+/// Removes bits outside `CHANNEL_SCOPED` from every override (see the module docs). Idempotent: the query only
+/// finds overrides that still carry such bits.
+async fn strip_unscoped_overrides(db: &Pool) -> anyhow::Result<u64> {
+    let mask = !permissions::CHANNEL_SCOPED as i64;
+    let rows = sqlx::query(
+        "SELECT id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny
+         FROM permission_overrides WHERE (allow & $1) <> 0 OR (deny & $1) <> 0",
+    )
+    .bind(mask)
+    .fetch_all(db)
+    .await?;
+    let mut changed = 0;
+    for row in rows {
+        let (id, room_id, target_type, target_id): (String, String, String, String) =
+            (row.try_get("id")?, row.try_get("room_id")?, row.try_get("target_type")?, row.try_get("target_id")?);
+        let (subject_type, subject_id): (String, String) = (row.try_get("subject_type")?, row.try_get("subject_id")?);
+        let (allow, deny) = (row.try_get::<i64, _>("allow")? as u64, row.try_get::<i64, _>("deny")? as u64);
+        let uploads = row.try_get::<i64, _>("upload_allow")? != 0 || row.try_get::<i64, _>("upload_deny")? != 0;
+        let removed = (allow | deny) & !permissions::CHANNEL_SCOPED;
+        let (allow, deny) = (allow & permissions::CHANNEL_SCOPED, deny & permissions::CHANNEL_SCOPED);
+        let mut tx = db.begin().await?;
+        if allow == 0 && deny == 0 && !uploads {
+            sqlx::query("DELETE FROM permission_overrides WHERE id = $1").bind(&id).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE permission_overrides SET allow = $1, deny = $2 WHERE id = $3")
+                .bind(allow as i64)
+                .bind(deny as i64)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        store::rooms::audit(
+            db,
+            Some(&room_id),
+            None,
+            "role.override_restricted",
+            &target_id,
+            "Room-wide permissions can no longer be set per channel or category",
+            serde_json::json!({ "target_type": target_type, "subject_type": subject_type, "subject_id": subject_id,
+                                "removed": removed.to_string(), "names": permissions::names(removed) }),
+        )
+        .await?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 /// Adds `read_history` to every `@everyone` role lacking it, once per node (see the module docs).

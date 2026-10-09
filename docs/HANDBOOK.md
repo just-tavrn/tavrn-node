@@ -24,7 +24,7 @@ repository, which is the `protocol/` submodule of this repository.
 11. [Metrics and health](#metrics-and-health)
 12. [Scaling with Valkey](#scaling-with-valkey)
 13. [Webhooks and applications](#webhooks-and-applications)
-14. [Legal pages and GDPR](#legal-pages-and-gdpr)
+14. [Legal pages and GDPR](#legal-pages-and-gdpr) ([Age gates](#age-gates))
 15. [Moderation and auto-moderation](#moderation-and-auto-moderation)
 16. [Threads and forum channels](#threads-and-forum-channels)
 17. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
@@ -143,6 +143,7 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_EMAIL` | `optional` | `none`, `optional` or `required` (`required` needs `TAVRN_SMTP_URL`). |
 | `TAVRN_SMTP_URL` | unset | `smtp://host:port` (plain, internal relay), `smtps://host:port` (TLS) or `smtp+starttls://host:port`, optionally `user:pass@`. Test it with `tavrn-node send-test-mail you@example.org`. |
 | `TAVRN_SMTP_FROM` | `noreply@<TAVRN_DOMAIN>` | Sender address. |
+| `TAVRN_MAIL_TEMPLATES_DIR` | `<TAVRN_DATA_DIR>/templates/mail` | Your own texts for the node's mails, per language: `<dir>/<language>/<name>.txt`. See [Mail languages and templates](#mail-languages-and-templates). |
 | `TAVRN_CAPTCHA_PROVIDER` | `none` | `none` or `turnstile` (Cloudflare Turnstile). |
 | `TAVRN_TURNSTILE_SITE_KEY`, `TAVRN_TURNSTILE_SECRET_KEY` | unset | Required with `TAVRN_CAPTCHA_PROVIDER=turnstile`. |
 | `TAVRN_CAPTCHA_REGISTER` | `true` | Require the captcha at registration (only with a provider). |
@@ -151,7 +152,9 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_WEBAUTHN_RP_ID` | `TAVRN_DOMAIN` | Relying party id of passkeys; must be the host of the origin or a parent domain of it, otherwise the node refuses to start. Changing it later invalidates every registered passkey ([Passkeys](#passkeys)). |
 | `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
+| `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
 | `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. |
+| `TAVRN_MINIMUM_AGE` | `16` | Minimum age for registration (13–99). Every registration path asks for the date of birth and refuses younger people; see [Age gates](#age-gates). |
 | `TAVRN_DM_POLICY` | `everyone` | Upper bound of every user's "Who can message me": `friends`, `everyone_shared` (friends and shared rooms) or `everyone` (`open` is the old name). Users choose within it (their default is `everyone_shared`); non-friends land in the recipient's message requests; blocks always apply. |
 
 The second factor (TOTP or passkeys) is mandatory for every account and cannot be switched off.
@@ -162,6 +165,33 @@ and the captcha, and the app picks up the session. A passkey used there also unl
 page seals the passkey's unlock secret to a key only the app holds, and the node keeps that sealed box (at most
 1 KiB, never logged, handed out once) until the app picks it up. There is nothing to configure; `/connect` must be
 served like every other page of the web client.
+
+#### Mail languages and templates
+
+The node's mails (email confirmation, password reset, account deleted and restored, takedown notices and statements
+of reasons, app token expiry) are written in the recipient's language: the language the user picked in the client
+(the client stores it on the node; a new account starts with the browser's language), for reporters of takedown
+notices the browser language of the notice form. The node has English and German texts; any other language falls
+back to English. The texts are the templates in `templates/mail/<language>/<name>.txt` of this repository:
+
+```text
+Subject: Reset your password
+
+Hello {name},
+
+you can set a new password via this link:
+{link}
+```
+
+The first line is the subject (the node puts its name in front), the second is empty, the rest is the plain-text
+body. `{name}`-style variables are filled in; every template knows `{node}` (`TAVRN_NAME`), `{domain}` and
+`{public_url}` plus its own (`check-config` names them when one is wrong). To change a text, copy the file to
+`TAVRN_MAIL_TEMPLATES_DIR` (default `/data/templates/mail`) under the same language and name, for example
+`/data/templates/mail/de/password_reset.txt`, and edit it; you can also add a language the node has no texts for
+(`/data/templates/mail/fr/…`, used for users whose language is `fr` or `fr-ca`). The files are read when a mail is
+sent, so changes apply without a restart. `tavrn-node check-config` validates the directory (unknown names, a
+missing subject line, unknown variables, files over 64 KiB); a file that is broken when a mail goes out is skipped
+with a warning and the built-in text is sent instead.
 
 ### Single sign-on (OpenID Connect)
 
@@ -234,7 +264,7 @@ you out; those names are never given to accounts created by SSO. `TAVRN_OIDC_CLI
 | `TAVRN_UPLOAD_DM_CATEGORIES` | `images,audio,video,documents,archives,other` | Upload categories in DMs and group DMs hosted here. |
 | `TAVRN_STORAGE_QUOTA_PER_ROOM_BYTES` | `10737418240` (10 GiB) | Storage per room (entitlement `storage.max_bytes_per_room`). |
 | `TAVRN_STORAGE_ENCRYPTION` | `on` | Encryption at rest of every stored file; `off` stores new files unencrypted (debugging only; encrypted files stay readable). See [Storage and media](#storage-and-media). |
-| `TAVRN_RETENTION_DAYS` | `0` | Accepted for compatibility; this version does not use it. File retention is `TAVRN_ATTACHMENT_RETENTION_DAYS`. |
+| `TAVRN_RETENTION_DAYS` | `0` | Message retention: messages of channels, DMs and group DMs hosted here are deleted this many days after they were sent by the hourly housekeeping, with their attachments, reactions and pins. Pinned messages and the welcome channel's entries are kept. Rooms may only shorten it (room setting). 0–36500, `0` = keep forever. See [Message retention](#message-retention). |
 | `TAVRN_EMOJI_MAX_PER_ROOM` | `100` | Custom emojis per room (entitlement `emoji.max_per_room`). |
 | `TAVRN_EMOJI_MAX_BYTES` | `262144` (256 KiB) | Largest custom emoji file. |
 | `TAVRN_PREVIEW_AUTO_MAX_BYTES` | `5242880` (5 MiB) | Images up to this size load as previews by themselves where the user's setting allows it (always / friends and shared rooms / never); larger ones show a placeholder with a "Load" button. `0` = never automatically. |
@@ -580,7 +610,8 @@ be the origin's host or a parent domain of it: `example.org` covers `chat.exampl
 later move to `app.example.org` keeps every passkey. A public URL on an unrelated host (`chat.example.net` for
 `example.org`) needs `TAVRN_WEBAUTHN_RP_ID=chat.example.net`; the node refuses to start otherwise. Changing the
 relying party id later invalidates all registered passkeys (users sign in with TOTP or a recovery code and
-register them again).
+register them again). The node publishes the id as `webauthn.rp_id` (`GET /api/v1/node`, `/.well-known/tavrn`), so
+clients use it for the assertions they build themselves (unlocking the secret storage with a passkey).
 
 Everything else that builds absolute URLs (mail links, invite and application add links, the OIDC redirect URI
 `<public URL>/api/v1/auth/oidc/callback`, the LiveKit signaling URL, `turn.<public host>`) uses the public URL.
@@ -688,7 +719,7 @@ still opens the files of that time.
   PostgreSQL version on an empty data directory, restore, then start the node. Do not just change the image tag of
   the `db` service on an existing `./pgdata`.
 - The node cleans up after itself through the hourly **housekeeping** (handshake log, federation state, orphaned
-  files, attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
+  files, message and attachment retention, stale devices, remote users, legal retention, …); no database maintenance besides
   PostgreSQL's own autovacuum is needed.
 
 ## Storage and media
@@ -743,6 +774,44 @@ Upload size, types, the executable rule, per-room quotas and attachment retentio
 hourly housekeeping deletes expired attachments (messages keep listing them as "file expired"; pinned messages keep
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
 Files channels can use external WebDAV/S3 stores only with `TAVRN_FILES_EXTERNAL=on`.
+
+### Files channels: what the node stores
+
+New files channels are **end-to-end encrypted** by default (protocol: FILES.md §8); the room's managers choose this
+when they create a channel and cannot change it later. In an encrypted files channel the node (and an external
+WebDAV/S3 store) only ever holds what the clients encrypted: the file contents and client-made thumbnails as
+ciphertext, and per entry an encrypted "entry record" with the name, type and key. In plaintext it keeps the entry
+ids, the folder tree (which entry is in which folder), who uploaded what and when, and the ciphertext sizes; never a
+name, a folder name, a type or content. Quotas, the entry limit, the orphan sweep, deletes and the audit log work on
+those fields (the audit log names entry ids instead of file names). Thumbnails of encrypted channels are always kept
+in the node's own storage, also for channels on an external store. The node cannot search, preview or classify
+encrypted files; upload categories are declared by the clients. Members who lost their keys can still list and
+delete their own uploads.
+
+Unencrypted files channels work as before: their files use the storage encryption at rest (readable by the node)
+or, on an external store, `encrypt_files` (which encrypted channels do not need and refuse).
+
+Deleting a files channel or a room deletes the files in the node's storage at once. Objects on an external store are
+deleted in the background with the credentials stored for the channel; when the store is unreachable they wait in a
+queue (`file_pending_deletes`, the configuration sealed with `secrets.key`) that the hourly housekeeping retries for
+7 days before it gives up and logs the object key. While `TAVRN_FILES_EXTERNAL=off` the queue pauses. On request
+(`keep_external`, offered by the client only for unencrypted external channels) the objects stay on the store;
+the audit log records how many were kept.
+
+### Message retention
+
+`TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
+sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
+together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
+again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
+and the entries of a room's **welcome channel** (the room's security log). A room owner or a member with "Manage
+room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
+node's value); a longer room value has no effect, a room can only shorten. Each run that deleted something writes one
+entry `retention.messages` to the node's audit log (`deleted`, `node_days`, `rooms` with an own shorter value,
+`incomplete` when the run's time budget of one minute ran out; the rest follows an hour later). Clients are not told:
+an open client keeps showing what it already loaded until it reloads, and messages users saved themselves (exports,
+the local search index of encrypted conversations) are outside the node's reach. `tavrn-node check-config` refuses
+values above 36500. Tell your users in the privacy policy.
 
 ### Profiles, presence and message requests
 
@@ -1005,7 +1074,13 @@ How it behaves:
   endpoints are chosen by the browsers (hosts of Google, Mozilla, Apple, Microsoft and others), so egress HTTPS to
   the internet must be allowed. Endpoints on private or loopback addresses are refused.
 - **Remote conversations**: notifications for rooms on other nodes arrive through the federation `notify` hint at
-  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations).
+  the user's home node, which sends the push (only DMs, group DMs, mentions and calls for remote conversations). A
+  channel set to "all messages" in a room on another node therefore does not push for ordinary messages; the client
+  says so in the notification settings. This is a design decision: subscriptions stay with the home node, which holds
+  the settings (PROTOCOL.md §6d).
+- **Reports**: room moderators and node admins without an open connection get a push for every new report (its kind
+  and room only, at most one per room every 30 seconds); each of them can turn it off ("Reports" in the notification
+  settings).
 - **Several instances**: any instance sends; the rate counters live in Valkey.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
@@ -1241,22 +1316,25 @@ at any time; the leader moves by itself.
 | `TAVRN_INSTANCE_ID` | random per start (logged) | `[A-Za-z0-9._-]{1,64}`; names the instance in logs, the cache and `livekit-<id>.yaml` |
 | `TAVRN_INSTANCE_URL` | address towards the cache + listen port | `http(s)://host[:port]` where the other instances reach this one |
 
-> **Command interactions (APPLICATIONS.md §5.6)** reach a bot connected to any instance. The instance that takes the >
-invocation owns the pending interaction, in memory as on a single node; the 3-second wait happens there. Every >
-instance registers its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field >
-`<instance>/<connection>`, removed when the connection closes; entries of instances that stopped sending heartbeats >
-are ignored). Without a local receiver the owner picks one live instance holding a receiver (round robin) and >
-publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to one of its >
-connections (round robin over the bot's devices as before). The owner also stores `interaction:<id>` = its instance id
-> (TTL 16 minutes, the interaction's lifetime plus a minute). The bot answers over REST, which the load balancer may
-send > anywhere: callbacks and follow-ups (`/interactions/{id}/callback|messages`) for an interaction that is not
-pending on > the receiving instance are relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` (like the requests
-relayed to the > leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when the owner does
-not answer). > Chosen over moving pending interactions into the cache because the waiting invocation, the "first
-response wins" > claim and the follow-up counter stay in one process, with no distributed locking. A restart or crash
-of the owner > loses its pending interactions (invokers get `504 interaction.no_ack`), as on a single node. The
-interactions URL > (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` nothing
-changes.
+> **Command interactions (APPLICATIONS.md §5.6)** reach a bot connected to any instance. Every instance registers
+> its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field `<instance>/<connection>`, removed
+> when the connection closes; entries of instances that stopped sending heartbeats are ignored). Without a local
+> receiver the instance that took the invocation (the owner) picks one live instance holding a receiver (round
+> robin) and publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to
+> one of its connections (round robin over the bot's devices as before). The pending interaction lives in the cache,
+> sealed with a key derived from `secrets.key` like connect codes (`interaction-state:<id>`, TTL 16 minutes: the
+> interaction's lifetime plus a minute); the first response is a lease (`interaction-claim:<id>`, held by the claim
+> or by `dropped` once nobody answered in 3 seconds) and the follow-ups a counter (`interaction-followups:<id>`), so
+> "the first response wins" and "at most ten follow-ups" hold across instances. Only the invoker's waiting request
+> (the 3-second wait) stays in the owner's memory; the owner also stores `interaction:<id>` = its instance id. The
+> bot answers over REST, which the load balancer may send anywhere: callbacks and follow-ups
+> (`/interactions/{id}/callback|messages`) for an interaction that is not pending on the receiving instance are
+> relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` while it lives, so the invoker gets the answer at once (like
+> the requests relayed to the leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when
+> the owner does not answer). When the owner is gone (restarted or stopped), any instance takes them from the cache:
+> a deferred command's follow-ups still arrive, and a callback within the 3 seconds is stored as the reply message.
+> The interactions URL (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` the
+> interactions stay in memory, and a restart loses them.
 
 
 ### How the instances act as one node
@@ -1303,13 +1381,14 @@ Events are never dropped silently: every failed publish is logged and leads to t
 |---|---|---|
 | Hub broadcast (`hub.rs`) | **shared** | Bus fan-out, see [How the instances act as one node](#how-the-instances-act-as-one-node). |
 | Hub online map (WebSockets per user) | per instance + replica | The local count stays; `presence::is_online` adds the replicated connections of the other instances (calls ringing, presence audiences, `notify` hints to remote members in `federation/social.rs`). |
+| Channel visibility snapshots (`visibility.rs`): per room the roles, overrides, channels and members, and per channel the members who may view it | per instance | Used by the WebSocket fan-out, web push, `notify` hints and the whiteboard audience (PROTOCOL.md §6: a channel's events only to its viewers). Each instance drops a room's snapshot when its hub publishes *or injects from the bus* a `room.*`, `channel.*`, `category.*`, `role.*`, `member.*` or `override.*` event, before any connection sees it; at the latest after 60 s. Between instances the change applies once its event arrived over the bus (the same ordering as every other event). |
 | `last_event_id` replay | — | No ring buffer exists; always `resync` ([Realtime resync](#realtime-resync)). |
 | Presence registry (`presence.rs`): connections, idle flag, activity per device | **shared** (bus replica) | REST calls (`PUT /users/me/presence`, activity) and the WebSocket of the same device usually hit different instances. |
 | Presence batching (`last_sent`, `pending`, `last_public`) | per instance | Only throttles the updates an instance sends; a duplicate update after a change on another instance is harmless (clients apply the latest). |
 | Custom status expiry timers | per instance | Readers filter expired statuses anyway; the timer only pushes the update. |
 | Typing throttle (per connection) | per instance | Bound to the WebSocket. |
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
-| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** registry + owner | Receivers in the hash `cmdrecv:<bot user id>`; a pending interaction lives on the instance that took the invocation, `interaction:<id>` names it, callbacks and follow-ups are relayed there (see the note at the end). |
+| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives (see the note at the end). |
 | `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
 
 #### Rate limits
@@ -1324,6 +1403,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | `app_request_limiter`, `app_token_limiter`, `app_rotate_limiter`, `app_create_limiter` | **shared** | Protocol limits of applications and token issuance (APPLICATIONS.md §2.7). |
 | `connect_session_limiter`, `connect_session_node_limiter`, `connect_poll_limiter`, `connect_poll_ip_limiter` | **shared** | App sessions of the connect flow (FEDERATION.md §8 step 3): unauthenticated creation per IP and for the whole node, polls per session and IP. |
 | `voice_limiter`, ring limiter of calls, `ephemeral_limiter` | node-wide by relaying | Their routes are relayed to the leader, so the leader's counter is the node's. |
+| `user_api_limiter` (`TAVRN_RATE_USER_PER_MINUTE`), `files_limiter` (files list and search 120, uploads 120 per user and minute), `purge_limiter` (purge previews, 10 per moderator and minute), `media_proxy_limiter` (the unauthenticated emoji and sound proxy `?host=`, 600 per address and minute), room presence toggles (`presence_limiter`, 60 per user and minute) | per instance | Load shedding: generous limits that bound what one account (or one address for the proxy) can make an instance do. |
 | `claim_limiter`, `key_package_limiter`, `commit_limiter`, `backup_limiter`, `friend_limiter`, `conversation_limiter`, `secret_storage_limiter`, `read_limiter`, `presence_limiter`, `media_limiter`, `scene_limiter`, `admin_limiter`, `direct_invite_limiter`, `room_invite_inbox_limiter`, `notify_limiter`, `keys_fetch_limiter`, `directory_announce_limiter`, `directory_limiter`, `federation_api_limiter`, `federation_claim_limiter`, `bot_message_limiter`, `bot_dm_limiter`, unfurl per user, OIDC start/token per IP, files backend changes | per instance | Load shedding and spam damping of authenticated or already-signed traffic: with N instances a client gets at most N× the budget, which bounds the load per instance exactly as before. The OIDC exchange guards 256-bit codes, not a guessable secret. |
 
 #### Single-use tokens, nonces and challenges
@@ -1367,7 +1447,7 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 | Job | Decision |
 |---|---|
-| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
+| Housekeeping (handshake log, federation state, orphaned files, in-place storage encryption, **message and attachment retention**, entitlement grants, **remote emoji/sound cache eviction**, history shares, device cleanup incl. the ghost scan cursor, app token expiry notices, remote users, directory reports) | leader only |
 | Federation outbox delivery | leader only (any instance queues and wakes it) |
 | Event subscription delivery | leader only (any instance queues and wakes it) |
 | Directory announce and pruning | leader only |
@@ -1392,7 +1472,10 @@ are in [tavrn-js](https://github.com/just-tavrn/tavrn-js). What the operator dec
 - **How many**: `TAVRN_APPS_PER_USER` (default 5 per owner, node admins included), `TAVRN_APPS_PER_ROOM` (default 25
   installed per room).
 - **Tokens and load**: `TAVRN_APP_TOKEN_MAX_DAYS` (default 365) caps the token lifetime; `TAVRN_APP_RATE_REQUESTS`
-  (default 1200 per application and minute) caps REST and WebSocket operations.
+  (default 1200 per application and minute) caps REST and WebSocket operations. Seven days and one day before a token
+  expires, the hourly housekeeping tells the owner in the client and, with SMTP and a confirmed address, by e-mail
+  (once per token and step, in the owner's language; templates `app_token_expiring_week` and `app_token_expiring_day`,
+  see [Mail languages and templates](#mail-languages-and-templates)).
 - **Command review**: `TAVRN_APP_COMMANDS_REQUIRE_APPROVAL=true` makes node admins approve every command definition
   (and every change of one) before it is offered in this node's rooms.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and
@@ -1423,6 +1506,10 @@ Post the JSON payload:
 curl -X POST "$WEBHOOK_URL" -H 'content-type: application/json' \
   -d '{ "content": { "type": "text", "body": "Deploy **v1.2** finished" }, "username": "CI" }'
 ```
+
+A webhook of a forum channel posts into one of its posts: add `"thread_id": "<post id>"` (the id is in the post's
+link). Forum channels show posts only, so a message without `thread_id` is refused there (`400
+message.thread_required`); in text and announcement channels `thread_id` is optional and posts into a thread.
 
 ### Webhooks in end-to-end encrypted channels
 
@@ -1596,10 +1683,38 @@ the node and remain responsible for it. Settings: [Legal settings](#legal-settin
 What the node can and cannot see, for the privacy policy: the content of encrypted conversations (messages, voice,
 whiteboards) is end-to-end encrypted and never readable by the node; metadata (who is in which room, when messages
 are sent, IP addresses in logs) and unencrypted channels are. Link previews show the node which URLs users preview.
-Web push payloads carry no content of encrypted conversations. Retention you control: attachments
-(`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
+Web push payloads carry no content of encrypted conversations. Retention you control: messages
+(`TAVRN_RETENTION_DAYS`), attachments (`TAVRN_ATTACHMENT_RETENTION_DAYS`), stale devices (`TAVRN_DEVICE_STALE_DAYS`), remote users
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
+
+
+### Age gates
+
+Since `age.v1` (protocol PROTOCOL.md §5e) every registration asks for the **date of birth**: the password and passkey
+registration, the registration on the connect page of the apps, and accounts created by single sign-on (they are
+asked right after their first login). People younger than `TAVRN_MINIMUM_AGE` (default 16, the GDPR consent age in
+Germany) cannot register. Accounts that existed before are asked once at their next sign-in; until they answer, the
+node refuses everything but the account itself, the legal pages and sign-out (`age.status_required`).
+
+- **Private.** The date of birth stays on this node. Nobody but the user sees it or the derived status (adult from
+  the 18th birthday on, minor before, unknown without a date; unknown counts as minor). Other nodes only learn the
+  signed "18 or older: yes/no/unknown" claim in the federated sign-in when the user acts there, and never show it.
+- **Gates.** Room managers can mark a room "adults only" (Room settings → Overview), channel managers a channel
+  (Channel settings). Users under 18 never see a gated room in Discover and cannot join it, not even with an invite;
+  a gated channel stays in the list but is locked for them: no messages, files, search, notifications, push or voice.
+  This applies to moderators and owners as well. Only adults can switch a gate on.
+- **Corrections.** Users enter the date once. To correct it on request: `PUT /api/v1/admin/users/{user_id}/date-of-birth`
+  with `{"date_of_birth": "YYYY-MM-DD"}` (or `null` to ask the user again); audited as `admin.date_of_birth` without
+  the date.
+- **Privacy policy.** The privacy templates (Admin → Legal → "Insert template") contain a paragraph that explains why
+  the date of birth is collected, where it is stored, what other nodes learn and how to correct it; the minimum age is
+  filled in from `TAVRN_MINIMUM_AGE`.
+- **What it is not.** The date of birth is self-declared. It is not age verification in the sense of the EU Digital
+  Services Act guidelines, the planned EU KIDS Act or the German JMStV (closed user groups need a KJM-approved age
+  verification system); pluggable verification providers are planned. The legal background and the full design are in
+  the umbrella issue [just-tavrn/tavrn#2](https://github.com/just-tavrn/tavrn/issues/2). You remain responsible for
+  the age rules of your jurisdiction.
 
 ## Moderation and auto-moderation
 
@@ -1611,6 +1726,11 @@ room-creation grants, delete all content, reset a locked-out user's second facto
 `TAVRN_REGISTRATION=invite`, node-wide bans, other nodes with their conformance results (block, unblock, check),
 entitlements, legal pages and notices, and the node audit log. Room moderation (kicks, bans, timeouts, roles and
 permissions) is done by each room's owners and moderators.
+
+Room permissions are layered (protocol `permissions.md`): roles give the base, a category's overrides apply to all
+of its channels, and a channel's own overrides win over the category's. Overrides only hold channel-scoped
+permissions; at start the node removes room-wide permissions from overrides created by older versions and records
+each change in the room's audit log (`role.override_restricted`). Nothing needs to be done by the operator.
 
 ### Spam bursts
 
@@ -1631,11 +1751,13 @@ can release the plaintext of the reported message and up to ten messages before 
 "released by the reporter", the node cannot verify it. Plaintext messages are linked and snapshotted instead. The
 inbox offers shortcuts (delete the message, time out, kick, ban, delete the user's content) that run the normal
 moderation actions and note the report in the audit log. Every moderator of a room sees the room's reports,
-including those about channels hidden from them.
+including those about channels hidden from them: moderation needs the context, and the reporter addressed the
+room's moderators as a whole (MODERATION.md §1.1). Give a private area that needs its own moderators its own room.
 
 `TAVRN_REPORTS_RATE_PER_HOUR` (default 10) limits reports per user, `TAVRN_REPORTS_RETENTION_DAYS` (default 90)
 deletes resolved and dismissed reports with their evidence; admins can delete a report at any time. Reports are
-announced in the client (bell and toast), not by web push.
+announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
+only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
 ### Content auto-moderation
 
@@ -1645,12 +1767,32 @@ channels; actions block, delete or timeout), checked on send and edit, including
 you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
 (one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
 line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;
-`check-config` names problems); restart the node after a change. Matches are audited with the matched term, never
-the message text, and show up in the moderators' inbox.
+`check-config` names problems) and read again, without a restart, by the hourly housekeeping and when the node gets
+`SIGHUP` (`docker compose kill -s HUP tavrn`; with several instances every instance reads its own copy, so signal
+each one or wait for the hour). A reload validates both files like `check-config`: when one of them is invalid or
+unreadable, the node keeps **both** previous lists and logs a warning naming the problem; otherwise it logs how many
+terms and domains were added and removed ("Auto-moderation node lists reloaded"). Point the variables at a file, not
+at a path that does not exist yet: the paths themselves are read from the configuration at start. Matches are
+audited with the matched term, never the message text, and show up in the moderators' inbox.
 
 The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
+
+### History restore after a key reset
+
+A user who resets their security key (lost every device and the recovery key) keeps their rooms but not their
+encrypted history: the node stops serving the encrypted messages from before the reset to them, and other members'
+apps no longer hand those keys over automatically (protocol: ENCRYPTION.md §7b). The member can ask the room for the
+history; the owner, administrators and roles with **Restore history** (`restore_history`, never `@everyone`, never a
+bot) approve or deny it in room settings → History requests. The approving member's app sends the keys from its own
+device, so an approval restores only what that device can read. Requests, approvals and denials are in the room's
+audit log (`history.restore_requested`, `history.restore_approved`, `history.restore_denied` with the reason) and the
+decision is an entry in the welcome channel. Rooms switch requests off in room settings → Overview ("History after a
+key reset"); remote members' resets are learned through federation like the key change itself. There is nothing to
+configure and nothing an operator can restore: the node never holds the keys. Decided requests are deleted after 30
+days by the housekeeping; an approval stays valid for key shares for 30 days. Tell moderators to verify the person's
+identity on another channel before approving: a key reset is also what someone who took over the account would do.
 
 ## Threads and forum channels
 

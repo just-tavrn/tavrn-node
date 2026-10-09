@@ -1,0 +1,9 @@
+Subject: Counter-notice received ({case})
+
+The uploader answered your notice (case {case}) with a counter-notice:
+
+{statement}
+
+Signed: {signature}
+
+The operator of {domain} will decide.

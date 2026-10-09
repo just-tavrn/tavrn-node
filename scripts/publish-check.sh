@@ -86,12 +86,24 @@ for f in "${files[@]}"; do
   [ -n "$hit" ] && report "possible secret in $f: $(cut -c1-80 <<< "$hit")"
 done
 
-# 4. gitleaks, if installed.
+# 4. gitleaks, if installed: only what would be published (the files above, not ignored build or test output such as
+#    build output or local data), plus the git history.
 if command -v gitleaks >/dev/null 2>&1; then
+  tree="$(mktemp -d)"
+  trap 'rm -rf "$tree"' EXIT
+  for f in "${files[@]}"; do [ -f "$f" ] && printf '%s\0' "$f"; done | tar --null -T - -cf - | tar -xf - -C "$tree"
   if gitleaks dir --help >/dev/null 2>&1; then
-    gitleaks dir --no-banner --redact . >/dev/null 2>&1 || report "gitleaks found secrets (run: gitleaks dir --redact .)"
+    (cd "$tree" && gitleaks dir --no-banner --redact . >/dev/null 2>&1) ||
+      report "gitleaks found secrets in the files to publish: $(cd "$tree" && gitleaks dir --no-banner --redact -v . 2>/dev/null | sed -n 's/^File: *//p' | sort -u | tr '\n' ' ')"
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      gitleaks git --no-banner --redact . >/dev/null 2>&1 || report "gitleaks found secrets in the git history (run: gitleaks git --redact -v .)"
+    fi
   else
-    gitleaks detect --no-git --no-banner --redact --source . >/dev/null 2>&1 || report "gitleaks found secrets (run: gitleaks detect --no-git --redact)"
+    (cd "$tree" && gitleaks detect --no-git --no-banner --redact --source . >/dev/null 2>&1) ||
+      report "gitleaks found secrets in the files to publish: $(cd "$tree" && gitleaks detect --no-git --no-banner --redact -v --source . 2>/dev/null | sed -n 's/^File: *//p' | sort -u | tr '\n' ' ')"
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      gitleaks detect --no-banner --redact --source . >/dev/null 2>&1 || report "gitleaks found secrets in the git history (run: gitleaks detect --redact -v)"
+    fi
   fi
 else
   echo "publish-check: gitleaks not installed, only the built-in secret patterns were checked" >&2

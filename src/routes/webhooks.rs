@@ -111,11 +111,12 @@ async fn require_manage(
     Ok(perms)
 }
 
-/// A channel webhooks can post in: a text or announcement channel of the room. Returns the sealing mode for it:
-/// `requested` (default `sender`) in encrypted channels, none in unencrypted ones (where asking for one is an error).
+/// A channel webhooks can post in: a text, announcement or forum channel of the room (forum: into posts only).
+/// Returns the sealing mode for it: `requested` (default `sender`) in encrypted channels, none in unencrypted ones
+/// (where asking for one is an error).
 fn check_target_channel(channel: &ChannelRow, requested: Option<&str>) -> Result<Option<Sealing>, ApiError> {
     if !wh::CHANNEL_KINDS.contains(&channel.kind.as_str()) {
-        return Err(bad("channel.no_text", "Webhooks post into text and announcement channels only"));
+        return Err(bad("channel.no_text", "Webhooks post into text, announcement and forum channels only"));
     }
     let requested = requested.map(Sealing::parse).transpose()?;
     if channel.encrypted == 0 {

@@ -466,7 +466,7 @@ async fn the_probe_account_cannot_log_in_and_is_hidden() {
                 Method::POST,
                 "/api/v1/auth/login",
                 None,
-                Some(json!({ "username": PROBE_USERNAME, "password": password })),
+                Some(json!({ "username": PROBE_USERNAME, "date_of_birth": "1990-01-01", "password": password })),
             )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
@@ -477,7 +477,7 @@ async fn the_probe_account_cannot_log_in_and_is_hidden() {
                 Method::POST,
                 "/api/v1/auth/register",
                 None,
-                Some(json!({ "username": PROBE_USERNAME, "password": "password-long-enough-123" })),
+                Some(json!({ "username": PROBE_USERNAME, "date_of_birth": "1990-01-01", "password": "password-long-enough-123" })),
             )
             .await;
         assert_eq!((status, json["code"].as_str()), (StatusCode::CONFLICT, Some("auth.username_taken")));

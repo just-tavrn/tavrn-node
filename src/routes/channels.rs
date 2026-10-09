@@ -3,18 +3,18 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::Deserialize;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     access,
     app::AppState,
     auth::AuthUser,
     error::{ApiError, ProblemDetails},
-    models::{CHANNEL_KINDS, Category, Channel, PermissionOverride},
+    models::{CHANNEL_KINDS, Category, Channel, ChannelRow, OverrideRow, PermissionOverride},
     permissions as p, store,
     validate::{self, bad},
 };
@@ -120,7 +120,37 @@ async fn no_bots_changed(
     Ok(())
 }
 
-/// Delete a category; its channels remain, without a category.
+/// The actor's permissions in a category: the layered evaluation (permissions.md) with the category's overrides on top of
+/// the role base and no channel layer.
+async fn category_perms(
+    state: &AppState,
+    access: &access::RoomAccess,
+    category: &Category,
+) -> Result<p::Perms, ApiError> {
+    let no_bots = category.no_bots != 0 || access.room.no_bots != 0;
+    if access.is_owner || access.is_node_admin {
+        return Ok(p::cap_bot(p::ALL, &access.kind, no_bots, access.scopes.as_deref()));
+    }
+    let user_id = access.member.as_ref().map(|m| m.user_id.clone()).unwrap_or_default();
+    let overrides = store::rooms::overrides_for(&state.db, "category", &category.id).await?;
+    Ok(p::compute(&p::Input {
+        user_id,
+        is_owner: false,
+        everyone_role_id: access.everyone.id.clone(),
+        everyone_permissions: access.everyone.perms(),
+        member_roles: access.member_roles_eval(),
+        category_overrides: overrides.iter().map(|o| o.to_eval()).collect(),
+        channel_overrides: Vec::new(),
+        timed_out: access.member.as_ref().is_some_and(crate::models::MemberRow::is_timed_out),
+        kind: access.kind.clone(),
+        no_bots,
+        scopes: access.scopes.clone(),
+        system_channel: false,
+    }))
+}
+
+/// Delete a category; its channels remain, without a category, and keep what the category's overrides gave and
+/// denied (its overrides are copied into each channel first, protocol permissions.md "Moving channels").
 #[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/categories/{category_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("category_id" = String, Path)), responses((status = 204)))]
 pub async fn delete_category(
     State(state): State<AppState>,
@@ -129,11 +159,194 @@ pub async fn delete_category(
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    // Its channels lose the category's "no bots" flag: bots never decide that (APPLICATIONS.md §3.5).
+    let category = store::rooms::categories(&state.db, &room_id).await?.into_iter().find(|c| c.id == category_id);
+    if category.as_ref().is_some_and(|c| c.no_bots != 0) {
+        crate::bot_channels::refuse_bots(&auth.user)?;
+    }
+    if category.is_none() {
+        return Err(access::not_found("Category", "category.not_found"));
+    }
+    // Its channels keep what the category's overrides gave and denied (permissions.md "Moving channels").
+    for channel in store::rooms::channels(&state.db, &room_id).await? {
+        if channel.category_id.as_deref() == Some(category_id.as_str()) {
+            leave_category(&state, &room_id, &auth.user, &channel, None).await?;
+        }
+    }
     if !store::rooms::delete_category(&state.db, &room_id, &category_id).await? {
         return Err(access::not_found("Category", "category.not_found"));
     }
     state.hub.room(&room_id, "category.delete", serde_json::json!({ "room_id": room_id, "id": category_id }));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The channel's own overrides with its category's merged in, for a channel that leaves the category: per subject
+/// the channel's setting of a bit wins, the category's fills the bits it leaves neutral; a bit the channel's
+/// `@everyone` override decides is decided for everybody in the channel layer, so it drops from the category's.
+fn merge_layers(
+    category: &[OverrideRow],
+    channel: &[OverrideRow],
+    channel_id: &str,
+    everyone_id: &str,
+) -> Vec<OverrideRow> {
+    let decided = |o: &OverrideRow| (o.allow | o.deny, o.upload_allow | o.upload_deny);
+    let (everyone, everyone_uploads) =
+        channel.iter().find(|o| o.subject_type == "role" && o.subject_id == everyone_id).map(decided).unwrap_or((0, 0));
+    let mut merged: Vec<OverrideRow> = channel.to_vec();
+    for c in category {
+        let i = match merged.iter().position(|o| o.subject_type == c.subject_type && o.subject_id == c.subject_id) {
+            Some(i) => i,
+            None => {
+                merged.push(OverrideRow {
+                    id: String::new(),
+                    target_type: "channel".into(),
+                    target_id: channel_id.into(),
+                    allow: 0,
+                    deny: 0,
+                    upload_allow: 0,
+                    upload_deny: 0,
+                    ..c.clone()
+                });
+                merged.len() - 1
+            }
+        };
+        let o = &mut merged[i];
+        let (bits, uploads) = decided(o);
+        let open = !(bits | everyone);
+        let open_uploads = !(uploads | everyone_uploads);
+        o.allow |= c.allow & open;
+        o.deny |= c.deny & open;
+        o.upload_allow |= c.upload_allow & open_uploads;
+        o.upload_deny |= c.upload_deny & open_uploads;
+    }
+    merged
+}
+
+/// A channel leaves its category (the category is deleted, or the channel moves to `to`): the category's overrides
+/// are written into the channel's own ([`merge_layers`]) so that nothing becomes visible that was not; a member who
+/// would still gain a permission (one layer cannot express every pair of layers) gets a deny of their own for it.
+/// Audited as `channel.overrides_copied`; `override.update` for the channel (permissions.md "Moving channels").
+async fn leave_category(
+    state: &AppState,
+    room_id: &str,
+    actor: &crate::models::UserRow,
+    channel: &ChannelRow,
+    to: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(category_id) = channel.category_id.as_deref() else { return Ok(()) };
+    let Some(view) = crate::visibility::load(state, room_id).await? else { return Ok(()) };
+    let everyone_id = view.everyone_id().unwrap_or_default().to_string();
+    let of = |target_type: &str, target_id: &str| -> Vec<OverrideRow> {
+        view.overrides().iter().filter(|o| o.target_type == target_type && o.target_id == target_id).cloned().collect()
+    };
+    let own = of("channel", &channel.id);
+    let mut merged = merge_layers(&of("category", category_id), &own, &channel.id, &everyone_id);
+    let moved = ChannelRow { category_id: to.map(str::to_string), ..channel.clone() };
+    let before = view.perms_with(channel, view.overrides());
+    let with = |merged: &[OverrideRow]| -> Vec<OverrideRow> {
+        let others = view.overrides().iter().filter(|o| !(o.target_type == "channel" && o.target_id == channel.id));
+        others.cloned().chain(merged.iter().cloned()).collect()
+    };
+    let after = view.perms_with(&moved, &with(&merged));
+    let mut denied = Vec::new();
+    for (user_id, perms) in after {
+        let gained = (perms & !before.get(&user_id).copied().unwrap_or(0) & p::CHANNEL_SCOPED) as i64;
+        if gained == 0 {
+            continue;
+        }
+        denied.push(user_id.clone());
+        match merged.iter_mut().find(|o| o.subject_type == "member" && o.subject_id == user_id) {
+            Some(o) => {
+                o.allow &= !gained;
+                o.deny |= gained;
+            }
+            None => merged.push(OverrideRow {
+                id: String::new(),
+                room_id: room_id.to_string(),
+                target_type: "channel".into(),
+                target_id: channel.id.clone(),
+                subject_type: "member".into(),
+                subject_id: user_id,
+                allow: 0,
+                deny: gained,
+                upload_allow: 0,
+                upload_deny: 0,
+            }),
+        }
+    }
+    let changed: Vec<&OverrideRow> = merged
+        .iter()
+        .filter(|m| {
+            !own.iter().any(|o| {
+                o.subject_type == m.subject_type
+                    && o.subject_id == m.subject_id
+                    && (o.allow, o.deny, o.upload_allow, o.upload_deny)
+                        == (m.allow, m.deny, m.upload_allow, m.upload_deny)
+            })
+        })
+        .collect();
+    for m in &changed {
+        store::rooms::set_override(
+            &state.db,
+            store::rooms::SetOverride {
+                room_id,
+                target_type: "channel",
+                target_id: &channel.id,
+                subject_type: &m.subject_type,
+                subject_id: &m.subject_id,
+                allow: m.allow as u64,
+                deny: m.deny as u64,
+                upload_allow: Some(m.upload_allow as u64),
+                upload_deny: Some(m.upload_deny as u64),
+            },
+        )
+        .await?;
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    store::rooms::audit(
+        &state.db,
+        Some(room_id),
+        Some(&actor.id),
+        "channel.overrides_copied",
+        &channel.id,
+        "",
+        serde_json::json!({ "category_id": category_id, "to": to, "overrides": changed.len(), "members_denied": denied }),
+    )
+    .await?;
+    let overrides: Vec<PermissionOverride> =
+        store::rooms::overrides_for(&state.db, "channel", &channel.id).await?.iter().map(|o| o.to_api()).collect();
+    state.hub.room(room_id, "override.update", serde_json::json!({ "room_id": room_id, "target_type": "channel", "target_id": channel.id, "overrides": overrides }));
+    Ok(())
+}
+
+/// A channel without a category moves into `to`: the category's overrides apply underneath the channel's own from
+/// then on. If that grants anybody more than today, the actor needs `manage_roles` in that category, as for setting
+/// those overrides (`403 role.manage_forbidden`).
+async fn enter_category(
+    state: &AppState,
+    access: &access::RoomAccess,
+    channel: &ChannelRow,
+    to: &str,
+) -> Result<(), ApiError> {
+    let Some(view) = crate::visibility::load(state, &access.room.id).await? else { return Ok(()) };
+    let moved = ChannelRow { category_id: Some(to.to_string()), ..channel.clone() };
+    let before = view.perms_with(channel, view.overrides());
+    let grants = view
+        .perms_with(&moved, view.overrides())
+        .into_iter()
+        .any(|(user_id, perms)| perms & !before.get(&user_id).copied().unwrap_or(0) & p::CHANNEL_SCOPED != 0);
+    if !grants {
+        return Ok(());
+    }
+    let category = store::rooms::categories(&state.db, &access.room.id)
+        .await?
+        .into_iter()
+        .find(|c| c.id == to)
+        .ok_or_else(|| bad("category.not_found", "This category does not exist in this room"))?;
+    let held = category_perms(state, access, &category).await?;
+    access::require(held, p::VIEW_CHANNEL | p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -144,14 +357,21 @@ pub struct CreateChannelRequest {
     pub topic: Option<String>,
     pub category_id: Option<String>,
     pub position: Option<i64>,
-    /// Can be switched off only for text/announcement/forum. DMs and voice are always encrypted.
+    /// Can be switched off only for text/announcement/forum. DMs and voice are always encrypted. Files channels:
+    /// chosen here (default `true`) and fixed afterwards (FILES.md §1).
     pub encrypted: Option<bool>,
     pub bitrate_kbps: Option<i64>,
     pub user_limit: Option<i64>,
+    /// `none` (default) or `adults_only` (PROTOCOL.md §5e); the room's gate is the minimum. Only an adult can set
+    /// `adults_only`.
+    pub age_gate: Option<String>,
 }
 
-fn files_never_encrypted() -> ApiError {
-    bad("channel.files_unencrypted", "Files channels are never end-to-end encrypted")
+fn encryption_fixed() -> ApiError {
+    bad(
+        "channel.encryption_fixed",
+        "The encryption of a files channel is chosen when it is created; create a new channel and upload the files again",
+    )
 }
 
 /// The welcome channel is fixed: no renaming, moving, deleting (only its topic and overrides change).
@@ -191,6 +411,10 @@ pub async fn create_channel(
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let kind = validate::one_of("kind", &req.kind, CHANNEL_KINDS)?;
     let name = channel_name(&kind, &req.name)?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "channel").await?;
+    }
     let topic = validate::text("topic", req.topic.as_deref().unwrap_or(""), 0, 1024)?;
     if let Some(cat) = &req.category_id
         && !store::rooms::category_exists(&state.db, &room_id, cat).await?
@@ -198,9 +422,8 @@ pub async fn create_channel(
         return Err(bad("category.not_found", "This category does not exist in this room"));
     }
     let encrypted = match (kind.as_str(), req.encrypted) {
-        // Files channels are never end-to-end encrypted: no MLS group, a banner instead.
-        ("files", Some(true)) => return Err(files_never_encrypted()),
-        ("files", _) => false,
+        // Files channels are end-to-end encrypted unless created without (FILES.md §1).
+        ("files", e) => e.unwrap_or(true),
         ("voice", Some(false)) => {
             return Err(bad("channel.voice_always_encrypted", "Voice channels are always encrypted"));
         }
@@ -241,6 +464,13 @@ pub async fn create_channel(
         },
     )
     .await?;
+    if let Some(gate) = age_gate.as_deref().filter(|g| *g != crate::age::GATE_NONE) {
+        store::rooms::set_channel_age_gate(&state.db, &id, gate).await?;
+    }
+    if kind == "files" {
+        // A file share shows new members everything by default (FILES.md §8.7).
+        store::history::set_policy(&state.db, &id, &crate::history::Policy::All.to_string()).await?;
+    }
     let channel = store::rooms::channel_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| access::not_found("Channel", "channel.not_found"))?
@@ -252,7 +482,7 @@ pub async fn create_channel(
         "channel.create",
         &id,
         "",
-        serde_json::json!({ "name": name, "kind": kind, "encrypted": encrypted }),
+        serde_json::json!({ "name": name, "kind": kind, "encrypted": encrypted, "age_gate": channel.age_gate }),
     )
     .await?;
     state.hub.room(&room_id, "channel.create", &channel);
@@ -266,6 +496,9 @@ pub struct UpdateChannelRequest {
     #[serde(default, with = "crate::serde_with_double_option")]
     pub category_id: Option<Option<String>>,
     pub position: Option<i64>,
+    /// Deprecated and ignored (protocol permissions.md "Changes", 2026-10-09): overrides are layered, a channel
+    /// always inherits its category's overrides underneath its own. Accepted for one release, then unknown.
+    #[schema(deprecated)]
     pub sync_with_category: Option<bool>,
     pub slowmode_secs: Option<i64>,
     pub bitrate_kbps: Option<i64>,
@@ -284,10 +517,15 @@ pub struct UpdateChannelRequest {
     pub auto_archive_minutes: Option<i64>,
     /// Forum channels: the complete new tag list (at most 20; entries without `id` are new tags). Audit-logged.
     pub tags: Option<Vec<crate::threads::TagInput>>,
+    /// `none` or `adults_only` (PROTOCOL.md §5e): the channel's own age gate; the room's gate stays the minimum.
+    /// Only an adult can switch it on. Audited as `channel.age_gate`.
+    pub age_gate: Option<String>,
 }
 
-/// Update a channel (`manage_channels`).
-#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel)))]
+/// Update a channel (`manage_channels`). Moving it out of its category copies the category's overrides into the
+/// channel; moving it into a category that grants more needs `manage_roles` there (protocol permissions.md "Moving
+/// channels").
+#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel), (status = 403, body = ProblemDetails)))]
 pub async fn update_channel(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -297,11 +535,14 @@ pub async fn update_channel(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let current = access::channel_in_room(&state, &room_id, &channel_id).await?;
+    // In the channel itself (permissions.md step 4; bots get nothing in "no bots" channels, APPLICATIONS.md §3.5).
+    let perms = access::channel_perms(&state, &access, &current, &auth.user.id).await?;
+    access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    let before = store::rooms::channels(&state.db, &room_id).await?;
     if current.kind == "system"
         && (req.name.is_some()
             || req.category_id.is_some()
             || req.position.is_some()
-            || req.sync_with_category.is_some()
             || req.slowmode_secs.is_some()
             || req.bitrate_kbps.is_some()
             || req.user_limit.is_some()
@@ -325,7 +566,15 @@ pub async fn update_channel(
         })
         .transpose()?;
     let tags = req.tags.as_deref().map(|t| crate::threads::check_channel_tags(&current, t)).transpose()?;
+    let age_gate = req.age_gate.as_deref().map(crate::age::validate_gate).transpose()?;
+    if let Some(gate) = &age_gate {
+        crate::age::require_adult_to_gate(&state, &auth.user, gate, "channel").await?;
+    }
     let history_policy = req.history_for_new_members.as_deref().map(crate::history::validate).transpose()?;
+    if current.kind == "files" && matches!(history_policy, Some(crate::history::Policy::Days(_))) {
+        // A file share shows new members everything or nothing from before (FILES.md §8.7).
+        return Err(bad("channel.history_policy_invalid", "Files channels share their history with all or since_join"));
+    }
     let name = req.name.as_deref().map(|n| channel_name(&current.kind, n)).transpose()?;
     let topic = req.topic.as_deref().map(|t| validate::text("topic", t, 0, 1024)).transpose()?;
     if let Some(Some(cat)) = &req.category_id
@@ -346,8 +595,8 @@ pub async fn update_channel(
             (Some(b2), Some(u2))
         }
     };
-    if current.kind == "files" && req.encrypted == Some(true) {
-        return Err(files_never_encrypted());
+    if current.kind == "files" && req.encrypted.is_some_and(|e| e != (current.encrypted != 0)) {
+        return Err(encryption_fixed());
     }
     if current.kind == "voice" && req.encrypted == Some(false) {
         return Err(bad("channel.voice_always_encrypted", "Voice channels are always encrypted"));
@@ -357,6 +606,15 @@ pub async fn update_channel(
         // Bots never decide who may read along (APPLICATIONS.md §3.5).
         crate::bot_channels::refuse_bots(&auth.user)?;
     }
+    if let Some(to) = &req.category_id
+        && to.as_deref() != current.category_id.as_deref()
+    {
+        if current.category_id.is_some() {
+            leave_category(&state, &room_id, &auth.user, &current, to.as_deref()).await?;
+        } else if let Some(to) = to {
+            enter_category(&state, &access, &current, to).await?;
+        }
+    }
     store::rooms::update_channel(
         &state.db,
         &channel_id,
@@ -365,7 +623,6 @@ pub async fn update_channel(
             topic: topic.as_deref(),
             category_id: req.category_id.as_ref().map(|c| c.as_deref()),
             position: req.position,
-            sync_with_category: req.sync_with_category,
             slowmode_secs: slowmode,
             bitrate_kbps: bitrate,
             user_limit,
@@ -386,8 +643,29 @@ pub async fn update_channel(
     if let Some(value) = req.bots_allowed {
         crate::bot_channels::set_channel_setting(&state, &room_id, &auth.user, &current, value).await?;
     }
+    // A move into a "no bots" category closes the channel to bots like the flag itself (APPLICATIONS.md §3.5).
+    if req.category_id.is_some() {
+        let moved: Vec<_> = before.iter().filter(|c| c.id == channel_id).cloned().collect();
+        crate::bot_channels::effective_changed(&state, &room_id, &moved, Some(&channel_id)).await?;
+    }
     if let Some(minutes) = auto_archive {
         store::threads::set_auto_archive(&state.db, &channel_id, minutes).await?;
+    }
+    if let Some(gate) = age_gate.filter(|g| *g != current.age_gate) {
+        store::rooms::set_channel_age_gate(&state.db, &channel_id, &gate).await?;
+        store::rooms::audit(
+            &state.db,
+            Some(&room_id),
+            Some(&auth.user.id),
+            "channel.age_gate",
+            &channel_id,
+            "",
+            serde_json::json!({ "age_gate": gate }),
+        )
+        .await?;
+        if gate == crate::age::GATE_ADULTS {
+            crate::e2ee::below_age_gate(&state, &room_id, std::slice::from_ref(&channel_id)).await?;
+        }
     }
     if let Some(tags) = &tags {
         let json = serde_json::to_string(tags).map_err(|e| ApiError::Internal(e.into()))?;
@@ -468,22 +746,35 @@ pub async fn update_channel(
     Ok(Json(channel))
 }
 
-/// Permanently delete a channel with its entire history (`manage_channels`).
-#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), responses((status = 204)))]
+#[derive(Deserialize, IntoParams, Default)]
+pub struct DeleteFilesQuery {
+    /// Files channels on an external store that are not end-to-end encrypted: keep the objects on the store
+    /// (FILES.md §9; ignored for encrypted channels, whose objects are unreadable without the channel's keys).
+    #[serde(default)]
+    pub keep_external: bool,
+}
+
+/// Permanently delete a channel with its entire history (`manage_channels`). The files of a files channel go
+/// with it: stored on the node at once, on an external store in the background (FILES.md §9).
+#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path), DeleteFilesQuery), responses((status = 204)))]
 pub async fn delete_channel(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
+    Query(q): Query<DeleteFilesQuery>,
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     let channel = access::channel_in_room(&state, &room_id, &channel_id).await?;
+    let perms = access::channel_perms(&state, &access, &channel, &auth.user.id).await?;
+    access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
     if channel.kind == "system" {
         return Err(system_protected());
     }
     // The files of every upload in the channel go with it (rows cascade, files are deleted here).
     let blob_ids = store::blobs::ids_of_conversation(&state.db, &channel_id).await?;
-    let files = crate::routes::files::Cleanup::collect(&state, "channel_id", &channel_id).await?;
+    let files = crate::routes::files::Cleanup::collect(&state, "channel_id", &channel_id, q.keep_external).await?;
+    let kept = files.kept_objects();
     store::rooms::delete_channel(&state.db, &channel_id).await?;
     for id in &blob_ids {
         state.storage.delete(id).await;
@@ -496,7 +787,11 @@ pub async fn delete_channel(
         "channel.delete",
         &channel_id,
         "",
-        serde_json::json!({ "name": channel.name }),
+        if channel.kind == "files" {
+            serde_json::json!({ "name": channel.name, "keep_external": q.keep_external && kept > 0, "kept_objects": kept })
+        } else {
+            serde_json::json!({ "name": channel.name })
+        },
     )
     .await?;
     state.hub.room(&room_id, "channel.delete", serde_json::json!({ "room_id": room_id, "id": channel_id }));
@@ -523,8 +818,29 @@ pub struct SetOverrideRequest {
     pub upload_deny: Option<Vec<String>>,
 }
 
+/// Overrides carry channel-scoped bits only (protocol permissions.md "Channel-scoped bits"): room-level bits are
+/// granted through roles. `400 permissions.not_channel_scoped` with the refused names in `meta.names`.
+fn check_channel_scoped(bits: u64) -> Result<(), ApiError> {
+    let refused = bits & !p::CHANNEL_SCOPED;
+    if refused == 0 {
+        return Ok(());
+    }
+    Err(ApiError::BadRequestMeta {
+        code: "permissions.not_channel_scoped",
+        detail: format!(
+            "These permissions are room-wide and cannot be set per channel: {}",
+            p::names(refused).join(", ")
+        ),
+        meta: serde_json::json!({ "names": p::names(refused) }),
+    })
+}
+
 /// Set an override, or remove it when allow = deny = 0 (`manage_roles`).
-#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>)))]
+///
+/// Overrides are layered (protocol permissions.md "Evaluation"): a category's overrides apply to the role base of
+/// every channel in it, the channel's own on top; a bit an override neither allows nor denies inherits from the
+/// layer below. Only channel-scoped bits are accepted (`400 permissions.not_channel_scoped`).
+#[utoipa::path(put, path = "/api/v1/rooms/{room_id}/overrides", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = SetOverrideRequest, responses((status = 200, body = Vec<PermissionOverride>), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn set_override(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -535,13 +851,27 @@ pub async fn set_override(
     access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
     let target_type = validate::one_of("target_type", &req.target_type, &["category", "channel"])?;
     let subject_type = validate::one_of("subject_type", &req.subject_type, &["role", "member"])?;
-    let exists = match target_type.as_str() {
-        "category" => store::rooms::category_exists(&state.db, &room_id, &req.target_id).await?,
-        _ => access::channel_in_room(&state, &room_id, &req.target_id).await.is_ok(),
+    // The actor's permissions where the override applies: an override can only be set with `manage_roles` there,
+    // and grants only what the actor holds there (permissions.md step 4 and "Hierarchy").
+    let held = match target_type.as_str() {
+        "category" => {
+            match store::rooms::categories(&state.db, &room_id).await?.into_iter().find(|c| c.id == req.target_id) {
+                Some(category) => Some(category_perms(&state, &access, &category).await?),
+                None => None,
+            }
+        }
+        _ => match access::channel_in_room(&state, &room_id, &req.target_id).await {
+            Ok(channel) => Some(access::channel_perms(&state, &access, &channel, &auth.user.id).await?),
+            Err(_) => None,
+        },
     };
-    if !exists {
+    let Some(held) = held else {
         return Err(access::not_found("Target", "override.target_not_found"));
-    }
+    };
+    access::require(held, p::VIEW_CHANNEL | p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
+    let allow = validate::permissions("allow", &req.allow)?;
+    let deny = validate::permissions("deny", &req.deny)?;
+    check_channel_scoped(allow | deny)?;
     match subject_type.as_str() {
         "role" => {
             let role = store::rooms::role_by_id(&state.db, &room_id, &req.subject_id)
@@ -554,17 +884,19 @@ pub async fn set_override(
                 });
             }
             if role.is_everyone != 0 {
-                crate::routes::roles::check_everyone(validate::permissions("allow", &req.allow)?)?;
+                crate::routes::roles::check_everyone(allow)?;
             }
         }
         _ => {
             if store::rooms::member(&state.db, &room_id, &req.subject_id).await?.is_none() {
                 return Err(access::not_found("Member", "member.not_found"));
             }
+            // Like roles: only members below the actor (or the actor themselves, within what they hold).
+            if req.subject_id != auth.user.id {
+                crate::routes::rooms::moderation_target(&state, &access, &req.subject_id).await?;
+            }
         }
     }
-    let allow = validate::permissions("allow", &req.allow)?;
-    let deny = validate::permissions("deny", &req.deny)?;
     if allow & deny != 0 {
         return Err(bad("override.conflict", "A permission cannot be allowed and denied at once"));
     }
@@ -574,7 +906,7 @@ pub async fn set_override(
         return Err(bad("override.conflict", "An upload category cannot be allowed and denied at once"));
     }
     // Nobody can grant themselves more permissions through an override than they have.
-    if !access.is_owner && !access.is_node_admin && allow & !access.room_perms != 0 {
+    if !access.is_owner && !access.is_node_admin && allow & !held != 0 {
         return Err(ApiError::Forbidden {
             code: "override.escalation",
             detail: "You can only grant permissions you have yourself".into(),
@@ -612,4 +944,50 @@ pub async fn set_override(
         .collect();
     state.hub.room(&room_id, "override.update", serde_json::json!({ "room_id": room_id, "target_type": target_type, "target_id": req.target_id, "overrides": overrides }));
     Ok(Json(overrides))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn o(target_type: &str, subject_type: &str, subject_id: &str, allow: u64, deny: u64) -> OverrideRow {
+        OverrideRow {
+            id: String::new(),
+            room_id: "r".into(),
+            target_type: target_type.into(),
+            target_id: if target_type == "channel" { "ch".into() } else { "cat".into() },
+            subject_type: subject_type.into(),
+            subject_id: subject_id.into(),
+            allow: allow as i64,
+            deny: deny as i64,
+            upload_allow: 0,
+            upload_deny: 0,
+        }
+    }
+
+    fn bits(merged: &[OverrideRow], subject_id: &str) -> (u64, u64) {
+        merged.iter().find(|o| o.subject_id == subject_id).map(|o| (o.allow as u64, o.deny as u64)).unwrap_or((0, 0))
+    }
+
+    #[test]
+    fn the_channel_wins_per_subject_and_the_category_fills_the_rest() {
+        let (v, s) = (p::VIEW_CHANNEL, p::SEND_MESSAGES);
+        let category = [o("category", "role", "everyone", 0, v | s), o("category", "role", "staff", v, 0)];
+        let channel = [o("channel", "role", "staff", s, v)];
+        let merged = merge_layers(&category, &channel, "ch", "nobody");
+        assert_eq!(bits(&merged, "everyone"), (0, v | s), "copied");
+        assert_eq!(bits(&merged, "staff"), (s, v), "the channel's own deny of view stays");
+        assert!(merged.iter().all(|o| o.target_type == "channel" && o.target_id == "ch"));
+    }
+
+    #[test]
+    fn bits_the_channel_decides_for_everyone_drop_from_the_category() {
+        let v = p::VIEW_CHANNEL;
+        let category = [o("category", "role", "staff", v, 0), o("category", "member", "u1", v, 0)];
+        let channel = [o("channel", "role", "everyone", 0, v)];
+        let merged = merge_layers(&category, &channel, "ch", "everyone");
+        assert_eq!(bits(&merged, "everyone"), (0, v));
+        assert_eq!(bits(&merged, "staff"), (0, 0));
+        assert_eq!(bits(&merged, "u1"), (0, 0));
+    }
 }

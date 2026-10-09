@@ -72,6 +72,9 @@ pub struct ThreadsApi;
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateThreadRequest {
+    /// The thread id chosen by the client, so the first message's signature can cover `thread_id`: a ULID in its
+    /// canonical form (uppercase) whose time is within 10 minutes of the node's clock. Without it the node picks one.
+    pub id: Option<String>,
     /// 1–100 characters; in encrypted channels content-format ciphertext of `{ "type": "thread.title", "body" }`.
     #[schema(value_type = String)]
     pub title: Value,
@@ -91,7 +94,7 @@ pub struct CreateThreadRequest {
     params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = CreateThreadRequest,
     responses((status = 201, body = Thread), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
               (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails)),
-    description = "Starts a thread inside a text or announcement channel (from a root message of the channel or standalone, `send_messages` and `create_threads`) or a post in a forum channel (title, tags and the first message in one request, `send_messages`). In encrypted channels the title is ciphertext. The creator follows the thread; `thread.create` and then `message.create` for the first message are sent to the room.")]
+    description = "Starts a thread inside a text or announcement channel (from a root message of the channel or standalone, `send_messages` and `create_threads`) or a post in a forum channel (title, tags and the first message in one request, `send_messages`). In encrypted channels the title is ciphertext. The client may choose the thread id (`id`, a canonical ULID of about now) so the first message's signature covers its `thread_id` (`400 thread.id_invalid`, `409 thread.id_taken`). The creator follows the thread; `thread.create` and then `message.create` for the first message are sent to the room.")]
 pub async fn create_thread(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -140,7 +143,16 @@ pub async fn create_thread(
         None => None,
     };
     let (title, title_epoch) = th::check_title(&state, &auth, &conv, &req.title, req.title_epoch).await?;
-    let id = util::ulid();
+    let id = match req.id.as_deref() {
+        Some(id) => {
+            check_client_id(id, chrono::Utc::now())?;
+            if store::threads::by_id(&state.db, id).await?.is_some() {
+                return Err(id_taken());
+            }
+            id.to_string()
+        }
+        None => util::ulid(),
+    };
     let inserted = store::threads::insert(
         &state.db,
         NewThread {
@@ -159,10 +171,12 @@ pub async fn create_thread(
     )
     .await?;
     if !inserted {
-        // Another request started a thread on the same root in between.
-        let existing =
-            store::threads::id_by_root(&state.db, root.as_deref().unwrap_or_default()).await?.unwrap_or_default();
-        return Err(exists(&existing));
+        // Another request started a thread on the same root in between, or took the client's id.
+        let existing = match root.as_deref() {
+            Some(r) => store::threads::id_by_root(&state.db, r).await?,
+            None => None,
+        };
+        return Err(existing.map_or_else(id_taken, |e| exists(&e)));
     }
     store::threads::follow(&state.db, &id, &auth.user.id, None).await?;
     th::publish(&state, "thread.create", &id).await?;
@@ -178,6 +192,28 @@ pub async fn create_thread(
     let row = store::threads::by_id(&state.db, &id).await?.ok_or_else(th::not_found)?;
     let thread = th::one(&state, &auth.user, th::ThreadAccess { row, conv }).await?;
     Ok((StatusCode::CREATED, Json(thread)))
+}
+
+/// Largest distance between the time of a client-chosen thread id and the node's clock.
+const CLIENT_ID_SKEW_MINUTES: i64 = 10;
+
+/// A client-chosen thread id (PROTOCOL.md §7e): the canonical ULID string (the first message's signature covers it
+/// exactly), its time near the node's clock (it orders the threads by creation).
+fn check_client_id(id: &str, now: chrono::DateTime<chrono::Utc>) -> Result<(), ApiError> {
+    let invalid = || bad("thread.id_invalid", "id: a canonical (uppercase) ULID of about now");
+    let parsed = ulid::Ulid::from_string(id).map_err(|_| invalid())?;
+    if parsed.to_string() != id {
+        return Err(invalid());
+    }
+    let skew = (now.timestamp_millis() - parsed.timestamp_ms() as i64).abs();
+    if skew > CLIENT_ID_SKEW_MINUTES * 60_000 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn id_taken() -> ApiError {
+    ApiError::conflict("thread.id_taken", "A thread with this id exists; pick another id")
 }
 
 fn exists(thread_id: &str) -> ApiError {
@@ -316,6 +352,10 @@ pub async fn update_thread(
             code: "thread.manage_forbidden",
             detail: "Only the thread's creator or members with manage_threads change it".into(),
         });
+    }
+    // The creator changes the thread like an own message: with `send_messages` (gone in a timeout).
+    if !p::has(t.conv.perms, p::MANAGE_THREADS) {
+        t.conv.require(p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
     }
     let title = match &req.title {
         Some(title) => Some(th::check_title(&state, &auth, &t.conv, title, req.title_epoch).await?),
@@ -495,4 +535,24 @@ pub async fn followed_threads(
 ) -> Result<Json<FollowedThreads>, ApiError> {
     let room = access::room_access(&state, &room_id, &auth.user).await?;
     Ok(Json(FollowedThreads { items: th::followed(&state, &auth.user, &room).await? }))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn client_chosen_ids_are_canonical_ulids_of_about_now() {
+        let now = chrono::Utc::now();
+        let at = |offset_minutes: i64| {
+            let ms = (now + chrono::Duration::minutes(offset_minutes)).timestamp_millis() as u64;
+            ulid::Ulid::from_parts(ms, 42).to_string()
+        };
+        assert!(check_client_id(&at(0), now).is_ok());
+        assert!(check_client_id(&at(-9), now).is_ok() && check_client_id(&at(9), now).is_ok(), "clock skew");
+        for bad in [at(-11), at(11), at(0).to_lowercase(), "nope".into(), format!("{}0", at(0)), String::new()] {
+            assert_eq!(check_client_id(&bad, now).unwrap_err().code(), "thread.id_invalid", "{bad}");
+        }
+    }
 }

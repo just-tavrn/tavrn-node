@@ -632,7 +632,6 @@ mod tests {
             name: "f".into(),
             topic: String::new(),
             position: 0,
-            sync_with_category: 1,
             slowmode_secs: 0,
             bitrate_kbps: 64,
             user_limit: 0,
@@ -646,6 +645,8 @@ mod tests {
             has_webhooks: 0,
             auto_archive_minutes: DEFAULT_AUTO_ARCHIVE_MINUTES,
             forum_tags: tags.into(),
+            age_gate: "none".into(),
+            room_age_gate: "none".into(),
         }
     }
 
