@@ -149,7 +149,8 @@ async fn category_perms(
     }))
 }
 
-/// Delete a category; its channels remain, without a category.
+/// Delete a category; its channels remain, without a category, and keep what the category's overrides gave and
+/// denied (its overrides are copied into each channel first, protocol permissions.md "Moving channels").
 #[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/categories/{category_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("category_id" = String, Path)), responses((status = 204)))]
 pub async fn delete_category(
     State(state): State<AppState>,
@@ -521,8 +522,10 @@ pub struct UpdateChannelRequest {
     pub age_gate: Option<String>,
 }
 
-/// Update a channel (`manage_channels`).
-#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel)))]
+/// Update a channel (`manage_channels`). Moving it out of its category copies the category's overrides into the
+/// channel; moving it into a category that grants more needs `manage_roles` there (protocol permissions.md "Moving
+/// channels").
+#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel), (status = 403, body = ProblemDetails)))]
 pub async fn update_channel(
     State(state): State<AppState>,
     auth: AuthUser,

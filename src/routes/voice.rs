@@ -1056,7 +1056,7 @@ pub async fn update_sound(
 /// The audio of any clip of this node, room or personal, without authentication: players of
 /// every node fetch clips they are allowed to play from here. Ids are random; nothing else is revealed.
 #[utoipa::path(get, path = "/api/v1/sounds/{sound_id}/audio", params(("sound_id" = String, Path), SoundQuery),
-    responses((status = 200, description = "Audio file"), (status = 304), (status = 404, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
+    responses((status = 200, description = "Audio file"), (status = 304), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
 pub async fn public_sound_audio(
     State(state): State<AppState>,
     crate::auth::ClientIp(ip): crate::auth::ClientIp,

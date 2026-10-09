@@ -118,7 +118,7 @@ pub async fn get_room_setting(
 /// Hide or show my presence in one room.
 #[utoipa::path(put, path = "/api/v1/rooms/{room_id}/presence", security(("bearer" = [])), params(("room_id" = String, Path)),
     request_body = RoomPresenceSetting,
-    responses((status = 200, body = RoomPresenceSetting), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, body = RoomPresenceSetting), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn put_room_setting(
     State(state): State<AppState>,
     auth: AuthUser,

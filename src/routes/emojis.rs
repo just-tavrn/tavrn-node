@@ -296,7 +296,7 @@ pub(crate) fn proxy_limit(state: &AppState, ip: &str) -> Result<(), ApiError> {
 /// every conversation references emojis by id (`<:name:ID@host>`), and readers on every node load them from
 /// here. Ids are random; nothing about rooms or owners is revealed. `?still=1`: the still variant.
 #[utoipa::path(get, path = "/api/v1/emojis/{emoji_id}/image", params(("emoji_id" = String, Path), ImageQuery),
-    responses((status = 200, description = "WebP (or PNG/GIF/JPEG of emojis uploaded before conversion)"), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, description = "WebP (or PNG/GIF/JPEG of emojis uploaded before conversion)"), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn public_image(
     State(state): State<AppState>,
     crate::auth::ClientIp(ip): crate::auth::ClientIp,

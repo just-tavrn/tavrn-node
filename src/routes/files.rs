@@ -572,7 +572,7 @@ pub struct FileList {
 /// Entries of a folder, or a name search across the channel (`view_channel`).
 #[utoipa::path(get, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path), ListQuery),
-    responses((status = 200, body = FileList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, body = FileList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -763,7 +763,7 @@ fn quota_exceeded(limit: i64, used: i64) -> ApiError {
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/files/upload", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
-    responses((status = 201, body = FileEntry), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
+    responses((status = 201, body = FileEntry), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
 pub async fn upload(
     State(state): State<AppState>,
     auth: AuthUser,

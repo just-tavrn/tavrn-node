@@ -1282,7 +1282,7 @@ struct ConfirmExtra {
 }
 
 /// Bulk deletion (`purge`): first a preview with count and confirmation token, then permanent deletion.
-#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails)))]
+#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn purge(
     State(state): State<AppState>,
     auth: AuthUser,
