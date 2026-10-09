@@ -30,7 +30,7 @@ pub fn ulid() -> String {
     static GEN: Mutex<Option<ulid::Generator>> = Mutex::new(None);
     let mut guard = GEN.lock().unwrap_or_else(|e| e.into_inner());
     let generator = guard.get_or_insert_with(ulid::Generator::new);
-    generator.generate().unwrap_or_else(|_| ulid::Ulid::new()).to_string()
+    generator.generate().unwrap_or_else(|_| ulid::Ulid::generate()).to_string()
 }
 
 pub fn is_ulid(s: &str) -> bool {

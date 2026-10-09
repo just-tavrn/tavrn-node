@@ -22,7 +22,7 @@ pub struct TempDatabase {
 
 impl TempDatabase {
     pub async fn create(admin_url: &str) -> Result<Self> {
-        let name = format!("perf_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let name = format!("perf_{}", ulid::Ulid::generate().to_string().to_lowercase());
         let mut conn = PgConnection::connect(admin_url)
             .await
             .with_context(|| format!("PostgreSQL not reachable at {admin_url} (docker start tavrn-test-pg?)"))?;

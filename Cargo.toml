@@ -75,7 +75,7 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "request-id", "set-header"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-ulid = "1"
+ulid = "3"
 subtle = "2"
 # The encryption core, consumed by tag while the repositories are private (workspace dependency: a git
 # dependency; set CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo uses your git credentials, README.md "Building").
