@@ -7,7 +7,7 @@
 //! answers `401 auth.second_factor_required`. The token is spent when the session is issued.
 
 use aes_gcm::{
-    Aes256Gcm, Nonce,
+    Aes256Gcm,
     aead::{Aead, KeyInit, Payload},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
@@ -304,9 +304,9 @@ fn totp_key(state: &AppState) -> Zeroizing<[u8; 32]> {
 pub fn encrypt_totp_secret(state: &AppState, user_id: &str, secret: &[u8]) -> Result<Vec<u8>, ApiError> {
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let cipher = Aes256Gcm::new(totp_key(state).as_ref().into());
+    let cipher = Aes256Gcm::new((&*totp_key(state)).into());
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: secret, aad: user_id.as_bytes() })
+        .encrypt((&nonce).into(), Payload { msg: secret, aad: user_id.as_bytes() })
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("TOTP secret not encryptable")))?;
     Ok([nonce.as_slice(), &ct].concat())
 }
@@ -316,9 +316,9 @@ pub fn decrypt_totp_secret(state: &AppState, user_id: &str, blob: &[u8]) -> Resu
     if blob.len() < 12 + 16 {
         return Err(fail());
     }
-    let cipher = Aes256Gcm::new(totp_key(state).as_ref().into());
+    let cipher = Aes256Gcm::new((&*totp_key(state)).into());
     cipher
-        .decrypt(Nonce::from_slice(&blob[..12]), Payload { msg: &blob[12..], aad: user_id.as_bytes() })
+        .decrypt(blob[..12].try_into().map_err(|_| fail())?, Payload { msg: &blob[12..], aad: user_id.as_bytes() })
         .map(Zeroizing::new)
         .map_err(|_| fail())
 }

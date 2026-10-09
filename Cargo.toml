@@ -65,10 +65,10 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 image-webp = "0.2"
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 # Files channels: NFC-normalised entry names and SigV4 signatures for S3-compatible stores.
 unicode-normalization = "0.1"
-hmac = "0.12"
+hmac = "0.13"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "any", "migrate"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["full"] }
@@ -86,8 +86,8 @@ utoipa = { version = "5", features = ["axum_extras"] }
 totp-rs = { version = "6", features = ["otpauth"] }
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 openssl = { version = "0.10", features = ["vendored"] }
-aes-gcm = "0.10"
-hkdf = "0.12"
+aes-gcm = "0.11"
+hkdf = "0.13"
 zeroize = { version = "1", features = ["serde"] }
 tokio-tungstenite = "0.29"
 # LiveKit tokens, webhook verification and the room service (voice); HTTP to 127.0.0.1 only, no TLS.

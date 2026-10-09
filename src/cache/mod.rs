@@ -30,7 +30,7 @@ use std::{
 };
 
 use aes_gcm::{
-    Aes256Gcm, Nonce,
+    Aes256Gcm,
     aead::{Aead, KeyInit, Payload},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -454,9 +454,9 @@ impl Cluster {
     fn seal(&self, aad: &str, plain: &[u8]) -> CacheResult<String> {
         let mut nonce = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let cipher = Aes256Gcm::new(self.seal.as_ref().into());
+        let cipher = Aes256Gcm::new((&*self.seal).into());
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: aad.as_bytes() })
+            .encrypt((&nonce).into(), Payload { msg: plain, aad: aad.as_bytes() })
             .map_err(|_| CacheError("seal failed".into()))?;
         Ok(URL_SAFE_NO_PAD.encode([nonce.as_slice(), &ct].concat()))
     }
@@ -466,9 +466,9 @@ impl Cluster {
         if blob.len() < 12 + 16 {
             return None;
         }
-        let cipher = Aes256Gcm::new(self.seal.as_ref().into());
+        let cipher = Aes256Gcm::new((&*self.seal).into());
         cipher
-            .decrypt(Nonce::from_slice(&blob[..12]), Payload { msg: &blob[12..], aad: aad.as_bytes() })
+            .decrypt(blob[..12].try_into().ok()?, Payload { msg: &blob[12..], aad: aad.as_bytes() })
             .ok()
             .map(Zeroizing::new)
     }

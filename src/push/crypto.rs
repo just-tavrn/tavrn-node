@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use aes_gcm::{
-    Aes128Gcm, KeyInit, Nonce,
+    Aes128Gcm, KeyInit,
     aead::{Aead, Payload},
 };
 use anyhow::{Context, anyhow};
@@ -182,7 +182,7 @@ fn encrypt_with(
     record.push(2);
     let cipher = Aes128Gcm::new_from_slice(&cek).map_err(|_| anyhow!("key length"))?;
     let sealed = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &record, aad: b"" })
+        .encrypt(nonce.as_slice().try_into().map_err(|_| anyhow!("nonce length"))?, Payload { msg: &record, aad: b"" })
         .map_err(|_| anyhow!("encryption failed"))?;
     let mut body = Vec::with_capacity(16 + 4 + 1 + 65 + sealed.len());
     body.extend_from_slice(salt);
@@ -209,7 +209,10 @@ pub fn decrypt(ua_secret: &SecretKey, auth: &[u8], body: &[u8]) -> anyhow::Resul
     let (cek, nonce) = derive(shared.raw_secret_bytes(), auth, salt, ua_public.as_bytes(), as_public_bytes)?;
     let cipher = Aes128Gcm::new_from_slice(&cek).map_err(|_| anyhow!("key length"))?;
     let mut record = cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: &body[key_end..], aad: b"" })
+        .decrypt(
+            nonce.as_slice().try_into().map_err(|_| anyhow!("nonce length"))?,
+            Payload { msg: &body[key_end..], aad: b"" },
+        )
         .map_err(|_| anyhow!("decryption failed"))?;
     // Strip the padding and the delimiter of the last record.
     while record.last() == Some(&0) {

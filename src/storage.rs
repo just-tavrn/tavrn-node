@@ -93,7 +93,7 @@ impl StorageKey {
     }
 
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(self.key.as_slice().into())
+        Aes256Gcm::new((&*self.key).into())
     }
 
     /// Wraps a file key, bound to its storage id (a wrapped key copied to another row does not unwrap).
@@ -102,18 +102,16 @@ impl StorageKey {
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let wrapped = self
             .cipher()
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: file_key, aad: storage_id.as_bytes() })
+            .encrypt((&nonce).into(), Payload { msg: file_key, aad: storage_id.as_bytes() })
             .map_err(|_| anyhow!("file key could not be wrapped"))?;
         Ok(WrappedKey { wrapped, nonce })
     }
 
     pub fn unwrap(&self, storage_id: &str, wrapped: &[u8], nonce: &[u8]) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-        if nonce.len() != 12 {
-            bail!("wrap nonce of {storage_id} is damaged");
-        }
+        let nonce: &Nonce<_> = nonce.try_into().map_err(|_| anyhow!("wrap nonce of {storage_id} is damaged"))?;
         let plain = Zeroizing::new(
             self.cipher()
-                .decrypt(Nonce::from_slice(nonce), Payload { msg: wrapped, aad: storage_id.as_bytes() })
+                .decrypt(nonce, Payload { msg: wrapped, aad: storage_id.as_bytes() })
                 .map_err(|_| anyhow!("the file key of {storage_id} does not unwrap with storage key {}", self.id))?,
         );
         let key: [u8; 32] =
@@ -331,7 +329,7 @@ where
         remaining -= n as u64;
         let last = index + 1 == chunks;
         let ct = cipher
-            .encrypt(Nonce::from_slice(&chunk_nonce(index, last)), &buf[..n])
+            .encrypt((&chunk_nonce(index, last)).into(), &buf[..n])
             .map_err(|_| anyhow!("chunk could not be encrypted"))?;
         out.write_all(&ct).await?;
     }
@@ -374,7 +372,7 @@ impl ChunkSealer {
     fn seal(&mut self, plain: &[u8], last: bool, out: &mut Vec<u8>) -> anyhow::Result<()> {
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&chunk_nonce(self.index, last)), plain)
+            .encrypt((&chunk_nonce(self.index, last)).into(), plain)
             .map_err(|_| anyhow!("chunk could not be encrypted"))?;
         self.index += 1;
         out.extend_from_slice(&ct);
@@ -464,7 +462,7 @@ impl ChunkOpener {
             let last = self.index + 1 == self.chunks;
             let plain = self
                 .cipher
-                .decrypt(Nonce::from_slice(&chunk_nonce(self.index, last)), &self.pending[start..start + size])
+                .decrypt((&chunk_nonce(self.index, last)).into(), &self.pending[start..start + size])
                 .map_err(|_| anyhow!("stored file failed authentication (damaged or tampered)"))?;
             out.extend_from_slice(&plain);
             self.index += 1;
@@ -545,9 +543,9 @@ impl BlobReader {
                     let mut buf = vec![0u8; size];
                     file.read_exact(&mut buf).await?;
                     *remaining -= size as u64;
-                    let plain = cipher.decrypt(Nonce::from_slice(&chunk_nonce(*index, last)), buf.as_slice()).map_err(
-                        |_| std::io::Error::other("stored file failed authentication (damaged or tampered)"),
-                    )?;
+                    let plain = cipher.decrypt((&chunk_nonce(*index, last)).into(), buf.as_slice()).map_err(|_| {
+                        std::io::Error::other("stored file failed authentication (damaged or tampered)")
+                    })?;
                     *index += 1;
                     Ok(Some((Bytes::from(plain), source)))
                 }
@@ -847,7 +845,7 @@ impl BlobStorage {
             let file_key = key.unwrap(id, &wrapped, &nonce)?;
             let (chunks, len) =
                 encrypted_layout(file_len).ok_or_else(|| anyhow!("stored file {id} is damaged (impossible length)"))?;
-            let cipher = Box::new(Aes256Gcm::new(file_key.as_slice().into()));
+            let cipher = Box::new(Aes256Gcm::new((&*file_key).into()));
             return Ok(Some(BlobReader {
                 len,
                 encrypted: true,
