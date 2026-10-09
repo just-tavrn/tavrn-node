@@ -41,6 +41,7 @@ mod suite {
     mod federation_rooms_flow;
     mod federation_social_flow;
     mod files_backends_flow;
+    mod files_e2ee_flow;
     mod files_flow;
     mod friends_flow;
     mod history_flow;

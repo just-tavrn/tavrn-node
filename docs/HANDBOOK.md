@@ -773,6 +773,29 @@ hourly housekeeping deletes expired attachments (messages keep listing them as "
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
 Files channels can use external WebDAV/S3 stores only with `TAVRN_FILES_EXTERNAL=on`.
 
+### Files channels: what the node stores
+
+New files channels are **end-to-end encrypted** by default (protocol: FILES.md §8); the room's managers choose this
+when they create a channel and cannot change it later. In an encrypted files channel the node (and an external
+WebDAV/S3 store) only ever holds what the clients encrypted: the file contents and client-made thumbnails as
+ciphertext, and per entry an encrypted "entry record" with the name, type and key. In plaintext it keeps the entry
+ids, the folder tree (which entry is in which folder), who uploaded what and when, and the ciphertext sizes; never a
+name, a folder name, a type or content. Quotas, the entry limit, the orphan sweep, deletes and the audit log work on
+those fields (the audit log names entry ids instead of file names). Thumbnails of encrypted channels are always kept
+in the node's own storage, also for channels on an external store. The node cannot search, preview or classify
+encrypted files; upload categories are declared by the clients. Members who lost their keys can still list and
+delete their own uploads.
+
+Unencrypted files channels work as before: their files use the storage encryption at rest (readable by the node)
+or, on an external store, `encrypt_files` (which encrypted channels do not need and refuse).
+
+Deleting a files channel or a room deletes the files in the node's storage at once. Objects on an external store are
+deleted in the background with the credentials stored for the channel; when the store is unreachable they wait in a
+queue (`file_pending_deletes`, the configuration sealed with `secrets.key`) that the hourly housekeeping retries for
+7 days before it gives up and logs the object key. While `TAVRN_FILES_EXTERNAL=off` the queue pauses. On request
+(`keep_external`, offered by the client only for unencrypted external channels) the objects stay on the store;
+the audit log records how many were kept.
+
 ### Message retention
 
 `TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were

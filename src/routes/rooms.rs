@@ -385,11 +385,12 @@ async fn set_room_no_bots(state: &AppState, room: &Room, actor: &UserRow, value:
 }
 
 /// Permanently delete a room (owner or node admin only).
-#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}", security(("bearer" = [])), params(("room_id" = String, Path)), responses((status = 204), (status = 403, body = ProblemDetails)))]
+#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}", security(("bearer" = [])), params(("room_id" = String, Path), crate::routes::channels::DeleteFilesQuery), responses((status = 204), (status = 403, body = ProblemDetails)))]
 pub async fn delete_room(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
+    Query(q): Query<crate::routes::channels::DeleteFilesQuery>,
 ) -> Result<StatusCode, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     if !access.is_owner && !access.is_node_admin {
@@ -404,7 +405,8 @@ pub async fn delete_room(
     // custom emojis, soundboard clips and the members' per-room avatars. The rows cascade.
     let files = store::rooms::room_files(&state.db, &room_id).await?;
     let room_media = store::rooms::room_member_media(&state.db, &room_id).await?;
-    let channel_files = crate::routes::files::Cleanup::collect(&state, "room_id", &room_id).await?;
+    let channel_files = crate::routes::files::Cleanup::collect(&state, "room_id", &room_id, q.keep_external).await?;
+    let kept = channel_files.kept_objects();
     store::rooms::delete_room(&state.db, &room_id).await?;
     channel_files.run(&state).await;
     for id in &files {
@@ -427,7 +429,7 @@ pub async fn delete_room(
         "room.delete",
         &room_id,
         "",
-        serde_json::json!({ "name": access.room.name }),
+        serde_json::json!({ "name": access.room.name, "keep_external": q.keep_external && kept > 0, "kept_objects": kept }),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)

@@ -204,9 +204,14 @@ async fn mark_new_members(
         }
         let Some(joined) = util::parse_time(&member.joined_at) else { continue };
         let window_start = cutoff(policy, true, joined).map(ulid_floor);
-        let older =
+        let mut older =
             store::history::has_encrypted_before(&state.db, &conv.id, &ulid_floor(joined), window_start.as_deref())
                 .await?;
+        // Files channels have entry records instead of messages (FILES.md §8.7).
+        if !older && channel.kind == "files" {
+            let from = cutoff(policy, true, joined).map(util::format_time);
+            older = store::files::has_records_between(&state.db, &conv.id, from.as_deref(), &member.joined_at).await?;
+        }
         store::history::set_pending(&state.db, &conv.id, &user.id, &member.joined_at, older).await?;
         if older {
             conv.publish(

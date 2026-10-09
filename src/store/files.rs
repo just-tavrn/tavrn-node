@@ -28,10 +28,20 @@ pub struct EntryRow {
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Entry record of an end-to-end encrypted channel (FILES.md §8.4), its epoch, writer and time.
+    pub record: Option<String>,
+    pub record_epoch: Option<i64>,
+    pub record_author: Option<String>,
+    pub record_device_id: Option<String>,
+    pub record_at: Option<String>,
+    /// Stored thumbnail (encrypted channels) and its size.
+    pub thumbnail_id: Option<String>,
+    pub thumbnail_size: i64,
 }
 
 const COLS: &str = "id, room_id, channel_id, parent_id, kind, name, name_key, storage_id, backend, encrypted, mime, \
-                    size, sha256, created_by, created_at, updated_at";
+                    size, sha256, created_by, created_at, updated_at, record, record_epoch, record_author, \
+                    record_device_id, record_at, thumbnail_id, thumbnail_size";
 
 impl EntryRow {
     pub fn is_folder(&self) -> bool {
@@ -39,7 +49,34 @@ impl EntryRow {
     }
 
     pub fn to_api(&self) -> FileEntry {
+        self.to_api_cut(None)
+    }
+
+    /// Bytes the entry occupies (file and thumbnail).
+    pub fn stored_bytes(&self) -> i64 {
+        self.size.saturating_add(self.thumbnail_size)
+    }
+
+    /// Is the record visible for a history window that starts at `cut` (RFC 3339; FILES.md §8.7)?
+    pub fn record_visible(&self, cut: Option<&str>) -> bool {
+        match (cut, self.record_at.as_deref()) {
+            (Some(cut), Some(at)) => at >= cut,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
+    /// The API form; the record is left out when it was written before `cut`.
+    pub fn to_api_cut(&self, cut: Option<&str>) -> FileEntry {
+        let visible = self.record.is_some() && self.record_visible(cut);
+        let r = |v: &Option<String>| if visible { v.clone() } else { None };
         FileEntry {
+            record: r(&self.record),
+            record_epoch: if visible { self.record_epoch } else { None },
+            record_author: r(&self.record_author),
+            record_device_id: r(&self.record_device_id),
+            record_at: r(&self.record_at),
+            thumbnail_size: self.thumbnail_size,
             id: self.id.clone(),
             channel_id: self.channel_id.clone(),
             parent_id: self.parent_id.clone(),
@@ -78,14 +115,27 @@ pub struct NewEntry<'a> {
     pub size: i64,
     pub sha256: &'a str,
     pub created_by: &'a str,
+    /// Encrypted channels: the entry record (`name` and `mime` are then empty).
+    pub record: Option<Record<'a>>,
 }
 
-/// Inserts an entry; `Ok(None)` when the name is taken in the folder.
+/// An entry record as it is stored (FILES.md §8.4).
+#[derive(Clone, Copy)]
+pub struct Record<'a> {
+    pub record: &'a str,
+    pub epoch: i64,
+    pub author: &'a str,
+    pub device_id: &'a str,
+}
+
+/// Inserts an entry; `Ok(None)` when the name (encrypted channels: the id) is taken.
 pub async fn insert(db: &Pool, e: NewEntry<'_>) -> Result<Option<EntryRow>, ApiError> {
     let ts = now();
+    // Encrypted entries have no name: the id is their unique key.
+    let key = if e.record.is_some() { e.id.to_string() } else { crate::files::name_key(e.name) };
     let r = sqlx::query(
-        "INSERT INTO file_entries (id, room_id, channel_id, parent_id, kind, name, name_key, storage_id, backend, encrypted, mime, size, sha256, created_by, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)",
+        "INSERT INTO file_entries (id, room_id, channel_id, parent_id, kind, name, name_key, storage_id, backend, encrypted, mime, size, sha256, created_by, created_at, updated_at, record, record_epoch, record_author, record_device_id, record_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16, $17, $18, $19, $20)",
     )
     .bind(e.id)
     .bind(e.room_id)
@@ -93,7 +143,7 @@ pub async fn insert(db: &Pool, e: NewEntry<'_>) -> Result<Option<EntryRow>, ApiE
     .bind(e.parent_id)
     .bind(e.kind)
     .bind(e.name)
-    .bind(crate::files::name_key(e.name))
+    .bind(key)
     .bind(e.storage_id)
     .bind(e.backend)
     .bind(i64::from(e.encrypted))
@@ -102,6 +152,11 @@ pub async fn insert(db: &Pool, e: NewEntry<'_>) -> Result<Option<EntryRow>, ApiE
     .bind(e.sha256)
     .bind(e.created_by)
     .bind(&ts)
+    .bind(e.record.map(|r| r.record))
+    .bind(e.record.map(|r| r.epoch))
+    .bind(e.record.map(|r| r.author))
+    .bind(e.record.map(|r| r.device_id))
+    .bind(e.record.map(|_| ts.clone()))
     .execute(db)
     .await;
     match r {
@@ -140,6 +195,136 @@ pub async fn update(db: &Pool, id: &str, name: &str, parent_id: Option<&str>) ->
         Err(err) if super::is_unique_violation(&err) => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Encrypted entries: a new record (rename) and/or a new folder (move).
+pub async fn update_encrypted(
+    db: &Pool,
+    id: &str,
+    record: Option<Record<'_>>,
+    parent_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let ts = now();
+    match record {
+        Some(r) => {
+            sqlx::query(
+                "UPDATE file_entries SET record = $1, record_epoch = $2, record_author = $3, record_device_id = $4,
+                 record_at = $5, parent_id = $6, updated_at = $5 WHERE id = $7",
+            )
+            .bind(r.record)
+            .bind(r.epoch)
+            .bind(r.author)
+            .bind(r.device_id)
+            .bind(&ts)
+            .bind(parent_id)
+            .bind(id)
+            .execute(db)
+            .await?;
+        }
+        None => {
+            sqlx::query("UPDATE file_entries SET parent_id = $1, updated_at = $2 WHERE id = $3")
+                .bind(parent_id)
+                .bind(&ts)
+                .bind(id)
+                .execute(db)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets the thumbnail of an entry; returns the storage id of the one it replaces.
+pub async fn set_thumbnail(db: &Pool, id: &str, storage_id: &str, size: i64) -> Result<Option<String>, ApiError> {
+    let old: Option<Option<String>> =
+        sqlx::query_scalar("SELECT thumbnail_id FROM file_entries WHERE id = $1").bind(id).fetch_optional(db).await?;
+    sqlx::query("UPDATE file_entries SET thumbnail_id = $1, thumbnail_size = $2 WHERE id = $3")
+        .bind(storage_id)
+        .bind(size)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(old.flatten())
+}
+
+/// The requester's own entries, oldest first (by id), after the cursor id.
+pub async fn mine(
+    db: &Pool,
+    channel_id: &str,
+    user_id: &str,
+    after: &str,
+    limit: i64,
+) -> Result<Vec<EntryRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {COLS} FROM file_entries WHERE channel_id = $1 AND created_by = $2 AND id > $3 ORDER BY id LIMIT $4"
+    ))
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Files, folders and bytes (files and thumbnails) of one member's entries in a channel.
+pub async fn mine_totals(db: &Pool, channel_id: &str, user_id: &str) -> Result<(i64, i64, i64), ApiError> {
+    let row = sqlx::query(
+        "SELECT CAST(COALESCE(SUM(CASE WHEN kind = 'file' THEN 1 ELSE 0 END), 0) AS BIGINT) AS files,
+                CAST(COALESCE(SUM(CASE WHEN kind = 'folder' THEN 1 ELSE 0 END), 0) AS BIGINT) AS folders,
+                CAST(COALESCE(SUM(size + thumbnail_size), 0) AS BIGINT) AS bytes
+         FROM file_entries WHERE channel_id = $1 AND created_by = $2",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    Ok((row.try_get("files")?, row.try_get("folders")?, row.try_get("bytes")?))
+}
+
+/// Filter of [`records`].
+pub struct RecordQuery<'a> {
+    pub epoch: Option<i64>,
+    /// Records written at or after this time (the later of the requested `since` and the history window).
+    pub since: Option<&'a str>,
+    /// Cursor: records after this one in (record_at, id) order.
+    pub after: Option<(&'a str, &'a str)>,
+    pub limit: i64,
+}
+
+/// Entries with a record, ordered by the time the record was written (FILES.md §3 `GET records`).
+pub async fn records(db: &Pool, channel_id: &str, q: RecordQuery<'_>) -> Result<Vec<EntryRow>, ApiError> {
+    let (at, aid) = q.after.unwrap_or(("", ""));
+    Ok(sqlx::query_as(&format!(
+        "SELECT {COLS} FROM file_entries WHERE channel_id = $1 AND record IS NOT NULL
+           AND ($2 < 0 OR record_epoch = $2) AND record_at >= $3
+           AND (record_at > $4 OR (record_at = $4 AND id > $5))
+         ORDER BY record_at, id LIMIT $6"
+    ))
+    .bind(channel_id)
+    .bind(q.epoch.unwrap_or(-1))
+    .bind(q.since.unwrap_or(""))
+    .bind(at)
+    .bind(aid)
+    .bind(q.limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Are there entry records written in `[from, before)` (history marks, ENCRYPTION.md §7b)?
+pub async fn has_records_between(
+    db: &Pool,
+    channel_id: &str,
+    from: Option<&str>,
+    before: &str,
+) -> Result<bool, ApiError> {
+    let row = sqlx::query(
+        "SELECT id FROM file_entries WHERE channel_id = $1 AND record IS NOT NULL AND record_at >= $2 AND record_at < $3 LIMIT 1",
+    )
+    .bind(channel_id)
+    .bind(from.unwrap_or(""))
+    .bind(before)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// The cursor condition of a listing (`$3`–`$5`): entries after `after` in the order kind DESC ('folder'
@@ -236,7 +421,7 @@ pub async fn delete_ids(db: &Pool, ids: &[String]) -> Result<(), ApiError> {
 /// Bytes, files and folders of a channel.
 pub async fn usage(db: &Pool, channel_id: &str) -> Result<(i64, i64, i64), ApiError> {
     let row = sqlx::query(
-        "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes,
+        "SELECT CAST(COALESCE(SUM(size + thumbnail_size), 0) AS BIGINT) AS bytes,
                 CAST(COALESCE(SUM(CASE WHEN kind = 'file' THEN 1 ELSE 0 END), 0) AS BIGINT) AS files,
                 CAST(COALESCE(SUM(CASE WHEN kind = 'folder' THEN 1 ELSE 0 END), 0) AS BIGINT) AS folders
          FROM file_entries WHERE channel_id = $1",
@@ -251,10 +436,12 @@ pub async fn usage(db: &Pool, channel_id: &str) -> Result<(i64, i64, i64), ApiEr
 /// objects are removed by the caller).
 pub async fn stored_of(db: &Pool, column: &str, id: &str) -> Result<Vec<EntryRow>, ApiError> {
     let column = if column == "room_id" { "room_id" } else { "channel_id" };
-    Ok(sqlx::query_as(&format!("SELECT {COLS} FROM file_entries WHERE {column} = $1 AND kind = 'file'"))
-        .bind(id)
-        .fetch_all(db)
-        .await?)
+    Ok(sqlx::query_as(&format!(
+        "SELECT {COLS} FROM file_entries WHERE {column} = $1 AND (kind = 'file' OR thumbnail_id IS NOT NULL)"
+    ))
+    .bind(id)
+    .fetch_all(db)
+    .await?)
 }
 
 /// Internal files older than `cutoff` (page by id): the orphan sweep checks that their stored file exists.
@@ -318,7 +505,116 @@ pub async fn set_backend(
     Ok(())
 }
 
+// ---------------------------------------------------------------- Pending external deletes
+
+#[derive(Debug, Clone, FromRow)]
+pub struct PendingDelete {
+    pub id: String,
+    pub channel_id: String,
+    pub kind: String,
+    pub config: String,
+    pub object_key: String,
+    pub attempts: i64,
+    pub next_at: String,
+    pub created_at: String,
+}
+
+const PENDING_COLS: &str = "id, channel_id, kind, config, object_key, attempts, next_at, created_at";
+
+/// Queues objects of one store for deletion (FILES.md §6); returns the queue ids.
+pub async fn enqueue_deletes(
+    db: &Pool,
+    channel_id: &str,
+    kind: &str,
+    config: &str,
+    keys: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let ts = now();
+    let mut ids = Vec::with_capacity(keys.len());
+    let mut tx = db.begin().await?;
+    for key in keys {
+        let id = ulid();
+        sqlx::query(&format!(
+            "INSERT INTO file_pending_deletes ({PENDING_COLS}) VALUES ($1, $2, $3, $4, $5, 0, $6, $6)"
+        ))
+        .bind(&id)
+        .bind(channel_id)
+        .bind(kind)
+        .bind(config)
+        .bind(key)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+        ids.push(id);
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// Queued deletes due at `now` (or the given ids), at most `limit`.
+pub async fn pending_deletes(
+    db: &Pool,
+    now: &str,
+    ids: Option<&[String]>,
+    limit: i64,
+) -> Result<Vec<PendingDelete>, ApiError> {
+    match ids {
+        Some(ids) => {
+            let mut out = Vec::new();
+            for chunk in ids.chunks(500) {
+                let list = (0..chunk.len()).map(|i| format!("${}", i + 1)).collect::<Vec<_>>().join(", ");
+                let sql = format!("SELECT {PENDING_COLS} FROM file_pending_deletes WHERE id IN ({list})");
+                let mut q = sqlx::query_as::<_, PendingDelete>(&sql);
+                for id in chunk {
+                    q = q.bind(id);
+                }
+                out.extend(q.fetch_all(db).await?);
+            }
+            Ok(out)
+        }
+        None => Ok(sqlx::query_as(&format!(
+            "SELECT {PENDING_COLS} FROM file_pending_deletes WHERE next_at <= $1 ORDER BY next_at, id LIMIT $2"
+        ))
+        .bind(now)
+        .bind(limit)
+        .fetch_all(db)
+        .await?),
+    }
+}
+
+/// Removes a queued delete (done or given up).
+pub async fn delete_pending(db: &Pool, id: &str) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM file_pending_deletes WHERE id = $1").bind(id).execute(db).await?;
+    Ok(())
+}
+
+/// A failed attempt: retried at `next_at`.
+pub async fn pending_failed(db: &Pool, id: &str, attempts: i64, next_at: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE file_pending_deletes SET attempts = $1, next_at = $2 WHERE id = $3")
+        .bind(attempts)
+        .bind(next_at)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// A fresh id for an entry.
 pub fn new_id() -> String {
     ulid()
+}
+
+/// Is the conversation (a files channel) end-to-end encrypted?
+pub async fn channel_encrypted(db: &Pool, channel_id: &str) -> Result<bool, ApiError> {
+    let v: Option<i64> = sqlx::query_scalar("SELECT encrypted FROM conversations WHERE id = $1")
+        .bind(channel_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(v.unwrap_or(0) != 0)
+}
+
+/// Does any files channel have an entry with this id?
+pub async fn id_exists(db: &Pool, id: &str) -> Result<bool, ApiError> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_entries WHERE id = $1").bind(id).fetch_one(db).await?;
+    Ok(n > 0)
 }

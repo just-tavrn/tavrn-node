@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Files channels (`protocol/FILES.md`): a folder tree per channel of kind `files`
-//! instead of a chat. Not end-to-end encrypted by design; files use the node's storage
-//! encryption at rest, or an external WebDAV/S3 store per channel ([`remote`]).
+//! instead of a chat. End-to-end encrypted channels (§8) keep only ciphertext and entry records the node cannot
+//! read; unencrypted ones use the node's storage encryption at rest. Either kind can keep its bytes on an
+//! external WebDAV/S3 store per channel ([`remote`]).
 //!
 //! This module holds what the routes share: name rules, the encrypted backend configuration, the API types
 //! and the stream adapters (size limit and hash, sealing for external stores, ranges).
@@ -188,6 +189,17 @@ pub struct FileEntry {
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Encrypted channels: the entry record (content format 1 with name, type and file key, FILES.md §8.4);
+    /// `null` in unencrypted channels and when it was written before the requester's history window (§8.7).
+    pub record: Option<String>,
+    pub record_epoch: Option<i64>,
+    /// Address of the user whose device wrote the record.
+    pub record_author: Option<String>,
+    pub record_device_id: Option<String>,
+    /// When the record was written.
+    pub record_at: Option<String>,
+    /// Size of the stored thumbnail (encrypted channels; 0 = none).
+    pub thumbnail_size: i64,
 }
 
 // ---------------------------------------------------------------- Stream adapters
@@ -316,6 +328,38 @@ pub async fn read_head(mut stream: ByteStream, max: usize) -> std::io::Result<(B
     Ok((head, Box::pin(first.chain(stream))))
 }
 
+/// Longest entry record in bytes (FILES.md §8.4).
+pub const MAX_RECORD_BYTES: usize = 8 * 1024;
+/// Shortest entry record: version, epoch, nonce, tag and signature (ENCRYPTION.md §5.3).
+pub const MIN_RECORD_BYTES: usize = 1 + 8 + 12 + 16 + 64;
+/// Largest thumbnail ciphertext.
+pub const MAX_THUMBNAIL_BYTES: usize = 1024 * 1024;
+/// Client-chosen entry ids must be within this many milliseconds of the node's clock.
+pub const ID_SKEW_MS: u64 = 24 * 3600 * 1000;
+
+/// A client-chosen entry id (encrypted channels): a ULID whose time is within a day of `now_ms`.
+pub fn client_id(id: Option<&str>, now_ms: u64) -> Result<String, ApiError> {
+    let invalid = || bad("files.id_invalid", "id must be a fresh ULID (its time within a day of the node's clock)");
+    let id = id.map(str::trim).filter(|i| crate::util::is_ulid(i)).ok_or_else(invalid)?;
+    let ts = ulid::Ulid::from_string(id).map_err(|_| invalid())?.timestamp_ms();
+    if ts.abs_diff(now_ms) > ID_SKEW_MS {
+        return Err(invalid());
+    }
+    Ok(id.to_string())
+}
+
+/// Shape of an entry record (base64url content format 1, 121 bytes to 8 KiB); epochs are checked by the caller.
+pub fn record_shape(record: Option<&str>) -> Result<&str, ApiError> {
+    let invalid = || bad("files.record_invalid", "record must be encrypted content (format 1) of at most 8 KiB");
+    let record = record.filter(|r| !r.is_empty() && r.len() <= MAX_RECORD_BYTES * 4 / 3 + 4).ok_or_else(invalid)?;
+    let bytes = tavrn_crypto::util::b64url_decode(record).map_err(|_| invalid())?;
+    if bytes.len() < MIN_RECORD_BYTES || bytes.len() > MAX_RECORD_BYTES || tavrn_crypto::content_header(record).is_err()
+    {
+        return Err(invalid());
+    }
+    Ok(record)
+}
+
 /// Parses a single-range `Range` header against a length: `Some(Ok((start, end)))` (inclusive),
 /// `Some(Err(()))` when unsatisfiable, `None` when absent or not a single byte range (served whole).
 pub fn parse_range(header: Option<&str>, len: u64) -> Option<Result<(u64, u64), ()>> {
@@ -391,6 +435,33 @@ mod tests {
         assert_eq!(upload_mime(Some("application/octet-stream"), "a.mp3", b""), "audio/mpeg");
         assert_eq!(upload_mime(Some("image/png"), "x.png", b"<svg xmlns='x'/>"), "image/svg+xml");
         assert_eq!(upload_mime(Some("text/html\r\nX: y"), "x.bin", b""), "application/octet-stream");
+    }
+
+    #[test]
+    fn client_ids_and_record_shapes_are_checked() {
+        let now = 1_760_000_000_000u64;
+        let fresh = ulid::Ulid::from_parts(now - 1000, 7).to_string();
+        assert_eq!(client_id(Some(&fresh), now).unwrap(), fresh);
+        for bad in [None, Some(""), Some("nope"), Some("01J9ZK3G5M8Q2W4E6R8T0Y2Vä1")] {
+            assert_eq!(client_id(bad, now).unwrap_err().code(), "files.id_invalid", "{bad:?}");
+        }
+        let old = ulid::Ulid::from_parts(now - ID_SKEW_MS - 1, 7).to_string();
+        let future = ulid::Ulid::from_parts(now + ID_SKEW_MS + 1, 7).to_string();
+        assert!(client_id(Some(&old), now).is_err() && client_id(Some(&future), now).is_err());
+
+        let mut raw = vec![1u8];
+        raw.extend_from_slice(&3u64.to_be_bytes());
+        raw.extend_from_slice(&[0u8; 12 + 16 + 64]);
+        let ok = URL_SAFE_NO_PAD.encode(&raw);
+        assert_eq!(record_shape(Some(&ok)).unwrap(), ok);
+        let short = URL_SAFE_NO_PAD.encode(&raw[..100]);
+        let mut v2 = raw.clone();
+        v2[0] = 2;
+        let big = URL_SAFE_NO_PAD.encode([raw.clone(), vec![0u8; MAX_RECORD_BYTES]].concat());
+        for bad in [None, Some(""), Some("AQAA"), Some(short.as_str()), Some("not base64!"), Some(big.as_str())] {
+            assert_eq!(record_shape(bad).unwrap_err().code(), "files.record_invalid", "{bad:?}");
+        }
+        assert!(record_shape(Some(&URL_SAFE_NO_PAD.encode(&v2))).is_err(), "unknown version");
     }
 
     #[test]
