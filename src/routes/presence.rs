@@ -118,7 +118,7 @@ pub async fn get_room_setting(
 /// Hide or show my presence in one room.
 #[utoipa::path(put, path = "/api/v1/rooms/{room_id}/presence", security(("bearer" = [])), params(("room_id" = String, Path)),
     request_body = RoomPresenceSetting,
-    responses((status = 200, body = RoomPresenceSetting), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, body = RoomPresenceSetting), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn put_room_setting(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -126,6 +126,8 @@ pub async fn put_room_setting(
     ApiJson(req): ApiJson<RoomPresenceSetting>,
 ) -> Result<Json<RoomPresenceSetting>, ApiError> {
     member(&state, &auth, &room_id).await?;
+    // Each toggle fans out to the whole room.
+    state.presence_limiter.check_all(&[format!("presence-room:{}", auth.user.id)])?;
     presence::set_room_hidden(&state, &room_id, &auth.user.id, req.hidden).await?;
     // The room's members now see the presence (or no longer do): one update for everyone.
     if req.hidden {

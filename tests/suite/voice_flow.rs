@@ -1298,17 +1298,30 @@ async fn authz_mass_move_does_not_reveal_hidden_voice_channels() {
     assert!(!j.to_string().contains("alice@t.local"), "the hidden channel's participant leaks: {j}");
 }
 
-/// Authorization audit (2026-10-09): losing `view_channel`/`connect` through a role or override change does not end
-/// a running voice session (only leave, kick, ban and timeout do); the member keeps hearing the channel until they
-/// reconnect. Needs a recomputation of connected participants after permission changes (ENCRYPTION.md §4.5 rule 4).
+/// Authorization audit (2026-10-09): losing `view_channel` or `connect` through a role or override change ends a
+/// running voice session within the next visibility refresh (the event that changed it), announced as `voice.state`.
 #[tokio::test]
-#[ignore = "design: permission changes do not disconnect voice participants who lost access"]
 async fn authz_losing_access_ends_the_voice_session() {
     let v = setup().await;
     assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
     v.connected(&v.bob).await;
     assert_eq!(v.participants(&v.alice).await.len(), 1);
+    let mut rx = v.node.state.hub.subscribe();
     v.override_everyone(&v.voice_id, &[], &[p::VIEW_CHANNEL]).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(next_event(&mut rx, "voice.state").await["participants"], json!([]), "announced as left");
     assert!(v.participants(&v.alice).await.is_empty(), "bob still sits in the channel he cannot see");
+}
+
+#[tokio::test]
+async fn authz_losing_connect_ends_the_voice_session() {
+    let v = setup().await;
+    assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
+    v.connected(&v.bob).await;
+    assert_eq!(v.join(&v.alice).await.0, StatusCode::OK);
+    v.connected(&v.alice).await;
+    v.override_everyone(&v.voice_id, &[], &[p::CONNECT]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let left: Vec<Value> = v.participants(&v.alice).await;
+    assert_eq!(left.len(), 1, "the owner stays: {left:?}");
+    assert_eq!(left[0]["identity"], v.identity(&v.alice));
 }

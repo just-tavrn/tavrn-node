@@ -49,6 +49,7 @@ pub struct FederatedLogin {
 /// its device, and issues the single session of that device.
 pub async fn federated_login(
     state: &AppState,
+    ip: &str,
     token: &str,
     device_name: &str,
     client: &str,
@@ -58,7 +59,7 @@ pub async fn federated_login(
         return Err(super::disabled());
     }
     let iss = tokens::peek_issuer(state, token)?;
-    let result = login_inner(state, token, &iss, device_name, client).await;
+    let result = login_inner(state, ip, token, &iss, device_name, client).await;
     let ms = started.elapsed().as_millis() as u64;
     match &result {
         Ok(login) => tracing::info!(
@@ -76,14 +77,17 @@ pub async fn federated_login(
 
 async fn login_inner(
     state: &AppState,
+    ip: &str,
     token: &str,
     iss: &str,
     device_name: &str,
     client: &str,
 ) -> Result<FederatedLogin, ApiError> {
     super::check_policy(state, iss).await?;
+    // Before the signature check the domain's budget counts per address: a peer's own attempts (the conformance
+    // check's burst of invalid logins, §9) reach `429`, forged ones from elsewhere cannot use up its budget.
     if !state.config.misbehaves("no_rate_limit") {
-        state.federation_login_limiter.check_all(&[format!("domain:{iss}")]).await?;
+        state.federation_login_limiter.check_all(&[format!("domain:{iss}|ip:{ip}")]).await?;
     }
     let t = match tokens::verify_federation_token(state, token, iss).await {
         Ok(t) => t,
@@ -95,6 +99,11 @@ async fn login_inner(
             return Err(e);
         }
     };
+    // Per domain only after the signature check (the route limits per address before): forged tokens in a
+    // peer's name must not use up its budget.
+    if !state.config.misbehaves("no_rate_limit") {
+        state.federation_login_limiter.check_all(&[format!("domain:{iss}")]).await?;
+    }
     // After the signature check, so only real peers can start a conformance run; before the `jti` is
     // spent, so the token can be retried after `federation.conformance_pending`.
     super::conformance::require(state, iss).await?;

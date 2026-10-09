@@ -135,6 +135,8 @@ async fn run(state: AppState, mut socket: WebSocket) {
         return;
     }
 
+    // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`).
+    visible.know(&state, &rooms, &auth.user.id).await;
     let (mut sink, mut stream) = socket.split();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
@@ -206,12 +208,23 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             let _ = sink.send(WsMessage::Close(Some(frame))).await;
                             break;
                         }
-                        // A room channel's events only to the members who may view it (PROTOCOL.md §6).
-                        if relevant
-                            && let Scope::Room(room_id) = &ev.scope
-                            && !visible.delivers(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await
-                        {
-                            continue;
+                        // A room channel's events only to the members who may view it, a private channel's
+                        // metadata only to those it is listed to, and what they gained or lost (PROTOCOL.md §6).
+                        if relevant && let Scope::Room(room_id) = &ev.scope {
+                            let delivery = visible.deliver(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await;
+                            let mut closed = false;
+                            for frame in delivery.before {
+                                if sink.send(WsMessage::Text(frame.into())).await.is_err() {
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            if closed {
+                                break;
+                            }
+                            if !delivery.event {
+                                continue;
+                            }
                         }
                         // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                         if relevant && sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
@@ -252,7 +265,7 @@ fn may_write(scopes: Option<&[String]>) -> bool {
     scopes.is_none_or(|s| s.iter().any(|x| x == "messages:write"))
 }
 
-/// Forwards a typing notice: room channels to the room members (the connection must be a member who may view the
+/// Forwards a typing notice: room channels to the room members (the connection must be a member who may send in the
 /// channel; the fan-out reaches only the channel's viewers), DMs and group DMs to their members (the sender must be
 /// one).
 async fn typing(
@@ -265,7 +278,18 @@ async fn typing(
 ) {
     match (room_id, channel_id, conversation_id) {
         (Some(room_id), Some(channel_id), _) if rooms.contains(&room_id) => {
-            if !crate::visibility::can_view(state, &room_id, &channel_id, &auth.user.id).await {
+            // Typing is writing: a member in timeout (or without `send_messages`) types nowhere (permissions.md step 5).
+            let may_send = match crate::visibility::room(state, &room_id).await {
+                Ok(Some(view)) => view
+                    .perms(&channel_id, &auth.user.id)
+                    .is_some_and(|p| crate::permissions::has(p, crate::permissions::SEND_MESSAGES)),
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::debug!(error = %e, "typing notice not deliverable");
+                    false
+                }
+            };
+            if !may_send {
                 return;
             }
             state.hub.room(

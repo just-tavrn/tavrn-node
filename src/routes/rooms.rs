@@ -93,13 +93,22 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
         }
         None => Vec::new(),
     };
+    // Only the overrides of the listed channels and categories (PROTOCOL.md §6 "Audiences").
+    let overrides = overrides
+        .iter()
+        .filter(|o| match o.target_type.as_str() {
+            "category" => categories.iter().any(|c| c.id == o.target_id),
+            _ => channels.iter().any(|c| c.id == o.target_id),
+        })
+        .map(|o| o.to_api())
+        .collect();
     Ok(RoomDetail {
         room: access.room.clone(),
         member_count: store::rooms::member_count(db, id).await?,
         categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
         roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
-        overrides: overrides.iter().map(|o| o.to_api()).collect(),
+        overrides,
         my_roles: access.member_roles.iter().map(|r| r.id.clone()).collect(),
         my_permissions: access.room_perms.to_string(),
         is_owner: access.is_owner,
@@ -1273,7 +1282,7 @@ struct ConfirmExtra {
 }
 
 /// Bulk deletion (`purge`): first a preview with count and confirmation token, then permanent deletion.
-#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails)))]
+#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/moderation/purge", security(("bearer" = [])), params(("room_id" = String, Path)), request_body = PurgeRequest, responses((status = 200, body = PurgeResponse), (status = 403, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn purge(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -1282,6 +1291,10 @@ pub async fn purge(
 ) -> Result<Json<PurgeResponse>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
+    // A preview counts messages across the room's channels: limited per moderator.
+    if req.confirm_token.is_none() {
+        state.purge_limiter.check_all(&[format!("purge:{}", auth.user.id)])?;
+    }
     let all_channels = store::rooms::channels(&state.db, &room_id).await?;
     let room_channels: Vec<String> = all_channels.iter().map(|c| c.id.clone()).collect();
     // Only channels in which the actor holds `purge` (permissions.md step 4: nothing without `view_channel`).

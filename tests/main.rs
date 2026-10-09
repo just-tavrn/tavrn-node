@@ -64,6 +64,7 @@ mod suite {
     mod presence_flow;
     mod profiles_flow;
     mod push_flow;
+    mod rate_limits_flow;
     mod reauth_flow;
     mod report_push_flow;
     mod reports_flow;

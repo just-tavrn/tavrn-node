@@ -345,6 +345,10 @@ impl FromRequestParts<AppState> for AuthUser {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         let token = bearer(&parts.headers).ok_or(ApiError::Unauthorized { code: "auth.required" })?;
         let auth = authenticate(state, token).await?;
+        // The general per-user limit (`TAVRN_RATE_USER_PER_MINUTE`); route limits come on top.
+        if let Some(limiter) = &state.user_api_limiter {
+            limiter.check_all(&[format!("user:{}", auth.user.id)])?;
+        }
         check_route(state, &auth, parts)?;
         // `TAVRN_LEGAL_TERMS_MODE=require`: nothing but the legal flow until the current terms are accepted.
         let path = parts.extensions.get::<axum::extract::MatchedPath>().map(axum::extract::MatchedPath::as_str);

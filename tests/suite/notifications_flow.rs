@@ -161,6 +161,8 @@ async fn role_mentions_count_and_settings_change_the_counts() {
 async fn home_node_drops_hints_the_user_does_not_want() {
     let s = setup().await;
     let bob = store::users::by_id(&s.node.state.db, &s.bob.user_id).await.unwrap().unwrap();
+    // Hints come only from nodes bob signed in on (FEDERATION.md §5.2).
+    store::federation::touch_target(&s.node.state.db, &bob.id, &s.bob.device_id, "b.test").await.unwrap();
     let room = tavrn_node::util::ulid();
     let conv = tavrn_node::util::ulid();
     let hint = |mention: bool, everyone: bool| Incoming::Notify {

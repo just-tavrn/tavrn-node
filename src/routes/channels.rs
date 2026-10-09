@@ -14,7 +14,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     error::{ApiError, ProblemDetails},
-    models::{CHANNEL_KINDS, Category, Channel, PermissionOverride},
+    models::{CHANNEL_KINDS, Category, Channel, ChannelRow, OverrideRow, PermissionOverride},
     permissions as p, store,
     validate::{self, bad},
 };
@@ -149,7 +149,8 @@ async fn category_perms(
     }))
 }
 
-/// Delete a category; its channels remain, without a category.
+/// Delete a category; its channels remain, without a category, and keep what the category's overrides gave and
+/// denied (its overrides are copied into each channel first, protocol permissions.md "Moving channels").
 #[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/categories/{category_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("category_id" = String, Path)), responses((status = 204)))]
 pub async fn delete_category(
     State(state): State<AppState>,
@@ -163,11 +164,189 @@ pub async fn delete_category(
     if category.as_ref().is_some_and(|c| c.no_bots != 0) {
         crate::bot_channels::refuse_bots(&auth.user)?;
     }
+    if category.is_none() {
+        return Err(access::not_found("Category", "category.not_found"));
+    }
+    // Its channels keep what the category's overrides gave and denied (permissions.md "Moving channels").
+    for channel in store::rooms::channels(&state.db, &room_id).await? {
+        if channel.category_id.as_deref() == Some(category_id.as_str()) {
+            leave_category(&state, &room_id, &auth.user, &channel, None).await?;
+        }
+    }
     if !store::rooms::delete_category(&state.db, &room_id, &category_id).await? {
         return Err(access::not_found("Category", "category.not_found"));
     }
     state.hub.room(&room_id, "category.delete", serde_json::json!({ "room_id": room_id, "id": category_id }));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The channel's own overrides with its category's merged in, for a channel that leaves the category: per subject
+/// the channel's setting of a bit wins, the category's fills the bits it leaves neutral; a bit the channel's
+/// `@everyone` override decides is decided for everybody in the channel layer, so it drops from the category's.
+fn merge_layers(
+    category: &[OverrideRow],
+    channel: &[OverrideRow],
+    channel_id: &str,
+    everyone_id: &str,
+) -> Vec<OverrideRow> {
+    let decided = |o: &OverrideRow| (o.allow | o.deny, o.upload_allow | o.upload_deny);
+    let (everyone, everyone_uploads) =
+        channel.iter().find(|o| o.subject_type == "role" && o.subject_id == everyone_id).map(decided).unwrap_or((0, 0));
+    let mut merged: Vec<OverrideRow> = channel.to_vec();
+    for c in category {
+        let i = match merged.iter().position(|o| o.subject_type == c.subject_type && o.subject_id == c.subject_id) {
+            Some(i) => i,
+            None => {
+                merged.push(OverrideRow {
+                    id: String::new(),
+                    target_type: "channel".into(),
+                    target_id: channel_id.into(),
+                    allow: 0,
+                    deny: 0,
+                    upload_allow: 0,
+                    upload_deny: 0,
+                    ..c.clone()
+                });
+                merged.len() - 1
+            }
+        };
+        let o = &mut merged[i];
+        let (bits, uploads) = decided(o);
+        let open = !(bits | everyone);
+        let open_uploads = !(uploads | everyone_uploads);
+        o.allow |= c.allow & open;
+        o.deny |= c.deny & open;
+        o.upload_allow |= c.upload_allow & open_uploads;
+        o.upload_deny |= c.upload_deny & open_uploads;
+    }
+    merged
+}
+
+/// A channel leaves its category (the category is deleted, or the channel moves to `to`): the category's overrides
+/// are written into the channel's own ([`merge_layers`]) so that nothing becomes visible that was not; a member who
+/// would still gain a permission (one layer cannot express every pair of layers) gets a deny of their own for it.
+/// Audited as `channel.overrides_copied`; `override.update` for the channel (permissions.md "Moving channels").
+async fn leave_category(
+    state: &AppState,
+    room_id: &str,
+    actor: &crate::models::UserRow,
+    channel: &ChannelRow,
+    to: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(category_id) = channel.category_id.as_deref() else { return Ok(()) };
+    let Some(view) = crate::visibility::load(state, room_id).await? else { return Ok(()) };
+    let everyone_id = view.everyone_id().unwrap_or_default().to_string();
+    let of = |target_type: &str, target_id: &str| -> Vec<OverrideRow> {
+        view.overrides().iter().filter(|o| o.target_type == target_type && o.target_id == target_id).cloned().collect()
+    };
+    let own = of("channel", &channel.id);
+    let mut merged = merge_layers(&of("category", category_id), &own, &channel.id, &everyone_id);
+    let moved = ChannelRow { category_id: to.map(str::to_string), ..channel.clone() };
+    let before = view.perms_with(channel, view.overrides());
+    let with = |merged: &[OverrideRow]| -> Vec<OverrideRow> {
+        let others = view.overrides().iter().filter(|o| !(o.target_type == "channel" && o.target_id == channel.id));
+        others.cloned().chain(merged.iter().cloned()).collect()
+    };
+    let after = view.perms_with(&moved, &with(&merged));
+    let mut denied = Vec::new();
+    for (user_id, perms) in after {
+        let gained = (perms & !before.get(&user_id).copied().unwrap_or(0) & p::CHANNEL_SCOPED) as i64;
+        if gained == 0 {
+            continue;
+        }
+        denied.push(user_id.clone());
+        match merged.iter_mut().find(|o| o.subject_type == "member" && o.subject_id == user_id) {
+            Some(o) => {
+                o.allow &= !gained;
+                o.deny |= gained;
+            }
+            None => merged.push(OverrideRow {
+                id: String::new(),
+                room_id: room_id.to_string(),
+                target_type: "channel".into(),
+                target_id: channel.id.clone(),
+                subject_type: "member".into(),
+                subject_id: user_id,
+                allow: 0,
+                deny: gained,
+                upload_allow: 0,
+                upload_deny: 0,
+            }),
+        }
+    }
+    let changed: Vec<&OverrideRow> = merged
+        .iter()
+        .filter(|m| {
+            !own.iter().any(|o| {
+                o.subject_type == m.subject_type
+                    && o.subject_id == m.subject_id
+                    && (o.allow, o.deny, o.upload_allow, o.upload_deny)
+                        == (m.allow, m.deny, m.upload_allow, m.upload_deny)
+            })
+        })
+        .collect();
+    for m in &changed {
+        store::rooms::set_override(
+            &state.db,
+            store::rooms::SetOverride {
+                room_id,
+                target_type: "channel",
+                target_id: &channel.id,
+                subject_type: &m.subject_type,
+                subject_id: &m.subject_id,
+                allow: m.allow as u64,
+                deny: m.deny as u64,
+                upload_allow: Some(m.upload_allow as u64),
+                upload_deny: Some(m.upload_deny as u64),
+            },
+        )
+        .await?;
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    store::rooms::audit(
+        &state.db,
+        Some(room_id),
+        Some(&actor.id),
+        "channel.overrides_copied",
+        &channel.id,
+        "",
+        serde_json::json!({ "category_id": category_id, "to": to, "overrides": changed.len(), "members_denied": denied }),
+    )
+    .await?;
+    let overrides: Vec<PermissionOverride> =
+        store::rooms::overrides_for(&state.db, "channel", &channel.id).await?.iter().map(|o| o.to_api()).collect();
+    state.hub.room(room_id, "override.update", serde_json::json!({ "room_id": room_id, "target_type": "channel", "target_id": channel.id, "overrides": overrides }));
+    Ok(())
+}
+
+/// A channel without a category moves into `to`: the category's overrides apply underneath the channel's own from
+/// then on. If that grants anybody more than today, the actor needs `manage_roles` in that category, as for setting
+/// those overrides (`403 role.manage_forbidden`).
+async fn enter_category(
+    state: &AppState,
+    access: &access::RoomAccess,
+    channel: &ChannelRow,
+    to: &str,
+) -> Result<(), ApiError> {
+    let Some(view) = crate::visibility::load(state, &access.room.id).await? else { return Ok(()) };
+    let moved = ChannelRow { category_id: Some(to.to_string()), ..channel.clone() };
+    let before = view.perms_with(channel, view.overrides());
+    let grants = view
+        .perms_with(&moved, view.overrides())
+        .into_iter()
+        .any(|(user_id, perms)| perms & !before.get(&user_id).copied().unwrap_or(0) & p::CHANNEL_SCOPED != 0);
+    if !grants {
+        return Ok(());
+    }
+    let category = store::rooms::categories(&state.db, &access.room.id)
+        .await?
+        .into_iter()
+        .find(|c| c.id == to)
+        .ok_or_else(|| bad("category.not_found", "This category does not exist in this room"))?;
+    let held = category_perms(state, access, &category).await?;
+    access::require(held, p::VIEW_CHANNEL | p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -343,8 +522,10 @@ pub struct UpdateChannelRequest {
     pub age_gate: Option<String>,
 }
 
-/// Update a channel (`manage_channels`).
-#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel)))]
+/// Update a channel (`manage_channels`). Moving it out of its category copies the category's overrides into the
+/// channel; moving it into a category that grants more needs `manage_roles` there (protocol permissions.md "Moving
+/// channels").
+#[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel), (status = 403, body = ProblemDetails)))]
 pub async fn update_channel(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -424,6 +605,15 @@ pub async fn update_channel(
         access.require(p::MANAGE_ROOM, "room.manage_forbidden", "Manage room")?;
         // Bots never decide who may read along (APPLICATIONS.md §3.5).
         crate::bot_channels::refuse_bots(&auth.user)?;
+    }
+    if let Some(to) = &req.category_id
+        && to.as_deref() != current.category_id.as_deref()
+    {
+        if current.category_id.is_some() {
+            leave_category(&state, &room_id, &auth.user, &current, to.as_deref()).await?;
+        } else if let Some(to) = to {
+            enter_category(&state, &access, &current, to).await?;
+        }
     }
     store::rooms::update_channel(
         &state.db,
@@ -754,4 +944,50 @@ pub async fn set_override(
         .collect();
     state.hub.room(&room_id, "override.update", serde_json::json!({ "room_id": room_id, "target_type": target_type, "target_id": req.target_id, "overrides": overrides }));
     Ok(Json(overrides))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn o(target_type: &str, subject_type: &str, subject_id: &str, allow: u64, deny: u64) -> OverrideRow {
+        OverrideRow {
+            id: String::new(),
+            room_id: "r".into(),
+            target_type: target_type.into(),
+            target_id: if target_type == "channel" { "ch".into() } else { "cat".into() },
+            subject_type: subject_type.into(),
+            subject_id: subject_id.into(),
+            allow: allow as i64,
+            deny: deny as i64,
+            upload_allow: 0,
+            upload_deny: 0,
+        }
+    }
+
+    fn bits(merged: &[OverrideRow], subject_id: &str) -> (u64, u64) {
+        merged.iter().find(|o| o.subject_id == subject_id).map(|o| (o.allow as u64, o.deny as u64)).unwrap_or((0, 0))
+    }
+
+    #[test]
+    fn the_channel_wins_per_subject_and_the_category_fills_the_rest() {
+        let (v, s) = (p::VIEW_CHANNEL, p::SEND_MESSAGES);
+        let category = [o("category", "role", "everyone", 0, v | s), o("category", "role", "staff", v, 0)];
+        let channel = [o("channel", "role", "staff", s, v)];
+        let merged = merge_layers(&category, &channel, "ch", "nobody");
+        assert_eq!(bits(&merged, "everyone"), (0, v | s), "copied");
+        assert_eq!(bits(&merged, "staff"), (s, v), "the channel's own deny of view stays");
+        assert!(merged.iter().all(|o| o.target_type == "channel" && o.target_id == "ch"));
+    }
+
+    #[test]
+    fn bits_the_channel_decides_for_everyone_drop_from_the_category() {
+        let v = p::VIEW_CHANNEL;
+        let category = [o("category", "role", "staff", v, 0), o("category", "member", "u1", v, 0)];
+        let channel = [o("channel", "role", "everyone", 0, v)];
+        let merged = merge_layers(&category, &channel, "ch", "everyone");
+        assert_eq!(bits(&merged, "everyone"), (0, v));
+        assert_eq!(bits(&merged, "staff"), (0, 0));
+        assert_eq!(bits(&merged, "u1"), (0, 0));
+    }
 }
