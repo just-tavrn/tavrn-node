@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post, put},
 };
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowHeaders, Any, CorsLayer},
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     set_header::SetResponseHeaderLayer,
@@ -442,27 +442,13 @@ impl AppState {
 /// bearer tokens. Any origin, never credentials (there are no cookies), the request headers clients
 /// send, the response headers they read, preflight cached for 10 minutes.
 pub fn cors() -> CorsLayer {
-    let h = |name: &'static str| HeaderName::from_static(name);
+    // Bearer tokens only, never cookies, so any origin may call the API without credentials, and the preflight
+    // mirrors whatever request headers a client names: the native apps (origin `tauri.localhost`) send the
+    // `Tavrn-*` headers of the upload routes, and a fixed list silently broke every new one ("network error").
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::IF_MATCH,
-            header::ACCEPT_LANGUAGE,
-            h("idempotency-key"),
-            h("tavrn-client"),
-            h("tavrn-file-name"),
-            h("tavrn-emoji-name"),
-            h("tavrn-sound-name"),
-            h("tavrn-sound-duration-ms"),
-            h("tavrn-sound-emoji"),
-            h("tavrn-scene-name"),
-            h("tavrn-parent"),
-            h("tavrn-conflict"),
-            h("tavrn-reauth"),
-        ])
+        .allow_headers(AllowHeaders::mirror_request())
         .expose_headers([
             header::ETAG,
             header::RETRY_AFTER,
