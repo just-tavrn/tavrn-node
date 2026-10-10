@@ -46,6 +46,9 @@ pub async fn reset_identity(db: &Pool, user_id: &str, key: &str) -> Result<Strin
     sqlx::query("DELETE FROM secret_storage WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
     // A reset starts a new chain at generation 0 (the key derived from the new master secret, §9a).
     sqlx::query("DELETE FROM identity_continuity WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
+    // The history window starts anew at the reset (ENCRYPTION.md §7b), in the same transaction: no automatic share
+    // of the old range can reach the account between the reset and a later bookkeeping step.
+    super::history::mark_key_reset_tx(&mut tx, user_id, &ts).await?;
     tx.commit().await?;
     Ok(ts)
 }

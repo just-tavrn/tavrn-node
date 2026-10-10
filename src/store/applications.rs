@@ -599,6 +599,8 @@ pub async fn clear_identity(db: &Pool, bot_user_id: &str) -> Result<String, ApiE
     .await?;
     sqlx::query("DELETE FROM key_packages WHERE user_id = $1").bind(bot_user_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM key_backups WHERE user_id = $1").bind(bot_user_id).execute(&mut *tx).await?;
+    // A reset starts the bot's history window anew (ENCRYPTION.md §7b), with the reset itself.
+    super::history::mark_key_reset_tx(&mut tx, bot_user_id, &ts).await?;
     tx.commit().await?;
     Ok(ts)
 }
