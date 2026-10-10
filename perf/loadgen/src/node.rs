@@ -55,6 +55,11 @@ pub struct SpawnedNode {
     pub log: PathBuf,
 }
 
+/// Identity domain of the started node. The node runs in production mode, whose configuration check demands a
+/// real-looking domain (lowercase, at least one dot; `localhost` alone passes only with `--dev`); nothing resolves
+/// it since federation is off and every request goes to the loopback listener.
+pub const DOMAIN: &str = "perf.localhost";
+
 impl SpawnedNode {
     /// Starts `bin` in production mode (no `--dev`): PostgreSQL, production rate limits, open
     /// registration and local room creation, no federation traffic, log level `warn`. Inherited
@@ -72,7 +77,7 @@ impl SpawnedNode {
             cmd.env_remove(key);
         }
         cmd.envs([
-            ("TAVRN_DOMAIN", "localhost"),
+            ("TAVRN_DOMAIN", DOMAIN),
             ("TAVRN_LISTEN", &format!("127.0.0.1:{port}")),
             ("TAVRN_DATABASE_URL", database_url),
             ("TAVRN_DATA_DIR", &data_dir.to_string_lossy()),

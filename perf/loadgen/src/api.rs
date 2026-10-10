@@ -21,7 +21,7 @@ pub struct User {
 
 impl User {
     pub fn address(&self) -> String {
-        format!("{}@localhost", self.username)
+        format!("{}@{}", self.username, crate::node::DOMAIN)
     }
 }
 
