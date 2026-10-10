@@ -21,9 +21,9 @@ pub fn b64(bytes: &[u8]) -> String {
     util::b64url_encode(bytes)
 }
 
-/// Qualified conversation id (MLS group id) on the node `localhost`.
+/// Qualified conversation id (MLS group id) on the started node (`node::DOMAIN`).
 pub fn qualified(conversation_id: &str) -> String {
-    format!("localhost/{conversation_id}")
+    format!("{}/{conversation_id}", crate::node::DOMAIN)
 }
 
 /// Accepted commits in epoch order.
@@ -136,7 +136,7 @@ mod tests {
         // Three devices in one group, without a node: the creator, one joiner by external commit
         // (catches up from nothing) and a second joiner whose commit the others process.
         let conv = qualified("01JPERF0000000000000000000");
-        let device = |name: &str, id: &str| Device::generate(&format!("{name}@localhost"), id);
+        let device = |name: &str, id: &str| Device::generate(&format!("{name}@{}", crate::node::DOMAIN), id);
         let mut creator = Client::new(device("alice", "01JPERFDEVA000000000000000")?);
         let group_info = creator.create_group(&conv)?;
         let log = CommitLog::default();
