@@ -408,14 +408,16 @@ pub async fn my_states(State(state): State<AppState>, auth: AuthUser) -> Result<
     if !state.config.voice_enabled {
         return Ok(Json(MyVoiceStates { rooms: Vec::new() }));
     }
-    // Only rooms with somebody in voice are looked at (few); membership is checked per room.
-    let room_ids: std::collections::BTreeSet<String> =
+    // The user's rooms with somebody in voice: one membership query, then only those rooms are looked at.
+    let active: std::collections::BTreeSet<String> =
         state.voice.participants().keys().into_iter().map(|(room_id, _)| room_id).collect();
     let mut rooms = Vec::new();
-    for room_id in room_ids {
-        if store::rooms::member(&state.db, &room_id, &auth.user.id).await?.is_none() {
-            continue;
-        }
+    if active.is_empty() {
+        return Ok(Json(MyVoiceStates { rooms }));
+    }
+    let mine: std::collections::BTreeSet<String> =
+        store::rooms::room_ids_of_user(&state.db, &auth.user.id).await?.into_iter().collect();
+    for room_id in active.intersection(&mine).cloned() {
         let access = match access::room_access(&state, &room_id, &auth.user).await {
             Ok(a) => a,
             // Left or deleted in between.
