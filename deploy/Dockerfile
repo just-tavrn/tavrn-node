@@ -19,8 +19,10 @@
 
 ARG TAVRN_WEB_SOURCE=git
 
+# Every base image is pinned by digest (Dependabot keeps tag and digest current); the tag says which release it is.
+
 # ---- Web client from the tavrn-web repository ------------------------------------
-FROM node:24-alpine AS web-git
+FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -54,7 +56,7 @@ COPY web/dist/ /dist/
 FROM web-${TAVRN_WEB_SOURCE} AS web
 
 # ---- Build the server -----------------------------------------------------------
-FROM rust:1-bookworm AS server
+FROM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS server
 WORKDIR /src
 # cargo fetches the private git dependency tavrn-crypto (and its protocol submodule) with the git CLI.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -85,7 +87,7 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
 # Only what the pipeline needs: image and short-video decoders, WebP encoding, file/pipe I/O. No network
 # protocols, no devices, no other muxers: a small static binary instead of Debian's ffmpeg with its
 # ~100 shared libraries. Keep the versions in sync with `just ffmpeg-install` (tests, development).
-FROM debian:bookworm-slim AS ffmpeg
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
 ARG FFMPEG_VERSION=8.0
 ARG FFMPEG_SHA256=b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e
 ARG LIBWEBP_VERSION=1.6.0
@@ -118,10 +120,10 @@ RUN curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSI
 
 # ---- LiveKit binary ---------------------------------------------------------
 # Pinned; keep in sync with livekit_version in the justfile and LIVEKIT_VERSION in .github/workflows/ci.yml.
-FROM livekit/livekit-server:v1.13.8 AS livekit
+FROM livekit/livekit-server:v1.13.8@sha256:ad961c9b4b064298cc08d618d772671f7c783e036001388079fa813929cc357e AS livekit
 
 # ---- Runtime image ---------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data tavrn && mkdir -p /data && chown tavrn:tavrn /data

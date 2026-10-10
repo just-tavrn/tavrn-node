@@ -41,24 +41,36 @@ jobs:
           livekit-server --version && ffmpeg -version | head -1 && valkey-cli -p 6379 ping
           exit 0
         fi
-        # Voice (protocol/VOICE.md): the node supervises livekit-server; the voice tests need the binary.
+        # Every download is checked against a pinned SHA-256 (the same pins as the justfile).
         mkdir -p "$HOME/.local/bin"
-        curl -fsSL "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz" | tar -xz -C "$HOME/.local/bin" livekit-server
-        "$HOME/.local/bin/livekit-server" --version
-        # Media pipeline (src/media.rs): ffmpeg with libwebp, like `just ffmpeg-install`.
         tmp="$(mktemp -d)"
-        curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" | tar -xJ -C "$tmp" --strip-components=2 --wildcards '*/bin/ffmpeg'
+        # Voice (protocol/VOICE.md): the node supervises livekit-server; the voice tests need the binary.
+        lk="livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz"
+        curl -fsSLo "$tmp/$lk" "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/$lk"
+        echo "${LIVEKIT_SHA256}  $tmp/$lk" | sha256sum -c --quiet -
+        tar -xzf "$tmp/$lk" -C "$HOME/.local/bin" livekit-server
+        "$HOME/.local/bin/livekit-server" --version
+        # Media pipeline (src/media.rs): ffmpeg with libwebp, like `just ffmpeg-install` (a dated build, not "latest").
+        ff="${FFMPEG_ASSET}"
+        curl -fsSLo "$tmp/$ff" "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/$ff"
+        echo "${FFMPEG_SHA256}  $tmp/$ff" | sha256sum -c --quiet -
+        tar -xJf "$tmp/$ff" -C "$tmp" --strip-components=2 --wildcards '*/bin/ffmpeg'
         install -m 0755 "$tmp/ffmpeg" "$HOME/.local/bin/ffmpeg"
         "$HOME/.local/bin/ffmpeg" -hide_banner -encoders | grep -q libwebp_anim
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        # Valkey for the cluster tests (several instances of one node, docs/SCALING.md).
-        docker run -d --name valkey -p 56379:6379 valkey/valkey:8
+        # Valkey for the cluster tests (several instances of one node, docs/SCALING.md), pinned by digest.
+        docker run -d --name valkey -p 56379:6379 valkey/valkey:8.1.10@sha256:640c5e62cea04b6d6f2084232651d0cc70362d31f4f805e7be94dbed6855e8f2
         for _ in $(seq 30); do docker exec valkey valkey-cli ping 2>/dev/null | grep -q PONG && break; sleep 1; done
-      # Appended to GITHUB_ENV before pre-test runs. LIVEKIT_VERSION: the same as the justfile and deploy/Dockerfile.
+      # Appended to GITHUB_ENV before pre-test runs. LIVEKIT_VERSION and the pins: the same as the justfile and
+      # deploy/Dockerfile.
       test-env: |
         TAVRN_TEST_CACHE_URL=redis://127.0.0.1:56379
         TAVRN_TEST_REQUIRE_LIVEKIT=1
         LIVEKIT_VERSION=1.13.8
+        LIVEKIT_SHA256=059f6de65da11a57400e4646027da705d592ce42acb48c08570a397df446f869
+        FFMPEG_RELEASE=autobuild-2026-09-30-13-08
+        FFMPEG_ASSET=ffmpeg-n8.1.3-9-g29e619e767-linux64-gpl-8.1.tar.xz
+        FFMPEG_SHA256=97ce978979194b5cf7e06a5e68020dbdaa7a4f3294c5452b6a1bc347100dbb79
     secrets:
       # The protocol submodule and the tavrn-crypto git dependency are private until the repositories go public.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
@@ -113,7 +125,9 @@ jobs:
   image:
     # Pushes to main (and manual runs on main) publish the image as ghcr.io/just-tavrn/tavrn-node:edge (plus a
     # short sha tag), the image tavrn-web's end-to-end suite runs against by default; pull requests do not build
-    # it (development phase, 2026-10-08). Releases are tagged by release.yml.
+    # it (development phase, 2026-10-08). Releases are tagged by release.yml. Built on ubuntu-latest, never on the
+    # self-hosted runners: other repositories run this image's binary (just-tavrn/.github runner/README.md
+    # "Security"), and a GitHub-hosted build shares no state with the self-hosted jobs.
     name: Container image
     needs: web-ref
     if: ${{ vars.CI_ENABLED == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
@@ -122,7 +136,7 @@ jobs:
       contents: read
       packages: write
     with:
-      runner: tavrn-heavy
+      runner: ubuntu-latest
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
       build-args: |

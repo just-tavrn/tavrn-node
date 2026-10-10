@@ -24,3 +24,12 @@ First public release of the node and its container image.
 - **Operators**: moderation with reports and evidence, auto-moderation, web push, localized mails with replaceable
   templates, message retention, metrics, legal tooling (takedown notices), clustering with Valkey, the operator
   handbook and deployment examples (Docker Compose, reverse proxies).
+
+### Security
+
+- Release images are built GitHub-hosted without any build cache, from a tavrn-web release tag (a branch fails the
+  release), by a reusable workflow pinned by commit, and carry a GitHub build provenance attestation.
+- The `edge` image is built on GitHub-hosted runners only, never on the shared self-hosted runners.
+- The Dockerfile pins every base image by digest; CI and the `just` install recipes check livekit-server and ffmpeg
+  downloads against pinned checksums, and the CI Valkey is pinned by digest.
+- The publication check prints only file and line of a private match, never the matching text.
