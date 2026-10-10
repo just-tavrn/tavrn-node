@@ -24,3 +24,13 @@ First public release of the node and its container image.
 - **Operators**: moderation with reports and evidence, auto-moderation, web push, localized mails with replaceable
   templates, message retention, metrics, legal tooling (takedown notices), clustering with Valkey, the operator
   handbook and deployment examples (Docker Compose, reverse proxies).
+
+### Security
+
+- An external join must remove every leaf that carries the joining device's identity or key; a device is in an MLS
+  group at most once.
+- A member may remove a leaf whose key is not the attested key of the device it names.
+- The delivery service refuses commits that change a leaf's identity or leave two leaves with the same key.
+- An identity reset records the history window of the account's memberships in the reset's own transaction.
+- KeyPackage claims for a user count against a budget per target user across all requesters, local and from other
+  nodes (`TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR`, default 60).

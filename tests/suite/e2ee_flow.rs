@@ -377,3 +377,29 @@ async fn capability_body_limits_and_json_errors() {
     let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(problem["code"], "request.too_large");
 }
+
+/// KeyPackage claims for one user count against a budget per target across all requesters
+/// (`TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR`, ENCRYPTION.md §4.5), so claims in many names cannot drain a user's
+/// KeyPackages; the user's own claims and claims for other users are not affected.
+#[tokio::test]
+async fn claims_per_target_user_are_budgeted_across_requesters() {
+    let node = common::test_node_with(DOMAIN, |c| c.e2ee_claims_per_target_per_hour = 2).await;
+    let bob = node.crypto_user("bob").await;
+    let _carol = node.crypto_user("carol").await;
+    let claim = |token: String, user: &'static str| {
+        let node = &node;
+        async move { node.post(&format!("/api/v1/users/{user}/key-packages/claim"), &token, json!({})).await }
+    };
+    for name in ["dave", "erin"] {
+        let s = node.register(name).await;
+        let (st, j) = claim(s.token.clone(), "bob").await;
+        assert_eq!(st, StatusCode::OK, "{j}");
+    }
+    let frank = node.register("frank").await;
+    let (st, j) = claim(frank.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a third requester exceeds bob's budget: {j}");
+    let (st, j) = claim(frank.token.clone(), "carol").await;
+    assert_eq!(st, StatusCode::OK, "other targets keep their own budget: {j}");
+    let (st, j) = claim(bob.session.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::OK, "own claims do not count: {j}");
+}
