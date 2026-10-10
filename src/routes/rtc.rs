@@ -140,8 +140,11 @@ async fn connect_upstream(url: &str, token: &str) -> Result<Upstream, ApiError> 
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     let mut request = url.into_client_request().map_err(|_| unavailable())?;
     request.headers_mut().insert(header::AUTHORIZATION, bearer(token)?);
-    match tokio::time::timeout(UPSTREAM_TIMEOUT, tokio_tungstenite::connect_async_with_config(request, Some(config), true))
-        .await
+    match tokio::time::timeout(
+        UPSTREAM_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(config), true),
+    )
+    .await
     {
         Ok(Ok((stream, _))) => Ok(stream),
         // LiveKit refused (e.g. 401 for a token it does not accept, 404 for an unknown room): pass it on.
