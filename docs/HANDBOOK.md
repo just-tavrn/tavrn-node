@@ -202,10 +202,25 @@ you can set a new password via this link:
 
 The first line is the subject (the node puts its name in front), the second is empty, the rest is the plain-text
 body. `{name}`-style variables are filled in; every template knows `{node}` (`TAVRN_NAME`), `{domain}` and
-`{public_url}` plus its own (`check-config` names them when one is wrong). To change a text, copy the file to
+`{public_url}` plus its own (`check-config` names them when one is wrong):
+
+| Template | Sent when | Own variables |
+|---|---|---|
+| `verify_email` | an account registers with an e-mail address | `{name}`, `{link}` |
+| `password_reset` | a user asks for a password reset | `{name}`, `{link}` |
+| `account_deleted`, `account_deleted_by_admin` | the user or a node admin deleted the account | `{address}`, `{purge_after}` |
+| `account_restored` | a node admin restored a deleted account | `{address}` |
+| `app_token_expiring_week`, `app_token_expiring_day` | an application token expires in seven days or in one day | `{name}`, `{application}`, `{expires_at}`, `{link}` |
+| `notice_received`, `notice_forwarded_in` | a takedown notice arrived (from the form or forwarded by another node) | `{case}`, `{link}` or `{origin}` |
+| `notice_content_removed`, `notice_account_disabled`, `notice_rejected`, `notice_forwarded` | the decision on a notice, for its reporter | `{case}`, `{reason}` or `{nodes}` |
+| `statement_content_removed`, `statement_account_disabled` | the statement of reasons for the uploader | `{case}`, `{basis}`, `{statement}`, `{deadline}` |
+| `counter_notice_received`, `counter_restored`, `counter_upheld` | a counter-notice and the decision on it | `{case}`, `{statement}` and `{signature}` or `{reason}` |
+
+The language is chosen per recipient: a user whose language is `de-AT` gets `de-at` if there is such a template,
+otherwise `de`, otherwise English. To change a text, copy the file to
 `TAVRN_MAIL_TEMPLATES_DIR` (default `/data/templates/mail`) under the same language and name, for example
 `/data/templates/mail/de/password_reset.txt`, and edit it; you can also add a language the node has no texts for
-(`/data/templates/mail/fr/…`, used for users whose language is `fr` or `fr-ca`). The files are read when a mail is
+(`/data/templates/mail/fr/…`, used for users whose language is `fr` or `fr-CA`). The files are read when a mail is
 sent, so changes apply without a restart. `tavrn-node check-config` validates the directory (unknown names, a
 missing subject line, unknown variables, files over 64 KiB); a file that is broken when a mail goes out is skipped
 with a warning and the built-in text is sent instead.
@@ -281,9 +296,9 @@ These settings limit who creates rooms and how many, how large uploads may be an
 | `TAVRN_MAX_ROOMS_PER_USER` | `5` | Rooms a user may own (entitlement `rooms.max_owned`; 0–1000000, `0` = unlimited). |
 | `TAVRN_UPLOADS_ENABLED` | `true` | `false` switches file uploads off. |
 | `TAVRN_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | Largest upload (entitlement `upload.max_bytes`); must be > 0 while uploads are on. The proxy must allow bodies at least this large. |
-| `TAVRN_UPLOAD_ALLOWED_TYPES` | `image/*,video/*,audio/*,application/pdf,text/plain,application/zip` | Allowed MIME types, wildcards like `image/*` allowed. |
+| `TAVRN_UPLOAD_ALLOWED_TYPES` | `image/*,video/*,audio/*,application/pdf,text/plain,application/zip` | MIME types allowed for attachments in unencrypted conversations (the declared type; wildcards like `image/*` allowed; others get `415 upload.type_not_allowed`). Encrypted uploads and files channels are limited by the upload categories only ([Who may upload what](#who-may-upload-what)). |
 | `TAVRN_UPLOAD_ALLOW_EXECUTABLES` | `false` | Executables, scripts, installers and disk images (`exe`, `msi`, `bat`, `sh`, `jar`, `apk`, `dmg`, `iso`, …; PROTOCOL.md §7a) are refused unless this is `true` **and** the member's upload categories (role setting) include `other`. |
-| `TAVRN_UPLOAD_DM_CATEGORIES` | `images,audio,video,documents,archives,other` | Upload categories in DMs and group DMs hosted here. |
+| `TAVRN_UPLOAD_DM_CATEGORIES` | `images,audio,video,documents,archives,other` | Upload categories in DMs and group DMs hosted here (rooms set them per role and channel). |
 | `TAVRN_STORAGE_QUOTA_PER_ROOM_BYTES` | `10737418240` (10 GiB) | Storage per room (entitlement `storage.max_bytes_per_room`). |
 | `TAVRN_STORAGE_ENCRYPTION` | `on` | Encryption at rest of every stored file; `off` stores new files unencrypted (debugging only; encrypted files stay readable). See [Storage and media](#storage-and-media). |
 | `TAVRN_RETENTION_DAYS` | `0` | Message retention: messages of channels, DMs and group DMs hosted here are deleted this many days after they were sent by the hourly housekeeping, with their attachments, reactions and pins. Pinned messages and the welcome channel's entries are kept. Rooms may only shorten it (room setting). 0–36500, `0` = keep forever. See [Message retention](#message-retention). |
@@ -495,6 +510,16 @@ Whichever proxy you use, it has to pass WebSockets through, forward the client's
    address, otherwise rate limits and bans apply to the proxy address instead of the client.
 3. **Allow large bodies**, at least as large as `TAVRN_UPLOAD_MAX_BYTES` (or `TAVRN_UPLOAD_MAX_BYTES_CEILING` when
    grants raise it).
+4. **Leave requests and CORS to the node**: pass `Authorization` and the `Tavrn-*` request headers through
+   unchanged (also on the `/rtc` WebSocket upgrade), answer `OPTIONS` preflights from the node, and do not add,
+   replace or strip `Access-Control-*` headers.
+
+The node answers CORS for every route itself: any origin, no credentials (it uses bearer tokens, never cookies),
+the request headers a preflight names are mirrored back, and preflights are cached for 10 minutes. Two kinds of
+clients depend on it: web clients of other nodes that act on this node for their users, and the desktop app, whose
+pages have their own origin, so every request it sends is cross-origin, including the uploads with their `Tavrn-*`
+headers. A proxy that answers preflights itself with a fixed header list breaks those clients ("network error")
+while the node's own web client, which is same-origin, keeps working.
 
 Also recommended: redirect HTTP to HTTPS, send HSTS, and block `/metrics` for the public
 ([Metrics and health](#metrics-and-health)). Route `/rtc` only to tavrn, never to LiveKit's port 7880 (which is
@@ -715,7 +740,7 @@ All of them are created at the first start with mode 0600:
 | File | What it is | If it is lost or replaced |
 |---|---|---|
 | `keys/node-<kid>.pem` | The node's Ed25519 signing keys (federation, tokens). All keys in the directory are published in `/.well-known/tavrn`; the newest one signs. | Other nodes no longer trust the node's identity. |
-| `keys/secrets.key` | 32 random bytes that encrypt data at rest such as the users' TOTP secrets, and the single-use values in the cache with several instances. Never rotated. | Every TOTP enrollment becomes unusable (users then need a passkey, a recovery code or an admin reset of their second factor). |
+| `keys/secrets.key` | 32 random bytes that encrypt data at rest such as the users' TOTP secrets and the credentials of [external file stores](#files-channels-on-external-stores), and the single-use values in the cache with several instances. Never rotated. | Every TOTP enrollment becomes unusable (users then need a passkey, a recovery code or an admin reset of their second factor), and files channels on external stores need their credentials entered again. |
 | `keys/storage.key` | The storage key: wraps the per-file keys of every stored file (attachments, avatars, headers, room icons, emojis, soundboard clips). `keys/storage.key.next` exists only during a [rotation](#rotating-the-storage-key). | **Every stored file is unreadable**; the node refuses to start when the file is missing or does not match the stored keys. |
 | `keys/livekit.key` | LiveKit's API key and secret (`<key>: <secret>`). | Regenerated at the next start, nothing lost. With several instances all must use the same file. |
 | `keys/vapid.key` | The VAPID key for [web push](#web-push): a P-256 private key, PKCS#8 PEM. | Every browser push subscription becomes invalid: users must re-enable push on each device. No other data is lost. |
@@ -839,7 +864,30 @@ Upload size, types, the executable rule, per-room quotas and attachment retentio
 [Rooms, uploads and storage](#rooms-uploads-and-storage) and [Entitlement defaults](#entitlement-defaults). The
 hourly housekeeping deletes expired attachments (messages keep listing them as "file expired"; pinned messages keep
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
-Files channels can use external WebDAV/S3 stores only with `TAVRN_FILES_EXTERNAL=on`.
+Files channels have their own quota (`TAVRN_FILES_CHANNELS_MAX_BYTES` per channel); they do not count towards the
+room's attachment quota and are exempt from attachment and message retention. They can use external WebDAV/S3
+stores only with `TAVRN_FILES_EXTERNAL=on` ([Files channels on external stores](#files-channels-on-external-stores)).
+
+### Who may upload what
+
+Every file falls into one upload category: `images`, `audio`, `video`, `documents`, `archives` or `other`
+(protocol: PROTOCOL.md §7a, `permissions.md` "Upload categories"). The node classifies plaintext uploads by their
+content first, then by the file name, then by the declared type; in encrypted conversations and encrypted files
+channels the node only sees ciphertext, so the client declares the category and the node checks the declaration
+(a modified client could lie; the protocol documents this).
+
+- **Rooms** decide per role which categories its members may upload (the role's "Allowed file types"; `@everyone`
+  allows all six by default, the highest role with its own setting wins), and channel or category overrides allow
+  or deny single categories on top ("File types" in the permissions of a channel or category), evaluated like
+  permissions. Members see what they may attach before they pick a file; a refused upload gets
+  `403 upload.type_forbidden` with the category.
+- **DMs and group DMs** hosted on this node use `TAVRN_UPLOAD_DM_CATEGORIES` (default all six).
+- **Executables** (programs, scripts, installers, disk images, shortcuts, macro documents) count as `other` and are
+  refused on every node by default. Only `TAVRN_UPLOAD_ALLOW_EXECUTABLES=true` **and** a member who may upload
+  `other` lets them through; no room setting can allow them on its own. Where they are allowed, the clients still
+  warn before they download a file that looks like a program.
+- `TAVRN_UPLOAD_ALLOWED_TYPES` additionally limits the declared MIME types of attachments in unencrypted
+  conversations; files channels and encrypted uploads are not affected by it.
 
 ### Files channels: what the node stores
 
@@ -856,6 +904,27 @@ delete their own uploads.
 
 Unencrypted files channels work as before: their files use the storage encryption at rest (readable by the node)
 or, on an external store, `encrypt_files` (which encrypted channels do not need and refuse).
+
+### Files channels on external stores
+
+With `TAVRN_FILES_EXTERNAL=on` (default `off`, protocol: FILES.md §5) members with *Manage channels* and *Manage
+files* can keep a files channel on a WebDAV server or an S3-compatible bucket instead of the node's own storage. The
+node proxies uploads and downloads as streams and keeps the folder tree in its database; it never lists the store.
+
+- **Credentials** (URL, user name and password or access keys) are stored sealed with `keys/secrets.key`, are
+  write-only in the API and never appear in logs or the audit log (`files.backend` records kind, host and
+  encryption). Without `secrets.key` the node cannot reach the stores any more: back it up with the other keys.
+- **`encrypt_files`** wraps new files with the storage key before they reach the store (unreadable outside tavrn and
+  lost without `keys/storage.key`); without it the store keeps the files as they are. End-to-end encrypted files
+  channels store the clients' ciphertext either way and refuse the switch.
+- **Network rules**: `https` only, every address the store's name resolves to must be public, redirects are never
+  followed, 10 s connect and 60 s read timeouts. `TAVRN_FILES_EXTERNAL_PRIVATE=on` also allows private, loopback
+  and link-local addresses and plain `http` (stores in your LAN); this turns the SSRF protection off for them.
+- **Switching it off**: with `TAVRN_FILES_EXTERNAL=off` existing external channels answer `403
+  files.external_disabled` until it is on again; nothing is deleted, and the queue of pending deletes on the stores
+  (below) pauses.
+- A channel can move to another store only while it is empty; credentials and `encrypt_files` can change at any
+  time. Backend changes and connection tests are limited to 20 per user and 10 minutes.
 
 Deleting a files channel or a room deletes the files in the node's storage at once. Objects on an external store are
 deleted in the background with the credentials stored for the channel; when the store is unreachable they wait in a
@@ -1029,7 +1098,9 @@ container.
 - **Signaling** goes through the proxy like everything else: `wss://<public host>/rtc`. tavrn checks the LiveKit
   token of every connection (signature, expiry, and that its holder may still join the channel or call) before it
   forwards it to LiveKit, which listens on `127.0.0.1:7880` inside the container only. Do not publish or proxy port
-  7880, and do not route `/rtc` anywhere but to tavrn.
+  7880, and do not route `/rtc` anywhere but to tavrn. Browsers send the token as the `access_token` query
+  parameter; the desktop app's native voice engine sends it as `Authorization: Bearer`, so the proxy must pass that
+  header through on the `/rtc` upgrade (see [Native voice in the desktop app](#native-voice-in-the-desktop-app)).
 - **Media** does **not** go through the proxy. Publish and forward (router port forwarding to the host running the
   container, firewall open) these ports 1:1, the same numbers outside and inside, because LiveKit announces them:
 
@@ -1122,6 +1193,39 @@ causes and what happens when a connection drops.
   `TAVRN_VOICE_RECONNECT_GRACE_SECS` (default 45) while the client rejoins by itself; a join from another device of
   the same user replaces the first.
 - Several instances: [Voice and video with several instances](#voice-and-video-with-several-instances).
+
+### Moved members
+
+A moderator with *Move members* can move a member into a voice channel the member could not open by themselves
+(protocol: VOICE.md §7 "Moved participations"). The move decides, not the member's permissions: for 60 seconds the
+member may join that channel even without *Connect* or *View channel* and above its user limit, and while they stay
+in it they see the channel, its text and its encryption group like a member who may view it. Everything else follows
+their roles as usual (speaking, streaming and writing need their own permissions; a timeout, a ban and
+`TAVRN_VOICE_MAX_PARTICIPANTS` still refuse, and the channel's age gate still applies). Leaving, being removed, the
+end of the reconnect grace period or a join elsewhere ends it: the channel disappears again unless the member's
+permissions show it, and they cannot come back by themselves. The API marks such participants with `moved: true`.
+There is nothing to configure; with several instances the leader announces the moved members to every instance.
+
+### Voice activity in the room list
+
+Clients show who is in voice where (also friends in voice, and a badge on rooms with voice activity) without opening
+every room: `GET /api/v1/users/me/voice` returns, in one request, the occupied voice channels of every room on this
+node the user is a member of, limited to the channels they may view, and `voice.state` events keep it current. Rooms
+on other nodes are asked on those nodes with the user's session there. With several instances the request is relayed
+to the leader, which holds the participants; with voice off it returns an empty list. Applications need the `voice`
+scope for it.
+
+### Native voice in the desktop app
+
+The desktop app (Linux and Windows) can use a native voice engine instead of the browser's WebRTC for calls and
+voice channels: on Linux it always does, on Windows it is an experimental setting that is off by default. It talks
+to the same `/rtc` signaling and the same media ports as the web client, with the same end-to-end encrypted frames;
+the only difference for the node is that it sends the LiveKit token in the `Authorization: Bearer` header instead of
+the query string. tavrn checks the token either way and hands it to LiveKit as a bearer header. Proxies pass the
+header by default; one that strips `Authorization` on WebSocket upgrades breaks desktop voice while browsers keep
+working. The rest of the desktop app needs nothing on the node besides the CORS handling of
+[What the proxy must do](#what-the-proxy-must-do) and the `/connect` page of the web client
+([Registration, accounts and sessions](#registration-accounts-and-sessions)).
 
 ## Web push
 
@@ -1417,27 +1521,6 @@ Three variables turn a node into one of several instances.
 | `TAVRN_INSTANCE_ID` | random per start (logged) | `[A-Za-z0-9._-]{1,64}`; names the instance in logs, the cache and `livekit-<id>.yaml` |
 | `TAVRN_INSTANCE_URL` | address towards the cache + listen port | `http(s)://host[:port]` where the other instances reach this one |
 
-> **Command interactions (APPLICATIONS.md §5.6)** reach a bot connected to any instance. Every instance registers
-> its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field `<instance>/<connection>`, removed
-> when the connection closes; entries of instances that stopped sending heartbeats are ignored). Without a local
-> receiver the instance that took the invocation (the owner) picks one live instance holding a receiver (round
-> robin) and publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to
-> one of its connections (round robin over the bot's devices as before). The pending interaction lives in the cache,
-> sealed with a key derived from `secrets.key` like connect codes (`interaction-state:<id>`, TTL 16 minutes: the
-> interaction's lifetime plus a minute); the first response is a lease (`interaction-claim:<id>`, held by the claim
-> or by `dropped` once nobody answered in 3 seconds) and the follow-ups a counter (`interaction-followups:<id>`), so
-> "the first response wins" and "at most ten follow-ups" hold across instances. Only the invoker's waiting request
-> (the 3-second wait) stays in the owner's memory; the owner also stores `interaction:<id>` = its instance id. The
-> bot answers over REST, which the load balancer may send anywhere: callbacks and follow-ups
-> (`/interactions/{id}/callback|messages`) for an interaction that is not pending on the receiving instance are
-> relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` while it lives, so the invoker gets the answer at once (like
-> the requests relayed to the leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when
-> the owner does not answer). When the owner is gone (restarted or stopped), any instance takes them from the cache:
-> a deferred command's follow-ups still arrive, and a callback within the 3 seconds is stored as the reply message.
-> The interactions URL (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` the
-> interactions stay in memory, and a restart loses them.
-
-
 ### How the instances act as one node
 
 The cache layer is `src/cache/`: a small `Cache` trait (fixed-window counters, single-use values, leases,
@@ -1471,6 +1554,28 @@ The node also sends `resync` on an open connection whenever events may have been
 
 Events are never dropped silently: every failed publish is logged and leads to that resync.
 
+#### Command interactions
+
+Command interactions (APPLICATIONS.md §5.6) reach a bot connected to any instance. Every instance registers
+its receiving bot connections in the cache (hash `cmdrecv:<bot user id>`, field `<instance>/<connection>`, removed
+when the connection closes; entries of instances that stopped sending heartbeats are ignored). Without a local
+receiver the instance that took the invocation (the owner) picks one live instance holding a receiver (round
+robin) and publishes `Invoke { instance, bot, data }` on the bus; that instance hands the `command.invoke` event to
+one of its connections (round robin over the bot's devices as before). The pending interaction lives in the cache,
+sealed with a key derived from `secrets.key` like connect codes (`interaction-state:<id>`, TTL 16 minutes: the
+interaction's lifetime plus a minute); the first response is a lease (`interaction-claim:<id>`, held by the claim
+or by `dropped` once nobody answered in 3 seconds) and the follow-ups a counter (`interaction-followups:<id>`), so
+"the first response wins" and "at most ten follow-ups" hold across instances. Only the invoker's waiting request
+(the 3-second wait) stays in the owner's memory; the owner also stores `interaction:<id>` = its instance id. The
+bot answers over REST, which the load balancer may send anywhere: callbacks and follow-ups
+(`/interactions/{id}/callback|messages`) for an interaction that is not pending on the receiving instance are
+relayed over HTTP to the owner's `TAVRN_INSTANCE_URL` while it lives, so the invoker gets the answer at once (like
+the requests relayed to the leader, `Tavrn-Relayed` stops a second hop; `503 interaction.owner_unavailable` when
+the owner does not answer). When the owner is gone (restarted or stopped), any instance takes them from the cache:
+a deferred command's follow-ups still arrive, and a callback within the 3 seconds is stored as the reply message.
+The interactions URL (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` the
+interactions stay in memory, and a restart loses them.
+
 ### Audit of the in-memory state
 
 "Per instance" means each instance keeps its own copy and that is correct (or acceptable, with the reason);
@@ -1492,7 +1597,7 @@ that holds them.
 | Custom status expiry timers | per instance | Readers filter expired statuses anyway; the timer only pushes the update. |
 | Typing throttle (per connection) | per instance | Bound to the WebSocket. |
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
-| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives (see the note at the end). |
+| Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives ([Command interactions](#command-interactions)). |
 | `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
 
 #### Rate limits
@@ -1606,7 +1711,7 @@ What the operator decides:
 - Bot tokens are a single factor: room owners can declare rooms, categories and channels "no bots".
 
 With several instances, command interactions reach a bot connected to any instance
-([Settings for several instances](#settings-for-several-instances) explains how).
+([Command interactions](#command-interactions) explains how).
 
 ### Incoming webhooks
 
@@ -1819,7 +1924,6 @@ Web push payloads carry no content of encrypted conversations. Retention you con
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
-
 ### Age gates
 
 Since `age.v1` (protocol PROTOCOL.md §5e) every registration asks for the **date of birth**: the password and passkey
@@ -1865,6 +1969,27 @@ Room permissions are layered (protocol `permissions.md`): roles give the base, a
 of its channels, and a channel's own overrides win over the category's. Overrides only hold channel-scoped
 permissions; at start the node removes room-wide permissions from overrides created by older versions and records
 each change in the room's audit log (`role.override_restricted`). Nothing needs to be done by the operator.
+
+### Channel visibility
+
+A channel that a member may not view (*View channel* after roles and overrides) does not exist for that member, and
+the node enforces this everywhere it sends data, not only in the client (protocol: PROTOCOL.md §6). Such a member
+does not get:
+
+- the channel itself: `GET /api/v1/rooms/{id}` leaves it and its overrides out, and a category without a visible
+  channel is left out too (unless the member may manage channels);
+- its realtime events: messages, edits, reactions, pins, typing, threads, voice participants (`voice.state`, also in
+  `GET /users/me/voice`), whiteboard sessions and the channel's own changes;
+- notifications about it: no unread or mention badges, no web push, and no `notify` hint to the member's home node
+  when the member is a user of another node;
+- its history, search results, files and encryption group.
+
+When a change of roles, overrides or membership shows or hides a channel, the member's clients get the channel (or
+its removal, marked as "hidden", not deleted) with the next event, so nothing has to reload. A channel above a
+member's age gate stays listed but locked ([Age gates](#age-gates)); a moderator's move into a voice channel shows it
+for the time of the move ([Moved members](#moved-members)). Room moderators still see reports about hidden channels
+([Reports](#reports)). With several instances each instance applies changes as their events arrive over the bus
+([Audit of the in-memory state](#realtime-presence-and-connections)).
 
 ### Spam bursts
 
@@ -1912,6 +2037,21 @@ audited with the matched term, never the message text, and show up in the modera
 The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
+
+### Audit logs
+
+Every room has an audit log (room settings → Audit log, for members with *View audit log*), and the node has one for
+its admins (Node administration → Audit log, `GET /api/v1/admin/audit-log`). Entries name the action, who did it,
+the target, a reason where one was given and details; they never contain message text, credentials or a date of
+birth. Some of the actions they record:
+
+| Audit log | Examples |
+|---|---|
+| Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
+| Node | `user.register`, `user.second_factor_enroll`, `user.recovery_code_used`, `admin.user_disable`, `admin.user_delete`, `admin.second_factor_reset`, `admin.date_of_birth`, `admin.ban`, `admin.federation_block`, `federation.block_auto`, `federation.user_deleted`, `app.create`, `app.token_create`, `webhook.create`, `entitlements.grant_create`, `legal.*`, `retention.messages`, `directory.reports_notice` |
+
+Moderation shortcuts of the reports inbox add the report they act on (`report_id`). The node keeps audit entries as
+long as the room (room log) or the node (node log) exists; deleted accounts stay in them pseudonymised (LEGAL.md).
 
 ### History restore after a key reset
 
