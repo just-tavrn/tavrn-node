@@ -114,6 +114,8 @@ impl Cache for InProcess {
     fn get(&self, key: &str) -> BoxFuture<'_, CacheResult<Option<String>>> {
         let out = self.with_map(|map, now| match Self::live(map, key, now).map(|s| &s.value) {
             Some(Value::Text(t)) => Some(t.clone()),
+            // A counter reads as its number, like `GET` of an `INCR` key in Valkey (rate limit peeks).
+            Some(Value::Count(n)) => Some(n.to_string()),
             _ => None,
         });
         ready(out)

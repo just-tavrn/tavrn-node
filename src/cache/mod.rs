@@ -130,6 +130,11 @@ pub enum VoiceEffect {
         conversation_id: String,
         user_id: String,
     },
+    /// Sessions ended: the user's devices (`devices`, or all of them) leave every voice channel and call.
+    DisconnectEverywhere {
+        user_id: String,
+        devices: Option<Vec<String>>,
+    },
 }
 
 /// Open connections and idle/activity of one device of a user (part of a presence sync).
@@ -781,6 +786,9 @@ mod tests {
                 frame: "{\"op\":\"event\"}".into(),
             },
             Message::Voice { effect: VoiceEffect::CloseRoom { room_id: "r".into() } },
+            Message::Voice {
+                effect: VoiceEffect::DisconnectEverywhere { user_id: "u".into(), devices: Some(vec!["d".into()]) },
+            },
             Message::Wake { job: Job::Outbox },
             Message::PresenceConn { user: "u".into(), devices: HashMap::from([("d".into(), 2)]) },
             Message::Invoke { instance: "i1".into(), bot: "b".into(), data: "{\"interaction_id\":\"x\"}".into() },

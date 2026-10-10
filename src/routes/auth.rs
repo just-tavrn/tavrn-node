@@ -15,6 +15,7 @@ use crate::{
     error::ApiError,
     models::UserPrivate,
     second_factor::{self, Stage},
+    sessions::Reason,
     store,
     util::{self, now},
     validate::{self, bad},
@@ -188,7 +189,7 @@ pub async fn register(
 
     let is_first = store::users::count_local(&state.db, &cfg.domain).await? == 0;
     let is_admin = is_first || cfg.admin_users().iter().any(|a| a == &username);
-    let password_hash = auth::hash_password(&req.password)?;
+    let password_hash = auth::hash(&state, &req.password).await?;
     let user = store::users::create_local(
         &state.db,
         store::users::NewLocalUser {
@@ -277,27 +278,35 @@ pub async fn login(
 ) -> Result<Json<PreAuthResponse>, ApiError> {
     let username = req.username.trim().to_lowercase();
     let username = username.strip_suffix(&format!("@{}", state.config.domain)).unwrap_or(&username).to_string();
-    state.login_limiter.check_all(&[format!("ip:{ip}"), format!("user:{username}")]).await?;
+    // Every attempt counts per address; per account only failed attempts count (below), so nobody can lock an
+    // account out by signing in as it, and a valid device proof passes even a locked account key.
+    state.login_limiter.check_all(&[format!("ip:{ip}")]).await?;
     // TAVRN_OIDC_ONLY: only the break-glass accounts of TAVRN_ADMIN_USERS sign in with a password.
     crate::oidc::check_password_login(&state.config, &username)?;
     state.captcha.check(state.config.captcha_required(CaptchaAction::Login), req.captcha_token.as_deref(), &ip).await?;
+    let user_key = format!("user:{username}");
+    let locked = state.login_limiter.peek(&user_key).await.err();
+    if let Some(retry_after_secs) = locked.filter(|_| req.device.is_none()) {
+        return Err(ApiError::RateLimited { retry_after_secs });
+    }
 
     let failed = || ApiError::Unauthorized { code: "auth.invalid_credentials" };
     let user = store::users::by_username(&state.db, &username, &state.config.domain).await?;
-    // Hash even for an unknown user, so the response time reveals nothing.
-    let ok = match &user {
-        // Bots have no interactive login (APPLICATIONS.md §1.4): the same answer as a wrong password.
-        Some(u) if u.is_bot() => {
-            let _ = auth::verify_password(&req.password, DUMMY_HASH);
-            false
-        }
-        Some(u) => u.password_hash.as_deref().is_some_and(|h| auth::verify_password(&req.password, h)),
+    // Hash even for an unknown user (and bots, which have no interactive login, APPLICATIONS.md §1.4), so the
+    // response time reveals nothing.
+    let hash = user.as_ref().filter(|u| !u.is_bot()).and_then(|u| u.password_hash.as_deref());
+    let ok = auth::verify(&state, &req.password, hash).await?;
+    let user = match user.filter(|_| ok) {
+        Some(user) => user,
         None => {
-            let _ = auth::verify_password(&req.password, DUMMY_HASH);
-            false
+            // A failed attempt counts against the account; beyond the limit the answer is 429.
+            state.login_limiter.check_all(std::slice::from_ref(&user_key)).await?;
+            if let Some(retry_after_secs) = locked {
+                return Err(ApiError::RateLimited { retry_after_secs });
+            }
+            return Err(failed());
         }
     };
-    let Some(user) = user.filter(|_| ok) else { return Err(failed()) };
     if user.deleted_at.is_some() {
         return Err(ApiError::Unauthorized { code: "auth.account_deleted" });
     }
@@ -313,6 +322,10 @@ pub async fn login(
     let device = device_name(req.device_name.as_deref(), "Device");
     // The proven device travels in the pre-auth token to the session issued after the second factor.
     let reuse = crate::device_proof::verify_opt(&state, &user, req.device.as_ref()).await?;
+    // A locked account key lets only the right password together with a valid device proof through.
+    if let Some(retry_after_secs) = locked.filter(|_| reuse.is_none()) {
+        return Err(ApiError::RateLimited { retry_after_secs });
+    }
     if !store::factors::has_factor(&state.db, &user.id).await? {
         let token = second_factor::issue_preauth(&state, &user.id, Stage::Enroll, &device, reuse.as_deref())?;
         return Ok(Json(enrollment_required(token)));
@@ -325,10 +338,6 @@ pub async fn login(
         expires_in: second_factor::PREAUTH_TTL_SECS,
     }))
 }
-
-/// Argon2id hash of a random value, only to spend the same time on unknown users.
-const DUMMY_HASH: &str =
-    "$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHRzb21lc2FsdA$Vh1J9m0K0qYQ9XQy3pQ7F1D2v3kQ1nUO7a0Q7b2Zc4Y";
 
 /// A single-use login nonce for a device proof (PROTOCOL.md §5b, ENCRYPTION.md §3.4): the client signs it with the
 /// key of a device it still holds and sends `device` with the login, so the new session continues that device.
@@ -376,7 +385,7 @@ pub async fn logout(
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
     let end_session_url = crate::routes::oidc::logout_url(&state, &auth.device_id).await?;
-    store::users::revoke_device_sessions(&state.db, &auth.device_id).await?;
+    crate::sessions::revoke_devices(&state, &auth.user, std::slice::from_ref(&auth.device_id), Reason::Logout).await?;
     if q.forget_device
         && !auth.is_remote()
         && auth.app.is_none()
@@ -469,11 +478,9 @@ pub async fn reset_password(
     if store::users::by_id(&state.db, &user_id).await?.is_some_and(|u| u.password_hash.is_none()) {
         return Err(sso_password_unavailable());
     }
-    store::users::set_password_hash(&state.db, &user_id, &auth::hash_password(&req.new_password)?).await?;
-    for d in store::users::devices_of(&state.db, &user_id).await? {
-        store::users::revoke_device_sessions(&state.db, &d.id).await?;
-    }
+    store::users::set_password_hash(&state.db, &user_id, &auth::hash(&state, &req.new_password).await?).await?;
     if let Some(user) = store::users::by_id(&state.db, &user_id).await? {
+        crate::sessions::revoke_all(&state, &user, None, Reason::PasswordReset).await?;
         crate::federation::remote::revoke_sessions(&state, &user, None).await?;
     }
     store::rooms::audit(&state.db, None, Some(&user_id), "user.password_reset", "", "", serde_json::json!({})).await?;
@@ -518,19 +525,16 @@ pub async fn change_password(
     if auth.user.password_hash.is_none() && !auth.is_remote() {
         return Err(sso_password_unavailable());
     }
-    let ok = auth.user.password_hash.as_deref().is_some_and(|h| auth::verify_password(&req.current_password, h));
+    state.login_limiter.check_all(&[format!("password-change:{}", auth.user.id)]).await?;
+    let ok = auth::verify(&state, &req.current_password, auth.user.password_hash.as_deref()).await?;
     if !ok {
         return Err(ApiError::Unauthorized { code: "auth.invalid_credentials" });
     }
     if !auth::valid_password(&req.new_password) {
         return Err(bad("auth.password_weak", "Password: at least 10 characters"));
     }
-    store::users::set_password_hash(&state.db, &auth.user.id, &auth::hash_password(&req.new_password)?).await?;
-    for d in store::users::devices_of(&state.db, &auth.user.id).await? {
-        if d.id != auth.device_id {
-            store::users::revoke_device_sessions(&state.db, &d.id).await?;
-        }
-    }
+    store::users::set_password_hash(&state.db, &auth.user.id, &auth::hash(&state, &req.new_password).await?).await?;
+    crate::sessions::revoke_all(&state, &auth.user, Some(&auth.device_id), Reason::PasswordChange).await?;
     crate::federation::remote::revoke_sessions(&state, &auth.user, None).await?;
     store::rooms::audit(
         &state.db,
@@ -562,10 +566,11 @@ pub async fn delete_device(
         return Err(bad("device.current", "The current device cannot be removed; please log out"));
     }
     crate::reauth::require(&state, &auth, &headers).await?;
-    store::users::revoke_device_sessions(&state.db, &device_id).await?;
+    // Only a device of this account: delete first (scoped by the user), end its sessions only if it was one.
     if !store::users::delete_device(&state.db, &auth.user.id, &device_id).await? {
         return Err(ApiError::NotFound { code: "device.not_found", what: "Device".into() });
     }
+    crate::sessions::revoke_devices(&state, &auth.user, std::slice::from_ref(&device_id), Reason::DeviceRemoved).await?;
     crate::e2ee::device_removed(&state, &auth.user, &device_id).await?;
     crate::federation::remote::revoke_sessions(&state, &auth.user, Some(&device_id)).await?;
     crate::federation::remote::devices_changed(&state, &auth.user).await?;
