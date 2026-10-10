@@ -3,7 +3,9 @@
 # Release of tavrn-node: a tag vX.Y.Z builds the container image with the web client of tavrn-web
 # (TAVRN_WEB_REF, repository variable, default main) and pushes it to ghcr.io/just-tavrn/tavrn-node
 # (tags X.Y.Z, X.Y and sha-…, with SLSA provenance and an SBOM), then creates the GitHub release with the
-# image digest. Gated by CI_ENABLED (docs/GITHUB.md); the private repositories are read with TAVRN_READ_PAT.
+# image digest (a tag with a hyphen, vX.Y.Z-rc.N, as a pre-release), and finally asks tavrn-website to rebuild its
+# download page, which shows the latest node image. Gated by CI_ENABLED (docs/GITHUB.md); the private repositories are
+# read with TAVRN_READ_PAT.
 name: Release
 
 on:
@@ -19,7 +21,7 @@ jobs:
     if: ${{ vars.CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: The tag matches Cargo.toml
@@ -69,5 +71,33 @@ jobs:
             echo
             echo "Web client: tavrn-web \`${WEB_REF}\`. Upgrade notes: README.md (\"Upgrading\")."
           } > "$notes"
+          # A pre-release is never "latest" for the website's download page.
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes-file "$notes" --generate-notes --verify-tag
+            --notes-file "$notes" --generate-notes --verify-tag "${prerelease[@]}"
+
+  # The website's download page shows the image tag of the latest node release (tavrn-website docs/RELEASE-DISPATCH.md);
+  # it rebuilds on this event. GITHUB_TOKEN cannot start workflows in another repository: WEBSITE_DISPATCH_TOKEN (a
+  # repository or organization secret: a fine-grained token with Contents read and write on just-tavrn/tavrn-website
+  # only) may, and without it the job only warns.
+  website:
+    name: Rebuild the download page
+    needs: release
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: repository_dispatch to tavrn-website
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::WEBSITE_DISPATCH_TOKEN is not set: the download page is not rebuilt automatically"
+            exit 0
+          fi
+          gh api --method POST repos/just-tavrn/tavrn-website/dispatches \
+            -f event_type=release-published \
+            -F "client_payload[repository]=$GITHUB_REPOSITORY" \
+            -F "client_payload[tag]=$TAG"
