@@ -135,7 +135,7 @@ the node; its own license audit lives in that repository.
 **ffmpeg in the Docker image** (`deploy/Dockerfile`, stage `ffmpeg`). The image builds its own static
 ffmpeg 8.0 with libwebp 1.6.0 (BSD-3-Clause) and zlib (Zlib). Configure flags used:
 
-```
+```text
 --prefix=/opt/ffmpeg --pkg-config-flags=--static --extra-ldflags=-static --enable-static --disable-shared
 --disable-everything --disable-autodetect --disable-network --disable-doc --disable-debug
 --disable-ffplay --disable-ffprobe --disable-avdevice --enable-small
@@ -158,7 +158,7 @@ tarballs); adding the license texts under `/usr/share/doc/ffmpeg/` in the image 
 For development and CI, `just ffmpeg-install` and the CI download the BtbN "gpl" static build (GPL-3.0); it is
 only executed on developer and CI machines, never distributed, so this is fine for every package.
 
-**LiveKit server** (`livekit/livekit-server` v1.13.7, copied into the image): Apache-2.0, a separate
+**LiveKit server** (`livekit/livekit-server` v1.13.8, copied into the image): Apache-2.0, a separate
 process supervised by the node.
 
 ## 5. Compatibility verdict

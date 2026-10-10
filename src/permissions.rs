@@ -153,6 +153,11 @@ pub const SYSTEM_CHANNEL_FORCED: Perms = VIEW_CHANNEL | READ_HISTORY;
 pub const SYSTEM_CHANNEL_DENIED: Perms =
     SEND_MESSAGES | ATTACH_FILES | CREATE_THREADS | MENTION_EVERYONE | USE_WHITEBOARD | PIN_MESSAGES;
 
+/// Granted in a voice channel while the member has a moved participation there (a moderator with `move_members`
+/// moved them in, `VOICE.md` §7): seeing the channel, reading it and staying connected. Speaking, sending and the
+/// rest follow the member's roles and overrides as usual; a timeout still strips everything but reading.
+pub const MOVED_FORCED: Perms = VIEW_CHANNEL | READ_HISTORY | CONNECT;
+
 // ---------------------------------------------------------------- bots (APPLICATIONS.md §2.4, §3.5)
 
 /// Permission bits a bot keeps whatever the scopes of its token.
@@ -340,6 +345,11 @@ pub struct Input {
     /// [`SYSTEM_CHANNEL_DENIED`] removed before the bot cap.
     #[serde(default)]
     pub system_channel: bool,
+    /// The member has a moved participation in this voice channel (`VOICE.md` §7 "Moved participations"): a
+    /// moderator moved them in, so [`MOVED_FORCED`] is added after the overrides, whatever they deny. Not part of
+    /// the protocol's test vectors (like the age gate, the node applies it around the evaluation).
+    #[serde(default)]
+    pub moved: bool,
 }
 
 fn user_kind() -> String {
@@ -380,6 +390,9 @@ fn compute_member(input: &Input) -> Perms {
     // No override can hide a system channel: as if view_channel and read_history were never denied.
     if input.system_channel {
         perms |= SYSTEM_CHANNEL_FORCED;
+    }
+    if input.moved {
+        perms |= MOVED_FORCED;
     }
     if !has(perms, VIEW_CHANNEL) {
         return 0;
@@ -444,6 +457,37 @@ mod tests {
                 names(got)
             );
         }
+    }
+
+    #[test]
+    fn a_moved_participation_grants_view_read_and_connect_but_nothing_else() {
+        let input = |moved: bool, timed_out: bool| Input {
+            user_id: "u1".into(),
+            is_owner: false,
+            everyone_role_id: "r0".into(),
+            everyone_permissions: VIEW_CHANNEL | CONNECT | SPEAK | SEND_MESSAGES,
+            member_roles: Vec::new(),
+            category_overrides: Vec::new(),
+            channel_overrides: vec![Override {
+                subject_type: SubjectType::Role,
+                subject_id: "r0".into(),
+                allow: 0,
+                deny: VIEW_CHANNEL | CONNECT | SEND_MESSAGES,
+            }],
+            timed_out,
+            kind: "user".into(),
+            no_bots: false,
+            scopes: None,
+            system_channel: false,
+            moved,
+        };
+        assert_eq!(compute(&input(false, false)), 0, "hidden without the move");
+        assert_eq!(compute(&input(true, false)), VIEW_CHANNEL | READ_HISTORY | CONNECT | SPEAK, "speak from the roles");
+        assert_eq!(compute(&input(true, true)), TIMEOUT_KEEPS, "a timeout still strips connect");
+        let mut bot = input(true, false);
+        bot.kind = "bot".into();
+        bot.no_bots = true;
+        assert_eq!(compute(&bot), 0, "the bot cap still applies");
     }
 
     #[test]

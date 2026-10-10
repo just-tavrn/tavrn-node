@@ -27,6 +27,9 @@ pub struct RoomAccess {
     /// The user passes `adults_only` gates (PROTOCOL.md §5e, `age::is_adult`). Below a channel's gate every
     /// permission in that channel is 0.
     pub adult: bool,
+    /// The voice channel in which the member has a moved participation (`VOICE.md` §7 "Moved participations"):
+    /// there they hold [`permissions::MOVED_FORCED`] whatever the overrides say.
+    pub moved_channel: Option<String>,
 }
 
 impl RoomAccess {
@@ -104,11 +107,13 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
         None => Vec::new(),
     };
     let adult = crate::age::is_adult(state, user).await?;
-    member_access(room, &roles, member, &role_ids, user, adult)
+    let moved_channel = if member.is_some() { crate::voice::moved::channel_of(state, room_id, &user.id) } else { None };
+    member_access(room, &roles, member, &role_ids, user, adult, moved_channel)
 }
 
 /// The [`RoomAccess`] of `user` from already loaded room data: the room's `roles` (with @everyone), the user's
-/// membership and role ids, and whether the user passes age gates (`age::is_adult`). [`room_access`] uses it for one request, the channel visibility snapshot
+/// membership and role ids, whether the user passes age gates (`age::is_adult`) and the voice channel of a moved
+/// participation (`voice::moved`). [`room_access`] uses it for one request, the channel visibility snapshot
 /// (`visibility.rs`) for every member of a room at once.
 pub fn member_access(
     room: Room,
@@ -117,6 +122,7 @@ pub fn member_access(
     role_ids: &[String],
     user: &UserRow,
     adult: bool,
+    moved_channel: Option<String>,
 ) -> Result<RoomAccess, ApiError> {
     let is_node_admin = user.is_node_admin();
     let everyone = roles
@@ -145,6 +151,7 @@ pub fn member_access(
         kind: user.kind.clone(),
         scopes: user.app_scopes.clone(),
         adult,
+        moved_channel,
     })
 }
 
@@ -223,6 +230,7 @@ pub fn channel_perms_with(
         no_bots: channel.no_bots(),
         scopes: access.scopes.clone(),
         system_channel: system,
+        moved: channel.kind == "voice" && access.moved_channel.as_deref() == Some(channel.id.as_str()),
     };
     permissions::compute(&input)
 }

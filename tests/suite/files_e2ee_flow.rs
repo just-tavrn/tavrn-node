@@ -624,6 +624,48 @@ async fn new_members_wait_for_keys_when_records_are_in_their_window() {
     assert_eq!(pending["items"][0]["user"], format!("carol@{DOMAIN}"), "{pending}");
 }
 
+/// Carol joins the room, Alice uploads `after_join` (or nothing), then Carol's device joins the files channel's group
+/// under `since_join`: the members waiting for keys.
+async fn since_join_pending(upload_after_join: bool) -> Value {
+    let s = setup().await;
+    let (st, j) = s
+        .node
+        .patch(
+            &format!("/api/v1/rooms/{}/channels/{}", s.room_id, s.channel),
+            s.alice.token(),
+            json!({ "history_for_new_members": "since_join" }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    s.upload(&s.alice, None, b"before carol").await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let mut carol = s.node.crypto_user("carol").await;
+    join(&s.node, s.alice.token(), &s.room_id, carol.token()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    if upload_after_join {
+        s.upload(&s.alice, None, b"since carol joined").await;
+    }
+    let (st, gi) = s.node.get_auth(&format!("/api/v1/conversations/{}/mls/group-info", s.channel), carol.token()).await;
+    assert_eq!(st, StatusCode::OK, "{gi}");
+    let out =
+        carol.client.join_by_external_commit(&qualified(&s.channel), &common::e2ee::unb64(&gi["group_info"])).unwrap();
+    let (st, j) = s.node.post_commit(carol.token(), &s.channel, &out).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (_, pending) =
+        s.node.get_auth(&format!("/api/v1/conversations/{}/history-pending", s.channel), s.alice.token()).await;
+    pending
+}
+
+#[tokio::test]
+async fn under_since_join_records_since_the_join_make_a_member_wait() {
+    // Records from before the join never count.
+    let pending = since_join_pending(false).await;
+    assert_eq!(pending["items"], json!([]), "{pending}");
+    // A record written after Carol's room join, before her device entered the group, does.
+    let pending = since_join_pending(true).await;
+    assert_eq!(pending["items"][0]["user"], format!("carol@{DOMAIN}"), "{pending}");
+}
+
 #[tokio::test]
 async fn usage_names_the_store_only_for_managers() {
     let s = setup().await;

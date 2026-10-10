@@ -151,7 +151,8 @@ pub struct VoiceJoin {
     pub ice_aliases: Vec<String>,
 }
 
-/// Join a voice channel: checks `connect`, the user limit and the node policies and returns a LiveKit token.
+/// Join a voice channel: checks `connect` (or a moderator's move into this channel), the user limit and the node
+/// policies and returns a LiveKit token.
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/join", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)),
     responses((status = 200, body = VoiceJoin), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
@@ -166,7 +167,12 @@ pub async fn join(
     if store::rooms::is_banned(&state.db, Some(&room_id), &auth.user.address(), &auth.user.domain).await? {
         return Err(ApiError::Forbidden { code: "room.banned", detail: "You are banned from this room".into() });
     }
-    if !vc.has(p::CONNECT) {
+    let key = vc.key();
+    // A moderator's move into this channel entitles the join without `connect` (the open grant, or a rejoin of the
+    // running moved participation); a timeout still refuses it.
+    let timed_out = vc.access.member.as_ref().is_some_and(crate::models::MemberRow::is_timed_out);
+    let moved = !timed_out && state.voice.participants().move_entitles(&key, &auth.user.id, Instant::now());
+    if !vc.has(p::CONNECT) && !moved {
         return Err(ApiError::Forbidden {
             code: "voice.connect_forbidden",
             detail: "Missing permission: Join voice channel".into(),
@@ -180,7 +186,6 @@ pub async fn join(
         server_muted,
     };
     let identity = who.identity();
-    let key = vc.key();
     let config = &state.config;
     let user_limit = usize::try_from(vc.channel.user_limit).unwrap_or(0);
     let node_limit = config.voice_max_participants as usize;
@@ -198,7 +203,8 @@ pub async fn join(
                 meta: serde_json::json!({ "limit": limit }),
             });
         }
-        let over_channel = user_limit > 0 && occupancy >= user_limit && !vc.has(p::MOVE_MEMBERS);
+        // Members with `move_members` and moved members (the mover may fill a channel beyond its limit) may exceed it.
+        let over_channel = user_limit > 0 && occupancy >= user_limit && !vc.has(p::MOVE_MEMBERS) && !moved;
         if over_channel || occupancy >= node_limit {
             let limit = if over_channel { user_limit } else { node_limit };
             return Err(ApiError::Conflict {
@@ -207,7 +213,9 @@ pub async fn join(
                 meta: serde_json::json!({ "user_limit": limit }),
             });
         }
-        participants.reserve(&key, &who, Instant::now())
+        let reserved = participants.reserve(&key, &who, Instant::now());
+        participants.joined(&key, &auth.user.id);
+        reserved
     };
     // One voice session per user: another device of this user is disconnected.
     for (old_key, old_identity) in &reserved.displaced {
@@ -270,6 +278,9 @@ pub async fn leave(
     voice::remove_from_livekit(&state, &key, &identity).await;
     if visible {
         voice::publish(&state, &[key]).await;
+    } else {
+        // Leaving ends a moved participation even before it was visible.
+        voice::sync_moved(&state).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -349,16 +360,76 @@ pub async fn room_states(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomVoiceStates>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    let keys = state.voice.participants().active_channels(&room_id);
+    let items = visible_states(&state, &access, &room_id, &auth.user.id).await?;
+    Ok(Json(RoomVoiceStates { items }))
+}
+
+/// The voice channels of `room_id` with participants that the user of `access` can view (`view_channel`, which
+/// includes a moved participation), in the shape of `voice.state`.
+async fn visible_states(
+    state: &AppState,
+    access: &RoomAccess,
+    room_id: &str,
+    user_id: &str,
+) -> Result<Vec<VoiceChannelState>, ApiError> {
+    let keys = state.voice.participants().active_channels(room_id);
     let mut items = Vec::new();
     for key in keys {
-        let Ok(channel) = access::channel_in_room(&state, &room_id, &key.1).await else { continue };
-        let perms = access::channel_perms(&state, &access, &channel, &auth.user.id).await?;
+        let Ok(channel) = access::channel_in_room(state, room_id, &key.1).await else { continue };
+        let perms = access::channel_perms(state, access, &channel, user_id).await?;
         if p::has(perms, p::VIEW_CHANNEL) {
-            items.push(voice::channel_state(&state, &key).await);
+            items.push(voice::channel_state(state, &key).await);
         }
     }
-    Ok(Json(RoomVoiceStates { items }))
+    Ok(items)
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MyVoiceRoom {
+    pub room_id: String,
+    /// Voice channels of the room with at least one participant that the requester can view.
+    pub channels: Vec<VoiceChannelState>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MyVoiceStates {
+    /// Rooms of this node the requester is a member of with at least one such channel.
+    pub rooms: Vec<MyVoiceRoom>,
+}
+
+/// Who is in which voice channel of every room the requester is a member of.
+///
+/// The initial state of a room list in one request instead of one per room (changes arrive as `voice.state`): like
+/// `GET /rooms/{room_id}/voice` for every room of this node the requester is a member of, only channels with
+/// participants the requester can view, rooms without such a channel left out. Rooms of other nodes are asked there.
+#[utoipa::path(get, path = "/api/v1/users/me/voice", security(("bearer" = [])),
+    responses((status = 200, body = MyVoiceStates)))]
+pub async fn my_states(State(state): State<AppState>, auth: AuthUser) -> Result<Json<MyVoiceStates>, ApiError> {
+    if !state.config.voice_enabled {
+        return Ok(Json(MyVoiceStates { rooms: Vec::new() }));
+    }
+    // The user's rooms with somebody in voice: one membership query, then only those rooms are looked at.
+    let active: std::collections::BTreeSet<String> =
+        state.voice.participants().keys().into_iter().map(|(room_id, _)| room_id).collect();
+    let mut rooms = Vec::new();
+    if active.is_empty() {
+        return Ok(Json(MyVoiceStates { rooms }));
+    }
+    let mine: std::collections::BTreeSet<String> =
+        store::rooms::room_ids_of_user(&state.db, &auth.user.id).await?.into_iter().collect();
+    for room_id in active.intersection(&mine).cloned() {
+        let access = match access::room_access(&state, &room_id, &auth.user).await {
+            Ok(a) => a,
+            // Left or deleted in between.
+            Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let channels = visible_states(&state, &access, &room_id, &auth.user.id).await?;
+        if !channels.is_empty() {
+            rooms.push(MyVoiceRoom { room_id, channels });
+        }
+    }
+    Ok(Json(MyVoiceStates { rooms }))
 }
 
 // ---------------------------------------------------------------- moderator actions
@@ -436,6 +507,13 @@ fn require_move(vc: &VoiceChannel) -> Result<(), ApiError> {
     }
 }
 
+/// A moderator moved `user_id` into `key`: the grant of the user's next join there, announced before the client is
+/// told (`voice.move`), so the member's connections get the channel first (`channel.create`).
+async fn grant_move(state: &AppState, key: &ChannelKey, user_id: &str) {
+    state.voice.participants().grant_move(key, user_id, Instant::now());
+    voice::sync_moved(state).await;
+}
+
 /// Removes every device of `target` from `key` (LiveKit and state); `false` if none was there.
 async fn disconnect_devices(state: &AppState, key: &ChannelKey, target: &UserRow) -> bool {
     let identities = state.voice.participants().identities_of(key, &target.id);
@@ -487,9 +565,11 @@ pub struct MoveRequest {
     pub channel_id: String,
 }
 
-/// Move a member to another voice channel (`move_members` in both channels; the member needs `connect` in
-/// the target). The node disconnects the member here and sends `voice.move` to the member's devices, whose
-/// client then joins the target channel (a new token and frame key: every channel has its own MLS group).
+/// Move a member to another voice channel (`move_members` in both channels). The member needs no permission in
+/// the target: the move grants their next join there and, while that participation lasts, a view of the channel
+/// (VOICE.md §7 "Moved participations"); only the target's age gate holds. The node disconnects the member here and
+/// sends `voice.move` to the member's devices, whose client then joins the target channel (a new token and frame
+/// key: every channel has its own MLS group).
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/members/{address}/move", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path), ("address" = String, Path)), request_body = MoveRequest,
     responses((status = 204), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
@@ -509,16 +589,16 @@ pub async fn move_member(
     require_move(&to)?;
     let target = target(&state, &vc, &address).await?;
     let target_access = access::room_access(&state, &room_id, &target).await?;
-    let target_perms = access::channel_perms(&state, &target_access, &to.channel, &target.id).await?;
-    if !p::has(target_perms, p::CONNECT) {
+    if !access::age_passes(&target_access, &to.channel) {
         return Err(ApiError::Forbidden {
             code: "voice.target_forbidden",
-            detail: "The member may not join the target channel".into(),
+            detail: "The member is below the target channel's age gate".into(),
         });
     }
     if !disconnect_devices(&state, &vc.key(), &target).await {
         return Err(ApiError::NotFound { code: "voice.not_connected", what: "Member connection".into() });
     }
+    grant_move(&state, &to.key(), &target.id).await;
     state.hub.users(
         vec![target.id.clone()],
         "voice.move",
@@ -550,7 +630,7 @@ pub struct MoveAllRequest {
 pub struct MoveSkipped {
     /// User address.
     pub user: String,
-    /// `channel_full` (the target's user limit), `target_forbidden` (no `connect` in the target),
+    /// `channel_full` (the target's user limit), `target_forbidden` (below the target's age gate),
     /// `outranked` (owner, node admin or an equal or higher role) or `move_forbidden` (no `move_members`
     /// in the participant's channel).
     pub reason: String,
@@ -565,8 +645,9 @@ pub struct MoveAllResult {
 }
 
 /// Mass move: everybody in a voice channel of the room (or only in `from_channel_id`)
-/// to `to_channel_id`, needs `move_members` in the target and in every source channel. The target's user
-/// limit holds: members beyond it stay and are reported as `channel_full` (a partial result, still `200`).
+/// to `to_channel_id`, needs `move_members` in the target and in every source channel. The moved members need no
+/// permission in the target (like `…/move`); the target's age gate and user limit hold: members beyond the limit
+/// stay and are reported as `channel_full` (a partial result, still `200`).
 /// One audit entry `voice.move_all`.
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/voice/move-all", security(("bearer" = [])),
     params(("room_id" = String, Path)), request_body = MoveAllRequest,
@@ -638,11 +719,11 @@ pub async fn move_all(
                     Err(e) => return Err(e),
                 }
             };
-            let target_perms = match access::room_access(&state, &room_id, &target).await {
-                Ok(a) => access::channel_perms(&state, &a, &to.channel, &target.id).await?,
-                Err(_) => 0,
+            let below_gate = match access::room_access(&state, &room_id, &target).await {
+                Ok(a) => !access::age_passes(&a, &to.channel),
+                Err(_) => true,
             };
-            if !p::has(target_perms, p::CONNECT) {
+            if below_gate {
                 skipped.push(skip("target_forbidden"));
                 continue;
             }
@@ -654,6 +735,7 @@ pub async fn move_all(
                 continue;
             }
             room_left -= 1;
+            grant_move(&state, &to.key(), &target.id).await;
             state.hub.users(
                 vec![target.id.clone()],
                 "voice.move",

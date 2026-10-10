@@ -58,7 +58,7 @@ jobs:
       test-env: |
         TAVRN_TEST_CACHE_URL=redis://127.0.0.1:56379
         TAVRN_TEST_REQUIRE_LIVEKIT=1
-        LIVEKIT_VERSION=1.13.7
+        LIVEKIT_VERSION=1.13.8
     secrets:
       # The protocol submodule and the tavrn-crypto git dependency are private until the repositories go public.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}

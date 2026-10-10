@@ -7,7 +7,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 export CARGO_NET_GIT_FETCH_WITH_CLI := "true"
 
 # LiveKit version the node is tested with (also pinned in deploy/Dockerfile and .github/workflows/ci.yml)
-livekit_version := "1.13.7"
+livekit_version := "1.13.8"
 
 # Test containers of `just test-pg` (start them with `just test-services`)
 pg_url := env("TAVRN_TEST_DATABASE_URL", "postgres://tavrn:tavrn@localhost:55432/tavrn_test")

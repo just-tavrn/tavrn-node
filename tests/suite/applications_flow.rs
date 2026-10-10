@@ -552,6 +552,7 @@ async fn every_scope_boundary_and_administrator_masking() {
         ("moderation", Method::GET, format!("/api/v1/rooms/{room_id}/audit-log"), None),
         ("rooms:manage", Method::PATCH, format!("/api/v1/rooms/{room_id}"), Some(json!({ "description": "by bot" }))),
         ("voice", Method::GET, format!("/api/v1/rooms/{room_id}/voice"), None),
+        ("voice", Method::GET, "/api/v1/users/me/voice".into(), None),
         ("whiteboard", Method::GET, format!("/api/v1/conversations/{channel}/whiteboard"), None),
         ("presence", Method::GET, "/api/v1/users/me/presence".into(), None),
         ("dms", Method::POST, "/api/v1/conversations".into(), Some(json!({ "kind": "dm", "members": ["alice"] }))),

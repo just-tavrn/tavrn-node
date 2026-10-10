@@ -1,7 +1,7 @@
 # tavrn-node
 
 The server of [tavrn](https://github.com/just-tavrn/tavrn), a federated, self-hostable community chat with
-end-to-end encrypted conversations: rooms with text, voice, announcement and forum channels, roles and
+end-to-end encrypted conversations: rooms with text, voice, announcement, forum and files channels, roles and
 permissions, direct messages and friends across all nodes, voice, video and screen sharing. Anyone can run a
 node; the nodes federate with each other, and messages in encrypted conversations are end-to-end encrypted,
 so node operators can never read along.
@@ -58,15 +58,19 @@ range in [Configuration](docs/HANDBOOK.md#configuration). The handbook also cove
 - [Reverse proxy and TLS](docs/HANDBOOK.md#reverse-proxy-and-tls): WebSockets, nginx and Caddy, TURN over TLS,
   delegating an identity domain to another host.
 - [Keys and backups](docs/HANDBOOK.md#keys-and-backups), [Database](docs/HANDBOOK.md#database) and
-  [Storage and media](docs/HANDBOOK.md#storage-and-media): the key files, encryption at rest and the storage key.
+  [Storage and media](docs/HANDBOOK.md#storage-and-media): the key files, encryption at rest and the storage key,
+  who may upload what, files channels and external stores, message retention.
 - [Federation](docs/HANDBOOK.md#federation): the peer directory and conformance checks of other nodes;
-  [Voice and video](docs/HANDBOOK.md#voice-and-video): ports, addresses, TURN.
+  [Voice and video](docs/HANDBOOK.md#voice-and-video): ports, addresses, TURN, moved members and the desktop app's
+  native voice.
 - [Web push](docs/HANDBOOK.md#web-push) and [Metrics and health](docs/HANDBOOK.md#metrics-and-health).
 - [Scaling with Valkey](docs/HANDBOOK.md#scaling-with-valkey): several instances of one node behind a load balancer.
 - [Webhooks and applications](docs/HANDBOOK.md#webhooks-and-applications): bots and incoming webhooks, including
   encrypted channels.
-- [SSO with OpenID Connect](docs/HANDBOOK.md#single-sign-on-openid-connect), [legal pages and GDPR](docs/HANDBOOK.md#legal-pages-and-gdpr),
-  [moderation](docs/HANDBOOK.md#moderation-and-auto-moderation), the [CLI commands](docs/HANDBOOK.md#the-doctor-and-other-cli-commands),
+- [SSO with OpenID Connect](docs/HANDBOOK.md#single-sign-on-openid-connect), [mail languages and templates](docs/HANDBOOK.md#mail-languages-and-templates),
+  [legal pages and GDPR](docs/HANDBOOK.md#legal-pages-and-gdpr) with the [age gates](docs/HANDBOOK.md#age-gates),
+  [moderation](docs/HANDBOOK.md#moderation-and-auto-moderation) (channel visibility, audit logs, history restores
+  after a key reset), the [CLI commands](docs/HANDBOOK.md#the-doctor-and-other-cli-commands),
   [troubleshooting](docs/HANDBOOK.md#logs-and-troubleshooting) and a
   [security hardening checklist](docs/HANDBOOK.md#security-hardening-checklist).
 
@@ -79,7 +83,7 @@ created at the first start:
 | File | What it is | If it is lost |
 |---|---|---|
 | `keys/node-<kid>.pem` | the node's signing keys (federation, tokens) | other nodes no longer trust the node's identity |
-| `keys/secrets.key` | encrypts data at rest such as the users' TOTP secrets | every TOTP enrollment becomes unusable |
+| `keys/secrets.key` | encrypts data at rest such as the users' TOTP secrets and the credentials of external file stores | every TOTP enrollment becomes unusable; external file stores need their credentials again |
 | `keys/storage.key` | wraps the keys of every stored file (attachments, avatars, emojis, …) | **every stored file is unreadable**; the node refuses to start |
 | `keys/livekit.key` | LiveKit's API key | regenerated, nothing lost |
 | `keys/vapid.key` | the key that signs web push requests (VAPID) | every push subscription becomes invalid; users re-enable push on each device |

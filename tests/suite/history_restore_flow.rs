@@ -387,7 +387,7 @@ async fn restore_shares_work_under_since_join_and_need_view_channel_only() {
     let (st, j) = s.node.post(&format!("{}/{id}/approve", requests(&s)), s.alice.token(), json!({})).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     assert_eq!(j["partial"], false);
-    // since_join: ordinary shares stay refused, restore shares are accepted.
+    // since_join: restore shares are accepted.
     let (st, j) = share(&s, s.alice.token(), 0, 1).await;
     assert_eq!(st, StatusCode::CREATED, "{j}");
     // Bob reads from his join again (since_join): the two messages since then.

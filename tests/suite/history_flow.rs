@@ -416,14 +416,14 @@ async fn shares_are_refused_unless_sender_recipient_policy_and_limits_allow_them
         .await;
     assert!(s.is_success());
 
-    // `since_join` forbids shares.
+    // `since_join` allows shares too: the gap between the join and the device's first leaf (ENCRYPTION.md §7b).
     assert_eq!(set_policy(&r, "since_join").await.0, StatusCode::OK);
     let (s, j) = r.node.post(&base, r.alice.token(), share_body(&r, &to_bob, 0, 1)).await;
-    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("history.forbidden")), "{j}");
+    assert_eq!(s, StatusCode::CREATED, "{j}");
     assert_eq!(set_policy(&r, "days:7").await.0, StatusCode::OK);
 
     // 20 shares per recipient, conversation and day (acknowledged ones count too).
-    for i in 0..20 {
+    for i in 1..20 {
         let (s, j) = r.node.post(&base, r.alice.token(), share_body(&r, &to_bob, 0, 1)).await;
         assert_eq!(s, StatusCode::CREATED, "{i}: {j}");
     }

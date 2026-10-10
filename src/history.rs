@@ -53,7 +53,7 @@ pub fn restorable_kind(kind: &str) -> bool {
 /// The channel setting `history_for_new_members`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
-    /// Members see (and get keys for) nothing from before their join. Default.
+    /// Members see (and get keys for) nothing from before their join, but everything since. Default.
     SinceJoin,
     /// Members see the last `n` days before their join.
     Days(i64),
@@ -82,11 +82,6 @@ impl Policy {
     /// The stored value of a channel; NULL or anything unreadable is the default `since_join`.
     pub fn of(stored: Option<&str>) -> Self {
         stored.and_then(Self::parse).unwrap_or(Self::SinceJoin)
-    }
-
-    /// Does the policy give new members anything from before their join?
-    pub fn grants_history(self) -> bool {
-        self != Self::SinceJoin
     }
 }
 
@@ -199,8 +194,10 @@ pub async fn min_epoch(state: &AppState, conversation_id: &str, user_id: &str) -
 }
 
 /// After an accepted commit: users who got their first leaf in the group (an external join of a user
-/// without a leaf, or added users) are marked `history_pending` when the channel's policy and their
-/// `read_history` bit grant history and there are encrypted messages in the window. Members who wait get
+/// without a leaf, or added users) are marked `history_pending` when they hold `view_channel` and `read_history`
+/// and there are encrypted messages in their window from before this commit: from before the room join as far as
+/// the policy reaches, and those posted between the room join and the device's first leaf, under every policy
+/// (ENCRYPTION.md §7b; a device enters a channel's group only when it first opens the channel). Members who wait get
 /// `history.pending { conversation_id, user }` so that an online member shares the keys. Best effort: a
 /// failure here never fails the commit.
 pub async fn after_commit(state: &AppState, conv: &Conv, committer: &UserRow, summary: &CommitSummary, before: &[u8]) {
@@ -218,7 +215,7 @@ async fn mark_new_members(
 ) -> Result<(), ApiError> {
     let ConvKind::Channel { access, channel } = &conv.kind else { return Ok(()) };
     let policy = Policy::of(channel.history_for_new_members.as_deref());
-    if !conv.encrypted || !policy.grants_history() {
+    if !conv.encrypted {
         return Ok(());
     }
     // Users with a leaf before this commit already are in the group (a further device of theirs joins).
@@ -260,21 +257,22 @@ async fn mark_new_members(
         if store::history::pending_since(&state.db, &conv.id, &user.id).await?.as_deref() == Some(marker) {
             continue; // this membership (or this reset) was handled already
         }
-        // The automatic window: from the policy's start up to the join, or after a reset everything since the
-        // reset (never earlier, ENCRYPTION.md §7b "History after a key reset"). The same window as times for the
-        // entry records of a files channel.
-        let (until, from, until_time, from_time) = match reset.and_then(util::parse_time) {
-            Some(r) => (UNTIL_NOW.to_string(), Some(ulid_floor(r)), util::now(), Some(util::format_time(r))),
+        // The automatic window, up to this commit: from the policy's start (under `since_join` the join), or after a
+        // reset everything since the reset (never earlier, ENCRYPTION.md §7b "History after a key reset"). The same
+        // window as times for the entry records of a files channel.
+        let from_time = match reset.and_then(util::parse_time) {
+            Some(r) => Some(r),
             None => {
                 let Some(joined) = util::parse_time(&member.joined_at) else { continue };
-                let start = cutoff(policy, true, joined);
-                (ulid_floor(joined), start.map(ulid_floor), member.joined_at.clone(), start.map(util::format_time))
+                cutoff(policy, true, joined)
             }
         };
-        let mut older = store::history::has_encrypted_before(&state.db, &conv.id, &until, from.as_deref()).await?;
+        let from = from_time.map(ulid_floor);
+        let mut older = store::history::has_encrypted_before(&state.db, &conv.id, UNTIL_NOW, from.as_deref()).await?;
         // Files channels have entry records instead of messages (FILES.md §8.7).
         if !older && channel.kind == "files" {
-            older = store::files::has_records_between(&state.db, &conv.id, from_time.as_deref(), &until_time).await?;
+            let from_time = from_time.map(util::format_time);
+            older = store::files::has_records_between(&state.db, &conv.id, from_time.as_deref(), &util::now()).await?;
         }
         store::history::set_pending(&state.db, &conv.id, &user.id, marker, older).await?;
         if older {
@@ -323,9 +321,6 @@ mod tests {
         assert_eq!(Policy::of(None), Policy::SinceJoin);
         assert_eq!(Policy::of(Some("nonsense")), Policy::SinceJoin);
         assert_eq!(Policy::of(Some("days:30")).to_string(), "days:30");
-        assert!(
-            !Policy::SinceJoin.grants_history() && Policy::All.grants_history() && Policy::Days(2).grants_history()
-        );
         assert!(validate("days:0").is_err());
     }
 
