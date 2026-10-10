@@ -240,3 +240,62 @@ async fn password_reset_by_email() {
     assert_eq!(s, StatusCode::OK);
     let _ = alice;
 }
+
+/// Reset mails per account are limited (three per hour; the answer stays 204), and a request while a link is pending
+/// keeps that link valid instead of replacing it.
+#[tokio::test]
+async fn password_reset_requests_keep_the_pending_link_and_are_limited_per_account() {
+    let node = test_node("t.local").await;
+    let (s, _) = node
+        .req(
+            Method::POST,
+            "/api/v1/auth/register",
+            None,
+            Some(json!({ "username": "dora", "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": "dora@example.org" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'dora'").fetch_one(&node.state.db).await.unwrap();
+    tavrn_node::store::users::set_email_verified(&node.state.db, &user_id).await.unwrap();
+    let mails = || node.state.mailer.outbox.lock().unwrap().iter().filter(|m| m.1.contains("password")).count();
+    let forgot = || node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": "dora" })));
+    assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
+    assert_eq!(mails(), 1);
+    let first = node.state.mailer.outbox.lock().unwrap().last().unwrap().2.clone();
+    let link = first.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    // Further requests send nothing while the link is pending, and the link stays valid.
+    for _ in 0..5 {
+        assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(mails(), 1, "no new mail, the first link stays the valid one");
+    let (s, j) = node
+        .req(Method::POST, "/api/v1/auth/reset-password", None, Some(json!({ "token": link, "new_password": "new-password-123" })))
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    // Once it is used, new links come again, at most three per hour.
+    for _ in 0..6 {
+        assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
+        sqlx::query("DELETE FROM password_resets").execute(&node.state.db).await.unwrap();
+    }
+    assert_eq!(mails(), 3, "the first mail plus two more in the hour, then none");
+}
+
+/// Without SMTP a production node sends no reset link (it could only end up in the log): `503 mail.unavailable`.
+#[tokio::test]
+async fn forgot_password_without_smtp_is_unavailable_in_production() {
+    use tower::ServiceExt;
+    let node = test_node("t.local").await;
+    let mut state = node.state.clone();
+    let production = tavrn_node::config::Config { dev: false, ..(*state.config).clone() };
+    state.mailer = tavrn_node::mail::Mailer::from_config(&production);
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/forgot-password")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "account": "x" }).to_string()))
+        .unwrap();
+    let resp = tavrn_node::app::router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let j = common::body_json(resp).await;
+    assert_eq!(j["code"], "mail.unavailable", "{j}");
+}

@@ -154,6 +154,11 @@ impl Hub {
     }
 
     /// `true` while the user has at least one open WebSocket on this node.
+    /// Open WebSocket connections of `user_id` on this instance.
+    pub fn connections_of(&self, user_id: &str) -> usize {
+        self.online.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).copied().unwrap_or(0)
+    }
+
     pub fn is_online(&self, user_id: &str) -> bool {
         self.online.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).is_some_and(|n| *n > 0)
     }

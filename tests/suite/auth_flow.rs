@@ -3,7 +3,7 @@
 use crate::common;
 
 use axum::http::{Method, StatusCode};
-use common::test_node;
+use common::{test_node, test_node_with};
 use serde_json::json;
 
 #[tokio::test]
@@ -386,8 +386,8 @@ async fn password_change_revokes_other_devices() {
     let (s, _) =
         node.req(Method::POST, "/api/v1/auth/refresh", None, Some(json!({ "refresh_token": second_refresh }))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "the second device is signed out");
-    let (s, _) = node.get_auth("/api/v1/users/me", &second_token).await;
-    assert_eq!(s, StatusCode::OK, "the access token stays valid until it expires (1 h)");
+    let (s, j) = node.get_auth("/api/v1/users/me", &second_token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.session_revoked")), "its access token ends at once");
 
     // Remove devices
     let (_, devices) = node.get_auth("/api/v1/users/me/devices", &alice.token).await;
@@ -400,4 +400,35 @@ async fn password_change_revokes_other_devices() {
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, devices) = node.get_auth("/api/v1/users/me/devices", &alice.token).await;
     assert_eq!(devices.as_array().unwrap().len(), before - 1);
+}
+
+/// Password hashing runs on the blocking pool behind a semaphore: while many logins are being checked, the runtime
+/// still answers other requests at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_stays_responsive_while_logins_are_checked() {
+    let node = test_node_with("t.local", |c| c.password_hash_concurrency = 2).await;
+    node.register("alice").await;
+    let mut logins = Vec::new();
+    for i in 0..12 {
+        let router = node.router.clone();
+        logins.push(tokio::spawn(async move {
+            use tower::ServiceExt;
+            let body = json!({ "username": if i % 2 == 0 { "alice" } else { "nobody" }, "password": "wrong-password-123" });
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            router.oneshot(req).await.unwrap().status()
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let started = std::time::Instant::now();
+    let health = node.get("/healthz").await;
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(started.elapsed() < std::time::Duration::from_millis(300), "health answered after {:?}", started.elapsed());
+    for l in logins {
+        assert_eq!(l.await.unwrap(), StatusCode::UNAUTHORIZED);
+    }
 }

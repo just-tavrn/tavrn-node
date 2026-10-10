@@ -98,6 +98,8 @@ pub struct AppState {
     /// Link previews (`TAVRN_UNFURL`); `None` when switched off.
     pub unfurl: Option<Arc<crate::unfurl::Unfurler>>,
     pub login_limiter: Arc<SharedLimiter>,
+    /// Password reset mails per account (`forgot-user:<id>`, 3 per hour).
+    pub forgot_limiter: Arc<SharedLimiter>,
     pub register_limiter: Arc<SharedLimiter>,
     /// KeyPackage claims per claiming user (`claim:<user id>`).
     pub claim_limiter: Arc<RateLimiter>,
@@ -424,6 +426,7 @@ impl AppState {
             unfurl,
             mailer,
             login_limiter: shared("login", login_max, 60),
+            forgot_limiter: shared("forgot-user", 3, 3600),
             register_limiter: shared("register", register_max, 600),
             claim_limiter: limiter(e2ee.0, 60),
             key_package_limiter: limiter(e2ee.1, 60),
