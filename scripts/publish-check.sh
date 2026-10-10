@@ -42,7 +42,7 @@ for f in "${files[@]}"; do
   esac
 done
 
-# 2. Private domains and addresses (allowed only as the example default in the two deploy files).
+# 2. Private domains and addresses (only the example reference node is allowed, and only in the two deploy files).
 patterns=()
 IFS=',' read -r -a env_patterns <<< "${PUBLISH_CHECK_PRIVATE:-}"
 for p in "${env_patterns[@]}"; do [ -n "${p// /}" ] && patterns+=("${p// /}"); done
@@ -50,25 +50,31 @@ for list in ./.publish-check.private ../.publish-check.private "$here/.publish-c
   [ -f "$list" ] || continue
   while IFS= read -r p; do [ -n "$p" ] && [[ "$p" != \#* ]] && patterns+=("$p"); done < "$list"
 done
+# The example reference node (and its parent domain) is the one private name the two deploy examples may carry.
+reference=()
 for example in deploy/.env.example "$here/deploy/.env.example"; do
   [ -f "$example" ] || continue
   ref=$(sed -n 's/^TAVRN_REFERENCE_NODES=\([^ #]*\).*/\1/p' "$example" | head -n 1)
   for d in ${ref//,/ }; do
-    patterns+=("$d")
+    reference+=("$d")
     parent="${d#*.}"
-    [[ "$parent" == *.* ]] && patterns+=("$parent")
+    [[ "$parent" == *.* ]] && reference+=("$parent")
   done
 done
+patterns+=("${reference[@]}")
 [ "${#patterns[@]}" -gt 0 ] && mapfile -t patterns < <(printf '%s\n' "${patterns[@]}" | sort -u)
+is_reference() { local r; for r in "${reference[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
 if [ "${#patterns[@]}" -eq 0 ]; then
   report "no private domains or addresses configured (PUBLISH_CHECK_PRIVATE or .publish-check.private)"
 else
   for f in "${files[@]}"; do
     case "$f" in
-      deploy/docker-compose.yml | deploy/.env.example | */node_modules/* | *.lock | pnpm-lock.yaml) continue ;;
+      */node_modules/* | *.lock | pnpm-lock.yaml) continue ;;
     esac
     [ -f "$f" ] || continue
     for p in "${patterns[@]}"; do
+      # Only the reference node is allowed in the deploy examples; every other private string is refused there too.
+      case "$f" in deploy/docker-compose.yml | deploy/.env.example) is_reference "$p" && continue ;; esac
       if grep -qIF -- "$p" "$f"; then
         report "private domain/address in $f: $(grep -nIF -- "$p" "$f" | head -n 1 | cut -c1-120)"
       fi
