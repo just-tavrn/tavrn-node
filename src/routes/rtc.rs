@@ -56,7 +56,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
     let path = req.uri().path().to_string();
     let suffix = path.strip_prefix("/rtc").unwrap_or("/invalid");
     if !PATHS.contains(&suffix) {
-        return Err(ApiError::NotFound { code: "route.not_found", what: "Pfad".into() });
+        return Err(ApiError::NotFound { code: "route.not_found", what: "Path".into() });
     }
     let query = req.uri().query().unwrap_or("").to_string();
     let token = Query::<HashMap<String, String>>::try_from_uri(req.uri())
