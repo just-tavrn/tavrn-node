@@ -108,7 +108,7 @@ pub struct OidcStartResponse {
 }
 
 /// Starts an SSO flow (§8.2). `login` needs no session; `link` and `reauth` need the full session of a
-/// local user (`link`: not linked yet, `reauth`: linked).
+/// local user (`link`: not linked yet, and a reauth token in `Tavrn-Reauth`, PROTOCOL.md §5c; `reauth`: linked).
 #[utoipa::path(post, path = "/api/v1/auth/oidc/start", request_body = OidcStartRequest,
     responses((status = 200, body = OidcStartResponse), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails),
         (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails),
@@ -139,6 +139,10 @@ pub async fn start(
                 (Purpose::Link, Some(_)) => return Err(account::already_linked()),
                 (Purpose::Reauth, None) => return Err(not_linked()),
                 _ => {}
+            }
+            // Linking adds a login method that skips the second factor (§8.4): a fresh proof, like a new passkey.
+            if req.purpose == Purpose::Link {
+                crate::reauth::require(&state, &auth, &headers).await?;
             }
             Some(auth.user.id)
         }
@@ -308,11 +312,13 @@ pub async fn identity(State(state): State<AppState>, auth: AuthUser) -> Result<J
     Ok(Json(linked.map(|l| OidcIdentity { issuer: l.issuer, linked_at: l.linked_at, last_login_at: l.last_login_at })))
 }
 
-/// Unlinks the identity; only if the account keeps a password and a second factor (§8.3).
+/// Unlinks the identity; only if the account keeps a password and a second factor (§8.3). Needs a reauth token
+/// (`Tavrn-Reauth`, PROTOCOL.md §5c).
 #[utoipa::path(delete, path = "/api/v1/auth/oidc/identity", security(("bearer" = [])),
-    responses((status = 204), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails)))]
-pub async fn unlink(State(state): State<AppState>, auth: AuthUser) -> Result<StatusCode, ApiError> {
+    responses((status = 204), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails)))]
+pub async fn unlink(State(state): State<AppState>, headers: HeaderMap, auth: AuthUser) -> Result<StatusCode, ApiError> {
     let oidc = configured(&state)?;
+    crate::reauth::require(&state, &auth, &headers).await?;
     let issuer = &oidc.settings.issuer;
     if store::oidc::identity_of_user(&state.db, &auth.user.id, issuer).await?.is_none() {
         return Err(not_linked());

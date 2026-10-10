@@ -341,8 +341,8 @@ pub async fn own_device(db: &Pool, user_id: &str, device_id: &str) -> Result<Opt
 
 /// A new session continues an existing device (device proof at login, PROTOCOL.md §5b): the device's other
 /// sessions end (the client replaced their tokens), `client` and `last_seen_at` are updated.
-pub async fn reuse_device(db: &Pool, device_id: &str, client: &str) -> Result<(), ApiError> {
-    revoke_device_sessions(db, device_id).await?;
+pub async fn reuse_device(db: &Pool, user_id: &str, device_id: &str, client: &str) -> Result<(), ApiError> {
+    revoke_device_sessions(db, user_id, device_id).await?;
     sqlx::query("UPDATE devices SET client = $1, last_seen_at = $2 WHERE id = $3")
         .bind(client)
         .bind(now())

@@ -240,7 +240,7 @@ pub async fn session_device(
     if let Some(id) = reuse
         && store::users::own_device(&state.db, &user.id, id).await?.is_some()
     {
-        store::users::reuse_device(&state.db, id, client).await?;
+        store::users::reuse_device(&state.db, &user.id, id, client).await?;
         return Ok(id.to_string());
     }
     Ok(store::users::create_device(&state.db, &user.id, device_name, client).await?.id)

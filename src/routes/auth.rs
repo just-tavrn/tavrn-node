@@ -426,13 +426,22 @@ pub struct ForgotPasswordRequest {
     pub account: String,
 }
 
-/// Request a password reset by email. Always answers 204, so no accounts can be guessed.
-#[utoipa::path(post, path = "/api/v1/auth/forgot-password", request_body = ForgotPasswordRequest, responses((status = 204), (status = 429, body = crate::error::ProblemDetails)))]
+/// Request a password reset by email. Always answers 204, so no accounts can be guessed. At most three mails per
+/// account and hour; a link that has not expired stays valid (a new request sends no new one). A node without
+/// SMTP answers `503 mail.unavailable` (development nodes log the mail instead).
+#[utoipa::path(post, path = "/api/v1/auth/forgot-password", request_body = ForgotPasswordRequest,
+    responses((status = 204), (status = 429, body = crate::error::ProblemDetails), (status = 503, body = crate::error::ProblemDetails)))]
 pub async fn forgot_password(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
+    if !state.mailer.can_deliver() {
+        return Err(ApiError::Unavailable {
+            code: "mail.unavailable",
+            detail: "This node sends no e-mail; ask a node admin to reset your password".into(),
+        });
+    }
     state.register_limiter.check_all(&[format!("forgot:{ip}")]).await?;
     let account = req.account.trim().to_lowercase();
     let account = account
@@ -449,6 +458,13 @@ pub async fn forgot_password(
     };
     // SSO-only accounts have no password to reset (APPLICATIONS.md §8.3).
     if let Some(user) = user.filter(|u| u.disabled_at.is_none() && u.email.is_some() && u.password_hash.is_some()) {
+        // Per account (after the lookup, the answer stays 204): no mail bombing, and the link already sent stays
+        // the valid one while it lasts.
+        if store::admin::has_pending_password_reset(&state.db, &user.id).await?
+            || state.forgot_limiter.check_all(&[format!("forgot-user:{}", user.id)]).await.is_err()
+        {
+            return Ok(StatusCode::NO_CONTENT);
+        }
         let token = util::random_token(32);
         store::admin::set_password_reset(&state.db, &user.id, &util::sha256_b64(&token), 3600).await?;
         let locale = store::users::locale(&state.db, &user.id).await?;

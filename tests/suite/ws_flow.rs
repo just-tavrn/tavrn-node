@@ -336,3 +336,70 @@ async fn deleting_another_users_device_revokes_nothing() {
     assert_eq!(node.get_auth("/api/v1/users/me", &bob.token).await.0, StatusCode::OK);
     assert!(silent(&mut ws, 500).await, "bob's socket stays open");
 }
+
+/// One user holds at most `TAVRN_WS_MAX_SOCKETS_PER_USER` connections (close 4002 `too_many_connections` beyond).
+#[tokio::test]
+async fn sockets_per_user_are_capped() {
+    let node = common::test_node_with("t.local", |c| c.ws_max_sockets_per_user = 2).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let url = serve(&node).await;
+    let _a = hello(&url, &alice.token).await;
+    let _b = hello(&url, &alice.token).await;
+    let mut third = connect(&url).await;
+    third.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), third.next()).await.unwrap().unwrap().unwrap() {
+            Message::Close(Some(f)) => {
+                assert_eq!((u16::from(f.code), f.reason.as_str()), (4002, "too_many_connections"));
+                break;
+            }
+            Message::Close(None) => panic!("close without a code"),
+            _ => {}
+        }
+    }
+    let _c = hello(&url, &bob.token).await; // per user
+    drop(_a);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _d = hello(&url, &alice.token).await; // a closed socket frees its place
+}
+
+/// `ack` is limited like `PUT …/read`: acks over the limit are dropped silently.
+#[tokio::test]
+async fn acks_over_the_read_limit_are_dropped() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = common::TestNode::text_channel(&room);
+    let db = &node.state.db;
+    let (_, m) = node.send(&alice.token, &room_id, &channel, "hello").await;
+    // Sending may have set the author's own marker: start without one.
+    sqlx::query("DELETE FROM read_markers").execute(db).await.unwrap();
+    let url = serve(&node).await;
+    let mut ws = hello(&url, &alice.token).await;
+    while node.state.read_limiter.check(&format!("read:{}", alice.user_id)).is_ok() {}
+    let ack = json!({ "op": "ack", "conversation_id": channel, "message_id": m["id"] });
+    ws.send(Message::Text(ack.to_string().into())).await.unwrap();
+    assert!(silent(&mut ws, 700).await, "no read.update over the limit");
+    assert!(tavrn_node::store::messages::read_marker(db, &channel, &alice.user_id).await.unwrap().is_none());
+}
+
+/// Frames larger than 64 KiB are refused, also before the hello.
+#[tokio::test]
+async fn large_frames_close_the_socket() {
+    let node = test_node("t.local").await;
+    let url = serve(&node).await;
+    let mut ws = connect(&url).await;
+    let _ = ws.send(Message::Text("x".repeat(100 * 1024).into())).await;
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(closed, Ok(true));
+}

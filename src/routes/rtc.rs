@@ -79,7 +79,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
             ApiError::BadRequest { code: "voice.websocket_invalid", detail: "Invalid WebSocket handshake".into() }
         })?;
         let upstream = connect_upstream(&format!("ws://127.0.0.1:{port}{upstream_path}"), &token).await?;
-        Ok(upgrade.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| pump(socket, upstream)))
+        Ok(upgrade.max_message_size(MAX_MESSAGE).max_frame_size(MAX_MESSAGE).on_upgrade(move |socket| pump(socket, upstream)))
     } else {
         forward_http(&format!("http://127.0.0.1:{port}{upstream_path}"), &token).await
     }
