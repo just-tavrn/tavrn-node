@@ -175,6 +175,21 @@ pub async fn below_age_gate(state: &AppState, room_id: &str, channel_ids: &[Stri
     Ok(())
 }
 
+/// A member's moved participation in a voice channel ended (`VOICE.md` §7) and they may not view the channel by
+/// their permissions: their leaves in the channel's group.
+pub async fn left_channel_group(state: &AppState, channel_id: &str, user: &UserRow) -> Result<(), ApiError> {
+    if let Some(ds) = store::e2ee::group_state(&state.db, channel_id).await? {
+        remove_needed(
+            state,
+            vec![(channel_id.to_string(), ds)],
+            store::pending_removals::NOT_MEMBER,
+            of_user(user.address()),
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// A user left (or was removed from) a group DM.
 pub async fn user_left_conversation(state: &AppState, conversation_id: &str, user: &UserRow) -> Result<(), ApiError> {
     if let Some(ds) = store::e2ee::group_state(&state.db, conversation_id).await? {
