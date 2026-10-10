@@ -23,8 +23,7 @@ use crate::{
     auth::AuthUser,
     e2ee,
     error::{ApiError, ApiJson, ProblemDetails},
-    history::{self, Policy},
-    permissions, store, util,
+    history, permissions, store, util,
     validate::bad,
 };
 
@@ -119,8 +118,9 @@ pub struct HistoryShareCreated {
     pub id: String,
 }
 
-/// Share keys of past epochs with a new member. Allowed only in encrypted room channels whose policy
-/// grants history, from an attested device of a member to a member with `read_history`.
+/// Share keys of past epochs with a member who joined later. Allowed in encrypted room channels under every policy
+/// (under `since_join` for the epochs since the recipient's join: its window bounds what it is served and accepts),
+/// from an attested device of a member to a member with `read_history`.
 #[utoipa::path(post, path = "/api/v1/conversations/{conversation_id}/history-keys", security(("bearer" = [])), params(("conversation_id" = String, Path)), request_body = CreateHistoryShareRequest,
     responses((status = 201, body = HistoryShareCreated), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn create_share(
@@ -133,11 +133,10 @@ pub async fn create_share(
     if !conv.encrypted {
         return Err(bad("history.not_encrypted", "This conversation is not end-to-end encrypted"));
     }
-    let ConvKind::Channel { channel, .. } = &conv.kind else {
+    if !matches!(conv.kind, ConvKind::Channel { .. }) {
         // DMs: both participants are members from the start; group DMs: `since_join`.
         return Err(forbidden("History keys are shared only in room channels"));
-    };
-    let grants = Policy::of(channel.history_for_new_members.as_deref()).grants_history();
+    }
     let (version, boxes) = share_format(&req)?;
     if req.ciphertext.len() > history::MAX_SHARE_BYTES {
         return Err(ApiError::PayloadTooLarge {
@@ -191,13 +190,10 @@ pub async fn create_share(
         if !permissions::has(target.perms, permissions::VIEW_CHANNEL) {
             return Err(forbidden("The recipient may not read this channel"));
         }
-    } else {
-        if !grants {
-            return Err(forbidden("The channel does not give new members its history"));
-        }
-        if !permissions::has(target.perms, permissions::VIEW_CHANNEL | permissions::READ_HISTORY) {
-            return Err(forbidden("The recipient may not receive this channel's history"));
-        }
+    } else if !permissions::has(target.perms, permissions::VIEW_CHANNEL | permissions::READ_HISTORY) {
+        // Every policy: under `since_join` the recipient's window starts at its join, and its node serves it nothing
+        // older to check a key against (ENCRYPTION.md §7b).
+        return Err(forbidden("The recipient may not receive this channel's history"));
     }
     check_box_devices(&state, &recipient, &boxes).await?;
     let to = recipient.address();
@@ -336,8 +332,9 @@ pub struct HistoryPendingList {
     pub items: Vec<HistoryPendingMember>,
 }
 
-/// Members of the channel who still wait for history keys (at most 100, the last 30 days). Empty for DMs,
-/// group DMs, plaintext channels and channels whose policy is `since_join`.
+/// Members of the channel who still wait for history keys (at most 100, the last 30 days): also under `since_join`,
+/// for the messages posted between a member's join and its device's first leaf. Empty for DMs, group DMs and
+/// plaintext channels.
 #[utoipa::path(get, path = "/api/v1/conversations/{conversation_id}/history-pending", security(("bearer" = [])), params(("conversation_id" = String, Path)),
     responses((status = 200, body = HistoryPendingList), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn list_pending(
@@ -346,10 +343,10 @@ pub async fn list_pending(
     Path(conversation_id): Path<String>,
 ) -> Result<Json<HistoryPendingList>, ApiError> {
     let conv = entitled(&state, &auth, &conversation_id).await?;
-    let ConvKind::Channel { access, channel } = &conv.kind else {
+    let ConvKind::Channel { access, .. } = &conv.kind else {
         return Ok(Json(HistoryPendingList { items: vec![] }));
     };
-    if !conv.encrypted || !Policy::of(channel.history_for_new_members.as_deref()).grants_history() {
+    if !conv.encrypted {
         return Ok(Json(HistoryPendingList { items: vec![] }));
     }
     let newer_than = util::format_time(Utc::now() - Duration::days(history::MAX_AGE_DAYS));

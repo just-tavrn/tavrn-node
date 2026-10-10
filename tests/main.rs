@@ -50,6 +50,7 @@ mod suite {
     mod history_flow;
     mod history_restore_flow;
     mod history_shares_v2_flow;
+    mod history_since_join_flow;
     mod housekeeping_flow;
     mod identity_rotation_flow;
     mod legal_flow;
