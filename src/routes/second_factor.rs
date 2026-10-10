@@ -583,7 +583,7 @@ pub async fn webauthn_login_finish(
             record_use(&state, &user, &result).await?;
             let name = device_name(req.device_name.as_deref(), "Passkey");
             let reuse = crate::device_proof::verify_opt(&state, &user, req.device.as_ref()).await?;
-            Ok(Json(sf::start_session(&state, &user, &name, &client_header(&headers), reuse.as_deref()).await?))
+            Ok(Json(sf::start_session(&state, &user, &name, &client_header(&headers), reuse.as_deref(), true).await?))
         }
         _ => Err(challenge_invalid()),
     }

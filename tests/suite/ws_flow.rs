@@ -229,3 +229,110 @@ async fn an_open_socket_gets_the_events_of_a_room_its_user_creates_later() {
         }
     }
 }
+
+/// Waits (at most a ping interval) for the socket to close and returns the close code; events before it are skipped.
+async fn closed_with(ws: &mut Socket) -> Option<u16> {
+    let deadline = tokio::time::Instant::now() + tavrn_node::ws::PING_INTERVAL + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return None,
+            Ok(None | Some(Err(_))) => return Some(0),
+            Ok(Some(Ok(Message::Close(frame)))) => return Some(frame.map(|f| u16::from(f.code)).unwrap_or(0)),
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// How a session of alice's second device ("victim") ends.
+#[derive(Clone, Copy, Debug)]
+enum Revocation {
+    Logout,
+    ChangePassword,
+    ResetPassword,
+    DeleteDevice,
+    AdminDisable,
+    NodeBan,
+    AdminSecondFactorReset,
+}
+
+async fn revoke(node: &common::TestNode, how: Revocation, alice: &common::Session, victim: &common::Session, admin: &common::Session) {
+    use axum::http::{Method, StatusCode};
+    let (s, j) = match how {
+        Revocation::Logout => node.post("/api/v1/auth/logout", &victim.token, json!({})).await,
+        Revocation::ChangePassword => {
+            node.post(
+                "/api/v1/users/me/password",
+                &alice.token,
+                json!({ "current_password": common::password("alice"), "new_password": "a-brand-new-password" }),
+            )
+            .await
+        }
+        Revocation::ResetPassword => {
+            let token = "reset-token-of-the-test";
+            tavrn_node::store::admin::set_password_reset(&node.state.db, &alice.user_id, &tavrn_node::util::sha256_b64(token), 3600)
+                .await
+                .unwrap();
+            node.req(Method::POST, "/api/v1/auth/reset-password", None, Some(json!({ "token": token, "new_password": "a-brand-new-password" })))
+                .await
+        }
+        Revocation::DeleteDevice => node.delete(&format!("/api/v1/users/me/devices/{}", victim.device_id), &alice.token).await,
+        Revocation::AdminDisable => {
+            node.patch(&format!("/api/v1/admin/users/{}", alice.user_id), &admin.token, json!({ "disabled": true })).await
+        }
+        Revocation::NodeBan => node.post("/api/v1/admin/bans", &admin.token, json!({ "subject": "alice@t.local" })).await,
+        Revocation::AdminSecondFactorReset => {
+            node.post(&format!("/api/v1/admin/users/{}/second-factor/reset", alice.user_id), &admin.token, json!({})).await
+        }
+    };
+    assert!(s == StatusCode::NO_CONTENT || s == StatusCode::OK || s == StatusCode::CREATED, "{how:?}: {s} {j}");
+}
+
+/// Every local revocation ends the access token at once and closes the WebSockets opened with it (4001), not only the
+/// refresh token.
+#[tokio::test]
+async fn revoked_local_sessions_close_their_websockets_and_lose_the_access_token() {
+    use axum::http::StatusCode;
+    for how in [
+        Revocation::Logout,
+        Revocation::ChangePassword,
+        Revocation::ResetPassword,
+        Revocation::DeleteDevice,
+        Revocation::AdminDisable,
+        Revocation::NodeBan,
+        Revocation::AdminSecondFactorReset,
+    ] {
+        let node = test_node("t.local").await;
+        let admin = node.register("admin").await;
+        let alice = node.register("alice").await;
+        let victim = node.login("alice").await;
+        let url = serve(&node).await;
+        let mut ws = hello(&url, &victim.token).await;
+        // A request just before the revocation (a cached liveness check must not outlive it).
+        assert_eq!(node.get_auth("/api/v1/users/me", &victim.token).await.0, StatusCode::OK);
+        revoke(&node, how, &alice, &victim, &admin).await;
+        assert_eq!(closed_with(&mut ws).await, Some(4001), "{how:?}: the socket closes with 4001");
+        let (s, j) = node.get_auth("/api/v1/users/me", &victim.token).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{how:?}: {j}");
+        // A new socket with the old token is refused as well.
+        let mut again = connect(&url).await;
+        again.send(Message::Text(json!({ "op": "hello", "token": victim.token }).to_string().into())).await.unwrap();
+        assert_eq!(next_json(&mut again).await["code"], 4001, "{how:?}");
+    }
+}
+
+/// Deleting a device of another user changes nothing: no session of the other user ends.
+#[tokio::test]
+async fn deleting_another_users_device_revokes_nothing() {
+    use axum::http::{Method, StatusCode};
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let url = serve(&node).await;
+    let mut ws = hello(&url, &bob.token).await;
+    let (s, j) = node.delete(&format!("/api/v1/users/me/devices/{}", bob.device_id), &alice.token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::NOT_FOUND, Some("device.not_found")), "{j}");
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/refresh", None, Some(json!({ "refresh_token": bob.refresh }))).await;
+    assert_eq!(s, StatusCode::OK, "bob's session lives on: {j}");
+    assert_eq!(node.get_auth("/api/v1/users/me", &bob.token).await.0, StatusCode::OK);
+    assert!(silent(&mut ws, 500).await, "bob's socket stays open");
+}

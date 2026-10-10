@@ -667,3 +667,30 @@ async fn a_fixed_group_map_cannot_be_changed_in_the_admin_api() {
     let (s, j) = put_map(&node, &admin.token, json!({})).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("sso.group_map_fixed")));
 }
+
+/// Linking adds a login method that skips the second factor, and unlinking removes one: both need a fresh proof
+/// (a reauth token), not just a session.
+#[tokio::test]
+async fn linking_and_unlinking_need_a_reauth_token() {
+    let idp = FakeIdp::start().await;
+    let node = sso_node(&idp).await;
+    let bob = node.register("bob").await;
+    let stolen = node.login("bob").await;
+    node.forget_reauth(&stolen.token);
+    idp.set_login(Login::new("sub-mallory", "mallory"));
+    assert_eq!(
+        flow(&node, "link", Some(&stolen.token)).await.exchange_error(),
+        (StatusCode::FORBIDDEN, "auth.reauth_required".into()),
+        "a bare access token links nothing"
+    );
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM external_identities").fetch_one(&node.state.db).await.unwrap();
+    assert_eq!(n, 0);
+    // With the reauth token of a fresh login it works, and unlinking needs one too.
+    idp.set_login(Login::new("sub-bob", "robert"));
+    assert_eq!(flow(&node, "link", Some(&bob.token)).await.ok(), json!({ "linked": true }));
+    let (s, j) = node.delete("/api/v1/auth/oidc/identity", &stolen.token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.reauth_required")), "{j}");
+    let (s, j) = node.delete("/api/v1/auth/oidc/identity", &bob.token).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+}

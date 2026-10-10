@@ -242,6 +242,10 @@ pub struct AppState {
     pub push: Arc<crate::push::Push>,
     /// Counters and gauges of `GET /metrics` (`metrics.rs`).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Local devices whose session was found live recently (`sessions::device_live`).
+    pub live_sessions: Arc<crate::sessions::LiveCache>,
+    /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
+    pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -311,6 +315,7 @@ impl AppState {
         cluster: Arc<crate::cache::Cluster>,
         push: Arc<crate::push::Push>,
     ) -> anyhow::Result<Self> {
+        crate::auth::set_ipv6_rate_prefix(config.rate_limit_ipv6_prefix);
         let mailer = Mailer::from_config(&config);
         let captcha = CaptchaVerifier::from_config(&config);
         let gifs = GifClient::from_config(&config);
@@ -389,6 +394,11 @@ impl AppState {
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            live_sessions: Arc::default(),
+            password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
+                0 => crate::auth::default_hash_concurrency(),
+                n => n as usize,
+            })),
             push,
             metrics: Arc::new(crate::metrics::Metrics::new(SOFTWARE_VERSION, cluster.is_shared())),
             app_connections: Arc::new(crate::applications::Connections::new(&cluster)),
