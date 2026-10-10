@@ -583,8 +583,10 @@ pub async fn close_room(state: &AppState, room_id: &str) {
 }
 
 /// Disconnects the participants of a room's voice channels who no longer hold `view_channel` and `connect` there
-/// (a role, override, membership or age change), against the current visibility snapshot (VOICE.md §4). Runs on
-/// the leader, which holds the participants.
+/// (a role, override, membership or age change), against the current visibility snapshot (VOICE.md §4). A moved
+/// participation holds both through the snapshot (`permissions::MOVED_FORCED`) as long as the member is in the
+/// room, not timed out and above the channel's age gate (VOICE.md §7). Runs on the leader, which holds the
+/// participants.
 pub async fn check_access(state: &AppState, room_id: &str) {
     if !state.cluster.is_leader() {
         return;
