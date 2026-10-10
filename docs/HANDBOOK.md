@@ -34,6 +34,9 @@ repository, which is the `protocol/` submodule of this repository.
 
 ## Requirements
 
+A node needs a Linux host with Docker, a domain, a reverse proxy with TLS, PostgreSQL and a data volume; voice
+needs a few open ports, and SMTP and Valkey are optional.
+
 | What | Details |
 |---|---|
 | **A Linux host with Docker** | Docker Engine with the Compose plugin. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
@@ -47,6 +50,9 @@ repository, which is the `protocol/` submodule of this repository.
 | **Optional: Valkey or Redis ≥ 7** | Only to run one node as several instances behind a load balancer ([Scaling with Valkey](#scaling-with-valkey)). |
 
 ## Install with Docker Compose
+
+The compose setup runs the node next to PostgreSQL; these steps take a fresh host to a running node whose first
+account is the node admin.
 
 1. Put [`deploy/docker-compose.yml`](../deploy/docker-compose.yml) and [`deploy/.env.example`](../deploy/.env.example)
    into a directory on the host, and copy `.env.example` to `.env` there.
@@ -94,11 +100,15 @@ Many published UDP ports make Docker's userland proxy slow; with large ranges co
 
 ## Configuration
 
+The node is configured through `TAVRN_*` environment variables; this section explains how they are loaded and lists
+every variable by topic.
+
 ### How the configuration is loaded
 
 Every setting is a `TAVRN_*` environment variable; in the compose setup they come from `.env`
-([`deploy/.env.example`](../deploy/.env.example) is the annotated template). The node reads, later sources
-overriding earlier ones:
+([`deploy/.env.example`](../deploy/.env.example) is the annotated template).
+
+The node reads, later sources overriding earlier ones:
 
 1. the built-in defaults (the tables below),
 2. an optional TOML file named by `TAVRN_CONFIG` (keys are the variable names without `TAVRN_` in lowercase,
@@ -122,6 +132,8 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 
 ### Node identity, addresses and database
 
+These settings fix the node's identity domain, where it is served and which database it uses.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_DOMAIN` | **required** | Identity domain of the node: addresses `alice@<domain>`, node keys, tokens. Lowercase, without scheme, path or port. Cannot be changed later without losing the node's identity. |
@@ -136,6 +148,9 @@ and OIDC issuers, `TAVRN_FEDERATION_DEV_PEERS` and `TAVRN_DEV_MISBEHAVE` are onl
 | `TAVRN_CONFIG` | unset | Path of an optional TOML configuration file (see above). |
 
 ### Registration, accounts and sessions
+
+These settings decide who may create an account and how, which mail and captcha services take part, how passkeys
+and sessions work and the minimum age.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -172,7 +187,9 @@ The node's mails (email confirmation, password reset, account deleted and restor
 of reasons, app token expiry) are written in the recipient's language: the language the user picked in the client
 (the client stores it on the node; a new account starts with the browser's language), for reporters of takedown
 notices the browser language of the notice form. The node has English and German texts; any other language falls
-back to English. The texts are the templates in `templates/mail/<language>/<name>.txt` of this repository:
+back to English.
+
+The texts are the templates in `templates/mail/<language>/<name>.txt` of this repository:
 
 ```text
 Subject: Reset your password
@@ -194,6 +211,9 @@ missing subject line, unknown variables, files over 64 KiB); a file that is brok
 with a warning and the built-in text is sent instead.
 
 ### Single sign-on (OpenID Connect)
+
+With an OpenID Connect provider configured, people sign in with the provider's accounts, and its groups can be
+mapped to roles.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -253,6 +273,8 @@ you out; those names are never given to accounts created by SSO. `TAVRN_OIDC_CLI
 
 ### Rooms, uploads and storage
 
+These settings limit who creates rooms and how many, how large uploads may be and how stored files are kept.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_ROOM_CREATION` | `invite` | Who may create rooms: `none` (node admins only), `invite` (node admins and users with a room-creation grant), `local` (every local user) or `federated` (also users of other nodes signed in through federation). |
@@ -293,6 +315,9 @@ marked "entitlement" above are the node defaults; node admins extend them per us
 | `TAVRN_FILES_EXTERNAL_PRIVATE` | `off` | `on` also allows external stores on private, loopback or link-local addresses and plain `http` (stores in the LAN); this disables the SSRF protection for them. |
 
 ### Media, previews and search
+
+These settings control the conversion of images and videos, GIF search, link previews and the node's search in
+plaintext channels.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -338,6 +363,8 @@ The node starts and supervises `livekit-server` with a configuration generated f
 
 ### Federation and directory settings
 
+These settings decide whether and with whom the node federates and how it takes part in the node directory.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_FEDERATION_ENABLED` | `true` | `false`: no federation tokens, federated logins, inbox or outbox. |
@@ -381,6 +408,8 @@ Bot tokens are a single factor: rooms, categories and channels can be declared "
 
 ### Moderation settings
 
+These settings tune the flood detection that works in every channel, encrypted or not.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_AUTOMOD_BURST_LIMIT` | `10` | More than this many messages of a user per channel within 5 seconds count as spam (`0` = off). |
@@ -405,6 +434,8 @@ Details: [Legal pages and GDPR](#legal-pages-and-gdpr).
 
 ### Web push and metrics settings
 
+These settings switch web push notifications and the Prometheus metrics endpoint on or off and configure them.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_PUSH` | `on` | Web push notifications to browsers and installed web apps (PWAs). See [Web push](#web-push). |
@@ -425,12 +456,17 @@ Details: [Scaling with Valkey](#scaling-with-valkey).
 
 ### Logging
 
+Two settings control how much the node logs and in which format.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_LOG_LEVEL` | `info` (`--dev`: `debug,sqlx=info`) | A log filter: a level (`error`, `warn`, `info`, `debug`, `trace`) or per-module directives such as `info,sqlx=warn`. An invalid filter falls back to `info`. |
 | `TAVRN_LOG_FORMAT` | `text` | `text` or `json` (one JSON object per line, for log collectors). |
 
 ### Variables outside the node
+
+A few variables configure the compose setup around the node: the database password, the image tag, the host port
+and the optional Valkey password.
 
 These are read by `docker-compose.yml`, not by the node:
 
@@ -449,6 +485,8 @@ proxy in front of it. This is mandatory, not optional: nodes only federate over 
 
 ### What the proxy must do
 
+Whichever proxy you use, it has to pass WebSockets through, forward the client's address and accept large uploads.
+
 1. **Pass WebSockets through** (`Upgrade`/`Connection` headers) for `/api/v1/ws` and for the voice signaling
    under `/rtc` (`/rtc`, `/rtc/v1`; the HTTP checks `/rtc/validate` and `/rtc/v1/validate` are plain GETs). Use a
    long read timeout (an hour): both are long-lived connections.
@@ -466,6 +504,8 @@ from outside are rejected unless signed with the node's LiveKit secret, so the p
 
 ### nginx and Caddy
 
+Ready-made configurations for nginx and Caddy cover everything the node needs from its proxy.
+
 Complete examples are in the repository:
 
 - [`deploy/nginx.conf.example`](../deploy/nginx.conf.example): HTTPS server with HTTP/2 and HSTS,
@@ -479,6 +519,8 @@ Several instances: list every instance as an upstream (nginx `upstream`, Caddy `
 upstreams), see [Load balancer](#load-balancer).
 
 ### Nginx Proxy Manager (Portainer)
+
+Nginx Proxy Manager is configured in its web interface with one proxy host and two advanced settings.
 
 Create a proxy host:
 
@@ -505,7 +547,9 @@ With `TAVRN_RTC_TURN_ENABLED=true` and `TAVRN_RTC_TURN_TLS_PORT` (default 5349),
 proxy does: give the TURN domain its own DNS record pointing at the proxy, a certificate for it, and a **TCP
 stream** that terminates TLS and forwards plain TCP to the container's TLS port (publish it on `127.0.0.1` only,
 see the commented line in `docker-compose.yml`). Port 443 of the TURN domain must not be an HTTP virtual host at
-the same time. nginx:
+the same time.
+
+nginx:
 
 ```nginx
 stream {
@@ -528,9 +572,10 @@ use TURN over UDP. The rest of TURN is in [Voice and video](#turn-optional-for-s
 
 ### Identity domain and node host (delegation)
 
-The identity of a node is its domain (`TAVRN_DOMAIN`): addresses `alice@example.org`, node keys, tokens. The node
-itself may run on another host (`TAVRN_PUBLIC_URL`, default `https://<TAVRN_DOMAIN>`), for example because the
-domain already carries a website:
+The identity of a node is its domain (`TAVRN_DOMAIN`): addresses `alice@example.org`, node keys, tokens.
+
+The node itself may run on another host (`TAVRN_PUBLIC_URL`, default `https://<TAVRN_DOMAIN>`), for example because
+the domain already carries a website:
 
 ```bash
 TAVRN_DOMAIN=example.org                    # addresses alice@example.org
@@ -587,6 +632,9 @@ long as the document (5 minutes to 1 hour), and a cached endpoint that stops ans
 
 #### SRV record instead of the well-known file
 
+When the website on the identity domain cannot serve the well-known file, a DNS SRV record can point to the node's
+host instead.
+
 You need EITHER the well-known on the identity domain OR a DNS record, never both:
 
 ```dns
@@ -621,8 +669,9 @@ Everything else that builds absolute URLs (mail links, invite and application ad
 A hosting service that runs nodes as `<name>.example.org` gives every node its own identity domain
 (`TAVRN_DOMAIN=<name>.example.org`, `TAVRN_PUBLIC_URL=https://<name>.example.org`, the default) and its own
 well-known on its own host. They never collide with the delegation of `example.org` itself (another domain,
-another document, other keys). The node needs nothing special; the hosting service must enforce, before it
-creates a node name:
+another document, other keys).
+
+The node needs nothing special; the hosting service must enforce, before it creates a node name:
 
 - **Reserved labels**: `www`, `app`, `api`, `turn` (and `turn.<label>` names for TURN over TLS), `mail`, `smtp`,
   `imap`, `mx`, `ns1`/`ns2`, `cdn`, `static`, `assets`, `status`, `docs`, `blog`, `git`, `matrix`, `identity`,
@@ -639,6 +688,8 @@ creates a node name:
 
 ### Verify the proxy
 
+Four requests from outside show whether discovery, readiness, health and the voice signaling get through the proxy.
+
 ```bash
 curl -s https://chat.example.org/.well-known/tavrn | jq .domain   # discovery reachable
 curl -s https://chat.example.org/readyz                             # {"ready":true,"database":true,"livekit":true,"cache":null}
@@ -651,10 +702,15 @@ without a token).
 
 ## Keys and backups
 
+The node's keys live in the data volume next to the uploaded files; they are backed up and restored together with
+the database, because neither is usable without the other.
+
 ### The key files
 
 The data volume (`./data`, mounted at `/data`, `TAVRN_DATA_DIR`) holds the uploaded files in `blobs/` and, in
-`keys/`, the node's keys. All of them are created at the first start with mode 0600:
+`keys/`, the node's keys.
+
+All of them are created at the first start with mode 0600:
 
 | File | What it is | If it is lost or replaced |
 |---|---|---|
@@ -694,6 +750,8 @@ holds.
 
 ### Restoring
 
+A restore brings back the database and the data volume from the same backup, so the keys match the data.
+
 1. Stop the node, restore the database dump (`docker compose exec -T db pg_restore -U tavrn -d tavrn --clean
    --if-exists < backup/tavrn-<date>.dump`) and the `data` directory (including `keys/`) **from the same backup**.
 2. Start the image version the backup was taken with, or a newer one (migrations only go forward; an older binary
@@ -704,6 +762,8 @@ Because a storage key rotation does not re-encrypt the files, an old key togethe
 still opens the files of that time.
 
 ## Database
+
+PostgreSQL holds everything except the uploaded files and the keys; SQLite is only for development.
 
 - **PostgreSQL** is the production database: the compose service `db` (`postgres:17-alpine`, data in
   `./pgdata`) or an external server or managed service via `TAVRN_DATABASE_URL`
@@ -724,6 +784,9 @@ still opens the files of that time.
 
 ## Storage and media
 
+Uploaded files lie encrypted at rest in the data volume, and the node converts images and videos with its own media
+pipeline.
+
 ### Encryption at rest and the storage key
 
 Stored files are encrypted at rest (`TAVRN_STORAGE_ENCRYPTION=on`, the default): attachments, avatars, headers,
@@ -741,6 +804,9 @@ creating a new one. Files written by older versions are encrypted in place in th
 debugging only; encrypted files stay readable, a warning is logged at every start).
 
 ### Rotating the storage key
+
+The storage key that wraps every file's key can be replaced in seconds, because the files themselves are not
+re-encrypted.
 
 Stop the node, run the rotation, start it again and back up the new key file:
 
@@ -866,6 +932,8 @@ Outbound federation requests go only to public addresses (private and loopback a
 
 ### Blocklists, allowlists and limits
 
+The operator decides which nodes this node federates with and how much load other nodes may cause.
+
 - `TAVRN_FEDERATION_BLOCKLIST`: domains never federated with, including their subdomains. Node admins can also
   block a node in the Federation tab of the node administration.
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
@@ -955,6 +1023,9 @@ voice off completely (no LiveKit process). All settings: [Voice and video settin
 
 ### Signaling and media ports
 
+Voice takes two paths: the signaling through the reverse proxy, the media directly to ports published by the
+container.
+
 - **Signaling** goes through the proxy like everything else: `wss://<public host>/rtc`. tavrn checks the LiveKit
   token of every connection (signature, expiry, and that its holder may still join the channel or call) before it
   forwards it to LiveKit, which listens on `127.0.0.1:7880` inside the container only. Do not publish or proxy port
@@ -1019,7 +1090,9 @@ needed.
 
 Media ports cannot be proxied: HTTP reverse proxies and CDNs like Cloudflare forward neither UDP nor arbitrary TCP
 ports, so the media path must reach your host directly. Keep the web/API/`/rtc` hostname behind the proxy if you
-like, but use direct (DNS-only, "grey cloud") records for media. With a home connection whose address changes:
+like, but use direct (DNS-only, "grey cloud") records for media.
+
+With a home connection whose address changes:
 
 - **Hostname entries with dynamic DNS**: `TAVRN_RTC_EXTERNAL_IP=home.dyndns.example` (and/or hostnames in
   `TAVRN_RTC_ADVERTISE_IPS`). The node resolves them (A and AAAA) at start and every minute, or after the record's
@@ -1033,6 +1106,9 @@ like, but use direct (DNS-only, "grey cloud") records for media. With a home con
   through an HTTP-only CDN). This is the most robust path for rotating addresses and strict networks at once.
 
 ### Limits and dropped connections
+
+Settings and entitlements limit voice quality and channel sizes; this section also explains the traffic a channel
+causes and what happens when a connection drops.
 
 - **Limits:** `TAVRN_VOICE_MAX_BITRATE_KBPS`, `TAVRN_VOICE_MAX_PARTICIPANTS`, `TAVRN_SCREENSHARE_*`,
   `TAVRN_CAMERA_*`, and the entitlement defaults `TAVRN_VOICE_CHANNEL_MAX_PARTICIPANTS`, `TAVRN_STREAM_*`,
@@ -1089,7 +1165,12 @@ How it behaves:
 
 ## Metrics and health
 
+The node offers health endpoints for container runtimes and load balancers, and an optional Prometheus endpoint for
+monitoring.
+
 ### Health endpoints
+
+Two endpoints tell whether the node is alive and whether it is ready to serve.
 
 | Endpoint | Answers | Use it for |
 |---|---|---|
@@ -1103,6 +1184,7 @@ when the configuration, the LiveKit binary or (with SSO) the provider check fail
 ### Prometheus metrics
 
 `TAVRN_METRICS=on` exposes `GET /metrics` in the Prometheus text format on the node's HTTP port (`TAVRN_LISTEN`).
+
 Access:
 
 - `TAVRN_METRICS_TOKEN` set (16–256 printable ASCII characters without spaces): scrapers must send
@@ -1154,7 +1236,9 @@ scrape_configs:
 ### Dashboards and alerts
 
 Graph request rate and latency per `route`, WebSocket connections, voice participants and the database pool in
-Grafana or a similar tool. Alerts worth having (adapt thresholds to your node):
+Grafana or a similar tool.
+
+Alerts worth having (adapt thresholds to your node):
 
 ```yaml
 groups:
@@ -1199,7 +1283,12 @@ where every piece of in-memory state went.
 
 ### Operating several instances
 
+Several instances of one node share the database, the data volume and Valkey, and a load balancer spreads the
+requests across them.
+
 #### Requirements for several instances
+
+All instances need the same configuration and reach the same database, data volume and Valkey.
 
 - **The same configuration** on every instance (`TAVRN_DOMAIN`, `TAVRN_PUBLIC_URL`, policies, `TAVRN_CACHE_URL`),
   except `TAVRN_INSTANCE_ID`, `TAVRN_INSTANCE_URL` and the per-instance media ports below.
@@ -1219,6 +1308,8 @@ where every piece of in-memory state went.
 
 #### Load balancer
 
+Any load balancer that passes WebSockets through works; it needs no sticky sessions.
+
 - **No sticky sessions needed for HTTP**: every request may go to any instance.
 - **WebSockets** (`/api/v1/ws`, `/rtc`) stay on the instance they connected to until they reconnect; nothing else
   is required (no affinity). The proxy must pass `Upgrade` as for a single node.
@@ -1234,7 +1325,9 @@ where every piece of in-memory state went.
 With `TAVRN_CACHE_URL` every instance writes `livekit-<instance id>.yaml` with a `redis:` section (`address`,
 `username`, `db`, `use_tls` for `rediss://`; the password goes to the child as `REDIS_PASSWORD`, never into the
 file). The LiveKit processes then form **one distributed LiveKit**: a room lives on one LiveKit node, signaling
-from any node is relayed through Redis, so the `/rtc` proxy of every instance reaches every room. Operator steps:
+from any node is relayed through Redis, so the `/rtc` proxy of every instance reaches every room.
+
+Operator steps:
 
 - **Media addresses**: clients send media to the LiveKit node that hosts the room, directly. Either every
   instance gets its **own public IP**, or instances sharing an IP need **different port ranges**
@@ -1250,12 +1343,16 @@ from any node is relayed through Redis, so the `/rtc` proxy of every instance re
 
 #### Web push and metrics with several instances
 
+Web push needs nothing extra with several instances; metrics are scraped from every instance.
+
 - [Web push](#web-push): any instance sends; the per-user rate counters live in Valkey.
 - [Metrics](#metrics-and-health): each instance exposes its own `/metrics`; scrape every instance (by its own
   address, not through the load balancer). `tavrn_cache_up` reports Valkey per instance; the housekeeping
   timestamp comes from the leader.
 
 #### Example: two instances on one host
+
+This compose override runs two instances of one node with Valkey on a single host.
 
 ```yaml
 # docker-compose.override.yml next to deploy/docker-compose.yml (uncomment the "valkey" service there)
@@ -1300,6 +1397,8 @@ at any time; the leader moves by itself.
 
 #### Failure behaviour
 
+When Valkey, the bus, an instance or the leader fails, the node reacts as follows.
+
 | Situation | Behaviour |
 |---|---|
 | `TAVRN_CACHE_URL` set but unreachable at start | `tavrn-node serve` exits with code **3** and `TAVRN_CACHE_URL: Valkey/Redis at host:port is not reachable (…)` (no password in the message). |
@@ -1309,6 +1408,8 @@ at any time; the leader moves by itself.
 | The leader is unreachable for relayed requests | `503 node.leader_unavailable` with `Retry-After: 2`. |
 
 #### Settings for several instances
+
+Three variables turn a node into one of several instances.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -1377,6 +1478,9 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 #### Realtime, presence and connections
 
+Live events reach every instance over the bus; connections and the state derived from them stay with the instance
+that holds them.
+
 | State | Decision | Reason / implementation |
 |---|---|---|
 | Hub broadcast (`hub.rs`) | **shared** | Bus fan-out, see [How the instances act as one node](#how-the-instances-act-as-one-node). |
@@ -1393,6 +1497,8 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 #### Rate limits
 
+Limits that protect against guessing and abuse are shared across the instances; the rest are counted per instance.
+
 | Limiter | Decision | Reason |
 |---|---|---|
 | `login_limiter` (login, re-auth, connect exchange, federated login, device nonces, identity reset), `register_limiter` (registration, forgot password) | **shared** | Password guessing and account creation must not scale with the number of instances. |
@@ -1408,6 +1514,9 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 #### Single-use tokens, nonces and challenges
 
+Everything that may be used only once is kept in the database or the shared cache, so it is spent once across all
+instances.
+
 | Item | Decision | Reason |
 |---|---|---|
 | Device-proof nonce (`POST /auth/device-nonce`) | database (already) | A JWT signed with the shared node key; its `jti` is spent in the pre-auth spend table, so a nonce issued by one instance is accepted once by any. |
@@ -1422,6 +1531,8 @@ Events are never dropped silently: every failed publish is logged and leads to t
 
 #### Caches
 
+Caches stay per instance where a stale entry does no harm and go to the database where it would.
+
 | Cache | Decision | Reason |
 |---|---|---|
 | Unfurl results (1 h, LRU) | per instance | Public link previews; a miss refetches. |
@@ -1432,6 +1543,8 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | Whiteboard audience cache (2 s) | leader only | Ephemeral events are relayed to the leader. |
 
 #### Voice, calls, whiteboards
+
+Voice and call state is kept by the leader, which all voice requests are relayed to.
 
 | State | Decision | Reason |
 |---|---|---|
@@ -1444,6 +1557,8 @@ Events are never dropped silently: every failed publish is logged and leads to t
 | Voice reconciliation, grace sweep | leader only | |
 
 #### Background jobs
+
+Most background jobs run on the leader only, so each job runs once for the node.
 
 | Job | Decision |
 |---|---|
@@ -1461,11 +1576,16 @@ database (`pending_removals`), so it is unaffected.
 
 ## Webhooks and applications
 
+Applications, bots and webhooks let services act and post in rooms; this section covers what the operator decides
+and how services post through webhooks.
+
 ### Applications and bots
 
 Applications (bots) act through app tokens, slash commands, interactions and event subscriptions (protocol:
 [APPLICATIONS.md](https://github.com/just-tavrn/tavrn-protocol/blob/main/APPLICATIONS.md)); the bot runtime and SDK
-are in [tavrn-js](https://github.com/just-tavrn/tavrn-js). What the operator decides:
+are in [tavrn-js](https://github.com/just-tavrn/tavrn-js).
+
+What the operator decides:
 
 - **Who may create applications**: `TAVRN_APP_CREATION` = `all` (default), `invite` (an admin grants it per user,
   `PATCH /admin/users/{id} { app_creation_grant }`, or through the SSO group map) or `admins`.
@@ -1500,6 +1620,8 @@ in `protocol/APPLICATIONS.md` §6.1 (payload, limits) and §6.1a (encrypted chan
 
 ### Webhooks in unencrypted channels
 
+In an unencrypted channel a service posts a message with a plain HTTPS request carrying JSON.
+
 Post the JSON payload:
 
 ```sh
@@ -1512,6 +1634,9 @@ link). Forum channels show posts only, so a message without `thread_id` is refus
 message.thread_required`); in text and announcement channels `thread_id` is optional and posts into a thread.
 
 ### Webhooks in end-to-end encrypted channels
+
+In an end-to-end encrypted channel the node must never see the text, so every message is sealed before it reaches
+the node.
 
 The person who creates the webhook chooses who seals the messages:
 
@@ -1536,6 +1661,8 @@ read the message, and the node accepts any epoch up to the newest one.
 
 #### Node.js (`libsodium-wrappers`)
 
+The steps above in Node.js, with `libsodium-wrappers`.
+
 ```js
 import sodium from "libsodium-wrappers";
 
@@ -1558,6 +1685,8 @@ await postSealed(process.env.WEBHOOK_URL, { content: { type: "text", body: "Depl
 
 #### Python (`pynacl`, `requests`)
 
+The steps above in Python, with `pynacl` and `requests`.
+
 ```python
 import base64, json, os
 import requests
@@ -1579,6 +1708,8 @@ post_sealed(os.environ["WEBHOOK_URL"], {"content": {"type": "text", "body": "Bac
 ```
 
 #### Go (`golang.org/x/crypto/nacl/box`)
+
+The steps above in Go, with `golang.org/x/crypto/nacl/box`.
 
 ```go
 package main
@@ -1718,6 +1849,9 @@ node refuses everything but the account itself, the legal pages and sign-out (`a
 
 ## Moderation and auto-moderation
 
+Node admins run the node from its administration page; flood detection, reports and content rules help rooms and
+the node against spam and abuse.
+
 ### Node administration
 
 The first account registered on a node becomes node admin (plus anyone listed in `TAVRN_ADMIN_USERS`). Node admins
@@ -1836,6 +1970,9 @@ docker compose run --rm tavrn tavrn-node rotate-storage-key      # node stopped
 
 ## Logs and troubleshooting
 
+The node logs to standard output and names most problems there; the table below lists the common ones with their
+fixes.
+
 ### Logs
 
 `docker compose logs -f tavrn` shows the node's log on stdout/stderr. `TAVRN_LOG_LEVEL` (default `info`) takes a level
@@ -1847,6 +1984,8 @@ media=…` (announced addresses and ports), `new node signing key generated` (fi
 encryption progress, `Auto-moderation: message flood`.
 
 ### Common problems
+
+These are the problems operators run into most often, each with its cause and fix.
 
 | Symptom | Cause and fix |
 |---|---|
@@ -1875,6 +2014,8 @@ encryption progress, `Auto-moderation: message flood`.
 | `503 node.leader_unavailable` or `node.cache_unavailable` with several instances | See [Failure behaviour](#failure-behaviour). |
 
 ## Upgrade and rollback
+
+An upgrade pulls the new image and restarts the container; the database migrations run by themselves at the start.
 
 ```sh
 docker compose pull && docker compose up -d
@@ -1905,6 +2046,8 @@ docker compose up -d
 ```
 
 ## Security hardening checklist
+
+Go through this list before the node opens to the public, and again after larger changes.
 
 - [ ] TLS at the reverse proxy with HSTS; HTTP redirects to HTTPS; the node's port 8080 is published on
       `127.0.0.1` (or only on the proxy's Docker network), never on a public interface.
