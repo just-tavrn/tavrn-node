@@ -84,7 +84,9 @@ pub struct VoiceParticipant {
     /// unknown values as `connected`.
     pub connection: Connection,
     /// A moderator moved the user here (`VOICE.md` §7): they may be here without `view_channel` or `connect` for as
-    /// long as this participation lasts. Clients may show "moved here". Always `false` in calls.
+    /// long as this participation lasts. Clients may show "moved here". Always `false` in calls; absent from older
+    /// nodes (= `false`).
+    #[schema(required = false)]
     pub moved: bool,
 }
 
