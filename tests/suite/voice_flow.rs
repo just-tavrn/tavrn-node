@@ -980,6 +980,29 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
     })
     .await;
     assert!(closed.is_ok(), "the proxied connection ends after the disconnect");
+
+    let (_, j) = v.join(&v.bob).await;
+    let token = j["token"].as_str().unwrap().to_string();
+    // LiveKit's Rust SDK (the desktop app's native voice engine) sends the token as `Authorization: Bearer`: the node
+    // checks it and hands it on to LiveKit, over HTTP and on the WebSocket.
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/rtc/validate"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}/rtc?protocol=16&sdk=rust&version=0.0.1&auto_subscribe=1")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("proxied WebSocket with a bearer token");
+        let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(first, Message::Binary(ref b) if !b.is_empty()), "{first:?}");
+        ws.close(None).await.unwrap();
+    }
     supervisor.stop().await;
 }
 
@@ -1324,4 +1347,106 @@ async fn authz_losing_connect_ends_the_voice_session() {
     let left: Vec<Value> = v.participants(&v.alice).await;
     assert_eq!(left.len(), 1, "the owner stays: {left:?}");
     assert_eq!(left[0]["identity"], v.identity(&v.alice));
+}
+
+// ---------------------------------------------------------------- GET /users/me/voice
+
+/// `(channel id, [user addresses])` of one channel.
+type ChannelUsers = (String, Vec<String>);
+
+/// The rooms of `GET /users/me/voice` as `room id → [(channel id, [user addresses])]`, sorted.
+async fn my_voice(v: &Voice, s: &Session) -> Vec<(String, Vec<ChannelUsers>)> {
+    let (st, j) = v.node.get_auth("/api/v1/users/me/voice", &s.token).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let mut rooms: Vec<(String, Vec<ChannelUsers>)> = j["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let mut channels: Vec<ChannelUsers> = r["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    assert_eq!(c["room_id"], r["room_id"], "{j}");
+                    let users = c["participants"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| p["user"].as_str().unwrap().to_string())
+                        .collect();
+                    (c["channel_id"].as_str().unwrap().to_string(), users)
+                })
+                .collect();
+            channels.sort();
+            (r["room_id"].as_str().unwrap().to_string(), channels)
+        })
+        .collect();
+    rooms.sort();
+    rooms
+}
+
+/// `GET /users/me/voice` (VOICE.md §5): the voice state of every room the requester is a member of, with only the
+/// channels they can view, like `GET /rooms/{id}/voice` per room; nothing of rooms they are not in.
+#[tokio::test]
+async fn my_voice_lists_the_viewable_channels_of_all_member_rooms() {
+    let v = setup().await;
+    let staff = voice_channel(&v, "Staff").await;
+    v.override_everyone(&staff, &[], &[p::VIEW_CHANNEL]).await;
+    connect_to(&v, &v.alice, &staff).await;
+    connect_to(&v, &v.bob, &v.voice_id).await;
+    // A second room of alice's that bob is not in, with dave in its voice channel.
+    let other = v.node.create_room(&v.alice.token, "Other").await;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    let other_voice = other["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "voice").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dave = v.node.register("dave").await;
+    let (_, invite) = v.node.post(&format!("/api/v1/rooms/{other_id}/invites"), &v.alice.token, json!({})).await;
+    v.node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &dave.token, json!({})).await;
+    let (st, j) = v
+        .node
+        .post(&format!("/api/v1/rooms/{other_id}/channels/{other_voice}/voice/join"), &dave.token, json!({}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let ev = json!({ "event": "participant_joined", "room": { "name": format!("{other_id}:{other_voice}") }, "participant": { "identity": v.identity(&dave), "state": "ACTIVE" } });
+    assert_eq!(v.webhook(ev).await.0, StatusCode::OK);
+
+    // Bob: his room only, without the hidden staff channel.
+    assert_eq!(
+        my_voice(&v, &v.bob).await,
+        vec![(v.room_id.clone(), vec![(v.voice_id.clone(), vec!["bob@t.local".to_string()])])]
+    );
+    // Alice (owner of both): both rooms, the staff channel too.
+    let mut room_channels =
+        vec![(v.voice_id.clone(), vec!["bob@t.local".to_string()]), (staff.clone(), vec!["alice@t.local".to_string()])];
+    room_channels.sort();
+    let mut expected = vec![
+        (v.room_id.clone(), room_channels),
+        (other_id.clone(), vec![(other_voice.clone(), vec!["dave@t.local".to_string()])]),
+    ];
+    expected.sort();
+    assert_eq!(my_voice(&v, &v.alice).await, expected);
+    // Dave: the other room only. Somebody in no room: nothing.
+    assert_eq!(
+        my_voice(&v, &dave).await,
+        vec![(other_id.clone(), vec![(other_voice.clone(), vec!["dave@t.local".to_string()])])]
+    );
+    let eve = v.node.register("eve").await;
+    assert!(my_voice(&v, &eve).await.is_empty());
+    // A room the user left disappears.
+    let (st, _) = v.node.post(&format!("/api/v1/rooms/{other_id}/leave"), &dave.token, json!({})).await;
+    assert!(st.is_success());
+    assert!(my_voice(&v, &dave).await.is_empty());
+    // Without a session: 401.
+    let (st, _) = v.node.get_auth("/api/v1/users/me/voice", "nope").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn my_voice_is_empty_when_voice_is_disabled() {
+    let v = setup_with(|c| c.voice_enabled = false).await;
+    let (st, j) = v.node.get_auth("/api/v1/users/me/voice", &v.alice.token).await;
+    assert_eq!((st, j), (StatusCode::OK, json!({ "rooms": [] })));
 }

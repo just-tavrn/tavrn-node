@@ -25,7 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
 tavrn-crypto.workspace = true
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 totp-rs = "6"
 ulid = "3"
 

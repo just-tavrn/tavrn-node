@@ -366,6 +366,68 @@ async fn voice_effects_and_wakeups_reach_the_leader(cache: Arc<dyn Cache>) {
 }
 both!(voice_effects_and_wakeups_reach_the_leader, effects_in_process, effects_valkey);
 
+/// A member moved into a voice channel they may not view (VOICE.md §7) sees it through every instance: the leader's
+/// announcement reaches the other instances' hubs, so their REST routes and WebSockets follow it.
+async fn a_moved_member_views_the_channel_on_every_instance(cache: Arc<dyn Cache>) {
+    let nodes = instances(&domain(), cache, 2).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    elect(&nodes, 0, Duration::from_secs(30)).await;
+    let alice = a.node.register("alice").await;
+    let bob = a.node.register("bob").await;
+    let (room_id, _) = room(a, &alice, &[&bob]).await;
+    let (_, detail) = a.node.get_auth(&format!("/api/v1/rooms/{room_id}"), &alice.token).await;
+    let lobby = detail["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "voice").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let everyone = detail["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"].clone();
+    let (st, stage) = a
+        .node
+        .post(&format!("/api/v1/rooms/{room_id}/channels"), &alice.token, json!({ "kind": "voice", "name": "Stage" }))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{stage}");
+    let stage = stage["id"].as_str().unwrap().to_string();
+    let deny = (tavrn_node::permissions::VIEW_CHANNEL | tavrn_node::permissions::CONNECT).to_string();
+    let (st, j) = a
+        .node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            &alice.token,
+            json!({ "target_type": "channel", "target_id": stage, "subject_type": "role", "subject_id": everyone, "allow": "0", "deny": deny }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let listed = |detail: &Value| detail["channels"].as_array().unwrap().iter().any(|c| c["id"] == stage.as_str());
+    let mut ws_bob = connect(&b.ws_url(), &bob.token, None).await;
+
+    // Bob joins the lobby and Alice moves him to the stage, both through B (relayed to the leader A).
+    let voice = |channel: &str, rest: &str| format!("/api/v1/rooms/{room_id}/channels/{channel}/voice/{rest}");
+    let (st, j) = b.node.post(&voice(&lobby, "join"), &bob.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let domain = a.node.state.config.domain.clone();
+    let (st, j) = b
+        .node
+        .post(&voice(&lobby, &format!("members/bob@{domain}/move")), &alice.token, json!({ "channel_id": stage }))
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{j}");
+    let created = wait_event(&mut ws_bob, "channel.create", 5000).await.expect("channel.create on B");
+    assert_eq!(created["data"]["id"], stage.as_str());
+    assert!(wait_event(&mut ws_bob, "voice.move", 5000).await.is_some());
+    let (_, detail) = b.node.get_auth(&format!("/api/v1/rooms/{room_id}"), &bob.token).await;
+    assert!(listed(&detail), "B's room detail lists the stage for the moved member");
+    let (st, j) = b.node.post(&voice(&stage, "join"), &bob.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+
+    // Leaving through B ends it on B too.
+    let (st, _) = b.node.post(&voice(&stage, "leave"), &bob.token, json!({})).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let hidden = wait_event(&mut ws_bob, "channel.delete", 5000).await.expect("channel.delete on B");
+    assert_eq!(hidden["data"]["hidden"], true);
+    let (_, detail) = b.node.get_auth(&format!("/api/v1/rooms/{room_id}"), &bob.token).await;
+    assert!(!listed(&detail));
+}
+both!(a_moved_member_views_the_channel_on_every_instance, moved_in_process, moved_valkey);
+
 // ---------------------------------------------------------------- command interactions (APPLICATIONS.md §5.6)
 
 /// A request on an instance's router in its own task (an invocation waits for the bot's answer).

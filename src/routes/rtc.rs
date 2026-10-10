@@ -7,7 +7,9 @@
 //! issuer, expiry) and re-checks that its holder may still connect to the channel (member, not banned,
 //! `connect`), so a kicked member's unexpired token is worthless; for calls, that the holder is an accepted
 //! member of the conversation while its call runs; connection-test tokens only reach their empty room. Nothing else of LiveKit (room service,
-//! other paths) is reachable from outside.
+//! other paths) is reachable from outside. The token may come as the `access_token` query parameter (livekit-client) or
+//! as `Authorization: Bearer` (LiveKit's Rust SDK, the desktop app's native voice engine); either way the checked token
+//! is handed on to LiveKit as a bearer header.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -54,7 +56,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
     let path = req.uri().path().to_string();
     let suffix = path.strip_prefix("/rtc").unwrap_or("/invalid");
     if !PATHS.contains(&suffix) {
-        return Err(ApiError::NotFound { code: "route.not_found", what: "Pfad".into() });
+        return Err(ApiError::NotFound { code: "route.not_found", what: "Path".into() });
     }
     let query = req.uri().query().unwrap_or("").to_string();
     let token = Query::<HashMap<String, String>>::try_from_uri(req.uri())
@@ -76,10 +78,10 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
         let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &state).await.map_err(|_| {
             ApiError::BadRequest { code: "voice.websocket_invalid", detail: "Invalid WebSocket handshake".into() }
         })?;
-        let upstream = connect_upstream(&format!("ws://127.0.0.1:{port}{upstream_path}")).await?;
+        let upstream = connect_upstream(&format!("ws://127.0.0.1:{port}{upstream_path}"), &token).await?;
         Ok(upgrade.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| pump(socket, upstream)))
     } else {
-        forward_http(&format!("http://127.0.0.1:{port}{upstream_path}")).await
+        forward_http(&format!("http://127.0.0.1:{port}{upstream_path}"), &token).await
     }
 }
 
@@ -128,10 +130,21 @@ async fn authorize(state: &AppState, token: &str) -> Result<(), ApiError> {
 
 type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect_upstream(url: &str) -> Result<Upstream, ApiError> {
+/// The checked token as LiveKit's bearer header (the query parameter, if any, is passed on as well).
+fn bearer(token: &str) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| token_invalid())
+}
+
+async fn connect_upstream(url: &str, token: &str) -> Result<Upstream, ApiError> {
+    use tungstenite::client::IntoClientRequest;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-    match tokio::time::timeout(UPSTREAM_TIMEOUT, tokio_tungstenite::connect_async_with_config(url, Some(config), true))
-        .await
+    let mut request = url.into_client_request().map_err(|_| unavailable())?;
+    request.headers_mut().insert(header::AUTHORIZATION, bearer(token)?);
+    match tokio::time::timeout(
+        UPSTREAM_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(config), true),
+    )
+    .await
     {
         Ok(Ok((stream, _))) => Ok(stream),
         // LiveKit refused (e.g. 401 for a token it does not accept, 404 for an unknown room): pass it on.
@@ -151,10 +164,10 @@ async fn connect_upstream(url: &str) -> Result<Upstream, ApiError> {
     }
 }
 
-async fn forward_http(url: &str) -> Result<Response, ApiError> {
+async fn forward_http(url: &str, token: &str) -> Result<Response, ApiError> {
     let client =
         reqwest::Client::builder().timeout(UPSTREAM_TIMEOUT).build().map_err(|e| ApiError::Internal(e.into()))?;
-    let resp = client.get(url).send().await.map_err(|e| {
+    let resp = client.get(url).header(header::AUTHORIZATION, bearer(token)?).send().await.map_err(|e| {
         tracing::warn!(error = %e, "LiveKit unreachable");
         unavailable()
     })?;

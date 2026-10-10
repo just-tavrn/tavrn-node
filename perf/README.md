@@ -70,7 +70,6 @@ clients, rate, durations).
 The load generator runs on the same machine as the node and uses CPU too (MLS clients, 1000 sockets).
 Compare runs from the same machine.
 
-
 ## Reading the report
 
 `perf/report.ts` merges the raw results (`perf/results/raw/node.json`, and `client-<project>.json` when the web

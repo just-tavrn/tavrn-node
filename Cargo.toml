@@ -93,7 +93,9 @@ openssl = { version = "0.10", features = ["vendored"] }
 aes-gcm = "0.11"
 hkdf = "0.13"
 zeroize = { version = "1", features = ["serde"] }
-tokio-tungstenite = "0.29"
+# WebSocket client of the LiveKit signalling proxy (routes/rtc.rs) and the tests. axum 0.8 still builds its server
+# side on tungstenite 0.29, so both are in the tree until axum moves; the two never exchange types (rtc.rs converts).
+tokio-tungstenite = "0.30"
 # LiveKit tokens, webhook verification and the room service (voice); HTTP to 127.0.0.1 only, no TLS.
 livekit-api = { version = "0.8", default-features = false, features = ["services", "webhooks", "access-token"] }
 livekit-protocol = "0.8"

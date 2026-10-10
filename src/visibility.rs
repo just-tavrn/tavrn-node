@@ -107,6 +107,8 @@ pub struct Member {
     pub user: UserRow,
     /// Passes `adults_only` gates (`age::is_adult`): below a channel's gate the member cannot view it (§5e).
     pub adult: bool,
+    /// The voice channel of the member's moved participation (`voice::moved`): they view it while it lasts.
+    pub moved: Option<String>,
 }
 
 /// A snapshot of one room: everything the permission evaluation needs, and the viewers per channel, each computed
@@ -236,8 +238,16 @@ impl RoomView {
 
     fn access(&self, user_id: &str) -> Option<access::RoomAccess> {
         let m = self.members.get(user_id)?;
-        access::member_access(self.room.clone(), &self.roles, Some(m.member.clone()), &m.role_ids, &m.user, m.adult)
-            .ok()
+        access::member_access(
+            self.room.clone(),
+            &self.roles,
+            Some(m.member.clone()),
+            &m.role_ids,
+            &m.user,
+            m.adult,
+            m.moved.clone(),
+        )
+        .ok()
     }
 
     /// `ignore_age`: as if the member passed every age gate (the channel is listed below the gate, §5e).
@@ -284,11 +294,13 @@ pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView
     let overrides = store::rooms::overrides_of_room(db, room_id).await?;
     let mut users: HashMap<String, UserRow> =
         store::users::members_of_room(db, room_id).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    let mut moved = crate::voice::moved::of_room(state, room_id);
     let mut members = HashMap::new();
     for (member, role_ids) in store::rooms::members_with_roles(db, room_id).await? {
         let Some(user) = users.remove(&member.user_id) else { continue };
         let adult = crate::age::is_adult(state, &user).await?;
-        members.insert(member.user_id.clone(), Member { member, role_ids, user, adult });
+        let moved = moved.remove(&member.user_id);
+        members.insert(member.user_id.clone(), Member { member, role_ids, user, adult, moved });
     }
     let categories = store::rooms::categories(db, room_id).await?.into_iter().map(|c| (c.id.clone(), c)).collect();
     let viewers = channels.keys().map(|id| (id.clone(), OnceLock::new())).collect();
@@ -511,7 +523,10 @@ impl Filter {
         data: &Value,
         user_id: &str,
     ) -> Delivery {
-        if !is_metadata(kind) {
+        // The leader's announcement of moved voice participations (`voice::moved`): internal, never delivered, but
+        // what the user gained or lost through it (a moved member's voice channel) comes as usual.
+        let internal = kind == crate::voice::moved::EVENT;
+        if !internal && !is_metadata(kind) {
             let refs = refs(data);
             if refs.is_empty() {
                 return Delivery::event(true);
@@ -524,26 +539,26 @@ impl Filter {
                 }
             };
         }
-        if !changes_visibility(kind) {
+        if !internal && !changes_visibility(kind) {
             return Delivery::event(true);
         }
-        let target = target(kind, data);
+        let target = if internal { None } else { target(kind, data) };
         let view = match self.view(state, room_id).await {
             Ok(Some(view)) => view,
             Ok(None) => {
                 self.known.remove(room_id);
-                return Delivery::event(target.is_none() || kind.ends_with(".delete"));
+                return Delivery::event(!internal && (target.is_none() || kind.ends_with(".delete")));
             }
             Err(e) => {
                 tracing::warn!(error = %e, room_id, "channel visibility could not be determined, event dropped");
-                return Delivery::event(target.is_none());
+                return Delivery::event(!internal && target.is_none());
             }
         };
         let new = view.known_by(user_id);
         let old = self.known.insert(room_id.to_string(), new.clone());
         let deleted = kind.ends_with(".delete") && !kind.starts_with("override.");
         let (skip, event) = match target {
-            None => (None, true),
+            None => (None, !internal),
             Some(Target::Channel(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.channels.contains(id))),
             Some(Target::Category(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.categories.contains(id))),
             Some(Target::Channel(id)) => (kind.ends_with(".create").then_some(id), new.channels.contains(id)),
