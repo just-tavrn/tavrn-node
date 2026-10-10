@@ -174,57 +174,52 @@ pub async fn get(
 /// `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST`; returns how many.
 pub async fn enforce_host_cap(state: &AppState, host: &str, keep: &str) -> Result<u64, ApiError> {
     let cap = i64::try_from(state.config.media_cache_max_bytes_per_host).unwrap_or(i64::MAX);
-    let mut deleted = 0;
-    loop {
-        let used: i64 =
-            sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache WHERE origin_host = $1")
-                .bind(host)
-                .fetch_one(&state.db)
-                .await?;
-        if used <= cap {
-            return Ok(deleted);
-        }
-        let victims: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM remote_emoji_cache WHERE origin_host = $1 AND id <> $2 ORDER BY used_at, id LIMIT 50",
-        )
+    let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache WHERE origin_host = $1")
         .bind(host)
-        .bind(keep)
-        .fetch_all(&state.db)
+        .fetch_one(&state.db)
         .await?;
-        if victims.is_empty() {
-            return Ok(deleted);
-        }
-        deleted += delete_copies(state, &victims).await?;
-    }
+    evict_oldest(
+        state,
+        used - cap,
+        "SELECT id, size FROM remote_emoji_cache WHERE origin_host = $1 AND id <> $2 ORDER BY used_at, id LIMIT 100",
+        &[host, keep],
+    )
+    .await
 }
 
 /// Deletes the least recently used copies of all hosts until the cache is within `TAVRN_MEDIA_CACHE_MAX_BYTES`;
 /// returns how many.
 pub async fn enforce_total_cap(state: &AppState) -> Result<u64, ApiError> {
     let cap = i64::try_from(state.config.media_cache_max_bytes).unwrap_or(i64::MAX);
-    let mut deleted = 0;
-    loop {
-        let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache")
-            .fetch_one(&state.db)
-            .await?;
-        if used <= cap {
-            return Ok(deleted);
-        }
-        let victims: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100").fetch_all(&state.db).await?;
-        if victims.is_empty() {
-            return Ok(deleted);
-        }
-        deleted += delete_copies(state, &victims).await?;
-    }
+    let used: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache").fetch_one(&state.db).await?;
+    evict_oldest(state, used - cap, "SELECT id, size FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100", &[])
+        .await
 }
 
-async fn delete_copies(state: &AppState, ids: &[(String,)]) -> Result<u64, ApiError> {
-    for (id,) in ids {
-        sqlx::query("DELETE FROM remote_emoji_cache WHERE id = $1").bind(id).execute(&state.db).await?;
-        state.storage.delete(id).await;
+/// Deletes copies in the order of `query` (oldest use first, pages of at most 100) until `excess` bytes are freed.
+async fn evict_oldest(state: &AppState, mut excess: i64, query: &str, binds: &[&str]) -> Result<u64, ApiError> {
+    let mut deleted = 0;
+    while excess > 0 {
+        let mut q = sqlx::query_as::<_, (String, i64)>(query);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        let page = q.fetch_all(&state.db).await?;
+        if page.is_empty() {
+            break;
+        }
+        for (id, size) in page {
+            if excess <= 0 {
+                break;
+            }
+            sqlx::query("DELETE FROM remote_emoji_cache WHERE id = $1").bind(&id).execute(&state.db).await?;
+            state.storage.delete(&id).await;
+            excess -= size.max(1);
+            deleted += 1;
+        }
     }
-    Ok(ids.len() as u64)
+    Ok(deleted)
 }
 
 async fn touch(state: &AppState, id: &str, used_at: &str) -> Result<(), ApiError> {
