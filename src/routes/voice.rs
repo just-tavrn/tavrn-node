@@ -360,16 +360,74 @@ pub async fn room_states(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomVoiceStates>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    let keys = state.voice.participants().active_channels(&room_id);
+    let items = visible_states(&state, &access, &room_id, &auth.user.id).await?;
+    Ok(Json(RoomVoiceStates { items }))
+}
+
+/// The voice channels of `room_id` with participants that the user of `access` can view (`view_channel`, which
+/// includes a moved participation), in the shape of `voice.state`.
+async fn visible_states(
+    state: &AppState,
+    access: &RoomAccess,
+    room_id: &str,
+    user_id: &str,
+) -> Result<Vec<VoiceChannelState>, ApiError> {
+    let keys = state.voice.participants().active_channels(room_id);
     let mut items = Vec::new();
     for key in keys {
-        let Ok(channel) = access::channel_in_room(&state, &room_id, &key.1).await else { continue };
-        let perms = access::channel_perms(&state, &access, &channel, &auth.user.id).await?;
+        let Ok(channel) = access::channel_in_room(state, room_id, &key.1).await else { continue };
+        let perms = access::channel_perms(state, access, &channel, user_id).await?;
         if p::has(perms, p::VIEW_CHANNEL) {
-            items.push(voice::channel_state(&state, &key).await);
+            items.push(voice::channel_state(state, &key).await);
         }
     }
-    Ok(Json(RoomVoiceStates { items }))
+    Ok(items)
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MyVoiceRoom {
+    pub room_id: String,
+    /// Voice channels of the room with at least one participant that the requester can view.
+    pub channels: Vec<VoiceChannelState>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MyVoiceStates {
+    /// Rooms of this node the requester is a member of with at least one such channel.
+    pub rooms: Vec<MyVoiceRoom>,
+}
+
+/// Who is in which voice channel of every room the requester is a member of.
+///
+/// The initial state of a room list in one request instead of one per room (changes arrive as `voice.state`): like
+/// `GET /rooms/{room_id}/voice` for every room of this node the requester is a member of, only channels with
+/// participants the requester can view, rooms without such a channel left out. Rooms of other nodes are asked there.
+#[utoipa::path(get, path = "/api/v1/users/me/voice", security(("bearer" = [])),
+    responses((status = 200, body = MyVoiceStates)))]
+pub async fn my_states(State(state): State<AppState>, auth: AuthUser) -> Result<Json<MyVoiceStates>, ApiError> {
+    if !state.config.voice_enabled {
+        return Ok(Json(MyVoiceStates { rooms: Vec::new() }));
+    }
+    // Only rooms with somebody in voice are looked at (few); membership is checked per room.
+    let room_ids: std::collections::BTreeSet<String> =
+        state.voice.participants().keys().into_iter().map(|(room_id, _)| room_id).collect();
+    let mut rooms = Vec::new();
+    for room_id in room_ids {
+        if store::rooms::member(&state.db, &room_id, &auth.user.id).await?.is_none() {
+            continue;
+        }
+        let access = match access::room_access(&state, &room_id, &auth.user).await {
+            Ok(a) => a,
+            // Left or deleted in between.
+            Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let channels = visible_states(&state, &access, &room_id, &auth.user.id).await?;
+        if !channels.is_empty() {
+            rooms.push(MyVoiceRoom { room_id, channels });
+        }
+    }
+    Ok(Json(MyVoiceStates { rooms }))
 }
 
 // ---------------------------------------------------------------- moderator actions
