@@ -574,6 +574,11 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                 Ok(n) => tracing::info!(copies = n, "Unused cached emojis and clips of other nodes evicted"),
                 Err(e) => tracing::warn!(error = %e, "Media cache housekeeping failed"),
             }
+            match crate::emoji_cache::enforce_total_cap(&state).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(copies = n, "Cached emojis and clips of other nodes evicted (TAVRN_MEDIA_CACHE_MAX_BYTES)"),
+                Err(e) => tracing::warn!(error = %e, "Media cache cap failed"),
+            }
             let (acked, old) = (
                 util::format_time(Utc::now() - chrono::Duration::hours(crate::history::ACKED_KEEP_HOURS)),
                 util::format_time(Utc::now() - chrono::Duration::days(crate::history::MAX_AGE_DAYS)),

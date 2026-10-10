@@ -313,7 +313,7 @@ pub async fn public_image(
             return Ok(r);
         }
         proxy_limit(&state, &ip)?;
-        let cached = crate::emoji_cache::get(&state, kind, host, &emoji_id).await?;
+        let cached = crate::emoji_cache::get(&state, kind, host, &emoji_id, &ip).await?;
         return Ok(file_response_tagged(cached.data, image_type(&cached.mime), true, Some(&tag)));
     }
     let tag = format!("{emoji_id}{}", if q.still() { "-still" } else { "" });

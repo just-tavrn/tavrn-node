@@ -620,6 +620,12 @@ pub fn parse_probe(stderr: &str) -> Option<Probe> {
     (probe.width > 0 && probe.height > 0).then_some(probe)
 }
 
+/// How many video streams `ffmpeg -i` reports: inputs with more than one are refused (the dimension check sees the
+/// first, a conversion without `-map` would pick the largest).
+pub fn video_streams(stderr: &str) -> usize {
+    stderr.lines().map(str::trim).filter(|l| l.starts_with("Stream #") && l.contains("Video:")).count()
+}
+
 /// Resamples an animation with per-frame durations to a constant rate of `fps` frames per second,
 /// limited to `max_ms`: [`Ticker::next`] says how often each frame is repeated. Durations below 20 ms
 /// count as 100 ms, like browsers do.
@@ -746,6 +752,12 @@ impl Job<'_> {
         let (_, stderr) = self.run_ffmpeg(&probe_args).await?;
         let probe = parse_probe(&stderr).ok_or_else(|| invalid("The file could not be read"))?;
         let max_side = self.kind.max_input_side(format.is_animated());
+        if video_streams(&stderr) > 1 {
+            return Err(ApiError::BadRequest {
+                code: "media.dimensions",
+                detail: "Only files with a single video stream are accepted".into(),
+            });
+        }
         if probe.width > max_side || probe.height > max_side {
             return Err(dimensions_too_large(max_side));
         }
@@ -763,6 +775,8 @@ impl Job<'_> {
         for q in self.kind.still_qualities() {
             let mut args = vec!["-loglevel".to_string(), "error".into(), "-y".into()];
             args.extend(input.iter().cloned());
+            // Exactly the stream the probe checked.
+            args.extend(["-map".to_string(), "0:v:0".into()]);
             args.extend(
                 ["-frames:v", "1", "-an", "-sn", "-dn", "-map_metadata", "-1", "-vf"].iter().map(|s| s.to_string()),
             );
@@ -791,6 +805,8 @@ impl Job<'_> {
         for &(q, fps) in ANIMATED_STEPS {
             let mut args = vec!["-loglevel".to_string(), "error".into(), "-y".into()];
             args.extend(input.iter().cloned());
+            // Exactly the stream the probe checked.
+            args.extend(["-map".to_string(), "0:v:0".into()]);
             args.extend([
                 "-t".to_string(),
                 self.kind.loop_secs().to_string(),
@@ -1067,6 +1083,10 @@ mod tests {
             "  Duration: N/A, bitrate: N/A\n  Stream #0:0: Video: png, rgba(pc, gbr/unknown/unknown), 64x48, 25 fps\n";
         assert_eq!(parse_probe(png), Some(Probe { duration_secs: None, width: 64, height: 48 }));
         assert_eq!(parse_probe("in: Invalid data found when processing input"), None);
+        assert_eq!(video_streams(mp4), 1);
+        let two = "  Stream #0:0: Video: h264, yuv420p, 16x16\n  Stream #0:1: Video: h264, yuv420p, 11000x11000\n  Stream #0:2: Audio: opus\n";
+        assert_eq!(video_streams(two), 2);
+        assert_eq!(parse_probe(two).map(|p| p.width), Some(16), "the first stream's size");
     }
 
     #[test]
@@ -1175,6 +1195,37 @@ mod tests {
         assert_eq!(sniff(&mp4), Some(Format::Mp4));
         let out = p.process(MediaKind::Header, mp4.into()).await.unwrap();
         assert_eq!(webp_info(&out.animated.unwrap()), ((1200, 400), true));
+    }
+
+    /// A fixture with one video stream per lavfi source (`None` without ffmpeg).
+    fn fixture_streams(sources: &[&str], out_args: &[&str]) -> Option<Vec<u8>> {
+        let ffmpeg = which("ffmpeg")?;
+        let dir = tempfile::tempdir().ok()?;
+        let path = dir.path().join("fixture");
+        let mut cmd = std::process::Command::new(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        for s in sources {
+            cmd.args(["-f", "lavfi", "-i", s]);
+        }
+        for i in 0..sources.len() {
+            cmd.args(["-map", &i.to_string()]);
+        }
+        let status = cmd.args(out_args).arg(&path).status().ok()?;
+        if !status.success() {
+            return None;
+        }
+        std::fs::read(path).ok()
+    }
+
+    #[tokio::test]
+    async fn inputs_with_several_video_streams_are_refused() {
+        let two = skip_without_ffmpeg!(fixture_streams(
+            &["testsrc=size=16x16:rate=5:duration=1", "testsrc=size=640x480:rate=5:duration=1"],
+            &["-c:v", "mpeg4", "-f", "mp4"]
+        ));
+        assert_eq!(sniff(&two), Some(Format::Mp4));
+        let (p, _dir) = pipeline("auto");
+        assert_eq!(p.process(MediaKind::Avatar, two.into()).await.unwrap_err().code(), "media.dimensions");
     }
 
     #[tokio::test]

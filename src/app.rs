@@ -190,6 +190,10 @@ pub struct AppState {
     pub purge_limiter: Arc<RateLimiter>,
     /// The unauthenticated emoji and sound proxy (`?host=`, remote fetches) per address (`ip:<address>`).
     pub media_proxy_limiter: Arc<RateLimiter>,
+    /// Fetches of the emoji and sound proxy from other nodes (cache misses) per client address (`miss:<ip>`).
+    pub media_miss_limiter: Arc<RateLimiter>,
+    /// When this instance last enforced `TAVRN_MEDIA_CACHE_MAX_BYTES` (`emoji_cache`).
+    pub media_cache_checked: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Whiteboard sessions and ephemeral audiences (`whiteboard.rs`).
     pub whiteboards: Arc<crate::whiteboard::Whiteboards>,
     /// Ephemeral events per sender (`eph:<user id>`, 30 per second, also in development).
@@ -371,6 +375,8 @@ impl AppState {
             files_limiter: limiter(if config.dev { 1000 } else { 120 }, 60),
             purge_limiter: limiter(if config.dev { 1000 } else { 10 }, 60),
             media_proxy_limiter: limiter(if config.dev { 10_000 } else { 600 }, 60),
+            media_miss_limiter: limiter(crate::emoji_cache::miss_limit(config.dev), 60),
+            media_cache_checked: Arc::default(),
             whiteboards: Arc::new(crate::whiteboard::Whiteboards::default()),
             ephemeral_limiter: limiter(crate::whiteboard::EVENTS_PER_SECOND, 1),
             // Autosave every 30 s plus manual saves, thumbnails and renames.
@@ -472,9 +478,14 @@ pub fn cors() -> CorsLayer {
         .max_age(Duration::from_secs(600))
 }
 
+/// `Permissions-Policy` of every response.
+pub const PERMISSIONS_POLICY: &str = "camera=(self), microphone=(self), display-capture=(self), geolocation=(), \
+     payment=(), usb=(), serial=(), hid=(), bluetooth=(), midi=(), accelerometer=(), gyroscope=(), magnetometer=()";
+
 pub fn router(state: AppState) -> Router {
     let request_id = HeaderName::from_static("x-request-id");
-    // Uploads may be as large as the node limit; all other routes check their bodies themselves (JSON ≤ 64 KB via validation).
+    // Uploads may be as large as the node limit. JSON routes are bounded by axum's default body limit (2 MiB) or a
+    // smaller `DefaultBodyLimit` of their own; byte routes check their sizes themselves.
     let body_limit =
         (state.config.upload_ceiling() as usize).max(routes::mls::MLS_BODY_LIMIT).max(crate::media::MAX_INPUT_BYTES)
             + 64 * 1024;
@@ -1001,6 +1012,12 @@ pub fn router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("referrer-policy"),
             axum::http::HeaderValue::from_static("no-referrer"),
+        ))
+        // Camera, microphone and screen capture only for the node's own pages (voice, video, screen sharing);
+        // every other powerful feature off.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("permissions-policy"),
+            axum::http::HeaderValue::from_static(PERMISSIONS_POLICY),
         ))
         .layer(cors())
         // Several instances: voice, call and whiteboard requests go to the leader (`cache::relay`).

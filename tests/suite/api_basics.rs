@@ -112,3 +112,34 @@ async fn node_info_and_well_known_publish_the_webauthn_relying_party_id() {
     let wk = body_json(node.get("/.well-known/tavrn").await).await;
     assert_eq!(wk["webauthn"]["rp_id"], "tavrn.test");
 }
+
+/// Every response carries the security headers; the web client's pages get a CSP that names the captcha hosts only
+/// when a captcha is configured and allows no plugins.
+#[tokio::test]
+async fn security_headers_and_the_web_client_csp() {
+    let node = common::test_node("t.local").await;
+    let resp = node.get("/api/v1/node").await;
+    let h = resp.headers();
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["referrer-policy"], "no-referrer");
+    let pp = h["permissions-policy"].to_str().unwrap();
+    for p in ["camera=(self)", "microphone=(self)", "display-capture=(self)", "geolocation=()", "payment=()", "usb=()"] {
+        assert!(pp.contains(p), "{p} in {pp}");
+    }
+    let page = node.get("/some/client/route").await;
+    if let Some(csp) = page.headers().get("content-security-policy") {
+        let csp = csp.to_str().unwrap();
+        assert!(csp.contains("object-src 'none'"), "{csp}");
+        assert!(!csp.contains("cloudflare") && !csp.contains("fonts.g"), "{csp}");
+    }
+    let captcha = common::test_node_with("c.local", |c| {
+        c.captcha_provider = tavrn_node::config::CaptchaProvider::Turnstile;
+        c.turnstile_site_key = Some("site".into());
+        c.turnstile_secret_key = Some("secret".into());
+    })
+    .await;
+    let page = captcha.get("/some/client/route").await;
+    if let Some(csp) = page.headers().get("content-security-policy") {
+        assert!(csp.to_str().unwrap().contains("https://challenges.cloudflare.com"));
+    }
+}

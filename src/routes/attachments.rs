@@ -151,10 +151,13 @@ async fn upload_in(
             .with_status(StatusCode::UNSUPPORTED_MEDIA_TYPE));
         }
         let raw_name = header_str(headers, "tavrn-file-name").map(percent_decode).unwrap_or_else(|| "file".into());
-        let class = crate::uploads::classify(&body, &raw_name, &mime);
+        // Classified by the name it is stored and downloaded under (control and bidi characters gone), never by the
+        // raw header: `run.bat\0` is `run.bat`.
+        let name = sanitize_name(&raw_name);
+        let class = crate::uploads::classify(&body, &name, &mime);
         // SVG is stored as what it is, whatever type was declared: clients never render it inline.
-        let mime = if crate::uploads::is_svg(&body, &raw_name, &mime) { "image/svg+xml".to_string() } else { mime };
-        (sanitize_name(&raw_name), mime, class)
+        let mime = if crate::uploads::is_svg(&body, &name, &mime) { "image/svg+xml".to_string() } else { mime };
+        (name, mime, class)
     };
     check_category(state, conv, &auth.user.id, class).await?;
     let room_id = conv.room_id();
@@ -285,9 +288,14 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 /// File name for display only: strip control characters and path separators, limit the length.
+/// The stored file name: no control or bidirectional control characters (a right-to-left override would show
+/// `photo\u{202E}gpj.bat` as `phototab.jpg`), no path separators, no leading dots, at most 255 characters.
 pub fn sanitize_name(name: &str) -> String {
-    let cleaned: String =
-        name.chars().filter(|c| !c.is_control()).map(|c| if matches!(c, '/' | '\\') { '_' } else { c }).collect();
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !crate::files::is_bidi_control(*c))
+        .map(|c| if matches!(c, '/' | '\\') { '_' } else { c })
+        .collect();
     let trimmed = cleaned.trim().trim_start_matches('.');
     let out: String = trimmed.chars().take(MAX_NAME_LEN).collect();
     if out.is_empty() { "file".into() } else { out }
@@ -578,6 +586,8 @@ mod tests {
     fn names_are_sanitized() {
         assert_eq!(sanitize_name("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(sanitize_name("image\u{0}.png"), "image.png");
+        assert_eq!(sanitize_name("photo\u{202E}gpj.bat"), "photogpj.bat");
+        assert_eq!(sanitize_name("a\u{2066}b\u{200F}c\u{061C}"), "abc");
         assert_eq!(sanitize_name("   "), "file");
         assert_eq!(sanitize_name(&"a".repeat(300)).len(), 255);
         assert_eq!(sanitize_name("c:\\path\\file.txt"), "c:_path_file.txt");

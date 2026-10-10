@@ -572,8 +572,14 @@ impl FederationClient {
     }
 
     async fn permits(&self, domain: &str) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), FetchError> {
+        /// Entries of the per-peer map above which idle ones are pruned.
+        const PER_PEER_MAX_IDLE: usize = 1024;
         let peer = {
             let mut map = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+            // Bounded: every domain string gets an entry, so idle ones (no request holds or waits for them) go.
+            if map.len() >= PER_PEER_MAX_IDLE && !map.contains_key(domain) {
+                map.retain(|_, s| Arc::strong_count(s) > 1);
+            }
             map.entry(domain.to_string()).or_insert_with(|| Arc::new(Semaphore::new(PER_PEER_CONCURRENCY))).clone()
         };
         let closed = |_| FetchError::Unreachable(domain.to_string());
