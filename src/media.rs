@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Media pipeline (PLAN.md 4.9): avatars, profile headers, room icons and voice backgrounds.
+//! Media pipeline (design note 4.9): avatars, profile headers, room icons and voice backgrounds.
 //!
 //! Every upload is checked before anything decodes it: at most [`MAX_INPUT_BYTES`], the format is sniffed
 //! from the magic bytes (the client's content type is ignored; SVG, HTML and everything else unknown is
@@ -60,9 +60,9 @@ pub enum MediaKind {
     Header,
     /// Voice/video background: at most 1280 px on the longer side, ≤ 2 MB per variant.
     Background,
-    /// Link preview image (PLAN.md 4.13 item 7): still only, at most 400 px on the longer side, ≤ 40 KiB.
+    /// Link preview image (design note 4.13 item 7): still only, at most 400 px on the longer side, ≤ 40 KiB.
     Preview,
-    /// Custom emoji (room or personal, PLAN.md 4.13): at most 128 px on the longer side, ≤ 256 KiB per
+    /// Custom emoji (room or personal, design note 4.13): at most 128 px on the longer side, ≤ 256 KiB per
     /// variant, animations cut to [`EMOJI_LOOP_SECS`] seconds and [`EMOJI_MAX_FRAMES`] frames. Images only
     /// (no MP4/WebM), animated input at most [`EMOJI_MAX_ANIMATED_SIDE`] px and [`EMOJI_MAX_INPUT_FRAMES`] frames.
     Emoji,
