@@ -38,6 +38,8 @@ pub fn leader_path(path: &str) -> bool {
         ["voice", "webhook"] => true,
         // GET /rooms/{id}/voice, POST /rooms/{id}/voice/move-all
         ["rooms", _, "voice", ..] => true,
+        // GET /users/me/voice (the participants live on the leader)
+        ["users", "me", "voice"] => true,
         // join, leave, state, members/{address}/(mute|disconnect|move)
         ["rooms", _, "channels", _, "voice", ..] => true,
         ["rooms", _, "channels", _, "soundboard", "play"] => true,
@@ -193,6 +195,7 @@ mod tests {
         for p in [
             "/api/v1/voice/webhook".to_string(),
             format!("/api/v1/rooms/{r}/voice"),
+            "/api/v1/users/me/voice".to_string(),
             format!("/api/v1/rooms/{r}/voice/move-all"),
             format!("/api/v1/rooms/{r}/channels/{r}/voice/join"),
             format!("/api/v1/rooms/{r}/channels/{r}/voice/members/a@b.test/mute"),

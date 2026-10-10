@@ -597,6 +597,7 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/users/me/background/{variant}", get(routes::profile::background_image))
+        .route("/users/me/voice", get(routes::voice::my_states))
         .route("/users/me/presence", get(routes::presence::get_mine).put(routes::presence::put_mine).layer(small()))
         .route(
             "/users/me/activity",
