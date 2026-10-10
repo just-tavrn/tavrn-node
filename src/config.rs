@@ -460,6 +460,9 @@ pub struct Config {
     /// Devices not seen for this many days are deleted by housekeeping (never the only device of a user, never one
     /// with a live session); `0` = never (default 180).
     pub device_stale_days: u32,
+    /// KeyPackage claims per target user and hour across all requesters, local and from other nodes (1–10000,
+    /// default 60; ENCRYPTION.md §4.5): nobody drains a user's KeyPackages by claiming in many names.
+    pub e2ee_claims_per_target_per_hour: u32,
     /// Who may create applications (bots), APPLICATIONS.md §1.2.
     pub app_creation: AppCreation,
     /// Applications per owner (0–100); node admins are not exempt.
@@ -660,6 +663,7 @@ impl Default for Config {
             session_access_minutes: 60,
             session_refresh_days: 90,
             device_stale_days: 180,
+            e2ee_claims_per_target_per_hour: 60,
             app_creation: AppCreation::All,
             apps_per_user: 5,
             apps_per_room: 25,
@@ -963,6 +967,9 @@ impl Config {
         }
         if self.device_stale_days > 36_500 {
             problems.push("TAVRN_DEVICE_STALE_DAYS must be between 0 and 36500 (0 = never)".into());
+        }
+        if !(1..=10_000).contains(&self.e2ee_claims_per_target_per_hour) {
+            problems.push("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR must be between 1 and 10000".into());
         }
         if !(13..=99).contains(&self.minimum_age) {
             problems.push("TAVRN_MINIMUM_AGE must be between 13 and 99".into());
@@ -2181,14 +2188,21 @@ mod tests {
         assert!(msg(Config { session_refresh_days: 0, ..prod() }).contains("TAVRN_SESSION_REFRESH_DAYS"));
         assert!(msg(Config { device_stale_days: 36_501, ..prod() }).contains("TAVRN_DEVICE_STALE_DAYS"));
         assert!(Config { device_stale_days: 0, ..prod() }.validate().is_ok(), "0 switches the cleanup off");
+        assert_eq!(c.e2ee_claims_per_target_per_hour, 60);
+        for bad in [0, 10_001] {
+            let c = Config { e2ee_claims_per_target_per_hour: bad, ..prod() };
+            assert!(msg(c).contains("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR"));
+        }
         figment::Jail::expect_with(|jail| {
             jail.set_env("TAVRN_DOMAIN", "env.example");
             jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
             jail.set_env("TAVRN_SESSION_ACCESS_MINUTES", "15");
             jail.set_env("TAVRN_SESSION_REFRESH_DAYS", "30");
             jail.set_env("TAVRN_DEVICE_STALE_DAYS", "0");
+            jail.set_env("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR", "7");
             let c = Config::load(false).unwrap();
             assert_eq!((c.session_access_minutes, c.session_refresh_days, c.device_stale_days), (15, 30, 0));
+            assert_eq!(c.e2ee_claims_per_target_per_hour, 7);
             Ok(())
         });
     }
