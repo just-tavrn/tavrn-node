@@ -19,6 +19,14 @@
 //! twice); a join of another device of the same user replaces the first (one voice session per user).
 //! [`VoiceState::expire`] removes participants whose grace period ran out.
 //!
+//! A moderator's move ([`VoiceState::grant_move`]) leaves a single-use *move grant* for the moved user and the
+//! target channel ([`MOVE_GRANT_TTL`]); it entitles the user's next join of that channel even without `connect`
+//! ([`VoiceState::move_entitles`]). The first join consumes it and turns it into a *moved participation*, which
+//! lasts as long as the user has an entry in that channel (a rejoin within the grace period keeps it); joining
+//! another channel, leaving or being removed ends it. While a grant or moved participation exists the user counts
+//! as a viewer of the channel ([`VoiceState::moved`], `voice::moved`), and the participant is shown with
+//! `moved: true`.
+//!
 //! Everything here is pure and synchronous; callers hold the mutex only for one call.
 
 use std::{
@@ -30,6 +38,9 @@ use serde::Serialize;
 
 /// A pending participant that LiveKit never reported is dropped after this time.
 pub const PENDING_TTL: Duration = Duration::from_secs(60);
+
+/// How long a move grant waits for the moved user's join.
+pub const MOVE_GRANT_TTL: Duration = Duration::from_secs(60);
 
 /// Default grace period for dropped connections (`TAVRN_VOICE_RECONNECT_GRACE_SECS`).
 pub const DEFAULT_RECONNECT_GRACE: Duration = Duration::from_secs(45);
@@ -72,6 +83,11 @@ pub struct VoiceParticipant {
     /// `connected`, or `reconnecting` while the node waits for a dropped device to come back. Clients treat
     /// unknown values as `connected`.
     pub connection: Connection,
+    /// A moderator moved the user here (`VOICE.md` §7): they may be here without `view_channel` or `connect` for as
+    /// long as this participation lasts. Clients may show "moved here". Always `false` in calls; absent from older
+    /// nodes (= `false`).
+    #[schema(required = false)]
+    pub moved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,10 +147,20 @@ pub enum Source {
     Camera,
 }
 
+/// A user's move into a channel: a grant until the first join, then the moved participation.
+#[derive(Debug, Clone)]
+struct Move {
+    key: ChannelKey,
+    /// The grant is open until then; `None` once a join consumed it.
+    grant_until: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub struct VoiceState {
     channels: BTreeMap<ChannelKey, Vec<Entry>>,
     grace: Duration,
+    /// Per user id: the user's move (one per user, a new move replaces it).
+    moves: HashMap<String, Move>,
 }
 
 impl Default for VoiceState {
@@ -146,7 +172,7 @@ impl Default for VoiceState {
 impl VoiceState {
     /// State with a grace period for dropped connections (zero: dropped participants leave at once).
     pub fn with_grace(grace: Duration) -> Self {
-        Self { channels: BTreeMap::new(), grace }
+        Self { channels: BTreeMap::new(), grace, moves: HashMap::new() }
     }
 
     /// The grace period for dropped connections.
@@ -311,7 +337,17 @@ impl VoiceState {
 
     /// Visible (connected) participants of `key`, in join order.
     pub fn participants(&self, key: &ChannelKey) -> Vec<VoiceParticipant> {
-        self.channels.get(key).map(|v| v.iter().filter(|e| e.active).map(|e| e.p.clone()).collect()).unwrap_or_default()
+        self.channels
+            .get(key)
+            .map(|v| v.iter().filter(|e| e.active).map(|e| self.shown(key, e)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The participant as clients see it (with the `moved` mark).
+    fn shown(&self, key: &ChannelKey, e: &Entry) -> VoiceParticipant {
+        let mut p = e.p.clone();
+        p.moved = self.moves.get(&p.user_id).is_some_and(|m| m.key == *key);
+        p
     }
 
     /// Connected (or reconnecting) participants plus valid reservations of other users (user limit check;
@@ -330,7 +366,51 @@ impl VoiceState {
 
     /// The device's participant in `key` (connected or reserved).
     pub fn get(&self, key: &ChannelKey, identity: &str) -> Option<VoiceParticipant> {
-        self.channels.get(key)?.iter().find(|e| e.p.identity == identity).map(|e| e.p.clone())
+        self.channels.get(key)?.iter().find(|e| e.p.identity == identity).map(|e| self.shown(key, e))
+    }
+
+    /// A moderator moved `user_id` into `key`: a grant for the user's next join there (replaces any earlier move of
+    /// the user).
+    pub fn grant_move(&mut self, key: &ChannelKey, user_id: &str, now: Instant) {
+        self.moves.insert(user_id.to_string(), Move { key: key.clone(), grant_until: Some(now + MOVE_GRANT_TTL) });
+    }
+
+    /// Does a move entitle `user_id` to join `key` (without `connect`)? An open grant, or the running moved
+    /// participation (a rejoin after a dropped connection).
+    pub fn move_entitles(&self, key: &ChannelKey, user_id: &str, now: Instant) -> bool {
+        self.moves.get(user_id).is_some_and(|m| m.key == *key && self.move_lasts(user_id, m, now))
+    }
+
+    /// After a successful join of `user_id` to `key`: a grant for `key` is consumed (the moved participation goes on
+    /// while the user is there); a move into another channel ends.
+    pub fn joined(&mut self, key: &ChannelKey, user_id: &str) {
+        match self.moves.get_mut(user_id) {
+            Some(m) if m.key == *key => m.grant_until = None,
+            Some(_) => {
+                self.moves.remove(user_id);
+            }
+            None => {}
+        }
+    }
+
+    /// The current moves per room (room id → user id → channel id), after dropping those that ended (grant expired
+    /// or consumed and the user no longer in the channel).
+    pub fn moved(&mut self, now: Instant) -> BTreeMap<String, BTreeMap<String, String>> {
+        let ended: Vec<String> =
+            self.moves.iter().filter(|(u, m)| !self.move_lasts(u, m, now)).map(|(u, _)| u.clone()).collect();
+        for user_id in ended {
+            self.moves.remove(&user_id);
+        }
+        let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for (user_id, m) in &self.moves {
+            out.entry(m.key.0.clone()).or_default().insert(user_id.clone(), m.key.1.clone());
+        }
+        out
+    }
+
+    fn move_lasts(&self, user_id: &str, m: &Move, now: Instant) -> bool {
+        m.grant_until.is_some_and(|until| now < until)
+            || self.channels.get(&m.key).is_some_and(|v| v.iter().any(|e| e.p.user_id == user_id))
     }
 
     /// Users with an entry in `key` (connected, reconnecting or reserved), each once.
@@ -488,6 +568,7 @@ fn participant(who: &Who, identity: &str) -> VoiceParticipant {
         server_muted: who.server_muted,
         joined_at: String::new(),
         connection: Connection::Connected,
+        moved: false,
     }
 }
 
@@ -674,6 +755,67 @@ mod tests {
         muted.server_muted = true;
         s.reserve(&key("c1"), &muted, now);
         assert!(s.get(&key("c1"), &id("bob", DEV_B)).unwrap().muted);
+    }
+
+    #[test]
+    fn move_grants_are_bound_to_user_and_channel_and_expire() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        s.grant_move(&key("c2"), "id-bob", t0);
+        assert!(s.move_entitles(&key("c2"), "id-bob", t0));
+        assert!(!s.move_entitles(&key("c1"), "id-bob", t0), "only for its channel");
+        assert!(!s.move_entitles(&key("c2"), "id-carol", t0), "only for its user");
+        let moved = BTreeMap::from([("room".to_string(), BTreeMap::from([("id-bob".to_string(), "c2".to_string())]))]);
+        assert_eq!(s.moved(t0 + MOVE_GRANT_TTL - Duration::from_secs(1)), moved, "the grant gives a view at once");
+        assert!(!s.move_entitles(&key("c2"), "id-bob", t0 + MOVE_GRANT_TTL), "expired");
+        assert!(s.moved(t0 + MOVE_GRANT_TTL).is_empty(), "an unused grant ends with its time");
+        // One move per user: a new one replaces the old.
+        s.grant_move(&key("c2"), "id-bob", t0);
+        s.grant_move(&key("c3"), "id-bob", t0);
+        assert!(!s.move_entitles(&key("c2"), "id-bob", t0) && s.move_entitles(&key("c3"), "id-bob", t0));
+    }
+
+    #[test]
+    fn the_first_join_consumes_the_grant_and_the_participation_lasts_while_the_user_is_there() {
+        let mut s = VoiceState::with_grace(Duration::from_secs(45));
+        let t0 = Instant::now();
+        let later = t0 + MOVE_GRANT_TTL * 3;
+        s.grant_move(&key("c2"), "id-bob", t0);
+        s.reserve(&key("c2"), &who("bob", DEV_A), t0);
+        s.joined(&key("c2"), "id-bob");
+        s.activate(&key("c2"), &who("bob", DEV_A), t0);
+        s.activate(&key("c2"), &who("alice", DEV_A), t0);
+        let marks: Vec<(String, bool)> = s.participants(&key("c2")).into_iter().map(|p| (p.user, p.moved)).collect();
+        assert_eq!(marks, vec![("bob@node.example".into(), true), ("alice@node.example".into(), false)]);
+        assert!(s.get(&key("c2"), &id("bob", DEV_A)).unwrap().moved);
+        // A dropped connection keeps it: the rejoin is entitled long after the grant's time.
+        s.lose(&key("c2"), &id("bob", DEV_A), later);
+        assert!(s.move_entitles(&key("c2"), "id-bob", later), "rejoin within the grace period");
+        assert_eq!(s.moved(later).len(), 1);
+        // Leaving ends it: no rejoin, no view.
+        s.remove(&key("c2"), &id("bob", DEV_A));
+        assert!(!s.move_entitles(&key("c2"), "id-bob", later));
+        assert!(s.moved(later).is_empty());
+        assert!(!s.move_entitles(&key("c2"), "id-bob", t0), "consumed: not even within the grant's time");
+    }
+
+    #[test]
+    fn joining_another_channel_ends_a_move() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        s.grant_move(&key("c2"), "id-bob", t0);
+        s.reserve(&key("c1"), &who("bob", DEV_A), t0);
+        s.joined(&key("c1"), "id-bob");
+        assert!(!s.move_entitles(&key("c2"), "id-bob", t0), "the grant is gone");
+        assert!(s.moved(t0).is_empty());
+        // From a moved participation into another channel: the reservation leaves c2, the move ends.
+        s.grant_move(&key("c2"), "id-bob", t0);
+        s.reserve(&key("c2"), &who("bob", DEV_A), t0);
+        s.joined(&key("c2"), "id-bob");
+        s.reserve(&key("c1"), &who("bob", DEV_A), t0);
+        s.joined(&key("c1"), "id-bob");
+        assert!(s.moved(t0).is_empty());
+        assert!(!s.participants(&key("c1")).iter().any(|p| p.moved));
     }
 
     #[test]

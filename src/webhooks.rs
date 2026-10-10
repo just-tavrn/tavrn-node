@@ -259,6 +259,7 @@ async fn channel_conv(state: &AppState, channel: ChannelRow) -> Result<Conv, Api
         scopes: None,
         // Webhooks only post (into channels their room manager chose); `channel_conv` never checks the gate here.
         adult: true,
+        moved_channel: None,
     };
     Ok(Conv {
         id: channel.id.clone(),

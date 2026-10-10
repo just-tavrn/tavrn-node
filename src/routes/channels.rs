@@ -146,6 +146,7 @@ async fn category_perms(
         no_bots,
         scopes: access.scopes.clone(),
         system_channel: false,
+        moved: false,
     }))
 }
 

@@ -7,11 +7,12 @@
 
 pub mod advertise;
 pub mod livekit;
+pub mod moved;
 pub mod state;
 pub mod token;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -48,6 +49,20 @@ pub struct VoiceRuntime {
     problem: Mutex<Option<String>>,
     /// Asks the supervisor to restart LiveKit with the current addresses.
     restart: tokio::sync::Notify,
+    /// The moved participations last announced per room ([`sync_moved`]).
+    announced: Mutex<Announced>,
+}
+
+/// What [`sync_moved`] announced last.
+struct Announced {
+    rooms: BTreeMap<String, BTreeMap<String, String>>,
+    at: Instant,
+}
+
+impl Default for Announced {
+    fn default() -> Self {
+        Self { rooms: BTreeMap::new(), at: Instant::now() }
+    }
 }
 
 impl VoiceRuntime {
@@ -68,6 +83,7 @@ impl VoiceRuntime {
             advertise: Mutex::new(Advertise::from_config(config)),
             problem: Mutex::new(None),
             restart: tokio::sync::Notify::new(),
+            announced: Mutex::default(),
         })
     }
 
@@ -80,6 +96,7 @@ impl VoiceRuntime {
             advertise: Mutex::default(),
             problem: Mutex::new(None),
             restart: tokio::sync::Notify::new(),
+            announced: Mutex::default(),
         }
     }
 
@@ -183,11 +200,66 @@ pub async fn channel_state(state: &AppState, key: &ChannelKey) -> VoiceChannelSt
     VoiceChannelState { room_id: key.0.clone(), channel_id: key.1.clone(), epoch, participants }
 }
 
-/// Publishes `voice.state` of each channel to the room's members.
+/// Publishes `voice.state` of each channel to the room's members (and announces moved participations that ended
+/// with the change, [`sync_moved`]).
 pub async fn publish(state: &AppState, keys: &[ChannelKey]) {
+    sync_moved(state).await;
     for key in keys {
         let data = channel_state(state, key).await;
         state.hub.room(&key.0, "voice.state", &data);
+    }
+}
+
+/// Announces the moved participations (`moved::EVENT`) of every room whose set changed since the last call, and
+/// all of them again every [`moved::REFRESH`]; the hubs of all instances take the announcement before anything else
+/// (`moved::Index`), so the moved members view their channel from then on. A member whose moved participation ended
+/// and who may not view the channel by their permissions is announced for removal from the channel's MLS group
+/// (`mls.remove_needed`). Runs on the leader, which holds the participations; cheap when nothing changed.
+pub async fn sync_moved(state: &AppState) {
+    if !state.cluster.is_leader() {
+        return;
+    }
+    let now = Instant::now();
+    let ended = {
+        let mut announced = state.voice.announced.lock().unwrap_or_else(|e| e.into_inner());
+        let current = state.voice.participants().moved(now);
+        let refresh = now.duration_since(announced.at) >= moved::REFRESH;
+        let until_ms = crate::cache::now_ms() + u64::try_from(moved::VALID.as_millis()).unwrap_or(u64::MAX);
+        let empty = BTreeMap::new();
+        let mut ended = Vec::new();
+        let rooms: std::collections::BTreeSet<&String> = current.keys().chain(announced.rooms.keys()).collect();
+        for room_id in rooms {
+            let (new, old) = (current.get(room_id).unwrap_or(&empty), announced.rooms.get(room_id).unwrap_or(&empty));
+            if new == old && !refresh {
+                continue;
+            }
+            for (user_id, channel_id) in old {
+                if new.get(user_id) != Some(channel_id) {
+                    ended.push((room_id.clone(), channel_id.clone(), user_id.clone()));
+                }
+            }
+            let announcement = moved::Announcement {
+                room_id: room_id.clone(),
+                leader: state.cluster.instance_id.clone(),
+                until_ms,
+                users: new.clone(),
+            };
+            state.hub.room(room_id, moved::EVENT, &announcement);
+        }
+        if refresh {
+            announced.at = now;
+        }
+        announced.rooms = current;
+        ended
+    };
+    for (room_id, channel_id, user_id) in ended {
+        if crate::visibility::can_view(state, &room_id, &channel_id, &user_id).await {
+            continue;
+        }
+        let Ok(Some(user)) = store::users::by_id(&state.db, &user_id).await else { continue };
+        if let Err(e) = crate::e2ee::left_channel_group(state, &channel_id, &user).await {
+            tracing::warn!(error = %e, channel_id, "MLS removal after a moved participation not announced");
+        }
     }
 }
 
@@ -348,7 +420,8 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes participants whose grace period ran out (and announces them as gone), in voice channels and calls.
+/// Removes participants whose grace period ran out (and announces them as gone), in voice channels and calls, and
+/// announces moved participations whose grant ran out ([`sync_moved`]).
 pub async fn expire_once(state: &AppState) {
     let changed = state.voice.participants().expire(Instant::now());
     publish(state, &changed).await;
@@ -510,8 +583,10 @@ pub async fn close_room(state: &AppState, room_id: &str) {
 }
 
 /// Disconnects the participants of a room's voice channels who no longer hold `view_channel` and `connect` there
-/// (a role, override, membership or age change), against the current visibility snapshot (VOICE.md §4). Runs on
-/// the leader, which holds the participants.
+/// (a role, override, membership or age change), against the current visibility snapshot (VOICE.md §4). A moved
+/// participation holds both through the snapshot (`permissions::MOVED_FORCED`) as long as the member is in the
+/// room, not timed out and above the channel's age gate (VOICE.md §7). Runs on the leader, which holds the
+/// participants.
 pub async fn check_access(state: &AppState, room_id: &str) {
     if !state.cluster.is_leader() {
         return;
