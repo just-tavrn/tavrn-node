@@ -550,3 +550,137 @@ async fn stale_epochs_are_refused_after_a_short_grace() {
     assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("mls.epoch_stale")), "{j}");
     assert_eq!(j["meta"]["epoch"], 3, "{j}");
 }
+
+/// Writes a commit straight into the group state, past the node's authorization rules: a leaf the rules never admit
+/// (a member's device id with a key that is not its attested key), as a group may hold one from before these rules
+/// or from a misbehaving hosting node.
+async fn inject_commit(node: &TestNode, conversation_id: &str, out: &tavrn_crypto::CommitOutput, committer: &str) {
+    use tavrn_node::store::e2ee as st;
+    let group = st::group(&node.state.db, conversation_id).await.unwrap().unwrap();
+    let mut ds = tavrn_crypto::ds::DsGroup::import_state(&group.ds_state).unwrap();
+    ds.process_commit(&out.commit, &out.group_info).unwrap();
+    let ds_state = ds.export_state().unwrap();
+    let accepted = st::apply_commit(
+        &node.state.db,
+        st::AcceptedCommit {
+            conversation_id,
+            epoch: group.epoch,
+            commit: &out.commit,
+            group_info: &out.group_info,
+            ds_state: &ds_state,
+            committer_device_id: committer,
+            welcome_devices: &[],
+            welcome: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(accepted);
+}
+
+/// ENCRYPTION.md §4.5 rules 2 and 4 against a leaf that names a member's attested device but carries another key: an
+/// Add of it is refused; if a group holds one, the device's external rejoin must remove it too (a device is in the
+/// group at most once), any member may remove it (its key is not the attested key), and housekeeping lists it.
+#[tokio::test]
+async fn leaves_whose_key_is_not_the_attested_key() {
+    let (node, mut alice, mut bob, dm) = dm_setup().await;
+    let conv = qualified(&dm);
+    node.add_user(&mut alice, &dm, "bob").await;
+    node.accept_welcomes(&mut bob).await;
+
+    // An Add whose KeyPackage names Bob's attested device id with another key is refused.
+    let forged = Client::new(Device::generate("bob@t.local", &bob.session.device_id).unwrap());
+    let out = alice.client.add_members(&conv, &[forged.create_key_package().unwrap()]).unwrap();
+    let (s, j) = node.post_commit(alice.token(), &dm, &out).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("mls.forbidden")), "{j}");
+    assert!(j["detail"].as_str().unwrap().contains("Key does not match"), "{j}");
+
+    // The group holds such a leaf anyway (written past the rules).
+    inject_commit(&node, &dm, &out, &alice.session.device_id).await;
+    alice.client.merge_pending_commit(&conv).unwrap();
+    node.catch_up(&mut bob, &dm).await;
+    let forged_leaf =
+        tavrn_crypto::RosterEntry { identity: bob.identity(), signature_key: forged.device().public_key() };
+
+    // Housekeeping records it as unattested.
+    tavrn_node::device_cleanup::detect_ghost_leaves(&node.state).await.unwrap();
+    let (_, j) = node.get_auth(&format!("/api/v1/conversations/{dm}/mls/pending-removals"), alice.token()).await;
+    assert_eq!(j["items"][0]["identity"], bob.identity().as_str(), "{j}");
+    assert_eq!(j["items"][0]["reason"], "unattested", "{j}");
+
+    // Bob's device rejoins: the external commit replaces his own leaf but leaves the other one with his identity.
+    let (_, gi) = node.get_auth(&format!("/api/v1/conversations/{dm}/mls/group-info"), bob.token()).await;
+    let join = bob.client.join_by_external_commit(&conv, &unb64(&gi["group_info"])).unwrap();
+    let (s, j) = node.post_commit(bob.token(), &dm, &join).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("mls.forbidden")), "{j}");
+    assert!(j["detail"].as_str().unwrap().contains("must remove the old leaf"), "{j}");
+    bob.client.discard_pending_commit(&conv).unwrap();
+
+    // Removing Bob's genuine leaf stays refused; the leaf with the other key may go.
+    let genuine =
+        tavrn_crypto::RosterEntry { identity: bob.identity(), signature_key: bob.client.device().public_key() };
+    let rm = alice.client.remove_leaves(&conv, &[genuine]).unwrap();
+    let (s, j) = node.post_commit(alice.token(), &dm, &rm).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
+    alice.client.discard_pending_commit(&conv).unwrap();
+    let rm = alice.client.remove_leaves(&conv, &[forged_leaf]).unwrap();
+    let (s, j) = node.post_commit(alice.token(), &dm, &rm).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    alice.client.merge_pending_commit(&conv).unwrap();
+
+    // Now the rejoin goes through and the group holds each device once.
+    let (_, gi) = node.get_auth(&format!("/api/v1/conversations/{dm}/mls/group-info"), bob.token()).await;
+    let join = bob.client.join_by_external_commit(&conv, &unb64(&gi["group_info"])).unwrap();
+    let (s, j) = node.post_commit(bob.token(), &dm, &join).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    bob.client.merge_pending_commit(&conv).unwrap();
+    node.catch_up(&mut alice, &dm).await;
+    let roster = alice.client.roster(&conv).unwrap();
+    assert_eq!(roster.len(), 2);
+    assert!(roster.iter().any(|e| e.signature_key == bob.client.device().public_key()));
+}
+
+/// The group a client creates (ENCRYPTION.md §4.4) starts at epoch 0 with exactly the uploader's attested device:
+/// a later epoch (which is also the only way to have more than one leaf) and someone else's GroupInfo are refused.
+#[tokio::test]
+async fn group_creation_takes_only_the_posters_device_at_epoch_zero() {
+    let node = test_node(DOMAIN).await;
+    let mut alice = node.crypto_user("alice").await;
+    let bob = node.crypto_user("bob").await;
+    node.befriend(&alice.session, &bob.session).await;
+    let dm = node.create_dm(&alice.session, &bob.session).await;
+    let conv = qualified(&dm);
+    let path = format!("/api/v1/conversations/{dm}/mls/group");
+    let gi0 = alice.client.create_group(&conv).unwrap();
+
+    // Two leaves (Alice added Bob locally first): epoch 1.
+    node.upload_kps(&bob, 1).await;
+    let kps = node.claim(alice.token(), "bob").await;
+    let add = alice.client.add_members(&conv, &kps).unwrap();
+    alice.client.merge_pending_commit(&conv).unwrap();
+    let (s, j) = node.post(&path, alice.token(), json!({ "group_info": b64(&add.group_info) })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("mls.invalid")), "{j}");
+    // One leaf, but a later epoch.
+    let up = alice.client.self_update(&conv).unwrap();
+    let (s, j) = node.post(&path, alice.token(), json!({ "group_info": b64(&up.group_info) })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("mls.invalid")), "{j}");
+    assert!(j["detail"].as_str().unwrap().contains("epoch 0"), "{j}");
+    // Alice's genuine epoch-0 GroupInfo posted by Bob.
+    let (s, j) = node.post(&path, bob.token(), json!({ "group_info": b64(&gi0) })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("mls.forbidden")), "{j}");
+    // Alice posts it herself.
+    let (s, j) = node.post(&path, alice.token(), json!({ "group_info": b64(&gi0) })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+}
+
+/// History shares exist only for end-to-end encrypted conversations.
+#[tokio::test]
+async fn history_shares_need_an_encrypted_conversation() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.crypto_user("alice").await;
+    let room = node.plaintext_room(alice.token(), "Plain").await;
+    let channel = TestNode::text_channel(&room);
+    let body = json!({ "to_user": format!("alice@{DOMAIN}"), "epoch_from": 0, "epoch_to": 0, "ciphertext": "AAAA" });
+    let (s, j) = node.post(&format!("/api/v1/conversations/{channel}/history-keys"), alice.token(), body).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("history.not_encrypted")), "{j}");
+}

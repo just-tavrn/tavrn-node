@@ -55,7 +55,19 @@ async fn sleep() {
 }
 
 async fn reset(node: &TestNode, dev: Dev) -> Dev {
+    reset_via(node, dev, false).await
+}
+
+/// `store_only`: only the reset's own transaction runs (none of the route's later steps such as the welcome channel
+/// entry), as when the node stops right after it.
+async fn reset_via(node: &TestNode, dev: Dev, store_only: bool) -> Dev {
     let fresh = MasterSecret::generate().unwrap();
+    if store_only {
+        let key = b64(&fresh.identity_public_key());
+        tavrn_node::store::e2ee::reset_identity(&node.state.db, &dev.session.user_id, &key).await.unwrap();
+        let session = node.login(&dev.session.username).await;
+        return node.attest(session, fresh, 3).await;
+    }
     let (s, j) = node
         .post(
             "/api/v1/users/me/identity/reset",
@@ -73,6 +85,10 @@ async fn reset(node: &TestNode, dev: Dev) -> Dev {
 /// he could read (epoch 1). Bob resets his key, Alice writes once more (still epoch 1), and Bob's re-attested device
 /// joins the group again (epoch 2).
 async fn setup() -> Setup {
+    setup_via(false).await
+}
+
+async fn setup_via(store_only: bool) -> Setup {
     let node = test_node(DOMAIN).await;
     let mut alice = node.crypto_user("alice").await;
     let room = node.create_room(alice.token(), "Archive").await;
@@ -100,7 +116,7 @@ async fn setup() -> Setup {
     assert_eq!(node.send_encrypted(&alice, &channel, "Bob was there").await.0, StatusCode::CREATED);
     assert_eq!(encrypted_count(&node, bob.token(), &channel).await, 2, "policy all: Bob reads everything");
     sleep().await;
-    let bob = reset(&node, bob).await;
+    let bob = reset_via(&node, bob, store_only).await;
     sleep().await;
     assert_eq!(node.send_encrypted(&alice, &channel, "After the reset").await.0, StatusCode::CREATED);
     Setup { node, alice, bob, room_id, channel, welcome }
@@ -233,6 +249,23 @@ async fn a_reset_cuts_the_history_and_stops_automatic_shares_of_the_old_range() 
         s.node.get_auth(&format!("/api/v1/conversations/{}/history-pending", s.channel), s.alice.token()).await;
     let item = j["items"].as_array().unwrap().iter().find(|i| i["user"] == format!("carol@{DOMAIN}")).unwrap().clone();
     assert_eq!((item["key_reset_at"].clone(), item["min_epoch"].clone()), (Value::Null, Value::Null), "{item}");
+}
+
+/// The reset records the history window in its own transaction: without any later step of the route (the welcome
+/// channel entry used to record it), the cut applies and automatic shares of the pre-reset range are refused.
+#[tokio::test]
+async fn the_reset_itself_records_the_history_window() {
+    let mut s = setup_via(true).await;
+    let state = mine(&s).await;
+    assert!(state["key_reset_at"].is_string(), "{state}");
+    assert_eq!(encrypted_count(&s.node, s.bob.token(), &s.channel).await, 1);
+    rejoin(&mut s).await;
+    for (from, to) in [(0, 1), (1, 1), (0, 2)] {
+        let (st, j) = share(&s, s.alice.token(), from, to).await;
+        assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("history.forbidden")), "{from}..{to}: {j}");
+    }
+    let (st, j) = share(&s, s.alice.token(), 2, 2).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
 }
 
 #[tokio::test]

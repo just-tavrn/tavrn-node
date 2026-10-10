@@ -610,3 +610,21 @@ async fn claims_about_local_users_need_their_session_on_the_sending_node() {
     let (st, code) = s2s(&a, &b, inbox, envelope("room.invite", "alice@a.test", "bob@b.test", room), false).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{code}");
 }
+
+/// S2S claims share the per-target claim budget with local claims (ENCRYPTION.md §4.5): rotating requester names of
+/// the sending node do not get past it.
+#[tokio::test]
+async fn s2s_claims_count_against_the_target_users_budget() {
+    let (a, b) = two_nodes().await;
+    let carol = b.register("carol").await;
+    let claim = json!({ "user": "carol@b.test", "requester": "alice@a.test" });
+    let (st, code) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
+    while b.state.claim_target_limiter.check(&carol.user_id).await.is_ok() {}
+    let claim = json!({ "user": "carol@b.test", "requester": "someone-else@a.test" });
+    let (st, _) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a new requester name does not reset the budget");
+    let dave = b.register("dave").await;
+    let (st, _) = b.post("/api/v1/users/carol/key-packages/claim", &dave.token, json!({})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "local claims share the budget");
+}
