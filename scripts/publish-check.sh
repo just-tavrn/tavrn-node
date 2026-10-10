@@ -36,7 +36,7 @@ for f in "${files[@]}"; do
     test-results/* | */test-results/* | playwright-report/* | */playwright-report/* | perf/results/*) report "test output: $f" ;;
     .env | */.env | .env.* | */.env.*)
       case "$f" in *.env.example) ;; *) report "environment file: $f" ;; esac ;;
-    *.pem | *.key | *.p12 | *.pfx | *id_rsa* | *id_ed25519* | *.keystore | node.key | */node.key) report "key file: $f" ;;
+    *.pem | *.key | *.p12 | *.pfx | *id_rsa* | *id_ed25519* | *.keystore) report "key file: $f" ;;
     *.db | *.sqlite | *.sqlite3 | *.db-wal | *.db-shm) report "database file: $f" ;;
     .publish-check.private) report "private pattern list must stay untracked: $f" ;;
   esac
