@@ -1351,16 +1351,19 @@ async fn authz_losing_connect_ends_the_voice_session() {
 
 // ---------------------------------------------------------------- GET /users/me/voice
 
+/// `(channel id, [user addresses])` of one channel.
+type ChannelUsers = (String, Vec<String>);
+
 /// The rooms of `GET /users/me/voice` as `room id → [(channel id, [user addresses])]`, sorted.
-async fn my_voice(v: &Voice, s: &Session) -> Vec<(String, Vec<(String, Vec<String>)>)> {
+async fn my_voice(v: &Voice, s: &Session) -> Vec<(String, Vec<ChannelUsers>)> {
     let (st, j) = v.node.get_auth("/api/v1/users/me/voice", &s.token).await;
     assert_eq!(st, StatusCode::OK, "{j}");
-    let mut rooms: Vec<(String, Vec<(String, Vec<String>)>)> = j["rooms"]
+    let mut rooms: Vec<(String, Vec<ChannelUsers>)> = j["rooms"]
         .as_array()
         .unwrap()
         .iter()
         .map(|r| {
-            let mut channels: Vec<(String, Vec<String>)> = r["channels"]
+            let mut channels: Vec<ChannelUsers> = r["channels"]
                 .as_array()
                 .unwrap()
                 .iter()
