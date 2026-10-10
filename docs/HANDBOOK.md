@@ -46,7 +46,7 @@ needs a few open ports, and SMTP and Valkey are optional.
 | **A data volume** | `./data`, mounted at `/data`: the node's keys and the uploaded files. Back it up together with the database ([Keys and backups](#keys-and-backups)). |
 | **Ports for voice** | A UDP range (default `61000-61100`) and one TCP port (default `7881`) reachable from the internet, published 1:1 to the container and forwarded by the router. Optional: UDP `3478` for TURN, and TURN over TLS on 443 through the proxy. Voice can be switched off (`TAVRN_VOICE_ENABLED=false`). See [Voice and video](#voice-and-video). |
 | **Outbound HTTPS** | Federation with other nodes, the reference nodes of the directory, link previews, web push to the browser vendors' push services, the SSO provider and the captcha or GIF provider when configured. |
-| **Optional: SMTP** | E-mail confirmation, password resets and legal notices (`TAVRN_SMTP_URL`). Without it the node works without e-mail. |
+| **Optional: SMTP** | E-mail confirmation, password resets and legal notices (`TAVRN_SMTP_URL`). Without it the node works without e-mail: "Forgot password" answers `503 mail.unavailable` (a node admin resets the second factor or the account instead), and mails are not sent (the log notes the recipient and subject, never the body; only development nodes log whole mails). |
 | **Optional: Valkey or Redis ≥ 7** | Only to run one node as several instances behind a load balancer ([Scaling with Valkey](#scaling-with-valkey)). |
 
 ## Install with Docker Compose
@@ -141,7 +141,7 @@ These settings fix the node's identity domain, where it is served and which data
 | `TAVRN_NAME` | `tavrn` | Display name of the node (directory, discovery document). |
 | `TAVRN_DESCRIPTION` | empty | Short description of the node (directory). |
 | `TAVRN_LISTEN` | `0.0.0.0:8080` | Address and port of the plain-HTTP server. |
-| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. Connections from elsewhere are rate-limited and banned by their own address. Also decides who may read `/metrics` without a token. |
+| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. |
 | `TAVRN_DATABASE_URL` | empty (compose: built from `POSTGRES_PASSWORD`) | `postgres://user:password@host:port/db` (or `postgresql://`). `sqlite:` only with `--dev`. |
 | `TAVRN_DATA_DIR` | `/data` (image) | Directory for `keys/`, `blobs/` (stored files) and the generated LiveKit configuration. |
 | `TAVRN_ADMIN_USERS` | empty | Comma-separated usernames with node admin rights (besides the first registered account). |
@@ -165,9 +165,12 @@ and sessions work and the minimum age.
 | `TAVRN_CAPTCHA_LOGIN` | `false` | Require the captcha at login (only with a provider). |
 | `TAVRN_WEBAUTHN_ORIGIN` | the public URL | Origin of the web client for passkeys. Override only for development and tests (e.g. `http://localhost:5173`). |
 | `TAVRN_WEBAUTHN_RP_ID` | `TAVRN_DOMAIN` | Relying party id of passkeys; must be the host of the origin or a parent domain of it, otherwise the node refuses to start. Changing it later invalidates every registered passkey ([Passkeys](#passkeys)). |
-| `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). |
+| `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). A revocation (logout, password change or reset, device removal, an admin disabling the account or resetting its second factor, a node ban, account deletion) ends the access tokens and WebSockets of the affected devices at once (`401 auth.session_revoked`, close code 4001), and their voice and call connections; the node checks the session behind a token at most every 5 seconds per device and instance. |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
-| `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
+| `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route and WebSocket connect (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
+| `TAVRN_RATE_LIMIT_IPV6_PREFIX` | `64` | Per-address rate limits (login, registration, password reset, connect, directory, the emoji and sound proxy, …) count IPv6 clients by this prefix (32–128): one host usually holds a whole /64. IPv4 addresses count one by one. |
+| `TAVRN_PASSWORD_HASH_CONCURRENCY` | `0` (twice the CPU cores, at least 2) | Password hashes and checks (Argon2id, 64 MiB each) running at once, off the request threads; further logins wait for a slot. |
+| `TAVRN_WS_MAX_SOCKETS_PER_USER` | `20` | WebSocket connections one user may hold at once per instance (`0` = unlimited); beyond it the socket is closed with 4002 `too_many_connections`. App tokens keep their own limit of two. |
 | `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. |
 | `TAVRN_MINIMUM_AGE` | `16` | Minimum age for registration (13–99). Every registration path asks for the date of birth and refuses younger people; see [Age gates](#age-gates). |
 | `TAVRN_DM_POLICY` | `everyone` | Upper bound of every user's "Who can message me": `friends`, `everyone_shared` (friends and shared rooms) or `everyone` (`open` is the old name). Users choose within it (their default is `everyone_shared`); non-friends land in the recipient's message requests; blocks always apply. |
@@ -306,6 +309,8 @@ These settings limit who creates rooms and how many, how large uploads may be an
 | `TAVRN_EMOJI_MAX_BYTES` | `262144` (256 KiB) | Largest custom emoji file. |
 | `TAVRN_PREVIEW_AUTO_MAX_BYTES` | `5242880` (5 MiB) | Images up to this size load as previews by themselves where the user's setting allows it (always / friends and shared rooms / never); larger ones show a placeholder with a "Load" button. `0` = never automatically. |
 | `TAVRN_MEDIA_CACHE_UNUSED_DAYS` | `365` | Cached copies of other nodes' custom emojis and soundboard clips are evicted after this many days without use; `0` = never. |
+| `TAVRN_MEDIA_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | Total size of those cached copies; beyond it the least recently used go (checked at most every 10 seconds per instance and by the hourly housekeeping). |
+| `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST` | `67108864` (64 MiB) | Size of the cached copies from one origin node (at most `TAVRN_MEDIA_CACHE_MAX_BYTES`); beyond it that node's least recently used copies go. Fetches for copies not cached yet are limited to 60 per client address and minute. |
 
 ### Entitlement defaults
 
@@ -538,7 +543,8 @@ Complete examples are in the repository:
   `X-Forwarded-Proto`, the WebSocket headers (`Upgrade $http_upgrade`, `Connection "upgrade"`) and
   `proxy_read_timeout 3600s`, plus the HTTP → HTTPS redirect. Certificates e.g. via certbot.
 - [`deploy/Caddyfile.example`](../deploy/Caddyfile.example): `reverse_proxy 127.0.0.1:8080` with automatic
-  certificates and a 100 MB body limit; Caddy passes WebSockets and `X-Forwarded-For` by itself.
+  certificates, a 100 MB body limit, HSTS (`header Strict-Transport-Security "max-age=63072000"`, Caddy sends none by
+  itself) and `respond /metrics 404`; Caddy passes WebSockets and `X-Forwarded-For` by itself.
 
 Several instances: list every instance as an upstream (nginx `upstream`, Caddy `reverse_proxy` with several
 upstreams), see [Load balancer](#load-balancer).
@@ -1606,7 +1612,7 @@ Limits that protect against guessing and abuse are shared across the instances; 
 
 | Limiter | Decision | Reason |
 |---|---|---|
-| `login_limiter` (login, re-auth, connect exchange, federated login, device nonces, identity reset), `register_limiter` (registration, forgot password) | **shared** | Password guessing and account creation must not scale with the number of instances. |
+| `login_limiter` (login per address and failed logins per account, re-auth and identity reset per account with keys of their own, password change, connect exchange, federated login, device nonces), `register_limiter` (registration, forgot password per address), `forgot_limiter` (reset mails per account, 3 per hour) | **shared** | Password guessing and account creation must not scale with the number of instances. Only failed logins count against an account, and the right password with a valid device proof passes even then, so nobody can lock an owner out by guessing. |
 | `second_factor_user_limiter`, `second_factor_ip_limiter` | **shared** | TOTP / recovery code guessing. |
 | `federation_inbox_limiter`, `federation_login_limiter`, `federation_token_limiter` | **shared** | Per remote domain / device; a peer or token must not get N× its quota. |
 | `claim_pair_limiter` | **shared** | Protects KeyPackages from being drained by one requester. |
@@ -1614,7 +1620,7 @@ Limits that protect against guessing and abuse are shared across the instances; 
 | `app_request_limiter`, `app_token_limiter`, `app_rotate_limiter`, `app_create_limiter` | **shared** | Protocol limits of applications and token issuance (APPLICATIONS.md §2.7). |
 | `connect_session_limiter`, `connect_session_node_limiter`, `connect_poll_limiter`, `connect_poll_ip_limiter` | **shared** | App sessions of the connect flow (FEDERATION.md §8 step 3): unauthenticated creation per IP and for the whole node, polls per session and IP. |
 | `voice_limiter`, ring limiter of calls, `ephemeral_limiter` | node-wide by relaying | Their routes are relayed to the leader, so the leader's counter is the node's. |
-| `user_api_limiter` (`TAVRN_RATE_USER_PER_MINUTE`), `files_limiter` (files list and search 120, uploads 120 per user and minute), `purge_limiter` (purge previews, 10 per moderator and minute), `media_proxy_limiter` (the unauthenticated emoji and sound proxy `?host=`, 600 per address and minute), room presence toggles (`presence_limiter`, 60 per user and minute) | per instance | Load shedding: generous limits that bound what one account (or one address for the proxy) can make an instance do. |
+| `user_api_limiter` (`TAVRN_RATE_USER_PER_MINUTE`), `files_limiter` (files list and search 120, uploads 120 per user and minute), `purge_limiter` (purge previews, 10 per moderator and minute), `media_proxy_limiter` (the unauthenticated emoji and sound proxy `?host=`, 600 per address and minute) and `media_miss_limiter` (its fetches from other nodes, 60 per address and minute), room presence toggles (`presence_limiter`, 60 per user and minute) | per instance | Load shedding: generous limits that bound what one account (or one address for the proxy) can make an instance do. |
 | `claim_limiter`, `key_package_limiter`, `commit_limiter`, `backup_limiter`, `friend_limiter`, `conversation_limiter`, `secret_storage_limiter`, `read_limiter`, `presence_limiter`, `media_limiter`, `scene_limiter`, `admin_limiter`, `direct_invite_limiter`, `room_invite_inbox_limiter`, `notify_limiter`, `keys_fetch_limiter`, `directory_announce_limiter`, `directory_limiter`, `federation_api_limiter`, `federation_claim_limiter`, `bot_message_limiter`, `bot_dm_limiter`, unfurl per user, OIDC start/token per IP, files backend changes | per instance | Load shedding and spam damping of authenticated or already-signed traffic: with N instances a client gets at most N× the budget, which bounds the load per instance exactly as before. The OIDC exchange guards 256-bit codes, not a guessable secret. |
 
 #### Single-use tokens, nonces and challenges
@@ -2092,7 +2098,7 @@ the configuration first and exits with code **2** on a configuration error. The 
 |---|---|---|
 | `serve` (default) | Starts the server. | `1` on an error, `3` when `TAVRN_CACHE_URL` is set but Valkey is unreachable at start. |
 | `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. Also the image's health check. | `0` ok, `2` problem. |
-| `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP the mail is only logged). | `0` sent, `1` failed. |
+| `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP nothing is sent and the log says so). | `0` sent, `1` failed. |
 | `doctor --peer <domain>` | Runs the [conformance checks](#conformance-checks-of-other-nodes) against another node with this node's configuration, keys and database and prints one line per check (`pass`, `warn`, `fail`, `skip` with a reason). The result is stored like an admin's check (a hard failure blocks the peer). Run it while the node is running: the other node claims the probe's keys from it. | `0` ok, `1` hard failure, `2` the check could not run. |
 | `rotate-storage-key` | [Rotates the storage key](#rotating-the-storage-key). Stop the node first; back up the new key file afterwards. Resumable. | `0` done, `1` failed. |
 | `well-known` | Prints the discovery document (`/.well-known/tavrn`) for a [static copy](#identity-domain-and-node-host-delegation) on the identity domain. Needs the node keys (start the node once first). | `0` ok, `2` no keys. |

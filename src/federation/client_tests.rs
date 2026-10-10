@@ -1038,3 +1038,15 @@ fn document_and_delegation_lifetimes() {
     use super::discovery::ttl;
     assert_eq!((ttl(None), ttl(Some(10)), ttl(Some(900)), ttl(Some(86_400))), (300, 300, 900, 3600));
 }
+
+#[tokio::test]
+async fn the_per_peer_map_stays_bounded() {
+    let cfg = config("", false);
+    let c = client(&cfg, MapLookup::with(&[]));
+    for i in 0..3000 {
+        // Unresolvable names: each still passes `permits` before the lookup fails.
+        let _ = c.permits(&format!("n{i}.example")).await;
+    }
+    let len = c.per_peer.lock().unwrap().len();
+    assert!(len <= 1024, "per_peer holds {len} entries");
+}

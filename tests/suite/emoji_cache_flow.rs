@@ -240,3 +240,54 @@ async fn origins_resolving_to_private_addresses_are_refused() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
+
+/// The cache is bounded: per origin host and in total the least recently used copies go, and fetches (misses) are
+/// limited per client address while cached copies are still served.
+#[tokio::test]
+async fn the_cache_is_capped_per_host_and_in_total_and_misses_are_limited() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let port = serve(fake_origin(hits.clone())).await;
+    let node = test_node_with("t.local", |c| {
+        c.federation_allow_private = true;
+        c.federation_dev_peers = format!("fake.test=http://127.0.0.1:{port},other.test=http://127.0.0.1:{port}");
+        // Every clip of the fake origin has 10 bytes.
+        c.media_cache_max_bytes_per_host = 30;
+        c.media_cache_max_bytes = 50;
+    })
+    .await;
+    let r = &node.router;
+    let size = |host: &'static str| {
+        let db = node.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache WHERE origin_host = $1")
+                .bind(host)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let mut last = String::new();
+    for _ in 0..10 {
+        last = tavrn_node::util::ulid();
+        let (s, _, _) = get_with(r, &format!("/api/v1/sounds/{last}/audio?host=fake.test"), &[]).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    assert_eq!(size("fake.test").await, 30, "one host stops at its cap");
+    let (s, _, _) = get_with(r, &format!("/api/v1/sounds/{last}/audio?host=fake.test"), &[]).await;
+    assert_eq!(s, StatusCode::OK, "the newest copy stays");
+    assert_eq!(hits.load(Ordering::SeqCst), 10, "served from the cache");
+    for _ in 0..3 {
+        let id = tavrn_node::util::ulid();
+        assert_eq!(get_with(r, &format!("/api/v1/sounds/{id}/audio?host=other.test"), &[]).await.0, StatusCode::OK);
+    }
+    tavrn_node::emoji_cache::enforce_total_cap(&node.state).await.unwrap();
+    assert!(size("fake.test").await + size("other.test").await <= 50, "the total cap holds");
+    assert_eq!(size("other.test").await, 30, "the least recently used copies went first");
+
+    // Misses over the per-address budget: 429; cached copies are still served.
+    while node.state.media_miss_limiter.check("miss:unknown").is_ok() {}
+    let (s, _, body) = get_with(r, &format!("/api/v1/sounds/{}/audio?host=fake.test", tavrn_node::util::ulid()), &[]).await;
+    assert_eq!((s, code(&body).as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+    let (s, _, _) = get_with(r, &format!("/api/v1/sounds/{last}/audio?host=fake.test"), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+}
