@@ -571,6 +571,12 @@ impl FederationClient {
         }
     }
 
+    /// Entries of the per-peer semaphore map (tests: it stays bounded).
+    #[cfg(test)]
+    pub(crate) fn peer_entries(&self) -> usize {
+        self.per_peer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     async fn permits(&self, domain: &str) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), FetchError> {
         /// Entries of the per-peer map above which idle ones are pruned.
         const PER_PEER_MAX_IDLE: usize = 1024;
