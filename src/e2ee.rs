@@ -78,11 +78,21 @@ pub fn attested_key_of(row: Option<&DeviceKeyRow>, user_id: &str) -> Option<[u8;
     tavrn_crypto::util::b64url_decode(row.attested_key()?).ok()?.try_into().ok()
 }
 
-/// The claim budget of a target user (ENCRYPTION.md §4.5): KeyPackage claims for another user, local or from other
-/// nodes, count against `TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR` whoever claims, so that claims in many invented or
-/// sybil names cannot drain the user's KeyPackages. A user's claims for their own devices do not count.
-pub async fn claim_budget(state: &AppState, target: &UserRow) -> Result<(), ApiError> {
-    state.claim_target_limiter.check_all(std::slice::from_ref(&target.id)).await
+/// The claim budget of a target user (ENCRYPTION.md §3.2) for a claim by `requester` (an address) that arrives from
+/// `source` (`local`, or the requesting node's domain). Requesters who share a room, a DM or group DM or a friendship
+/// with the target are the legitimate claimers and are not limited here. Everybody else counts against
+/// `TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR` per source and target, and against ten times that per target in total, so
+/// that claims in many invented or sybil names neither drain the user's KeyPackages nor lock out their contacts.
+/// A user's claims for their own devices never get here.
+pub async fn claim_budget(state: &AppState, source: &str, requester: &str, target: &UserRow) -> Result<(), ApiError> {
+    if let Some((username, domain)) = crate::util::parse_address(requester)
+        && let Some(user) = store::federation::user_by_address(&state.db, username, domain).await?
+        && store::e2ee::claim_related(&state.db, &user.id, &target.id).await?
+    {
+        return Ok(());
+    }
+    state.claim_target_limiter.check_all(&[format!("{source}|{}", target.id)]).await?;
+    state.claim_target_total_limiter.check_all(std::slice::from_ref(&target.id)).await
 }
 
 // ---------------------------------------------------------------- mls.remove_needed

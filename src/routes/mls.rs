@@ -242,14 +242,14 @@ async fn authorize(
         return Err(forbidden("The commit is not from this device"));
     }
     // Rule 2: an external join (entitlement checked by the route) removes at most its own old leaf, and it must
-    // remove every leaf that carries its identity or its key: a device is in the group at most once.
+    // remove every leaf that carries its key: a device is in the group at most once. A leaf with its identity but
+    // another key is an unattested ghost (rule 4 lets any member remove it); OpenMLS joins do not remove it.
     if summary.external_join {
         if !summary.added.is_empty() || summary.removed.iter().any(|r| r != &me) {
             return Err(forbidden("An external join may only replace its own old device"));
         }
         let stale = roster_before.iter().any(|leaf| {
-            (leaf.identity == me || leaf.signature_key == summary.committer.signature_key)
-                && !summary.removed_leaves.contains(leaf)
+            leaf.signature_key == summary.committer.signature_key && !summary.removed_leaves.contains(leaf)
         });
         if stale {
             return Err(forbidden("An external join must remove the old leaf of this device"));

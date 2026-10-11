@@ -579,8 +579,9 @@ async fn inject_commit(node: &TestNode, conversation_id: &str, out: &tavrn_crypt
 }
 
 /// ENCRYPTION.md §4.5 rules 2 and 4 against a leaf that names a member's attested device but carries another key: an
-/// Add of it is refused; if a group holds one, the device's external rejoin must remove it too (a device is in the
-/// group at most once), any member may remove it (its key is not the attested key), and housekeeping lists it.
+/// Add of it is refused; if a group holds one, the device's own external rejoin still works (it replaces the leaf
+/// with its key and tolerates the ghost), any member may remove the ghost (its key is not the attested key), and
+/// housekeeping lists it.
 #[tokio::test]
 async fn leaves_whose_key_is_not_the_attested_key() {
     let (node, mut alice, mut bob, dm) = dm_setup().await;
@@ -608,13 +609,13 @@ async fn leaves_whose_key_is_not_the_attested_key() {
     assert_eq!(j["items"][0]["identity"], bob.identity().as_str(), "{j}");
     assert_eq!(j["items"][0]["reason"], "unattested", "{j}");
 
-    // Bob's device rejoins: the external commit replaces his own leaf but leaves the other one with his identity.
+    // Bob's device rejoins: the external commit replaces his own leaf; the ghost with his identity stays for now.
     let (_, gi) = node.get_auth(&format!("/api/v1/conversations/{dm}/mls/group-info"), bob.token()).await;
     let join = bob.client.join_by_external_commit(&conv, &unb64(&gi["group_info"])).unwrap();
     let (s, j) = node.post_commit(bob.token(), &dm, &join).await;
-    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("mls.forbidden")), "{j}");
-    assert!(j["detail"].as_str().unwrap().contains("must remove the old leaf"), "{j}");
-    bob.client.discard_pending_commit(&conv).unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    bob.client.merge_pending_commit(&conv).unwrap();
+    node.catch_up(&mut alice, &dm).await;
 
     // Removing Bob's genuine leaf stays refused; the leaf with the other key may go.
     let genuine =
@@ -627,14 +628,7 @@ async fn leaves_whose_key_is_not_the_attested_key() {
     let (s, j) = node.post_commit(alice.token(), &dm, &rm).await;
     assert_eq!(s, StatusCode::CREATED, "{j}");
     alice.client.merge_pending_commit(&conv).unwrap();
-
-    // Now the rejoin goes through and the group holds each device once.
-    let (_, gi) = node.get_auth(&format!("/api/v1/conversations/{dm}/mls/group-info"), bob.token()).await;
-    let join = bob.client.join_by_external_commit(&conv, &unb64(&gi["group_info"])).unwrap();
-    let (s, j) = node.post_commit(bob.token(), &dm, &join).await;
-    assert_eq!(s, StatusCode::CREATED, "{j}");
-    bob.client.merge_pending_commit(&conv).unwrap();
-    node.catch_up(&mut alice, &dm).await;
+    node.catch_up(&mut bob, &dm).await;
     let roster = alice.client.roster(&conv).unwrap();
     assert_eq!(roster.len(), 2);
     assert!(roster.iter().any(|e| e.signature_key == bob.client.device().public_key()));

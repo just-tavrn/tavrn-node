@@ -108,7 +108,7 @@ pub async fn serve(state: &AppState, ip: &str, headers: &HeaderMap, body: Body) 
         });
     }
     state.claim_pair_limiter.check_all(&[format!("{}|{}", req.requester, req.user)]).await?;
-    crate::e2ee::claim_budget(state, &user).await?;
+    crate::e2ee::claim_budget(state, &iss, &req.requester, &user).await?;
     let packages = claim_local(state, &user).await?;
     tracing::info!(
         node = iss,

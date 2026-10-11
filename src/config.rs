@@ -460,8 +460,9 @@ pub struct Config {
     /// Devices not seen for this many days are deleted by housekeeping (never the only device of a user, never one
     /// with a live session); `0` = never (default 180).
     pub device_stale_days: u32,
-    /// KeyPackage claims per target user and hour across all requesters, local and from other nodes (1–10000,
-    /// default 60; ENCRYPTION.md §4.5): nobody drains a user's KeyPackages by claiming in many names.
+    /// KeyPackage claims per target user and hour from one source (this node, or one other node) by requesters who
+    /// share no room, DM or friendship with the target (1–10000, default 60; ten times that per target over all
+    /// sources; ENCRYPTION.md §3.2): nobody drains a user's KeyPackages or locks out their contacts.
     pub e2ee_claims_per_target_per_hour: u32,
     /// Who may create applications (bots), APPLICATIONS.md §1.2.
     pub app_creation: AppCreation,
