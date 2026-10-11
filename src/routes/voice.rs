@@ -1160,7 +1160,8 @@ pub async fn public_sound_audio(
             return Ok(r);
         }
         crate::routes::emojis::proxy_limit(&state, &ip)?;
-        let cached = crate::emoji_cache::get(&state, crate::emoji_cache::CacheKind::Sound, host, &sound_id, &ip).await?;
+        let cached =
+            crate::emoji_cache::get(&state, crate::emoji_cache::CacheKind::Sound, host, &sound_id, &ip).await?;
         return Ok(crate::routes::emojis::file_response_tagged(
             cached.data,
             audio_type(&cached.mime),

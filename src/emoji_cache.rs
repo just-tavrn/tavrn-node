@@ -83,13 +83,7 @@ pub fn miss_limit(dev: bool) -> u32 {
 const TOTAL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The copy of `origin_id` from `host`, fetched on the first request; a fetch counts against `ip`'s miss budget.
-pub async fn get(
-    state: &AppState,
-    kind: CacheKind,
-    host: &str,
-    origin_id: &str,
-    ip: &str,
-) -> Result<Cached, ApiError> {
+pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str, ip: &str) -> Result<Cached, ApiError> {
     if !crate::emoji::valid_host(host) || !federation::valid_node_domain(host.split(':').next().unwrap_or(host)) {
         return Err(crate::validate::bad("media.host_invalid", "host must be a node domain"));
     }
@@ -163,7 +157,12 @@ pub async fn get(
         return Err(e.into());
     }
     enforce_host_cap(state, host, &id).await?;
-    if state.media_cache_checked.lock().unwrap_or_else(|e| e.into_inner()).is_none_or(|t| t.elapsed() >= TOTAL_CHECK_INTERVAL) {
+    if state
+        .media_cache_checked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none_or(|t| t.elapsed() >= TOTAL_CHECK_INTERVAL)
+    {
         *state.media_cache_checked.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         enforce_total_cap(state).await?;
     }
@@ -193,8 +192,7 @@ pub async fn enforce_total_cap(state: &AppState) -> Result<u64, ApiError> {
     let cap = i64::try_from(state.config.media_cache_max_bytes).unwrap_or(i64::MAX);
     let used: i64 =
         sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache").fetch_one(&state.db).await?;
-    evict_oldest(state, used - cap, "SELECT id, size FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100", &[])
-        .await
+    evict_oldest(state, used - cap, "SELECT id, size FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100", &[]).await
 }
 
 /// Deletes copies in the order of `query` (oldest use first, pages of at most 100) until `excess` bytes are freed.

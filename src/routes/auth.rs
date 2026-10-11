@@ -586,7 +586,8 @@ pub async fn delete_device(
     if !store::users::delete_device(&state.db, &auth.user.id, &device_id).await? {
         return Err(ApiError::NotFound { code: "device.not_found", what: "Device".into() });
     }
-    crate::sessions::revoke_devices(&state, &auth.user, std::slice::from_ref(&device_id), Reason::DeviceRemoved).await?;
+    crate::sessions::revoke_devices(&state, &auth.user, std::slice::from_ref(&device_id), Reason::DeviceRemoved)
+        .await?;
     crate::e2ee::device_removed(&state, &auth.user, &device_id).await?;
     crate::federation::remote::revoke_sessions(&state, &auth.user, Some(&device_id)).await?;
     crate::federation::remote::devices_changed(&state, &auth.user).await?;

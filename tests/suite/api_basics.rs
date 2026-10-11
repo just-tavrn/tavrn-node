@@ -123,7 +123,8 @@ async fn security_headers_and_the_web_client_csp() {
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(h["referrer-policy"], "no-referrer");
     let pp = h["permissions-policy"].to_str().unwrap();
-    for p in ["camera=(self)", "microphone=(self)", "display-capture=(self)", "geolocation=()", "payment=()", "usb=()"] {
+    for p in ["camera=(self)", "microphone=(self)", "display-capture=(self)", "geolocation=()", "payment=()", "usb=()"]
+    {
         assert!(pp.contains(p), "{p} in {pp}");
     }
     let page = node.get("/some/client/route").await;

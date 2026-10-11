@@ -53,10 +53,10 @@ fn serve(path: &str, cacheable: bool, dev: bool, captcha: bool) -> Option<Respon
         header::CACHE_CONTROL,
         HeaderValue::from_static(if cacheable { "public, max-age=31536000, immutable" } else { "no-cache" }),
     );
-    if path.ends_with(".html") {
-        if let Ok(value) = HeaderValue::from_str(&csp(dev, captcha)) {
-            headers.insert(header::CONTENT_SECURITY_POLICY, value);
-        }
+    if path.ends_with(".html")
+        && let Ok(value) = HeaderValue::from_str(&csp(dev, captcha))
+    {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
     }
     Some(resp)
 }
@@ -127,7 +127,9 @@ mod tests {
                 ]
             );
             let with = directive(&csp(dev, true), "frame-src");
-            assert!(with.starts_with("frame-src https://challenges.cloudflare.com https://*.challenges.cloudflare.com "));
+            assert!(
+                with.starts_with("frame-src https://challenges.cloudflare.com https://*.challenges.cloudflare.com ")
+            );
         }
         assert!(!csp(false, false).contains("cloudflare"), "no captcha, no captcha hosts");
         assert!(directive(&csp(false, true), "script-src").contains("https://challenges.cloudflare.com"));

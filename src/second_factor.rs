@@ -259,8 +259,7 @@ pub async fn start_session(
 ) -> Result<AuthResponse, ApiError> {
     let device_id = session_device(state, user, device_name, client, reuse).await?;
     let tokens = auth::issue_session(state, &user.id, &device_id).await?;
-    let reauth_token =
-        if proof { Some(crate::reauth::for_new_session(state, &user.id, &tokens).await?) } else { None };
+    let reauth_token = if proof { Some(crate::reauth::for_new_session(state, &user.id, &tokens).await?) } else { None };
     Ok(AuthResponse {
         status: SessionStatus::Ok,
         user: user.to_private(),

@@ -433,7 +433,8 @@ async fn a_disabled_account_leaves_its_calls() {
     assert_eq!(st, StatusCode::OK, "{joined}");
     connected(&node, &id, &alice).await;
     connected(&node, &id, &bob).await;
-    let (st, j) = node.patch(&format!("/api/v1/admin/users/{}", bob.user_id), &alice.token, json!({ "disabled": true })).await;
+    let (st, j) =
+        node.patch(&format!("/api/v1/admin/users/{}", bob.user_id), &alice.token, json!({ "disabled": true })).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     let (end, _) = next(&mut rx, "call.end").await;
     assert_eq!(end["conversation_id"], id.as_str(), "{end}");

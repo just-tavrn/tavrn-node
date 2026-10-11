@@ -255,7 +255,13 @@ enum Revocation {
     AdminSecondFactorReset,
 }
 
-async fn revoke(node: &common::TestNode, how: Revocation, alice: &common::Session, victim: &common::Session, admin: &common::Session) {
+async fn revoke(
+    node: &common::TestNode,
+    how: Revocation,
+    alice: &common::Session,
+    victim: &common::Session,
+    admin: &common::Session,
+) {
     use axum::http::{Method, StatusCode};
     let (s, j) = match how {
         Revocation::Logout => node.post("/api/v1/auth/logout", &victim.token, json!({})).await,
@@ -269,19 +275,35 @@ async fn revoke(node: &common::TestNode, how: Revocation, alice: &common::Sessio
         }
         Revocation::ResetPassword => {
             let token = "reset-token-of-the-test";
-            tavrn_node::store::admin::set_password_reset(&node.state.db, &alice.user_id, &tavrn_node::util::sha256_b64(token), 3600)
-                .await
-                .unwrap();
-            node.req(Method::POST, "/api/v1/auth/reset-password", None, Some(json!({ "token": token, "new_password": "a-brand-new-password" })))
-                .await
+            tavrn_node::store::admin::set_password_reset(
+                &node.state.db,
+                &alice.user_id,
+                &tavrn_node::util::sha256_b64(token),
+                3600,
+            )
+            .await
+            .unwrap();
+            node.req(
+                Method::POST,
+                "/api/v1/auth/reset-password",
+                None,
+                Some(json!({ "token": token, "new_password": "a-brand-new-password" })),
+            )
+            .await
         }
-        Revocation::DeleteDevice => node.delete(&format!("/api/v1/users/me/devices/{}", victim.device_id), &alice.token).await,
+        Revocation::DeleteDevice => {
+            node.delete(&format!("/api/v1/users/me/devices/{}", victim.device_id), &alice.token).await
+        }
         Revocation::AdminDisable => {
-            node.patch(&format!("/api/v1/admin/users/{}", alice.user_id), &admin.token, json!({ "disabled": true })).await
+            node.patch(&format!("/api/v1/admin/users/{}", alice.user_id), &admin.token, json!({ "disabled": true }))
+                .await
         }
-        Revocation::NodeBan => node.post("/api/v1/admin/bans", &admin.token, json!({ "subject": "alice@t.local" })).await,
+        Revocation::NodeBan => {
+            node.post("/api/v1/admin/bans", &admin.token, json!({ "subject": "alice@t.local" })).await
+        }
         Revocation::AdminSecondFactorReset => {
-            node.post(&format!("/api/v1/admin/users/{}/second-factor/reset", alice.user_id), &admin.token, json!({})).await
+            node.post(&format!("/api/v1/admin/users/{}/second-factor/reset", alice.user_id), &admin.token, json!({}))
+                .await
         }
     };
     assert!(s == StatusCode::NO_CONTENT || s == StatusCode::OK || s == StatusCode::CREATED, "{how:?}: {s} {j}");
@@ -331,7 +353,8 @@ async fn deleting_another_users_device_revokes_nothing() {
     let mut ws = hello(&url, &bob.token).await;
     let (s, j) = node.delete(&format!("/api/v1/users/me/devices/{}", bob.device_id), &alice.token).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::NOT_FOUND, Some("device.not_found")), "{j}");
-    let (s, j) = node.req(Method::POST, "/api/v1/auth/refresh", None, Some(json!({ "refresh_token": bob.refresh }))).await;
+    let (s, j) =
+        node.req(Method::POST, "/api/v1/auth/refresh", None, Some(json!({ "refresh_token": bob.refresh }))).await;
     assert_eq!(s, StatusCode::OK, "bob's session lives on: {j}");
     assert_eq!(node.get_auth("/api/v1/users/me", &bob.token).await.0, StatusCode::OK);
     assert!(silent(&mut ws, 500).await, "bob's socket stays open");
@@ -354,7 +377,7 @@ async fn sockets_per_user_are_capped() {
                 assert_eq!((u16::from(f.code), f.reason.as_str()), (4002, "too_many_connections"));
                 break;
             }
-            Message::Close(None) => panic!("close without a code"),
+            Message::Close(None) => unreachable!("close without a code"),
             _ => {}
         }
     }

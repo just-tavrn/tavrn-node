@@ -383,12 +383,13 @@ pub async fn revoke_session(db: &Pool, id: &str) -> Result<(), ApiError> {
 /// Revokes the sessions of `device_id` and drops its push subscriptions, only if it is a device of `user_id` (a
 /// device id of another account changes nothing).
 pub async fn revoke_device_sessions(db: &Pool, user_id: &str, device_id: &str) -> Result<(), ApiError> {
-    let r = sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND user_id = $3 AND revoked_at IS NULL")
-        .bind(now())
-        .bind(device_id)
-        .bind(user_id)
-        .execute(db)
-        .await?;
+    let r =
+        sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND user_id = $3 AND revoked_at IS NULL")
+            .bind(now())
+            .bind(device_id)
+            .bind(user_id)
+            .execute(db)
+            .await?;
     // A signed-out device gets no more pushes (PROTOCOL.md §6d).
     if r.rows_affected() > 0 || own_device(db, user_id, device_id).await?.is_some() {
         crate::store::push::delete_for_device(db, device_id).await?;

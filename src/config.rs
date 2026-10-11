@@ -2551,10 +2551,7 @@ mod tests {
             jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES", "1048576");
             jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST", "65536");
             let c = Config::load(false).unwrap();
-            assert_eq!(
-                (c.rate_limit_ipv6_prefix, c.password_hash_concurrency, c.ws_max_sockets_per_user),
-                (56, 3, 5)
-            );
+            assert_eq!((c.rate_limit_ipv6_prefix, c.password_hash_concurrency, c.ws_max_sockets_per_user), (56, 3, 5));
             assert_eq!((c.media_cache_max_bytes, c.media_cache_max_bytes_per_host), (1_048_576, 65_536));
             jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "16");
             assert!(Config::load(false).unwrap_err().to_string().contains("TAVRN_RATE_LIMIT_IPV6_PREFIX"));
