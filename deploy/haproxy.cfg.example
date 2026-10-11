@@ -1,0 +1,35 @@
+# HAProxy (2.x) in front of tavrn. HAProxy tunnels WebSockets (/api/v1/ws, voice signaling under /rtc) by itself
+# once "timeout tunnel" is long enough; it does not limit request bodies (it streams them). The certificate file
+# holds the full chain and the private key. Voice media does not go through HAProxy: publish
+# TAVRN_RTC_UDP_PORT_RANGE (UDP) directly to the tavrn container.
+global
+    log stdout format raw local0
+
+defaults
+    mode http
+    log global
+    option httplog
+    option forwardfor                 # X-Forwarded-For
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+    timeout tunnel  1h                # the WebSockets are long-lived
+
+frontend http
+    bind :80
+    bind [::]:80
+    http-request redirect scheme https code 301
+
+frontend https
+    bind :443 ssl crt /etc/haproxy/certs/chat.example.org.pem alpn h2,http/1.1
+    bind [::]:443 ssl crt /etc/haproxy/certs/chat.example.org.pem alpn h2,http/1.1
+    http-request set-header X-Forwarded-Proto https
+    # The metrics endpoint is for the monitoring inside your network, not for the public (docs/HANDBOOK.md).
+    acl metrics path_beg /metrics
+    acl internal src 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.1
+    http-request deny deny_status 404 if metrics !internal
+    http-response set-header Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    default_backend tavrn
+
+backend tavrn
+    server tavrn1 127.0.0.1:8080 check   # several instances: one server line each

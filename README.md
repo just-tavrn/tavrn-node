@@ -25,8 +25,8 @@ media). The node speaks plain HTTP; a reverse proxy in front terminates TLS.
 
 ## Quick start (Docker Compose)
 
-Requirements: a Linux host with Docker, a domain pointing to it, and a reverse proxy with TLS (nginx, Caddy,
-Traefik or Nginx Proxy Manager; the node never terminates TLS itself). For voice and video, a UDP port range
+Requirements: a Linux host with Docker, a domain pointing to it, and a reverse proxy with TLS (examples for Caddy,
+nginx, Nginx Proxy Manager, Traefik, Apache and HAProxy in `deploy/`; the node never terminates TLS itself). For voice and video, a UDP port range
 and one TCP port must be reachable from the internet.
 
 1. Put [`deploy/docker-compose.yml`](deploy/docker-compose.yml) and [`deploy/.env.example`](deploy/.env.example)

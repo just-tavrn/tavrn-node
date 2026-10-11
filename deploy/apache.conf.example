@@ -1,0 +1,34 @@
+# Apache httpd (2.4.47 or newer) in front of tavrn. Modules: proxy, proxy_http, ssl, headers, rewrite
+# (proxy_wstunnel is not needed: "upgrade=websocket" lets proxy_http tunnel the WebSockets of /api/v1/ws and
+# the voice signaling under /rtc). Certificates e.g. via certbot. Voice media does not go through Apache:
+# publish TAVRN_RTC_UDP_PORT_RANGE (UDP) directly to the tavrn container.
+<VirtualHost *:443>
+    ServerName chat.example.org
+
+    SSLEngine on
+    SSLCertificateFile    /etc/letsencrypt/live/chat.example.org/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/chat.example.org/privkey.pem
+    Protocols h2 http/1.1
+    Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains"
+
+    # Uploads: at least TAVRN_UPLOAD_MAX_BYTES (100 MB here).
+    LimitRequestBody 104857600
+
+    # The metrics endpoint is for the monitoring inside your network, not for the public (docs/HANDBOOK.md).
+    <Location "/metrics">
+        Require ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.1
+    </Location>
+
+    ProxyPreserveHost On
+    ProxyRequests Off
+    RequestHeader set X-Forwarded-Proto "https"
+    # X-Forwarded-For is added by mod_proxy itself.
+    ProxyPass        "/" "http://127.0.0.1:8080/" upgrade=websocket timeout=3600
+    ProxyPassReverse "/" "http://127.0.0.1:8080/"
+</VirtualHost>
+
+<VirtualHost *:80>
+    ServerName chat.example.org
+    RewriteEngine On
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+</VirtualHost>
