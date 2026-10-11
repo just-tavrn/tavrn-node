@@ -24,6 +24,9 @@ First public release of the node and its container image.
 - **Operators**: moderation with reports and evidence, auto-moderation, web push, localized mails with replaceable
   templates, message retention, metrics, legal tooling (takedown notices), clustering with Valkey, the operator
   handbook and deployment examples (Docker Compose, reverse proxies).
+- **Container image for `linux/amd64` and `linux/arm64`**: one manifest list per tag (`edge` and the releases), so
+  the node runs natively on ARM servers; the arm64 image is cross-compiled on the amd64 build host, and a plain
+  `docker build` still builds for the host's own architecture.
 
 ### Security
 
