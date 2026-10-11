@@ -779,3 +779,50 @@ async fn sealed_unlock_material_never_reaches_the_logs() {
         assert!(!logs.contains(secret), "sealed unlock material leaked into the logs:\n{logs}");
     }
 }
+
+/// The exchange proves no credential: the session it creates carries no reauth token, so it cannot pass a sudo-mode
+/// route (deleting the owner's other device).
+#[tokio::test]
+async fn the_exchange_issues_no_reauth_token() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let phone = a.login("alice").await;
+    let code = code_for(&a, &alice.token, ORIGIN).await;
+    let (status, session) = exchange(&a, Some(ORIGIN), &code, VERIFIER).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert!(session["refresh_token"].is_string(), "{session}");
+    assert!(session["reauth_token"].is_null(), "no sudo-mode token from the connect flow: {session}");
+    let new_token = session["access_token"].as_str().unwrap();
+    let (s, j) = a.delete(&format!("/api/v1/users/me/devices/{}", phone.device_id), new_token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.reauth_required")), "{j}");
+}
+
+/// A connect code mints a long-lived session: it needs a fresh proof (a reauth token) like the other sensitive
+/// changes, so a bare access token cannot turn itself into a new device.
+#[tokio::test]
+async fn a_connect_code_needs_a_reauth_token() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    a.forget_reauth(&alice.token);
+    let body = json!({ "origin": ORIGIN, "code_challenge": challenge(VERIFIER) });
+    let (s, j) = a.post("/api/v1/auth/connect/code", &alice.token, body.clone()).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.reauth_required")), "{j}");
+    // With a fresh proof (`POST /auth/reauth`) it works.
+    let (s, r) = a.post("/api/v1/auth/reauth", &alice.token, json!({ "password": common::password("alice") })).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    a.reauth.lock().unwrap().insert(alice.token.clone(), r["reauth_token"].as_str().unwrap().to_string());
+    let (s, j) = a.post("/api/v1/auth/connect/code", &alice.token, body).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
+
+/// REVIEW: an app session (`session_id`, a `login` session) mints a new long-lived session too: it needs a reauth
+/// token like the `origin` variant.
+#[tokio::test]
+async fn review_an_app_session_code_needs_a_reauth_token() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let id = new_session(&a, "Desktop app").await;
+    a.forget_reauth(&alice.token);
+    let (s, j) = confirm(&a, &alice.token, json!({ "session_id": id })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.reauth_required")), "{j}");
+}

@@ -207,10 +207,13 @@ async fn verify_foreign<T: DeserializeOwned>(
     } else {
         let kid = jwt::peek_kid(token).map_err(|_| token_invalid())?;
         let key = super::discovery::key_for(state, iss, &kid).await?;
-        jwt::verify_with_skew::<T>(token, &key, &expected, jwt::FEDERATION_SKEW_SECS).map_err(|e| match e {
-            jwt::JwtError::Expired => token_expired(),
-            _ => token_invalid(),
-        })?
+        let verified =
+            jwt::verify_with_skew::<T>(token, &key, &expected, jwt::FEDERATION_SKEW_SECS).map_err(|e| match e {
+                jwt::JwtError::Expired => token_expired(),
+                _ => token_invalid(),
+            })?;
+        super::discovery::verified(state, iss).await;
+        verified
     };
     if std.iat > std.exp || std.exp - std.iat > max_lifetime || !util::is_ulid(&std.jti) {
         return Err(token_invalid());

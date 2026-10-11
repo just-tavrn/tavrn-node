@@ -418,3 +418,25 @@ async fn a_removed_group_member_is_dropped_from_the_call() {
         state["participants"].as_array().unwrap().iter().map(|p| p["user"].as_str().unwrap()).collect();
     assert_eq!(users, vec!["alice@t.local"], "{state}");
 }
+
+/// A disabled account leaves its running DM call at once (a DM call then ends).
+#[tokio::test]
+async fn a_disabled_account_leaves_its_calls() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let id = dm(&node, &alice, &bob).await;
+    let mut rx = node.state.hub.subscribe();
+    let (st, start) = node.post(&path(&id, "start"), &alice.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{start}");
+    let (st, joined) = node.post(&path(&id, "join"), &bob.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{joined}");
+    connected(&node, &id, &alice).await;
+    connected(&node, &id, &bob).await;
+    let (st, j) =
+        node.patch(&format!("/api/v1/admin/users/{}", bob.user_id), &alice.token, json!({ "disabled": true })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (end, _) = next(&mut rx, "call.end").await;
+    assert_eq!(end["conversation_id"], id.as_str(), "{end}");
+    assert!(!node.state.calls.is_active(&id));
+}

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Email delivery via SMTP (`lettre`). Without `TAVRN_SMTP_URL`, mails are only logged. The texts are localized
+//! Email delivery via SMTP (`lettre`). Without `TAVRN_SMTP_URL` nothing is sent: development nodes log the mails,
+//! production nodes only note that a mail was not sent (never its body, which may carry a token). The texts are localized
 //! templates (`mail_templates.rs`).
 
 use std::sync::{Arc, Mutex};
@@ -94,7 +95,9 @@ pub struct Mailer {
     /// Operator overrides of the templates (`TAVRN_MAIL_TEMPLATES_DIR`).
     templates_dir: std::path::PathBuf,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
-    /// Most recently sent mails (recipient, subject, body), for development and tests.
+    /// Development mode (`--dev`, tests): without SMTP the mails are logged in full and kept in [`Mailer::outbox`].
+    dev: bool,
+    /// Most recently sent mails (recipient, subject, body); development mode and tests only (mails carry tokens).
     pub outbox: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
@@ -114,12 +117,18 @@ impl Mailer {
             domain: config.domain.clone(),
             templates_dir: mail_templates::dir_of(config),
             transport,
+            dev: config.dev,
             outbox: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn smtp_enabled(&self) -> bool {
         self.transport.is_some()
+    }
+
+    /// `true` if a mail can reach its recipient: SMTP is configured, or development mode (the log and the outbox).
+    pub fn can_deliver(&self) -> bool {
+        self.transport.is_some() || self.dev
     }
 
     /// The confirmation mail of a new email address, in the user's language.
@@ -179,15 +188,23 @@ impl Mailer {
     }
 
     async fn deliver(&self, to: &str, subject: String, body: String) -> anyhow::Result<()> {
-        if let Ok(mut o) = self.outbox.lock() {
+        if self.dev
+            && let Ok(mut o) = self.outbox.lock()
+        {
             o.push((to.to_string(), subject.clone(), body.clone()));
             if o.len() > 100 {
                 o.remove(0);
             }
         }
         match &self.transport {
-            None => {
+            // Development: the whole mail in the log (links to click). Production: never the body, it may carry a
+            // reset or verification token.
+            None if self.dev => {
                 tracing::info!(to, subject, "email (no SMTP configured):\n{body}");
+                Ok(())
+            }
+            None => {
+                tracing::info!(to, subject, "email not sent: no SMTP configured (TAVRN_SMTP_URL)");
                 Ok(())
             }
             Some(transport) => {
@@ -248,6 +265,7 @@ mod tests {
             domain: "tavrn.org".into(),
             public_url: Some("https://app.tavrn.org".into()),
             database_url: "postgres://x".into(),
+            dev: true,
             ..Config::default()
         };
         let m = Mailer::from_config(&config);
@@ -257,11 +275,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_smtp_mails_are_only_logged() {
+    async fn without_smtp_mails_are_only_logged_and_kept_in_development_only() {
         let config = Config { domain: "t.local".into(), database_url: "postgres://x".into(), ..Config::default() };
         let m = Mailer::from_config(&config);
         assert!(!m.smtp_enabled());
+        assert!(!m.can_deliver(), "production without SMTP delivers nothing");
         m.send_test("a@b.c").await.unwrap();
-        assert_eq!(m.outbox.lock().unwrap()[0].0, "a@b.c");
+        assert!(m.outbox.lock().unwrap().is_empty(), "no mail (no token) kept in memory in production");
+        let dev = Mailer::from_config(&Config { dev: true, ..config });
+        assert!(dev.can_deliver());
+        dev.send_test("a@b.c").await.unwrap();
+        assert_eq!(dev.outbox.lock().unwrap()[0].0, "a@b.c");
     }
 }

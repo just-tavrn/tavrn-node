@@ -7,8 +7,8 @@ what is configured in the repository and what has to be set by hand.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push to `main`, pull requests, by hand | the organization's `rust-ci.yml` (`cargo fmt`, `cargo clippy` of the node and the load generator, `cargo test` on PostgreSQL with livekit-server, ffmpeg and a Valkey for the cluster tests, incl. the protocol test vectors and the comparison with `protocol/openapi.json`, `cargo deny`); SPDX headers, `scripts/publish-check.sh`, the perf report tests; on pushes to `main` (and manual runs on `main`) the image is published as `ghcr.io/just-tavrn/tavrn-node:edge` (what tavrn-web's end-to-end suite pulls by default); the web client inside it is the current commit of tavrn-web `main` (or `vars.TAVRN_WEB_REF`), resolved before the build so the build cache never serves a stale bundle |
-| `release.yml` | tag `v*.*.*` | checks the tag against `Cargo.toml`, builds the image with the web client of tavrn-web at `TAVRN_WEB_REF` (the organization's `docker-publish.yml`: SLSA provenance, SBOM) and pushes `ghcr.io/just-tavrn/tavrn-node:<version>`, `:<major>.<minor>`, `:latest` and `:sha-…`, then creates the GitHub release |
+| `ci.yml` | push to `main`, pull requests, by hand | the organization's `rust-ci.yml` (`cargo fmt`, `cargo clippy` of the node and the load generator, `cargo test` on PostgreSQL with livekit-server, ffmpeg and a Valkey for the cluster tests, incl. the protocol test vectors and the comparison with `protocol/openapi.json`, `cargo deny`); SPDX headers, `scripts/publish-check.sh`, the perf report tests; on pushes to `main` (and manual runs on `main`) the image is built on `ubuntu-latest` (never on the self-hosted runners) and published as `ghcr.io/just-tavrn/tavrn-node:edge` (what tavrn-web's end-to-end suite pulls by default); the web client inside it is the current commit of tavrn-web `main` (or `vars.TAVRN_WEB_REF`), resolved before the build so the build cache never serves a stale bundle |
+| `release.yml` | tag `v*.*.*` | checks the tag against `Cargo.toml` and that `TAVRN_WEB_REF` is a tavrn-web release tag (a branch fails the release), builds the image GitHub-hosted and without any cache from that tag's commit (the organization's `docker-publish.yml`, pinned by commit: BuildKit's SLSA provenance and SBOM) and pushes `ghcr.io/just-tavrn/tavrn-node:<version>`, `:<major>.<minor>`, `:latest` and `:sha-…`, records GitHub's build provenance attestation of the digest, then creates the GitHub release with the digest |
 | `perf.yml` | nightly, by hand | release builds, the load generator against a release node with PostgreSQL, the budget report (`perf/README.md`) |
 | `gitleaks.yml` | push to `main`, pull requests, by hand | the organization's `gitleaks.yml`: secret scan of the full history (`.gitleaks.toml`) |
 | `dependency-review.yml` | pull requests | refuses vulnerable dependencies and licenses outside the allow-list |
@@ -25,7 +25,7 @@ Every job carries `if: ${{ vars.CI_ENABLED == 'true' }}`.
 |---|---|---|
 | `CI_ENABLED` | variable | `true` switches all workflows on. Unset or anything else: every job is skipped. |
 | `TAVRN_READ_PAT` | secret | Private phase only: fine-grained PAT with `contents: read` on `tavrn-protocol`, `tavrn-crypto`, `tavrn-js` and `tavrn-web`. The reusable workflows get it as `READ_TOKEN`: the Rust job fetches the `protocol/` submodule and the `tavrn-crypto` git dependency with it, the image build receives it as the build secret `read_token` (cargo's git fetch and the web stage cloning tavrn-web and its git dependencies). Delete it once the repositories are public. |
-| `TAVRN_WEB_REF` | variable | Branch, tag or commit of tavrn-web whose web client goes into the image (default `main`). Pin it to a tavrn-web release tag before tagging a node release. |
+| `TAVRN_WEB_REF` | variable | The tavrn-web release tag (`vX.Y.Z`) whose web client goes into release images; a release fails without it or with a branch name. The `edge` image of `main` uses it too (any branch, tag or commit; default `main`). Set it to the tavrn-web release before tagging a node release. |
 | `PUBLISH_CHECK_PRIVATE` | secret | Comma-separated private domains, hosts and addresses that `scripts/publish-check.sh` refuses (the same strings as the owner's local `.publish-check.private`). |
 | Dependabot secrets | secret (Dependabot) | Dependabot pull requests run with Dependabot's own secret store: add `TAVRN_READ_PAT` and `PUBLISH_CHECK_PRIVATE` again under Settings → Secrets and variables → Dependabot (or as organization Dependabot secrets), otherwise their CI fails at the private git dependencies and at the hygiene check. |
 | `CLA_PAT` | organization secret | the CLA bot's token (`contents: write` on `just-tavrn/cla-signatures`). Organization secrets do not reach private repositories on the free plan: until the repository is public, add it as a repository secret as well. |
@@ -45,6 +45,26 @@ GH_TOKEN=$(gh auth token) docker build -f deploy/Dockerfile -t tavrn-node:dev \
 `just docker-build` does the same (`just docker-build local` embeds a prebuilt `web/dist` instead of
 building tavrn-web). The token never ends up in a layer: the Dockerfile reads it from the secret mount inside a single
 `RUN` and hands it to git through environment variables.
+
+## Verifying an image
+
+Every release image carries BuildKit's SLSA provenance and SBOM in the registry. Release images built after the
+repository went public also carry GitHub's build provenance for their digest (GitHub's Free plan has no artifact
+attestations for private repositories, so `release.yml` skips that job until the public switch; the release notes
+print the command when it ran):
+
+```sh
+gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node:<version> --repo just-tavrn/tavrn-node
+docker buildx imagetools inspect ghcr.io/just-tavrn/tavrn-node:<version> --format '{{ json .Provenance }}'
+```
+
+The first proves that `release.yml` of this repository built the digest from the tagged commit on a GitHub-hosted
+runner; the second shows the build's inputs (the Dockerfile's base images, all pinned by digest, and the
+`TAVRN_WEB_REF` commit of tavrn-web). Pin the digest in your compose file (`image:
+ghcr.io/just-tavrn/tavrn-node:<version>@sha256:…`) to run exactly what you verified.
+
+`release.yml` calls the organization's `docker-publish.yml` by commit, not `@main`; bumping it is a reviewed pull
+request (just-tavrn/.github `docs/GITHUB.md` "Reusable workflows in release paths").
 
 ## Settings applied through the API
 

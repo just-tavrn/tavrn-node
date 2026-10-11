@@ -17,7 +17,7 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tavrn-crypto = { git = "https://github.com/just-tavrn/tavrn-crypto", rev = "864fd4a2707f9fba00574ab283299864bc3b79c0" }
+tavrn-crypto = { git = "https://github.com/just-tavrn/tavrn-crypto", rev = "19ac87b4b42b13ec07e0eec5f8c17a2b47f70f37" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

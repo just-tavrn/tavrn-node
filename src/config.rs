@@ -294,6 +294,10 @@ pub struct Config {
     /// Cached copies of other nodes' emojis and clips are evicted after this many days without use;
     /// 0 = never.
     pub media_cache_unused_days: u32,
+    /// Total size of the cached copies of other nodes' emojis and clips; the least recently used go first.
+    pub media_cache_max_bytes: u64,
+    /// Size of the cached copies from one origin node; its least recently used copies go first.
+    pub media_cache_max_bytes_per_host: u64,
     /// Files channels may use external WebDAV/S3 stores (`TAVRN_FILES_EXTERNAL`, default off, FILES.md §5).
     pub files_external: Switch,
     /// External stores may be on private, loopback or link-local addresses and use plain http
@@ -382,6 +386,12 @@ pub struct Config {
     pub federation_remote_bots: bool,
     /// API requests per user and minute (every authenticated route; `0` = off, the default in development mode).
     pub rate_user_per_minute: u32,
+    /// Argon2 password hashes and checks running at once (`0` = twice the CPU cores, at least 2).
+    pub password_hash_concurrency: u32,
+    /// IPv6 client addresses share their per-address rate limits by this prefix length (32–128; 64 = one /64).
+    pub rate_limit_ipv6_prefix: u8,
+    /// WebSocket connections one user may hold at once (`0` = unlimited).
+    pub ws_max_sockets_per_user: u32,
     /// Federated logins per remote domain and minute.
     pub federation_rate_logins: u32,
     /// Inbox messages per remote domain and minute.
@@ -394,6 +404,17 @@ pub struct Config {
     pub federation_max_remote_users: u32,
     /// Remote users per home domain.
     pub federation_max_remote_users_per_domain: u32,
+    /// Seconds a request to a peer waits for a free connection slot (per peer, then node-wide) before it fails
+    /// (1–120, default 10; FEDERATION.md §1.3): one slow peer cannot hold up requests to every other.
+    pub federation_permit_timeout_secs: u32,
+    /// Peers this node learned of only through signed requests whose signature it could not check yet (no
+    /// verified request from them so far): at most this many cached documents (10–1000000, default 1000); unused
+    /// rows are pruned after 30 days.
+    pub federation_max_unverified_peers: u32,
+    /// Discovery fetches at the same time for issuers of requests whose signature cannot be checked yet and for
+    /// which this node has no cached document (1–64, default 12): beyond it such requests are refused at once
+    /// (`503 federation.busy`), so unsigned requests naming many slow domains keep most connection slots free.
+    pub federation_discovery_slots: u32,
     /// Refuse federated logins and inbox messages of peers whose latest conformance result is neither
     /// `pass` nor `warn`, including peers not checked yet (FEDERATION.md §9.4).
     pub federation_require_conformance: bool,
@@ -460,6 +481,10 @@ pub struct Config {
     /// Devices not seen for this many days are deleted by housekeeping (never the only device of a user, never one
     /// with a live session); `0` = never (default 180).
     pub device_stale_days: u32,
+    /// KeyPackage claims per target user and hour from one source (this node, or one other node) by requesters who
+    /// share no room, DM or friendship with the target (1–10000, default 60; ten times that per target over all
+    /// sources; ENCRYPTION.md §3.2): nobody drains a user's KeyPackages or locks out their contacts.
+    pub e2ee_claims_per_target_per_hour: u32,
     /// Who may create applications (bots), APPLICATIONS.md §1.2.
     pub app_creation: AppCreation,
     /// Applications per owner (0–100); node admins are not exempt.
@@ -495,6 +520,9 @@ pub struct Config {
     pub legal_notice_rate_per_hour: u32,
     /// Days a closed case is kept after its last activity (30–36500, default 1095 = 3 years).
     pub legal_notice_retention_days: u32,
+    /// Notices forwarded by other nodes (S2S `legal.notice`) accepted per sending domain and hour (1–1000, default
+    /// 10); all domains together get five times as many.
+    pub legal_notice_inbound_per_hour: u32,
     /// Actioned notices against one user after which the admin page suggests disabling the account (1–100, default
     /// 3); a suggestion only, never automatic.
     pub legal_repeat_threshold: u32,
@@ -588,6 +616,8 @@ impl Default for Config {
             files_channels: Switch::On,
             files_channels_max_bytes: 0,
             media_cache_unused_days: 365,
+            media_cache_max_bytes: 2 * 1024 * 1024 * 1024,
+            media_cache_max_bytes_per_host: 64 * 1024 * 1024,
             files_external: Switch::Off,
             files_external_private: Switch::Off,
             gif_provider: GifProvider::None,
@@ -627,12 +657,18 @@ impl Default for Config {
             federation_dev_peers: String::new(),
             federation_remote_bots: true,
             rate_user_per_minute: 1200,
+            password_hash_concurrency: 0,
+            rate_limit_ipv6_prefix: 64,
+            ws_max_sockets_per_user: 20,
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
             federation_rate_claims: 120,
             federation_max_remote_users: 10_000,
             federation_max_remote_users_per_domain: 1000,
+            federation_permit_timeout_secs: 10,
+            federation_max_unverified_peers: 1000,
+            federation_discovery_slots: 12,
             federation_require_conformance: false,
             federation_remote_user_retention_days: 90,
             federation_notify_bans: false,
@@ -660,6 +696,7 @@ impl Default for Config {
             session_access_minutes: 60,
             session_refresh_days: 90,
             device_stale_days: 180,
+            e2ee_claims_per_target_per_hour: 60,
             app_creation: AppCreation::All,
             apps_per_user: 5,
             apps_per_room: 25,
@@ -675,6 +712,7 @@ impl Default for Config {
             legal_notices: Switch::Off,
             legal_notice_rate_per_hour: 5,
             legal_notice_retention_days: 1095,
+            legal_notice_inbound_per_hour: 10,
             legal_repeat_threshold: 3,
             legal_counter_notice_days: 14,
             legal_terms_mode: TermsMode::Notice,
@@ -812,6 +850,12 @@ impl Config {
 
         self.validate_public_url(&mut problems);
         self.validate_cache(&mut problems);
+        if !(32..=128).contains(&self.rate_limit_ipv6_prefix) {
+            problems.push("TAVRN_RATE_LIMIT_IPV6_PREFIX must be between 32 and 128".into());
+        }
+        if self.media_cache_max_bytes_per_host > self.media_cache_max_bytes {
+            problems.push("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST cannot exceed TAVRN_MEDIA_CACHE_MAX_BYTES".into());
+        }
 
         if self.listen.parse::<std::net::SocketAddr>().is_err() {
             problems.push(format!("TAVRN_LISTEN='{}' is not a valid address (e.g. 0.0.0.0:8080)", self.listen));
@@ -964,6 +1008,9 @@ impl Config {
         if self.device_stale_days > 36_500 {
             problems.push("TAVRN_DEVICE_STALE_DAYS must be between 0 and 36500 (0 = never)".into());
         }
+        if !(1..=10_000).contains(&self.e2ee_claims_per_target_per_hour) {
+            problems.push("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR must be between 1 and 10000".into());
+        }
         if !(13..=99).contains(&self.minimum_age) {
             problems.push("TAVRN_MINIMUM_AGE must be between 13 and 99".into());
         }
@@ -1054,6 +1101,9 @@ impl Config {
         }
         if !(30..=36_500).contains(&self.legal_notice_retention_days) {
             problems.push("TAVRN_LEGAL_NOTICE_RETENTION_DAYS must be between 30 and 36500".into());
+        }
+        if !(1..=1000).contains(&self.legal_notice_inbound_per_hour) {
+            problems.push("TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR must be between 1 and 1000".into());
         }
         if !(1..=100).contains(&self.legal_repeat_threshold) {
             problems.push("TAVRN_LEGAL_REPEAT_THRESHOLD must be between 1 and 100".into());
@@ -1328,6 +1378,15 @@ impl Config {
         }
         if self.federation_rate_claims == 0 {
             problems.push("TAVRN_FEDERATION_RATE_CLAIMS must be greater than 0".into());
+        }
+        if !(1..=120).contains(&self.federation_permit_timeout_secs) {
+            problems.push("TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS must be between 1 and 120".into());
+        }
+        if !(10..=1_000_000).contains(&self.federation_max_unverified_peers) {
+            problems.push("TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS must be between 10 and 1000000".into());
+        }
+        if !(1..=64).contains(&self.federation_discovery_slots) {
+            problems.push("TAVRN_FEDERATION_DISCOVERY_SLOTS must be between 1 and 64".into());
         }
         if !self.dev_misbehave.trim().is_empty() {
             if !self.dev {
@@ -2181,14 +2240,21 @@ mod tests {
         assert!(msg(Config { session_refresh_days: 0, ..prod() }).contains("TAVRN_SESSION_REFRESH_DAYS"));
         assert!(msg(Config { device_stale_days: 36_501, ..prod() }).contains("TAVRN_DEVICE_STALE_DAYS"));
         assert!(Config { device_stale_days: 0, ..prod() }.validate().is_ok(), "0 switches the cleanup off");
+        assert_eq!(c.e2ee_claims_per_target_per_hour, 60);
+        for bad in [0, 10_001] {
+            let c = Config { e2ee_claims_per_target_per_hour: bad, ..prod() };
+            assert!(msg(c).contains("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR"));
+        }
         figment::Jail::expect_with(|jail| {
             jail.set_env("TAVRN_DOMAIN", "env.example");
             jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
             jail.set_env("TAVRN_SESSION_ACCESS_MINUTES", "15");
             jail.set_env("TAVRN_SESSION_REFRESH_DAYS", "30");
             jail.set_env("TAVRN_DEVICE_STALE_DAYS", "0");
+            jail.set_env("TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR", "7");
             let c = Config::load(false).unwrap();
             assert_eq!((c.session_access_minutes, c.session_refresh_days, c.device_stale_days), (15, 30, 0));
+            assert_eq!(c.e2ee_claims_per_target_per_hour, 7);
             Ok(())
         });
     }
@@ -2323,6 +2389,17 @@ mod tests {
         assert_eq!((c.federation_rate_logins, c.federation_rate_inbox), (60, 300));
         assert_eq!((c.federation_rate_api, c.federation_rate_claims), (3000, 120));
         assert_eq!((c.federation_max_remote_users, c.federation_max_remote_users_per_domain), (10_000, 1000));
+        assert_eq!((c.federation_permit_timeout_secs, c.federation_max_unverified_peers), (10, 1000));
+        assert_eq!(c.federation_discovery_slots, 12);
+        assert_eq!(c.legal_notice_inbound_per_hour, 10);
+        for (bad, var) in [
+            (Config { federation_permit_timeout_secs: 0, ..prod() }, "TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS"),
+            (Config { federation_max_unverified_peers: 9, ..prod() }, "TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS"),
+            (Config { federation_discovery_slots: 65, ..prod() }, "TAVRN_FEDERATION_DISCOVERY_SLOTS"),
+            (Config { legal_notice_inbound_per_hour: 0, ..prod() }, "TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR"),
+        ] {
+            assert!(bad.validate().unwrap_err().problems.iter().any(|p| p.contains(var)), "{var}");
+        }
         assert!(c.federation_dev_peers().unwrap().is_empty());
         assert_eq!(c.federation_remote_user_retention_days, 90);
         assert!(!c.federation_notify_bans);
@@ -2524,6 +2601,19 @@ mod tests {
             jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
             jail.set_env("TAVRN_RATE_USER_PER_MINUTE", "90");
             assert_eq!(Config::load(false).unwrap().rate_user_per_minute, 90);
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "56");
+            jail.set_env("TAVRN_PASSWORD_HASH_CONCURRENCY", "3");
+            jail.set_env("TAVRN_WS_MAX_SOCKETS_PER_USER", "5");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES", "1048576");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST", "65536");
+            let c = Config::load(false).unwrap();
+            assert_eq!((c.rate_limit_ipv6_prefix, c.password_hash_concurrency, c.ws_max_sockets_per_user), (56, 3, 5));
+            assert_eq!((c.media_cache_max_bytes, c.media_cache_max_bytes_per_host), (1_048_576, 65_536));
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "16");
+            assert!(Config::load(false).unwrap_err().to_string().contains("TAVRN_RATE_LIMIT_IPV6_PREFIX"));
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "64");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST", "2097152");
+            assert!(Config::load(false).unwrap_err().to_string().contains("PER_HOST"));
             Ok(())
         });
     }

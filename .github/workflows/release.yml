@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Release of tavrn-node: a tag vX.Y.Z builds the container image with the web client of tavrn-web
-# (TAVRN_WEB_REF, repository variable, default main) and pushes it to ghcr.io/just-tavrn/tavrn-node
-# (tags X.Y.Z, X.Y and sha-…, with SLSA provenance and an SBOM), then creates the GitHub release with the
-# image digest (a tag with a hyphen, vX.Y.Z-rc.N, as a pre-release). The website's download page reads the latest
+# Release of tavrn-node: a tag vX.Y.Z builds the container image with the web client of a tavrn-web release
+# (TAVRN_WEB_REF, repository variable: a tavrn-web tag; a branch fails the release) and pushes it to
+# ghcr.io/just-tavrn/tavrn-node (tags X.Y.Z, X.Y and sha-…, with BuildKit's SLSA provenance and an SBOM, built
+# GitHub-hosted without any cache), records GitHub's build provenance attestation for the image digest, then
+# creates the GitHub release with the image digest (a tag with a hyphen, vX.Y.Z-rc.N, as a pre-release). The website's download page reads the latest
 # node release through GitHub's API itself. Gated by CI_ENABLED (docs/GITHUB.md); the private repositories are
 # read with TAVRN_READ_PAT.
 name: Release
@@ -20,6 +21,8 @@ jobs:
     name: Version check
     if: ${{ vars.CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    outputs:
+      web-sha: ${{ steps.web.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,12 +34,38 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match the workspace version $crate in Cargo.toml" >&2
             exit 1
           fi
+      # The web client of a release is a tavrn-web release: TAVRN_WEB_REF must name a tag of tavrn-web, never a
+      # branch (whose content changes under the same name). The image is built from the tag's commit.
+      - name: The web client is a tavrn-web release
+        id: web
+        env:
+          WEB_REF: ${{ vars.TAVRN_WEB_REF }}
+          READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
+        run: |
+          case "$WEB_REF" in
+            v[0-9]*) ;;
+            *) echo "::error::TAVRN_WEB_REF must be a tavrn-web release tag (vX.Y.Z), not '${WEB_REF:-unset}' (docs/GITHUB.md)"; exit 1 ;;
+          esac
+          url="https://github.com/just-tavrn/tavrn-web"
+          [ -n "$READ_TOKEN" ] && url="https://x-access-token:${READ_TOKEN}@github.com/just-tavrn/tavrn-web"
+          refs="$(git ls-remote "$url" "refs/heads/$WEB_REF" "refs/tags/$WEB_REF" "refs/tags/$WEB_REF^{}")"
+          if printf '%s\n' "$refs" | grep -q "refs/heads/"; then
+            echo "::error::tavrn-web has a branch named $WEB_REF: refusing the ambiguous ref"; exit 1
+          fi
+          # The commit of an annotated tag (^{}) or of a lightweight tag.
+          sha="$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk -v r="refs/tags/$WEB_REF" '$2 == r {print $1; exit}')"
+          [ -n "$sha" ] || { echo "::error::tavrn-web has no tag $WEB_REF"; exit 1; }
+          echo "tavrn-web $WEB_REF = $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
   image:
     name: Container image
     needs: version
     if: ${{ vars.CI_ENABLED == 'true' }}
-    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@main
+    # Pinned by commit: a later change of the reusable workflow never reaches a release unreviewed (just-tavrn/.github
+    # docs/GITHUB.md "Reusable workflows in release paths" has the bump procedure).
+    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@986b804e27987dfac8f5568ae1370cc78e1c2c13 # main of 2026-10-11
     permissions:
       contents: read
       packages: write
@@ -44,16 +73,34 @@ jobs:
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
       build-args: |
-        TAVRN_WEB_REF=${{ vars.TAVRN_WEB_REF || 'main' }}
+        TAVRN_WEB_REF=${{ needs.version.outputs.web-sha }}
       push: true
     secrets:
       # Read access to tavrn-crypto (cargo) and tavrn-web (the web stage), passed as the build secret read_token.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
 
+  # GitHub's build provenance for the pushed image (`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node:<version>
+  # --repo just-tavrn/tavrn-node`, docs/GITHUB.md "Verifying an image"). Artifact attestations need a public repository
+  # on GitHub's Free plan: skipped while the repository is private, and the release goes on without it.
+  attest:
+    name: Build provenance attestation
+    needs: image
+    if: ${{ vars.CI_ENABLED == 'true' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      packages: write
+    steps:
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/just-tavrn/tavrn-node
+          subject-digest: ${{ needs.image.outputs.digest }}
+
   release:
     name: GitHub release
-    needs: image
-    if: ${{ vars.CI_ENABLED == 'true' }}
+    needs: [version, image, attest]
+    if: ${{ always() && vars.CI_ENABLED == 'true' && needs.version.result == 'success' && needs.image.result == 'success' && (needs.attest.result == 'success' || needs.attest.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -62,14 +109,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ needs.image.outputs.digest }}
-          WEB_REF: ${{ vars.TAVRN_WEB_REF || 'main' }}
+          WEB_REF: ${{ vars.TAVRN_WEB_REF }}
+          WEB_SHA: ${{ needs.version.outputs.web-sha }}
+          ATTESTED: ${{ needs.attest.result }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           notes="$(mktemp)"
           {
             echo "Container image: \`ghcr.io/just-tavrn/tavrn-node:${version}\` (\`${DIGEST}\`)"
             echo
-            echo "Web client: tavrn-web \`${WEB_REF}\`. Upgrade notes: README.md (\"Upgrading\")."
+            echo "Web client: tavrn-web \`${WEB_REF}\` (\`${WEB_SHA}\`). Upgrade notes: README.md (\"Upgrading\")."
+            if [ "$ATTESTED" = success ]; then
+              echo
+              echo "Verify the image: \`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+            fi
           } > "$notes"
           # A pre-release is never "latest" for the website's download page.
           prerelease=()

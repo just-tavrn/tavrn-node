@@ -147,10 +147,11 @@ pub async fn require_or_password(
     }
 }
 
-/// Checks the current password (rate-limited like the login).
+/// Checks the current password (rate-limited like the login, with a key of its own: failed logins by others do not
+/// lock the owner out of sudo mode).
 pub async fn check_password(state: &AppState, user: &UserRow, password: &str) -> Result<(), ApiError> {
-    state.login_limiter.check_all(&[format!("user:{}", user.username)]).await?;
-    if !user.password_hash.as_deref().is_some_and(|h| crate::auth::verify_password(password, h)) {
+    state.login_limiter.check_all(&[format!("reauth:{}", user.id)]).await?;
+    if !crate::auth::verify(state, password, user.password_hash.as_deref()).await? {
         return Err(ApiError::Unauthorized { code: "auth.invalid_credentials" });
     }
     Ok(())

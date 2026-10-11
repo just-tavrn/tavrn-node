@@ -395,6 +395,8 @@ pub async fn verify_listing(state: &AppState, node: &str, room_id: &str, token: 
     let expected = Expected { iss: node.to_string(), aud: LISTING_AUD.into(), typ: LISTING_TYP };
     let (std, extra): (StandardClaims, ListingExtra) =
         jwt::verify_with_skew(token, &key, &expected, jwt::FEDERATION_SKEW_SECS).ok()?;
+    // A signature of the node verified with its own keys: it is no longer an unverified peer (§1.4).
+    discovery::verified(state, node).await;
     let name_len = extra.name.chars().count();
     if std.sub != room_id
         || std.exp - std.iat > LISTING_TTL_SECS + 600

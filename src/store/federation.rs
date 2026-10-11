@@ -15,13 +15,63 @@ use super::{is_unique_violation, users::USER_COLS};
 
 // ---------------------------------------------------------------- domain policy
 
-/// Node-wide ban of a whole domain (`POST /admin/bans` with a domain subject).
+/// The ban subjects that cover `domain` (FEDERATION.md §1.5, §3.3): the domain itself and its parent domains with
+/// at least two labels (`a.evil.example` → `a.evil.example`, `evil.example`), at most 10.
+pub fn covering_domains(domain: &str) -> Vec<String> {
+    let mut out = vec![domain.to_string()];
+    let mut rest = domain;
+    while let Some((_, parent)) = rest.split_once('.') {
+        if !parent.contains('.') || out.len() >= 10 {
+            break;
+        }
+        out.push(parent.to_string());
+        rest = parent;
+    }
+    out
+}
+
+/// The registrable domain of a node domain, approximated by its last two labels (`a.evil.example` →
+/// `evil.example`): per-domain budgets that must not multiply with wildcard subdomains are counted on it.
+pub fn parent_domain(domain: &str) -> &str {
+    match domain.rmatch_indices('.').nth(1) {
+        Some((i, _)) => &domain[i + 1..],
+        None => domain,
+    }
+}
+
+/// Is `domain` the domain `subject` or one of its subdomains?
+pub fn within_domain(domain: &str, subject: &str) -> bool {
+    domain == subject || domain.strip_suffix(subject).is_some_and(|head| head.ends_with('.'))
+}
+
+/// Node-wide ban of a whole domain or a parent domain (`POST /admin/bans` with a domain subject).
 pub async fn domain_banned(db: &Pool, domain: &str) -> Result<bool, ApiError> {
-    let row = sqlx::query("SELECT 1 AS x FROM bans WHERE room_id IS NULL AND subject = $1 LIMIT 1")
-        .bind(domain)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.is_some())
+    let subjects = covering_domains(domain);
+    let list = (1..=subjects.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
+    let sql = format!("SELECT 1 AS x FROM bans WHERE room_id IS NULL AND subject IN ({list}) LIMIT 1");
+    let mut q = sqlx::query(&sql);
+    for subject in &subjects {
+        q = q.bind(subject);
+    }
+    Ok(q.fetch_optional(db).await?.is_some())
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    #[test]
+    fn bans_cover_subdomains_only() {
+        assert_eq!(covering_domains("a.evil.example"), vec!["a.evil.example", "evil.example"]);
+        assert_eq!(covering_domains("evil.example"), vec!["evil.example"]);
+        assert_eq!(covering_domains(&format!("{}x.example", "a.".repeat(20))).len(), 10);
+        assert!(within_domain("a.evil.example", "evil.example"));
+        assert!(within_domain("evil.example", "evil.example"));
+        assert!(!within_domain("notevil.example", "evil.example"));
+        assert!(!within_domain("example", "evil.example"));
+        assert_eq!(parent_domain("a.b.evil.example"), "evil.example");
+        assert_eq!(parent_domain("evil.example"), "evil.example");
+    }
 }
 
 // ---------------------------------------------------------------- peers
@@ -51,25 +101,66 @@ pub async fn peer_status(db: &Pool, domain: &str) -> Result<Option<String>, ApiE
     Ok(row.map(|r| r.try_get::<String, _>("status")).transpose()?)
 }
 
-/// Stores a freshly fetched, valid document (status stays as it is).
+/// Stores a freshly fetched, valid document and where it came from (`well_known` or `srv`); the status stays as
+/// it is. `origin` (`request`: created to check an unverified request) is set only when the row is created.
 pub async fn upsert_peer(
     db: &Pool,
     domain: &str,
     document: &str,
     fetched_at: &str,
     expires_at: &str,
+    source: &str,
+    origin: Option<&str>,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4",
+        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, source, origin)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4, source = $5",
     )
     .bind(domain)
     .bind(document)
     .bind(fetched_at)
     .bind(expires_at)
+    .bind(source)
+    .bind(origin)
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Where the cached document of a peer came from (`None`: no row, or cached before the source was recorded).
+pub async fn peer_source(db: &Pool, domain: &str) -> Result<Option<String>, ApiError> {
+    let row =
+        sqlx::query("SELECT source FROM federation_peers WHERE domain = $1").bind(domain).fetch_optional(db).await?;
+    Ok(row.map(|r| r.try_get::<Option<String>, _>("source")).transpose()?.flatten())
+}
+
+/// Records that a signed request of the peer verified with its keys (at most one write per peer and day).
+pub async fn mark_peer_verified(db: &Pool, domain: &str, now: &str, cutoff: &str) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE federation_peers SET verified_at = $1 WHERE domain = $2 AND (verified_at IS NULL OR verified_at < $3)",
+    )
+    .bind(now)
+    .bind(domain)
+    .bind(cutoff)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Cached peers known only from requests whose signature never verified (FEDERATION.md §1.4): created to check such
+/// a request, never verified since, and with no users, sign-ins or directory entry here. Peers this node looked up
+/// itself (directory, relays, its users' actions) never count.
+pub async fn count_unverified_peers(db: &Pool) -> Result<i64, ApiError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM federation_peers p WHERE p.origin = 'request' AND p.verified_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE u.domain = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM federation_targets t WHERE t.target = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM directory_nodes d WHERE d.domain = p.domain)",
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(n)
 }
 
 /// Marks a peer (creating a row if needed, with an empty, expired document).
@@ -164,6 +255,22 @@ pub async fn target_domains(db: &Pool, user_id: &str) -> Result<Vec<String>, Api
     rows.iter().map(|r| Ok(r.try_get("target")?)).collect()
 }
 
+/// Does this node have federation history with `domain`: users of it known here since before `known_before` (a stub
+/// the sender itself just caused, for example by a friend request, does not count), local users who signed in
+/// there, or the node listed in this node's directory?
+pub async fn has_history(db: &Pool, domain: &str, known_before: &str) -> Result<bool, ApiError> {
+    let row = sqlx::query(
+        "SELECT 1 AS x FROM users WHERE domain = $1 AND created_at < $2
+         UNION ALL SELECT 1 AS x FROM federation_targets WHERE target = $1
+         UNION ALL SELECT 1 AS x FROM directory_nodes WHERE domain = $1 LIMIT 1",
+    )
+    .bind(domain)
+    .bind(known_before)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some())
+}
+
 // ---------------------------------------------------------------- profiles (home node)
 
 /// `(profile_version, avatar_sha256, avatar media id, avatar mime)` of a user (the still image).
@@ -219,6 +326,18 @@ pub async fn count_users_of_domain(db: &Pool, domain: &str) -> Result<i64, ApiEr
         .fetch_one(db)
         .await?;
     Ok(row.try_get("n")?)
+}
+
+/// Sets the account kind and owner of a remote user from a verified federation token of its home node (a stub
+/// created earlier, for example by a friend request, did not know them).
+pub async fn set_remote_kind(db: &Pool, user_id: &str, kind: &str, owner_id: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET kind = $1, owner_id = $2 WHERE id = $3")
+        .bind(kind)
+        .bind(owner_id)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Creates the users row of a remote user (no password, email or factors) and its mirror state.
@@ -493,14 +612,27 @@ pub async fn invalidate_keys(db: &Pool, user_id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Mirrors the identity key announced by the user's home node.
-pub async fn set_remote_identity(db: &Pool, user_id: &str, key: &str, reset_at: &str) -> Result<(), ApiError> {
+/// A remote user's identity changed (`identity.changed`, FEDERATION.md §5.2): the new key and reset time, and with
+/// `reset_window_at` the start of the user's history window on every membership here (ENCRYPTION.md §7b), in one
+/// transaction: the key change is never recorded without its window.
+pub async fn reset_remote_identity(
+    db: &Pool,
+    user_id: &str,
+    key: &str,
+    reset_at: &str,
+    reset_window_at: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut tx = db.begin().await?;
     sqlx::query("UPDATE users SET identity_pubkey = $1, identity_reset_at = $2 WHERE id = $3")
         .bind(key)
         .bind(reset_at)
         .bind(user_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    if let Some(at) = reset_window_at {
+        super::history::mark_key_reset_tx(&mut tx, user_id, at).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -651,6 +783,21 @@ pub async fn revoke_remote_sessions(
 }
 
 /// Users whose home domain is `domain`, and bots whose owner's home domain is `domain`.
+/// Users of `domain` and of its subdomains (and bots whose owner is one), the users a domain ban covers.
+pub async fn users_within_domain(db: &Pool, domain: &str) -> Result<Vec<UserRow>, ApiError> {
+    let cols: Vec<String> = USER_COLS.split(',').map(|c| format!("u.{}", c.trim())).collect();
+    let rows: Vec<UserRow> = sqlx::query_as(&format!(
+        "SELECT {} FROM users u LEFT JOIN users o ON o.id = u.owner_id
+         WHERE u.domain = $1 OR o.domain = $1 OR u.domain LIKE $2 OR o.domain LIKE $2",
+        cols.join(", ")
+    ))
+    .bind(domain)
+    .bind(format!("%.{domain}"))
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn users_of_domain(db: &Pool, domain: &str) -> Result<Vec<UserRow>, ApiError> {
     let cols: Vec<String> = USER_COLS.split(',').map(|c| format!("u.{}", c.trim())).collect();
     Ok(sqlx::query_as(&format!(
@@ -674,6 +821,12 @@ pub async fn user_by_address(db: &Pool, username: &str, domain: &str) -> Result<
 // ---------------------------------------------------------------- inbox
 
 /// Records an inbox message id of `iss`; `false` if it was seen before (duplicate).
+/// Forgets a seen inbox message whose handling failed on this node's side, so the sender's retry is handled again.
+pub async fn unmark_seen(db: &Pool, iss: &str, id: &str) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM federation_inbox_seen WHERE iss = $1 AND id = $2").bind(iss).bind(id).execute(db).await?;
+    Ok(())
+}
+
 pub async fn mark_seen(db: &Pool, iss: &str, id: &str, kind: &str) -> Result<bool, ApiError> {
     let r = sqlx::query("INSERT INTO federation_inbox_seen (iss, id, type, seen_at) VALUES ($1, $2, $3, $4)")
         .bind(iss)
@@ -819,10 +972,14 @@ pub struct FederationPrune {
     pub targets: u64,
     /// Push hints older than the inbox window and expired invitations.
     pub hints_and_invites: u64,
+    /// Cached peers unused for 30 days that nothing ties to this node.
+    pub peers: u64,
 }
 
 /// Drops spent `jti`s after their expiry, inbox ids and push hints after 7 days, expired invitations and
-/// federation targets after 30 days.
+/// federation targets after 30 days, and cached peer documents (with their key history) not fetched for 30 days
+/// when no user of the domain is known here, no local user signed in there, the directory does not list it and it
+/// is not blocked (FEDERATION.md §1.4).
 pub async fn prune(db: &Pool, now: &str, seen_cutoff: &str, targets_cutoff: &str) -> Result<FederationPrune, ApiError> {
     let replay =
         sqlx::query("DELETE FROM federation_replay WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
@@ -839,5 +996,18 @@ pub async fn prune(db: &Pool, now: &str, seen_cutoff: &str, targets_cutoff: &str
     let hints = super::invites::prune_hints(db, seen_cutoff).await?;
     let invites =
         sqlx::query("DELETE FROM user_invites WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
-    Ok(FederationPrune { replay, inbox_seen, targets, hints_and_invites: hints + invites })
+    let unused = "SELECT domain FROM federation_peers p WHERE p.fetched_at < $1 AND p.status = 'ok'
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE u.domain = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM federation_targets t WHERE t.target = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM directory_nodes d WHERE d.domain = p.domain)";
+    sqlx::query(&format!("DELETE FROM federation_peer_keys WHERE domain IN ({unused})"))
+        .bind(targets_cutoff)
+        .execute(db)
+        .await?;
+    let peers = sqlx::query(&format!("DELETE FROM federation_peers WHERE domain IN ({unused})"))
+        .bind(targets_cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(FederationPrune { replay, inbox_seen, targets, hints_and_invites: hints + invites, peers })
 }

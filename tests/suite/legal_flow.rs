@@ -674,6 +674,8 @@ async fn notices_about_federated_content_are_forwarded_to_its_node() {
     let admin_a = a.register("admina").await;
     let admin_b = b.register("adminb").await;
     let carol = b.register("carol").await;
+    // B accepts forwarded notices only from nodes it has federation history with: B's admin signed in on A.
+    a.sign_in_from(&b, &admin_b).await;
     let room = b.plaintext_room(&carol.token, "B room").await;
     let room_id = room["id"].as_str().unwrap();
     let channel = TestNode::text_channel(&room);
@@ -711,4 +713,52 @@ async fn notices_about_federated_content_are_forwarded_to_its_node() {
     let incomplete = json!({ "case_id": tavrn_node::util::ulid(), "basis": "copyright" });
     let err = tavrn_node::legal::notices::receive(&b.state, "a.test", &incomplete).await.unwrap_err();
     assert_eq!(err.code(), "federation.payload_invalid");
+    // The reporter's address came from A: B sends no confirmation (A confirmed the notice itself).
+    let mails = b.state.mailer.outbox.lock().unwrap().clone();
+    assert!(mails.is_empty(), "{mails:?}");
+}
+
+/// A forwarded notice opens a case that must be kept for years and names an address chosen by the sender: only nodes
+/// with federation history may forward (a stub the sender just caused, e.g. by a friend request, is not history),
+/// within a budget per registrable domain (subdomains share it) and a node-wide hourly budget.
+#[tokio::test]
+async fn forwarded_notices_need_federation_history_and_are_limited() {
+    let (a, b) = two_nodes_with(|_| {}, |c| c.legal_notice_inbound_per_hour = 2).await;
+    let alice = a.register("alice").await;
+    let bob = b.register("bob").await;
+    let payload = || {
+        let mut n = notice("https://b.test/");
+        n["case_id"] = json!(tavrn_node::util::ulid());
+        n["reporter"] =
+            json!({ "name": "Rita Reporter", "email": "victim@example.org", "address": "Street 1", "phone": "" });
+        n
+    };
+    let admit = |iss: &'static str| {
+        let state = b.state.clone();
+        async move { tavrn_node::legal::notices::admit_inbound(&state, iss).await.map_err(|e| e.code().to_string()) }
+    };
+    assert_eq!(admit("a.test").await, Err("legal.forward_refused".into()), "no history yet");
+    // A fresh stub of a user of A (alice signs in on B) is not history yet.
+    b.sign_in_from(&a, &alice).await;
+    assert_eq!(admit("a.test").await, Err("legal.forward_refused".into()), "a stub created just now");
+    // bob of B signed in on A: history.
+    a.sign_in_from(&b, &bob).await;
+    for _ in 0..2 {
+        admit("a.test").await.unwrap();
+        tavrn_node::legal::notices::receive(&b.state, "a.test", &payload()).await.unwrap();
+    }
+    assert_eq!(admit("a.test").await, Err("rate_limited".into()), "the third notice of the hour");
+    // Subdomains share the budget of their registrable domain.
+    let now = tavrn_node::util::now();
+    sqlx::query(
+        "INSERT INTO directory_nodes (domain, name, description, software_name, software_version, capabilities,
+         registration, source, first_seen, last_seen) VALUES ('x.a.test', 'n', '', 'tavrn-node', '0', '[]', 'open', 'relay', $1, $1)",
+    )
+    .bind(&now)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(admit("x.a.test").await, Err("rate_limited".into()), "x.a.test counts against a.test");
+    let mails = b.state.mailer.outbox.lock().unwrap().clone();
+    assert!(mails.iter().all(|(to, _, _)| to != "victim@example.org"), "no mail to the named address: {mails:?}");
 }

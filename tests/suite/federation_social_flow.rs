@@ -421,6 +421,92 @@ async fn forged_invitations_are_refused() {
     assert_eq!(list["items"].as_array().unwrap().len(), 1, "{list}");
 }
 
+/// FEDERATION.md §5.2: a node speaks for its own users only. An inviter of a third node named by the sending node
+/// is unverified: friendship with them does not count, the recipient's DM policy applies as to a stranger, the
+/// invitation is always a request, and it names the node it came through (`via`).
+#[tokio::test]
+async fn a_third_node_inviter_is_unverified() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    a.patch("/api/v1/users/me", &alice.token, json!({ "dm_policy": "friends" })).await;
+    // carol of c.test is alice's friend on A.
+    let carol = tavrn_node::federation::remote::ensure_remote_user(&a.state, "carol", C, "user", None).await.unwrap();
+    tavrn_node::store::social::add_friendship(&a.state.db, &alice.user_id, &carol.id).await.unwrap();
+    let conv = |members: Value| json!({ "conversation": { "node": B, "id": tavrn_node::util::ulid(), "kind": "group", "name": null, "members": members }, "requested": false });
+    let members = json!(["carol@c.test", "alice@a.test"]);
+    let (st, _) = inbox(&b, &a, "conversation.invite", "carol@c.test", "alice@a.test", conv(members.clone())).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    assert_eq!(list["items"], json!([]), "a stranger under dm_policy=friends: dropped: {list}");
+
+    a.patch("/api/v1/users/me", &alice.token, json!({ "dm_policy": "everyone" })).await;
+    let (st, _) = inbox(&b, &a, "conversation.invite", "carol@c.test", "alice@a.test", conv(members)).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{list}");
+    assert_eq!(items[0]["conversation"]["requested"], true, "always a request: {list}");
+    assert_eq!(items[0]["via"], B, "{list}");
+    // An inviter of the sending node itself is what that node vouches for: no `via`.
+    let members = json!(["bob@b.test", "alice@a.test"]);
+    let (st, _) = inbox(&b, &a, "conversation.invite", "bob@b.test", "alice@a.test", conv(members)).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    let own = list["items"].as_array().unwrap().iter().find(|i| i["inviter"] == "bob@b.test").unwrap().clone();
+    assert_eq!(own["via"], Value::Null, "{own}");
+}
+
+/// `ban.notify` (§5.2), like `notify`, only from a node the user signed in on: nobody else can have banned them.
+#[tokio::test]
+async fn ban_notices_come_only_from_nodes_the_user_signed_in_on() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    let mut alice_ws = ws(&a, &alice.token).await;
+    let payload = || json!({ "room": { "node": B, "id": tavrn_node::util::ulid(), "name": "Room" }, "scope": "room" });
+    let (st, _) = inbox(&b, &a, "ban.notify", B, "alice@a.test", payload()).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert!(no_event(&mut alice_ws, "ban.notify", 300).await, "alice never signed in on B");
+    b.sign_in_from(&a, &alice).await;
+    let (st, _) = inbox(&b, &a, "ban.notify", B, "alice@a.test", payload()).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert_eq!(event(&mut alice_ws, "ban.notify").await["room"]["node"], B);
+}
+
+/// ENCRYPTION.md §7b: a remote user's identity reset is recorded together with its history window, failing
+/// closed. When the window cannot be recorded, nothing is: the key stays as it was, the message is refused (`5xx`)
+/// and not remembered as seen, so the home node's retry is handled again.
+#[tokio::test]
+async fn a_remote_identity_reset_is_recorded_with_its_window_or_not_at_all() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    let key = |db: &tavrn_node::db::Pool| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT identity_pubkey FROM users WHERE username = 'alice' AND domain = 'a.test'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let before = key(&b.state.db).await;
+    sqlx::query("DROP TABLE history_reset_epochs").execute(&b.state.db).await.unwrap();
+    let new_key = tavrn_node::keys::NodeKey::generate("k").public_info().x;
+    let payload = json!({ "identity_public_key": new_key, "identity_reset_at": tavrn_node::util::now() });
+    let (st, _) = inbox(&a, &b, "identity.changed", "alice@a.test", B, payload).await;
+    assert!(st.is_server_error(), "{st}");
+    assert_eq!(key(&b.state.db).await, before, "the key change was not recorded without its window");
+    let seen: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM federation_inbox_seen WHERE type = 'identity.changed'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(seen, 0, "a retry is handled again");
+}
+
 // ---------------------------------------------------------------- notify and revocations
 
 #[tokio::test]
@@ -609,4 +695,29 @@ async fn claims_about_local_users_need_their_session_on_the_sending_node() {
     // Users of the sending node itself need nothing more.
     let (st, code) = s2s(&a, &b, inbox, envelope("room.invite", "alice@a.test", "bob@b.test", room), false).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{code}");
+}
+
+/// S2S claims count against a budget per requesting node and target (ENCRYPTION.md §3.2): rotating requester names
+/// of one node do not get past it, but that node's exhausted budget blocks neither claims arriving from elsewhere (here:
+/// local ones) nor the target's friends on the same node.
+#[tokio::test]
+async fn s2s_claims_are_budgeted_per_requesting_node() {
+    let (a, b) = two_nodes().await;
+    let carol = b.register("carol").await;
+    let path = "/api/v1/federation/key-packages/claim";
+    let (st, code) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "x1@a.test" }), false).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
+    while b.state.claim_target_limiter.check(&format!("a.test|{}", carol.user_id)).await.is_ok() {}
+    let (st, _) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "x2@a.test" }), false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a new requester name does not reset the node's budget");
+    let dave = b.register("dave").await;
+    let (st, j) = b.post("/api/v1/users/carol/key-packages/claim", &dave.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "local claims have their own budget: {j}");
+    // alice@a.test is carol's friend: her claims are not limited by the strangers of her node.
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    let stub = tavrn_node::store::federation::user_by_address(&b.state.db, "alice", "a.test").await.unwrap().unwrap();
+    tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &stub.id).await.unwrap();
+    let (st, code) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "alice@a.test" }), false).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
 }

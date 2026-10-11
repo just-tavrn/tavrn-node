@@ -191,6 +191,8 @@ pub async fn join(
     Path(conversation_id): Path<String>,
 ) -> Result<Json<CallJoin>, ApiError> {
     let (conv, _) = call_conversation(&state, &conversation_id, &auth).await?;
+    // Blocks always win (PROTOCOL.md §8a): a blocked person cannot join (or rejoin) the DM's call either.
+    crate::routes::messages::check_not_blocked(&state, &auth, &conv).await?;
     state.voice_limiter.check_all(&[format!("voice:{}", auth.user.id)])?;
     if !state.calls.is_active(&conv.id) {
         return Err(calls::not_active());

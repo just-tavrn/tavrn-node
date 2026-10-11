@@ -60,6 +60,54 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash).is_ok_and(|parsed| argon().verify_password(password.as_bytes(), &parsed).is_ok())
 }
 
+/// Argon2id (64 MiB, about 0.1–0.3 s of CPU) never runs on the async runtime: on the blocking pool, at most
+/// `TAVRN_PASSWORD_HASH_CONCURRENCY` at a time, so a burst of logins cannot stall WebSockets and federation or
+/// exhaust memory.
+async fn blocking_hash<T: Send + 'static>(
+    state: &AppState,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    let permit = state
+        .password_hashing
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("password hashing closed: {e}")))?;
+    // The blocking task holds the slot: a cancelled request (client gone) cannot free it while Argon2 still runs.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("password hashing: {e}")))
+}
+
+/// [`hash_password`] off the async runtime (see [`blocking_hash`]).
+pub async fn hash(state: &AppState, password: &str) -> Result<String, ApiError> {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    blocking_hash(state, move || hash_password(&password)).await?
+}
+
+/// [`verify_password`] off the async runtime (see [`blocking_hash`]). Without a hash (unknown user, bot, SSO-only
+/// account) a dummy hash is verified, so the answer takes as long.
+pub async fn verify(state: &AppState, password: &str, hash: Option<&str>) -> Result<bool, ApiError> {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    let (hash, real) = match hash {
+        Some(h) => (h.to_string(), true),
+        None => (DUMMY_HASH.to_string(), false),
+    };
+    Ok(blocking_hash(state, move || verify_password(&password, &hash)).await? && real)
+}
+
+/// Argon2id hash of a random value, only to spend the same time on unknown users.
+const DUMMY_HASH: &str =
+    "$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHRzb21lc2FsdA$Vh1J9m0K0qYQ9XQy3pQ7F1D2v3kQ1nUO7a0Q7b2Zc4Y";
+
+/// Default of `TAVRN_PASSWORD_HASH_CONCURRENCY`: twice the CPU cores, at least 2.
+pub fn default_hash_concurrency() -> usize {
+    (std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1) * 2).max(2)
+}
+
 /// At least 10 characters, at most 256; no composition rules (NIST 800-63B).
 pub fn valid_password(p: &str) -> bool {
     (10..=256).contains(&p.chars().count())
@@ -295,6 +343,11 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
     if user.is_bot() && user.domain == state.config.domain {
         return Err(invalid("auth.token_invalid"));
     }
+    // A local device whose sessions ended (logout, password change or reset, removal, disabled, …) loses its access
+    // tokens at once, not when they expire (PROTOCOL.md §5b).
+    if user.domain == state.config.domain && !crate::sessions::device_live(state, &extra.dev).await? {
+        return Err(invalid("auth.session_revoked"));
+    }
     if user.domain != state.config.domain {
         // Remote user: federation must (still) be allowed for the home domain and the federated session
         // must be live, so revocations (`session.revoke`) and the 7-day cap take effect immediately.
@@ -307,6 +360,13 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
             .ok_or_else(|| invalid("auth.token_invalid"))?;
         // Node bans of the address or its domain end the API access at once (FEDERATION.md §3.2).
         if store::rooms::is_banned(&state.db, None, &user.address(), &user.domain).await? {
+            return Err(invalid("auth.token_invalid"));
+        }
+        // A peer blocked after a key conflict or by an operator (FEDERATION.md §1.4, §9.4) loses its sessions at once.
+        if store::federation::peer_status(&state.db, &user.domain)
+            .await?
+            .is_some_and(|s| s != crate::federation::discovery::STATUS_OK)
+        {
             return Err(invalid("auth.token_invalid"));
         }
         // A bot whose owner is banned from the node goes too, as at the login (FEDERATION.md §3.2, APPLICATIONS.md §1.7).
@@ -426,37 +486,115 @@ impl FromRequestParts<AppState> for ClientIp {
 
 // ---------------------------------------------------------------- Rate limiter
 
+/// Prefix length IPv6 client addresses are grouped by in rate limit keys (`TAVRN_RATE_LIMIT_IPV6_PREFIX`): one
+/// host usually holds a whole /64, so per-address limits would be no limit at all. Set from the configuration when
+/// the node starts.
+static IPV6_RATE_PREFIX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(64);
+
+/// Sets the prefix of [`rate_key`] (`TAVRN_RATE_LIMIT_IPV6_PREFIX`, 32–128).
+pub fn set_ipv6_rate_prefix(prefix: u8) {
+    IPV6_RATE_PREFIX.store(prefix.clamp(32, 128), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rate limit identity of a client address: IPv4 addresses as they are, IPv6 addresses (except IPv4-mapped
+/// ones) by their network (`2001:db8:1:2::/64`), anything else unchanged.
+pub fn rate_key(ip: &str) -> String {
+    let Ok(addr) = ip.parse::<std::net::Ipv6Addr>() else { return ip.to_string() };
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return v4.to_string();
+    }
+    let prefix = u32::from(IPV6_RATE_PREFIX.load(std::sync::atomic::Ordering::Relaxed));
+    let mask = if prefix >= 128 { u128::MAX } else { !(u128::MAX >> prefix) };
+    format!("{}/{prefix}", std::net::Ipv6Addr::from(u128::from(addr) & mask))
+}
+
+/// A limiter key with its client address normalised by [`rate_key`]: `ip:2001:db8::1` and `ip:2001:db8::2` are the
+/// same key. Every limiter applies it, so no call site can forget it (keys are `<name>:<address>`, also
+/// `domain:<d>|ip:<address>`).
+pub fn normalize_key(key: &str) -> std::borrow::Cow<'_, str> {
+    // An IPv6 address is the rest of the key after one of its colons (it contains colons itself, usernames,
+    // domains and ids never do).
+    for (i, _) in key.match_indices(':') {
+        let rest = &key[i + 1..];
+        if rest.contains(':') && rest.parse::<std::net::Ipv6Addr>().is_ok() {
+            return std::borrow::Cow::Owned(format!("{}{}", &key[..=i], rate_key(rest)));
+        }
+    }
+    std::borrow::Cow::Borrowed(key)
+}
+
+/// Keys above this count make the limiter sweep expired windows (at most once per [`SWEEP_INTERVAL`]).
+const SWEEP_ABOVE: usize = 10_000;
+/// Hard bound of a limiter's map: when even live windows fill it, keys that are not over their limit are dropped.
+const MAX_KEYS: usize = 100_000;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Simple counter per key in a fixed window. Sufficient for a single instance;
 /// multiple instances will use Valkey (phase 5).
 pub struct RateLimiter {
     max: u32,
     window: Duration,
-    hits: Mutex<HashMap<String, (u32, Instant)>>,
+    hits: Mutex<Hits>,
+}
+
+struct Hits {
+    map: HashMap<String, (u32, Instant)>,
+    swept: Instant,
 }
 
 impl RateLimiter {
     pub fn new(max: u32, window: Duration) -> Self {
-        Self { max, window, hits: Mutex::new(HashMap::new()) }
+        Self { max, window, hits: Mutex::new(Hits { map: HashMap::new(), swept: Instant::now() }) }
+    }
+
+    /// Lazy eviction: expired windows go at most once per second, never on every call; a map full of live windows
+    /// keeps only the keys that are over their limit.
+    fn sweep(&self, hits: &mut Hits, now: Instant) {
+        if hits.map.len() <= SWEEP_ABOVE || now.duration_since(hits.swept) < SWEEP_INTERVAL {
+            return;
+        }
+        hits.swept = now;
+        hits.map.retain(|_, (_, start)| now.duration_since(*start) < self.window);
+        if hits.map.len() >= MAX_KEYS {
+            hits.map.retain(|_, (n, _)| *n > self.max);
+        }
     }
 
     /// `Ok(())` or `Err(seconds until the next attempt)`.
     pub fn check(&self, key: &str) -> Result<(), u32> {
+        let key = normalize_key(key);
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if hits.len() > 10_000 {
-            hits.retain(|_, (_, start)| now.duration_since(*start) < self.window);
-        }
-        let entry = hits.entry(key.to_string()).or_insert((0, now));
+        self.sweep(&mut hits, now);
+        let entry = hits.map.entry(key.into_owned()).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
             *entry = (0, now);
         }
-        entry.0 += 1;
+        entry.0 = entry.0.saturating_add(1);
         if entry.0 > self.max {
             let retry = self.window.saturating_sub(now.duration_since(entry.1)).as_secs() as u32 + 1;
             Err(retry)
         } else {
             Ok(())
         }
+    }
+
+    /// Like [`RateLimiter::check`] without counting: `Err(seconds)` while `key` is over its limit.
+    pub fn peek(&self, key: &str) -> Result<(), u32> {
+        let key = normalize_key(key);
+        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match hits.map.get(key.as_ref()) {
+            Some((n, start)) if *n >= self.max && now.duration_since(*start) < self.window => {
+                Err(self.window.saturating_sub(now.duration_since(*start)).as_secs() as u32 + 1)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.hits.lock().unwrap_or_else(|e| e.into_inner()).map.len()
     }
 
     pub fn check_all(&self, keys: &[String]) -> Result<(), ApiError> {
@@ -510,6 +648,62 @@ mod tests {
         assert_eq!(resolve_client_ip(&config, ip("172.18.0.2"), Some("10.0.0.9")), "10.0.0.9");
         assert_eq!(resolve_client_ip(&config, ip("172.18.0.2"), None), "172.18.0.2");
         assert_eq!(resolve_client_ip(&config, None, Some("1.2.3.4")), "unknown");
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_key_per_prefix() {
+        assert_eq!(rate_key("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(rate_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+        assert_ne!(rate_key("2001:db8:1:3::1"), rate_key("2001:db8:1:2::1"));
+        assert_eq!(rate_key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(rate_key("::ffff:203.0.113.9"), "203.0.113.9", "IPv4-mapped counts as IPv4");
+        assert_eq!(rate_key("unknown"), "unknown");
+        assert_eq!(normalize_key("ip:2001:db8::1"), "ip:2001:db8::/64");
+        assert_eq!(normalize_key("forgot:2001:db8::2"), "ip:2001:db8::/64".replace("ip:", "forgot:"));
+        assert_eq!(normalize_key("domain:a.example|ip:2001:db8::7"), "domain:a.example|ip:2001:db8::/64");
+        assert_eq!(normalize_key("ip:203.0.113.9"), "ip:203.0.113.9");
+        assert_eq!(normalize_key("user:alice"), "user:alice");
+        assert_eq!(normalize_key("2fa:01J9ZZZZZZZZZZZZZZZZZZZZZZ"), "2fa:01J9ZZZZZZZZZZZZZZZZZZZZZZ");
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(rl.check("ip:2001:db8::1").is_ok());
+        assert!(rl.check("ip:2001:db8::2").is_ok());
+        assert!(rl.check("ip:2001:db8::3").is_err(), "rotating addresses within a /64 share the limit");
+        assert!(rl.check("ip:2001:db8:0:1::1").is_ok(), "another /64 has its own");
+    }
+
+    #[test]
+    fn the_limiter_sweeps_lazily_and_stays_bounded() {
+        let rl = RateLimiter::new(1, Duration::from_millis(20));
+        for i in 0..(SWEEP_ABOVE + 100) {
+            let _ = rl.check(&format!("k{i}"));
+        }
+        assert!(rl.len() > SWEEP_ABOVE, "no sweep within the first second");
+        std::thread::sleep(Duration::from_millis(1100));
+        let _ = rl.check("fresh");
+        assert_eq!(rl.len(), 1, "expired windows go in one sweep");
+        // A map full of live windows keeps only the keys over their limit.
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        let _ = rl.check("blocked");
+        let _ = rl.check("blocked");
+        for i in 0..MAX_KEYS {
+            let _ = rl.check(&format!("k{i}"));
+        }
+        rl.hits.lock().unwrap().swept = Instant::now() - SWEEP_INTERVAL;
+        let _ = rl.check("next");
+        assert!(rl.len() <= 2, "{}", rl.len());
+        assert!(rl.peek("blocked").is_err(), "a blocked key stays blocked");
+    }
+
+    #[test]
+    fn peek_does_not_count() {
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        assert!(rl.peek("a").is_ok());
+        assert!(rl.check("a").is_ok());
+        assert!(rl.peek("a").is_ok());
+        assert!(rl.check("a").is_ok());
+        assert!(rl.peek("a").is_err(), "at the limit: the next attempt would be refused");
+        assert!(rl.peek("a").is_err());
+        assert!(rl.check("b").is_ok());
     }
 
     #[test]

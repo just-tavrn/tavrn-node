@@ -101,7 +101,8 @@ pub async fn get_profile(
     if user.disabled_at.is_some() || (user.domain != state.config.domain && !state.config.federation_enabled) {
         return Err(user_not_found());
     }
-    if user.domain != state.config.domain {
+    // At most one background refresh per remote user and minute, however often the profile is read.
+    if user.domain != state.config.domain && state.profile_refresh_limiter.check(&user.id).is_ok() {
         let (state, user) = (state.clone(), user.clone());
         tokio::spawn(async move {
             if let Err(e) = crate::federation::profiles::refresh(&state, &user, None).await {

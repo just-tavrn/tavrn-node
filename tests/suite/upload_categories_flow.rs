@@ -253,3 +253,18 @@ async fn encrypted_uploads_declare_their_category_and_dms_use_the_node_default()
     let r = upload(Some("archives"), dm_id.clone(), alice.token.clone()).await;
     assert_eq!(forbidden(&r), Some(("archives", false)));
 }
+
+/// The executable rule judges the name the file is stored and downloaded under: control characters (`run.bat%00`)
+/// and bidirectional overrides (`a<U+202E>gpj.bat`, shown as `abat.jpg`) cannot disguise a script.
+#[tokio::test]
+async fn disguised_executable_names_are_refused() {
+    let s = setup_with(|_| {}).await;
+    for name in ["run.bat%00", "setup.msi%01", "a%E2%80%AEgpj.bat", "x.hta%1F"] {
+        let r = up(&s.node, &s.bob.token, &s.channel, name, "text/plain", b"echo hi").await;
+        assert_eq!(forbidden(&r), Some(("other", true)), "{name}: {:?}", r.1);
+    }
+    // A harmless name keeps its text, without the bidi control.
+    let r = up(&s.node, &s.bob.token, &s.channel, "notes%E2%80%AE.txt", "text/plain", b"hello").await;
+    assert_eq!(r.0, StatusCode::CREATED, "{}", r.1);
+    assert_eq!(r.1["name"], "notes.txt", "{}", r.1);
+}

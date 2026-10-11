@@ -46,7 +46,7 @@ needs a few open ports, and SMTP and Valkey are optional.
 | **A data volume** | `./data`, mounted at `/data`: the node's keys and the uploaded files. Back it up together with the database ([Keys and backups](#keys-and-backups)). |
 | **Ports for voice** | A UDP range (default `61000-61100`) and one TCP port (default `7881`) reachable from the internet, published 1:1 to the container and forwarded by the router. Optional: UDP `3478` for TURN, and TURN over TLS on 443 through the proxy. Voice can be switched off (`TAVRN_VOICE_ENABLED=false`). See [Voice and video](#voice-and-video). |
 | **Outbound HTTPS** | Federation with other nodes, the reference nodes of the directory, link previews, web push to the browser vendors' push services, the SSO provider and the captcha or GIF provider when configured. |
-| **Optional: SMTP** | E-mail confirmation, password resets and legal notices (`TAVRN_SMTP_URL`). Without it the node works without e-mail. |
+| **Optional: SMTP** | E-mail confirmation, password resets and legal notices (`TAVRN_SMTP_URL`). Without it the node works without e-mail: "Forgot password" answers `503 mail.unavailable` (a node admin resets the second factor or the account instead), and mails are not sent (the log notes the recipient and subject, never the body; only development nodes log whole mails). |
 | **Optional: Valkey or Redis ≥ 7** | Only to run one node as several instances behind a load balancer ([Scaling with Valkey](#scaling-with-valkey)). |
 
 ## Install with Docker Compose
@@ -141,7 +141,7 @@ These settings fix the node's identity domain, where it is served and which data
 | `TAVRN_NAME` | `tavrn` | Display name of the node (directory, discovery document). |
 | `TAVRN_DESCRIPTION` | empty | Short description of the node (directory). |
 | `TAVRN_LISTEN` | `0.0.0.0:8080` | Address and port of the plain-HTTP server. |
-| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. Connections from elsewhere are rate-limited and banned by their own address. Also decides who may read `/metrics` without a token. |
+| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. |
 | `TAVRN_DATABASE_URL` | empty (compose: built from `POSTGRES_PASSWORD`) | `postgres://user:password@host:port/db` (or `postgresql://`). `sqlite:` only with `--dev`. |
 | `TAVRN_DATA_DIR` | `/data` (image) | Directory for `keys/`, `blobs/` (stored files) and the generated LiveKit configuration. |
 | `TAVRN_ADMIN_USERS` | empty | Comma-separated usernames with node admin rights (besides the first registered account). |
@@ -165,10 +165,14 @@ and sessions work and the minimum age.
 | `TAVRN_CAPTCHA_LOGIN` | `false` | Require the captcha at login (only with a provider). |
 | `TAVRN_WEBAUTHN_ORIGIN` | the public URL | Origin of the web client for passkeys. Override only for development and tests (e.g. `http://localhost:5173`). |
 | `TAVRN_WEBAUTHN_RP_ID` | `TAVRN_DOMAIN` | Relying party id of passkeys; must be the host of the origin or a parent domain of it, otherwise the node refuses to start. Changing it later invalidates every registered passkey ([Passkeys](#passkeys)). |
-| `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). |
+| `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). A revocation (logout, password change or reset, device removal, an admin disabling the account or resetting its second factor, a node ban, account deletion) ends the access tokens and WebSockets of the affected devices at once (`401 auth.session_revoked`, close code 4001), and their voice and call connections; the node checks the session behind a token at most every 5 seconds per device and instance. |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
-| `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
+| `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route and WebSocket connect (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
+| `TAVRN_RATE_LIMIT_IPV6_PREFIX` | `64` | Per-address rate limits (login, registration, password reset, connect, directory, the emoji and sound proxy, …) count IPv6 clients by this prefix (32–128): one host usually holds a whole /64. IPv4 addresses count one by one. |
+| `TAVRN_PASSWORD_HASH_CONCURRENCY` | `0` (twice the CPU cores, at least 2) | Password hashes and checks (Argon2id, 64 MiB each) running at once, off the request threads; further logins wait for a slot. |
+| `TAVRN_WS_MAX_SOCKETS_PER_USER` | `20` | WebSocket connections one user may hold at once per instance (`0` = unlimited); beyond it the socket is closed with 4002 `too_many_connections`. App tokens keep their own limit of two. |
 | `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. |
+| `TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR` | `60` | KeyPackage claims for one user per hour from one source (this node, or one other node) by requesters who share no room, DM, group DM or friendship with the user (1–10000); ten times that per user over all sources. Requesters who share one of these, and a user's claims for their own devices, are not counted. Protects users from having their KeyPackages drained by claims in many names without locking out their contacts. |
 | `TAVRN_MINIMUM_AGE` | `16` | Minimum age for registration (13–99). Every registration path asks for the date of birth and refuses younger people; see [Age gates](#age-gates). |
 | `TAVRN_DM_POLICY` | `everyone` | Upper bound of every user's "Who can message me": `friends`, `everyone_shared` (friends and shared rooms) or `everyone` (`open` is the old name). Users choose within it (their default is `everyone_shared`); non-friends land in the recipient's message requests; blocks always apply. |
 
@@ -306,6 +310,8 @@ These settings limit who creates rooms and how many, how large uploads may be an
 | `TAVRN_EMOJI_MAX_BYTES` | `262144` (256 KiB) | Largest custom emoji file. |
 | `TAVRN_PREVIEW_AUTO_MAX_BYTES` | `5242880` (5 MiB) | Images up to this size load as previews by themselves where the user's setting allows it (always / friends and shared rooms / never); larger ones show a placeholder with a "Load" button. `0` = never automatically. |
 | `TAVRN_MEDIA_CACHE_UNUSED_DAYS` | `365` | Cached copies of other nodes' custom emojis and soundboard clips are evicted after this many days without use; `0` = never. |
+| `TAVRN_MEDIA_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | Total size of those cached copies; beyond it the least recently used go (checked at most every 10 seconds per instance and by the hourly housekeeping). |
+| `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST` | `67108864` (64 MiB) | Size of the cached copies from one origin node (at most `TAVRN_MEDIA_CACHE_MAX_BYTES`); beyond it that node's least recently used copies go. Fetches for copies not cached yet are limited to 60 per client address and minute. |
 
 ### Entitlement defaults
 
@@ -397,6 +403,9 @@ These settings decide whether and with whom the node federates and how it takes 
 | `TAVRN_FEDERATION_RATE_CLAIMS` | `120` | KeyPackage claims per requesting node and minute (> 0). |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS_PER_DOMAIN` | `1000` | Remote users per home domain. |
+| `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` | `10` | How long a request to a peer waits for one of the peer's 4 connection slots and then one of the 64 node-wide slots before it fails (1–120). A slow peer only ever ties up its own slots. |
+| `TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS` | `1000` | Cached discovery documents of peers no signed request of which ever verified here (10–1000000). Beyond it, unsigned requests naming a new domain are refused (`503 federation.peer_limit`) before any fetch. Peers this node looked up itself, listed in its directory, or with users or sign-ins never count. Failed fetches are remembered for 60 seconds per domain, and peers unused for 30 days that nothing ties to the node are pruned. |
+| `TAVRN_FEDERATION_DISCOVERY_SLOTS` | `12` | Discovery fetches at the same time for unknown issuers of requests not verified yet (1–64). When all are taken such requests are refused at once (`503 federation.busy`), so unsigned requests naming many slow domains cannot take the connection slots that known peers need. |
 | `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS` | `90` | Remote users without a federated login for this many days and with nothing left on this node (no memberships, friendships, blocks, messages, …) are deleted by the hourly housekeeping; `0` keeps them forever. |
 | `TAVRN_FEDERATION_NOTIFY_BANS` | `false` | `true`: tell the home node of a remote user that a room or node ban removed them from a room (`ban.notify`, information only, never the reason). |
 | `TAVRN_FEDERATION_REQUIRE_CONFORMANCE` | `false` | `true`: also refuse federated logins and inbox messages of nodes that were not checked yet or failed ([conformance checks](#conformance-checks-of-other-nodes)). |
@@ -442,6 +451,7 @@ Details: [Legal pages and GDPR](#legal-pages-and-gdpr).
 | `TAVRN_LEGAL_NOTICES` | `off` | `on` opens the public takedown notice form `/legal/notice` (captcha when configured). Notices forwarded by other nodes are accepted either way. |
 | `TAVRN_LEGAL_NOTICE_RATE_PER_HOUR` | `5` (`--dev`: 1000) | Notices per client address and hour (1–1000). |
 | `TAVRN_LEGAL_NOTICE_RETENTION_DAYS` | `1095` | Cases are kept this long after their last change (30–36500; 1095 = 3 years). |
+| `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` | `10` | Notices forwarded by other nodes accepted per sending registrable domain (its subdomains share the budget) and hour (1–1000); five times as many from all domains together. Only nodes this node has history with (its users signed in there, users of that node known here for at least a day, or listed in its directory) may forward; forwarded cases get no confirmation mail here. |
 | `TAVRN_LEGAL_REPEAT_THRESHOLD` | `3` | Actioned notices against one user after which the admin page suggests disabling the account (1–100; a suggestion only, never automatic). |
 | `TAVRN_LEGAL_COUNTER_NOTICE_DAYS` | `14` | Days the uploader may answer an actioned notice with a counter-notice (1–365). |
 | `TAVRN_LEGAL_TERMS_MODE` | `notice` | `notice`: ask once after a new version of the terms; `require`: refuse the API (`403 legal.terms_required`) until accepted (declining signs out). |
@@ -538,7 +548,8 @@ Complete examples are in the repository:
   `X-Forwarded-Proto`, the WebSocket headers (`Upgrade $http_upgrade`, `Connection "upgrade"`) and
   `proxy_read_timeout 3600s`, plus the HTTP → HTTPS redirect. Certificates e.g. via certbot.
 - [`deploy/Caddyfile.example`](../deploy/Caddyfile.example): `reverse_proxy 127.0.0.1:8080` with automatic
-  certificates and a 100 MB body limit; Caddy passes WebSockets and `X-Forwarded-For` by itself.
+  certificates, a 100 MB body limit, HSTS (`header Strict-Transport-Security "max-age=63072000"`, Caddy sends none by
+  itself) and `respond /metrics 404`; Caddy passes WebSockets and `X-Forwarded-For` by itself.
 
 Several instances: list every instance as an upstream (nginx `upstream`, Caddy `reverse_proxy` with several
 upstreams), see [Load balancer](#load-balancer).
@@ -668,13 +679,21 @@ _tavrn._tcp.example.org. 3600 IN SRV 10 0 443 chat.example.org.
 
 Resolution order (FEDERATION.md §1.3 has the decision table): `https://example.org/.well-known/tavrn` first; when
 the website has no such file (404) or there is no HTTPS server on `example.org` at all, the SRV record
-(`TAVRN_FEDERATION_SRV_FALLBACK`, default on): the document is fetched from
-`https://chat.example.org:443/.well-known/tavrn` (the node serves it on its own host) and must name
-`example.org`; only then, after a 404, the direct `https://example.org/api/v1`. Other HTTP errors (5xx, 403, …)
+(`TAVRN_FEDERATION_SRV_FALLBACK`, default on): other nodes connect to `chat.example.org` port 443 but ask for
+`https://example.org:443/.well-known/tavrn` (TLS server name and `Host` are `example.org`), and the document must
+name `example.org`; only then, after a 404, the direct `https://example.org/api/v1`. Other HTTP errors (5xx, 403, …)
 are errors. Browsers cannot query DNS records, so web clients ask the node they were loaded from
 (`GET /api/v1/federation/resolve/example.org`), which runs the same order: the connect flow, invites and add links
-work with an SRV-only setup too. It relies on DNS (use DNSSEC where you can); the conformance and
-key-consistency checks still apply.
+work with an SRV-only setup too.
+
+**The SRV target must serve a certificate valid for the identity domain** (`example.org`), not only for its own
+name: a SAN entry for `example.org` (or a wildcard that covers it) on the certificate of `chat.example.org`
+suffices, and the reverse proxy must answer requests with `Host: example.org` on that port. A certificate valid only
+for `chat.example.org` is refused. The reason: DNS answers can be spoofed on the network path, and a spoofed SRV
+record must not be enough to impersonate your node; a certificate for the identity domain is. The conformance and
+key-consistency checks still apply, and a document that suddenly comes from the SRV path with none of the known
+keys is treated as a key conflict (peers block the node until their operators unblock it), so keep at least one
+old key published while you move between the well-known file and an SRV record.
 
 #### Passkeys
 
@@ -739,7 +758,7 @@ All of them are created at the first start with mode 0600:
 
 | File | What it is | If it is lost or replaced |
 |---|---|---|
-| `keys/node-<kid>.pem` | The node's Ed25519 signing keys (federation, tokens). All keys in the directory are published in `/.well-known/tavrn`; the newest one signs. | Other nodes no longer trust the node's identity. |
+| `keys/node-<kid>.pem` | The node's Ed25519 signing keys (federation, tokens). All keys in the directory are published in `/.well-known/tavrn`; the newest one signs. A generated key's `kid` is its creation date plus a random suffix (`20261011-3f9a1c`). | Other nodes no longer trust the node's identity: a node that starts without this directory generates a new key, and peers that knew the old one refuse the node until their operators unblock it (a lost key is never recovered by restarting). |
 | `keys/secrets.key` | 32 random bytes that encrypt data at rest such as the users' TOTP secrets and the credentials of [external file stores](#files-channels-on-external-stores), and the single-use values in the cache with several instances. Never rotated. | Every TOTP enrollment becomes unusable (users then need a passkey, a recovery code or an admin reset of their second factor), and files channels on external stores need their credentials entered again. |
 | `keys/storage.key` | The storage key: wraps the per-file keys of every stored file (attachments, avatars, headers, room icons, emojis, soundboard clips). `keys/storage.key.next` exists only during a [rotation](#rotating-the-storage-key). | **Every stored file is unreadable**; the node refuses to start when the file is missing or does not match the stored keys. |
 | `keys/livekit.key` | LiveKit's API key and secret (`<key>: <secret>`). | Regenerated at the next start, nothing lost. With several instances all must use the same file. |
@@ -1004,7 +1023,8 @@ Outbound federation requests go only to public addresses (private and loopback a
 The operator decides which nodes this node federates with and how much load other nodes may cause.
 
 - `TAVRN_FEDERATION_BLOCKLIST`: domains never federated with, including their subdomains. Node admins can also
-  block a node in the Federation tab of the node administration.
+  block a node in the Federation tab of the node administration. Node and room bans of a domain also cover its
+  subdomains (a ban of `evil.example` refuses `a.evil.example`).
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
   blocklist still wins.
 - Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;
@@ -1599,6 +1619,7 @@ that holds them.
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
 | Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives ([Command interactions](#command-interactions)). |
 | `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
+| Session liveness of access tokens (`sessions.rs`) | per instance | Positive answers are reused for 5 seconds per device; a revocation clears the entries of the instance that handled it at once, the others follow within 5 seconds (WebSockets everywhere close at once through the event bus). |
 
 #### Rate limits
 
@@ -1606,7 +1627,7 @@ Limits that protect against guessing and abuse are shared across the instances; 
 
 | Limiter | Decision | Reason |
 |---|---|---|
-| `login_limiter` (login, re-auth, connect exchange, federated login, device nonces, identity reset), `register_limiter` (registration, forgot password) | **shared** | Password guessing and account creation must not scale with the number of instances. |
+| `login_limiter` (login per address and failed logins per account, re-auth and identity reset per account with keys of their own, password change, connect exchange, federated login, device nonces), `register_limiter` (registration, forgot password per address), `forgot_limiter` (reset mails per account, 3 per hour) | **shared** | Password guessing and account creation must not scale with the number of instances. Only failed logins count against an account, and the right password with a valid device proof passes even then, so nobody can lock an owner out by guessing. |
 | `second_factor_user_limiter`, `second_factor_ip_limiter` | **shared** | TOTP / recovery code guessing. |
 | `federation_inbox_limiter`, `federation_login_limiter`, `federation_token_limiter` | **shared** | Per remote domain / device; a peer or token must not get N× its quota. |
 | `claim_pair_limiter` | **shared** | Protects KeyPackages from being drained by one requester. |
@@ -1614,7 +1635,7 @@ Limits that protect against guessing and abuse are shared across the instances; 
 | `app_request_limiter`, `app_token_limiter`, `app_rotate_limiter`, `app_create_limiter` | **shared** | Protocol limits of applications and token issuance (APPLICATIONS.md §2.7). |
 | `connect_session_limiter`, `connect_session_node_limiter`, `connect_poll_limiter`, `connect_poll_ip_limiter` | **shared** | App sessions of the connect flow (FEDERATION.md §8 step 3): unauthenticated creation per IP and for the whole node, polls per session and IP. |
 | `voice_limiter`, ring limiter of calls, `ephemeral_limiter` | node-wide by relaying | Their routes are relayed to the leader, so the leader's counter is the node's. |
-| `user_api_limiter` (`TAVRN_RATE_USER_PER_MINUTE`), `files_limiter` (files list and search 120, uploads 120 per user and minute), `purge_limiter` (purge previews, 10 per moderator and minute), `media_proxy_limiter` (the unauthenticated emoji and sound proxy `?host=`, 600 per address and minute), room presence toggles (`presence_limiter`, 60 per user and minute) | per instance | Load shedding: generous limits that bound what one account (or one address for the proxy) can make an instance do. |
+| `user_api_limiter` (`TAVRN_RATE_USER_PER_MINUTE`), `files_limiter` (files list and search 120, uploads 120 per user and minute), `purge_limiter` (purge previews, 10 per moderator and minute), `media_proxy_limiter` (the unauthenticated emoji and sound proxy `?host=`, 600 per address and minute) and `media_miss_limiter` (its fetches from other nodes, 60 per address and minute), room presence toggles (`presence_limiter`, 60 per user and minute) | per instance | Load shedding: generous limits that bound what one account (or one address for the proxy) can make an instance do. |
 | `claim_limiter`, `key_package_limiter`, `commit_limiter`, `backup_limiter`, `friend_limiter`, `conversation_limiter`, `secret_storage_limiter`, `read_limiter`, `presence_limiter`, `media_limiter`, `scene_limiter`, `admin_limiter`, `direct_invite_limiter`, `room_invite_inbox_limiter`, `notify_limiter`, `keys_fetch_limiter`, `directory_announce_limiter`, `directory_limiter`, `federation_api_limiter`, `federation_claim_limiter`, `bot_message_limiter`, `bot_dm_limiter`, unfurl per user, OIDC start/token per IP, files backend changes | per instance | Load shedding and spam damping of authenticated or already-signed traffic: with N instances a client gets at most N× the budget, which bounds the load per instance exactly as before. The OIDC exchange guards 256-bit codes, not a guessable secret. |
 
 #### Single-use tokens, nonces and challenges
@@ -2092,7 +2113,7 @@ the configuration first and exits with code **2** on a configuration error. The 
 |---|---|---|
 | `serve` (default) | Starts the server. | `1` on an error, `3` when `TAVRN_CACHE_URL` is set but Valkey is unreachable at start. |
 | `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. Also the image's health check. | `0` ok, `2` problem. |
-| `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP the mail is only logged). | `0` sent, `1` failed. |
+| `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP nothing is sent and the log says so). | `0` sent, `1` failed. |
 | `doctor --peer <domain>` | Runs the [conformance checks](#conformance-checks-of-other-nodes) against another node with this node's configuration, keys and database and prints one line per check (`pass`, `warn`, `fail`, `skip` with a reason). The result is stored like an admin's check (a hard failure blocks the peer). Run it while the node is running: the other node claims the probe's keys from it. | `0` ok, `1` hard failure, `2` the check could not run. |
 | `rotate-storage-key` | [Rotates the storage key](#rotating-the-storage-key). Stop the node first; back up the new key file afterwards. Resumable. | `0` done, `1` failed. |
 | `well-known` | Prints the discovery document (`/.well-known/tavrn`) for a [static copy](#identity-domain-and-node-host-delegation) on the identity domain. Needs the node keys (start the node once first). | `0` ok, `2` no keys. |
@@ -2146,6 +2167,9 @@ These are the problems operators run into most often, each with its cause and fi
 | Other nodes cannot reach yours, or the directory does not list it | `https://<TAVRN_DOMAIN>/.well-known/tavrn` must be reachable with a valid certificate; with delegation check the proxy rule or SRV record; a static copy may be stale after a key change. `TAVRN_DIRECTORY_LISTING` must be on. |
 | A peer answers `503 federation.conformance_pending` or your node is blocked by a peer | Conformance checks; run `tavrn-node doctor --peer <domain>` and see [Conformance checks](#conformance-checks-of-other-nodes). |
 | No e-mails arrive | Run `tavrn-node send-test-mail you@example.org`; check `TAVRN_SMTP_URL` and `TAVRN_SMTP_FROM`. |
+| "Forgot password" answers `503 mail.unavailable` | The node has no `TAVRN_SMTP_URL`, so it sends no reset links (they would only end up in the log). Configure SMTP, or reset the user's second factor or account as a node admin. |
+| Users are signed out with `401 auth.session_revoked` (WebSocket close `4001`) | The device's sessions ended: logout, a password change or reset, the device was removed, or a node admin disabled, banned or reset the account. Expected; the client signs in again. |
+| WebSockets close with `4002 too_many_connections` | The user holds more than `TAVRN_WS_MAX_SOCKETS_PER_USER` connections on this instance (many tabs or a client reconnecting in a loop). |
 | SSO login fails | Run `tavrn-node check-config`: it checks the issuer and prints the redirect URI to register; the issuer must match exactly (Authentik with the trailing slash). |
 | Avatars or animated images are refused, `503 media.busy` | ffmpeg missing (`TAVRN_MEDIA_FFMPEG`) or too many conversions at once (`TAVRN_MEDIA_WORKERS`). |
 | Webhook posts fail with `409 webhook.pending_key` or `400 webhook.sealed_required` | See [Webhooks in end-to-end encrypted channels](#webhooks-in-end-to-end-encrypted-channels). |
