@@ -394,6 +394,13 @@ pub struct Config {
     pub federation_max_remote_users: u32,
     /// Remote users per home domain.
     pub federation_max_remote_users_per_domain: u32,
+    /// Seconds a request to a peer waits for a free connection slot (per peer, then node-wide) before it fails
+    /// (1–120, default 10; FEDERATION.md §1.3): one slow peer cannot hold up requests to every other.
+    pub federation_permit_timeout_secs: u32,
+    /// Peers this node learned of only through signed requests whose signature it could not check yet (no
+    /// verified request from them so far): at most this many cached documents (10–1000000, default 1000); unused
+    /// rows are pruned after 30 days.
+    pub federation_max_unverified_peers: u32,
     /// Refuse federated logins and inbox messages of peers whose latest conformance result is neither
     /// `pass` nor `warn`, including peers not checked yet (FEDERATION.md §9.4).
     pub federation_require_conformance: bool,
@@ -495,6 +502,9 @@ pub struct Config {
     pub legal_notice_rate_per_hour: u32,
     /// Days a closed case is kept after its last activity (30–36500, default 1095 = 3 years).
     pub legal_notice_retention_days: u32,
+    /// Notices forwarded by other nodes (S2S `legal.notice`) accepted per sending domain and hour (1–1000, default
+    /// 10); all domains together get five times as many.
+    pub legal_notice_inbound_per_hour: u32,
     /// Actioned notices against one user after which the admin page suggests disabling the account (1–100, default
     /// 3); a suggestion only, never automatic.
     pub legal_repeat_threshold: u32,
@@ -633,6 +643,8 @@ impl Default for Config {
             federation_rate_claims: 120,
             federation_max_remote_users: 10_000,
             federation_max_remote_users_per_domain: 1000,
+            federation_permit_timeout_secs: 10,
+            federation_max_unverified_peers: 1000,
             federation_require_conformance: false,
             federation_remote_user_retention_days: 90,
             federation_notify_bans: false,
@@ -675,6 +687,7 @@ impl Default for Config {
             legal_notices: Switch::Off,
             legal_notice_rate_per_hour: 5,
             legal_notice_retention_days: 1095,
+            legal_notice_inbound_per_hour: 10,
             legal_repeat_threshold: 3,
             legal_counter_notice_days: 14,
             legal_terms_mode: TermsMode::Notice,
@@ -1055,6 +1068,9 @@ impl Config {
         if !(30..=36_500).contains(&self.legal_notice_retention_days) {
             problems.push("TAVRN_LEGAL_NOTICE_RETENTION_DAYS must be between 30 and 36500".into());
         }
+        if !(1..=1000).contains(&self.legal_notice_inbound_per_hour) {
+            problems.push("TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR must be between 1 and 1000".into());
+        }
         if !(1..=100).contains(&self.legal_repeat_threshold) {
             problems.push("TAVRN_LEGAL_REPEAT_THRESHOLD must be between 1 and 100".into());
         }
@@ -1328,6 +1344,12 @@ impl Config {
         }
         if self.federation_rate_claims == 0 {
             problems.push("TAVRN_FEDERATION_RATE_CLAIMS must be greater than 0".into());
+        }
+        if !(1..=120).contains(&self.federation_permit_timeout_secs) {
+            problems.push("TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS must be between 1 and 120".into());
+        }
+        if !(10..=1_000_000).contains(&self.federation_max_unverified_peers) {
+            problems.push("TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS must be between 10 and 1000000".into());
         }
         if !self.dev_misbehave.trim().is_empty() {
             if !self.dev {
@@ -2323,6 +2345,15 @@ mod tests {
         assert_eq!((c.federation_rate_logins, c.federation_rate_inbox), (60, 300));
         assert_eq!((c.federation_rate_api, c.federation_rate_claims), (3000, 120));
         assert_eq!((c.federation_max_remote_users, c.federation_max_remote_users_per_domain), (10_000, 1000));
+        assert_eq!((c.federation_permit_timeout_secs, c.federation_max_unverified_peers), (10, 1000));
+        assert_eq!(c.legal_notice_inbound_per_hour, 10);
+        for (bad, var) in [
+            (Config { federation_permit_timeout_secs: 0, ..prod() }, "TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS"),
+            (Config { federation_max_unverified_peers: 9, ..prod() }, "TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS"),
+            (Config { legal_notice_inbound_per_hour: 0, ..prod() }, "TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR"),
+        ] {
+            assert!(bad.validate().unwrap_err().problems.iter().any(|p| p.contains(var)), "{var}");
+        }
         assert!(c.federation_dev_peers().unwrap().is_empty());
         assert_eq!(c.federation_remote_user_retention_days, 90);
         assert!(!c.federation_notify_bans);

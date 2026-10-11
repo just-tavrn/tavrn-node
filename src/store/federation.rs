@@ -164,6 +164,20 @@ pub async fn target_domains(db: &Pool, user_id: &str) -> Result<Vec<String>, Api
     rows.iter().map(|r| Ok(r.try_get("target")?)).collect()
 }
 
+/// Does this node have federation history with `domain`: users of it known here, local users who signed in there,
+/// or the node listed in this node's directory?
+pub async fn has_history(db: &Pool, domain: &str) -> Result<bool, ApiError> {
+    let row = sqlx::query(
+        "SELECT 1 AS x FROM users WHERE domain = $1
+         UNION ALL SELECT 1 AS x FROM federation_targets WHERE target = $1
+         UNION ALL SELECT 1 AS x FROM directory_nodes WHERE domain = $1 LIMIT 1",
+    )
+    .bind(domain)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some())
+}
+
 // ---------------------------------------------------------------- profiles (home node)
 
 /// `(profile_version, avatar_sha256, avatar media id, avatar mime)` of a user (the still image).
@@ -219,6 +233,18 @@ pub async fn count_users_of_domain(db: &Pool, domain: &str) -> Result<i64, ApiEr
         .fetch_one(db)
         .await?;
     Ok(row.try_get("n")?)
+}
+
+/// Sets the account kind and owner of a remote user from a verified federation token of its home node (a stub
+/// created earlier, for example by a friend request, did not know them).
+pub async fn set_remote_kind(db: &Pool, user_id: &str, kind: &str, owner_id: Option<&str>) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET kind = $1, owner_id = $2 WHERE id = $3")
+        .bind(kind)
+        .bind(owner_id)
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Creates the users row of a remote user (no password, email or factors) and its mirror state.

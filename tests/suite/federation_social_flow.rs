@@ -421,6 +421,57 @@ async fn forged_invitations_are_refused() {
     assert_eq!(list["items"].as_array().unwrap().len(), 1, "{list}");
 }
 
+/// FEDERATION.md §5.2: a node speaks for its own users only. An inviter of a third node named by the sending node
+/// is unverified: friendship with them does not count, the recipient's DM policy applies as to a stranger, the
+/// invitation is always a request, and it names the node it came through (`via`).
+#[tokio::test]
+async fn a_third_node_inviter_is_unverified() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    a.patch("/api/v1/users/me", &alice.token, json!({ "dm_policy": "friends" })).await;
+    // carol of c.test is alice's friend on A.
+    let carol = tavrn_node::federation::remote::ensure_remote_user(&a.state, "carol", C, "user", None).await.unwrap();
+    tavrn_node::store::social::add_friendship(&a.state.db, &alice.user_id, &carol.id).await.unwrap();
+    let conv = |members: Value| json!({ "conversation": { "node": B, "id": tavrn_node::util::ulid(), "kind": "group", "name": null, "members": members }, "requested": false });
+    let members = json!(["carol@c.test", "alice@a.test"]);
+    let (st, _) = inbox(&b, &a, "conversation.invite", "carol@c.test", "alice@a.test", conv(members.clone())).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    assert_eq!(list["items"], json!([]), "a stranger under dm_policy=friends: dropped: {list}");
+
+    a.patch("/api/v1/users/me", &alice.token, json!({ "dm_policy": "everyone" })).await;
+    let (st, _) = inbox(&b, &a, "conversation.invite", "carol@c.test", "alice@a.test", conv(members)).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{list}");
+    assert_eq!(items[0]["conversation"]["requested"], true, "always a request: {list}");
+    assert_eq!(items[0]["via"], B, "{list}");
+    // An inviter of the sending node itself is what that node vouches for: no `via`.
+    let members = json!(["bob@b.test", "alice@a.test"]);
+    let (st, _) = inbox(&b, &a, "conversation.invite", "bob@b.test", "alice@a.test", conv(members)).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (_, list) = a.get_auth("/api/v1/users/me/invites", &alice.token).await;
+    let own = list["items"].as_array().unwrap().iter().find(|i| i["inviter"] == "bob@b.test").unwrap().clone();
+    assert_eq!(own["via"], Value::Null, "{own}");
+}
+
+/// `ban.notify` (§5.2), like `notify`, only from a node the user signed in on: nobody else can have banned them.
+#[tokio::test]
+async fn ban_notices_come_only_from_nodes_the_user_signed_in_on() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    let mut alice_ws = ws(&a, &alice.token).await;
+    let payload = || json!({ "room": { "node": B, "id": tavrn_node::util::ulid(), "name": "Room" }, "scope": "room" });
+    let (st, _) = inbox(&b, &a, "ban.notify", B, "alice@a.test", payload()).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert!(no_event(&mut alice_ws, "ban.notify", 300).await, "alice never signed in on B");
+    b.sign_in_from(&a, &alice).await;
+    let (st, _) = inbox(&b, &a, "ban.notify", B, "alice@a.test", payload()).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    assert_eq!(event(&mut alice_ws, "ban.notify").await["room"]["node"], B);
+}
+
 // ---------------------------------------------------------------- notify and revocations
 
 #[tokio::test]

@@ -748,15 +748,17 @@ pub async fn create(
             .execute(&state.db)
             .await?;
     }
+    let row = by_id(&state.db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("case missing")))?;
+    // A forwarded case gets no confirmation here: its address came from another node, which confirmed the notice
+    // itself; the reporter hears from this node once an admin acts (LEGAL.md §1.5).
+    if origin.is_some() {
+        return Ok((row, false));
+    }
     // The status link is only in the mail: the case id alone never opens the status page.
     let link = format!("{}/legal/notice/{id}?token={token}", state.mailer.public_url());
-    let (template, vars) = match origin {
-        None => ("notice_received", [("case", id.as_str()), ("link", link.as_str())]),
-        Some((node, _)) => ("notice_forwarded_in", [("case", id.as_str()), ("origin", node)]),
-    };
-    state.mailer.send_template(&n.reporter_email, locale, template, &vars).await;
+    let vars = [("case", id.as_str()), ("link", link.as_str())];
+    state.mailer.send_template(&n.reporter_email, locale, "notice_received", &vars).await;
     event(&state.db, &id, None, "mail.reporter", json!({ "kind": "confirmation" })).await?;
-    let row = by_id(&state.db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("case missing")))?;
     Ok((row, true))
 }
 
@@ -1549,6 +1551,22 @@ pub async fn decide_counter(
 
 /// The S2S type of a forwarded notice (FEDERATION.md §5.2): from the forwarding node, to this node's domain.
 pub const KIND: &str = "legal.notice";
+
+/// Admission of a `legal.notice` from `iss`, checked before the message counts as received (so a refused one can
+/// be sent again): only from a node with federation history here (users of it known here, local users signed in
+/// there, or listed in the directory; `403 legal.forward_refused`), at most `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` per domain and five times as
+/// many from all domains per hour (`429`).
+pub async fn admit_inbound(state: &AppState, iss: &str) -> Result<(), ApiError> {
+    if !store::federation::has_history(&state.db, iss).await? {
+        tracing::warn!(sender = iss, "forwarded legal notice refused: no federation history with the sender");
+        return Err(ApiError::Forbidden {
+            code: "legal.forward_refused",
+            detail: "This node forwards notices only between nodes that share users".into(),
+        });
+    }
+    state.legal_inbound_limiter.check_all(&[iss.to_string()]).await?;
+    state.legal_inbound_total_limiter.check_all(&["all".to_string()]).await
+}
 
 /// A `legal.notice` from `iss`: opens a case here in state `received` with the origin recorded (idempotent per
 /// origin case). Fields are checked like the form; the perjury statement is taken as sent.

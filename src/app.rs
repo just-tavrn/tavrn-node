@@ -233,6 +233,10 @@ pub struct AppState {
     pub admin_limiter: Arc<RateLimiter>,
     /// Takedown notices per client IP (`notice-ip:<ip>`, `TAVRN_LEGAL_NOTICE_RATE_PER_HOUR` per hour).
     pub legal_notice_limiter: Arc<SharedLimiter>,
+    /// Notices forwarded by other nodes per sending domain (`<domain>`, `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` per
+    /// hour) and from all domains together (five times as many).
+    pub legal_inbound_limiter: Arc<SharedLimiter>,
+    pub legal_inbound_total_limiter: Arc<SharedLimiter>,
     /// Status-link lookups (notices, account deletions) per client IP (`lookup-ip:<ip>`, 60 per hour).
     pub legal_lookup_limiter: Arc<SharedLimiter>,
     /// Access tokens issued before this Unix time are expired. Only development nodes move it
@@ -385,6 +389,8 @@ impl AppState {
             subscription_wakeup: Arc::new(tokio::sync::Notify::new()),
             admin_limiter: limiter(if config.dev { 100_000 } else { 600 }, 60),
             legal_notice_limiter: shared("legal-notice", config.legal_notice_rate_per_hour, 3600),
+            legal_inbound_limiter: shared("legal-inbound", config.legal_notice_inbound_per_hour, 3600),
+            legal_inbound_total_limiter: shared("legal-inbound-all", config.legal_notice_inbound_per_hour * 5, 3600),
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
