@@ -142,6 +142,11 @@ pub struct AppState {
     pub federation_claim_limiter: Arc<RateLimiter>,
     /// S2S KeyPackage claims per requester and user (`<requester>|<user>`, 10 per hour, FEDERATION.md §3.5).
     pub claim_pair_limiter: Arc<SharedLimiter>,
+    /// KeyPackage claims of unrelated requesters per source and target user (`<local | node domain>|<user id>`,
+    /// `TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR` per hour, ENCRYPTION.md §3.2).
+    pub claim_target_limiter: Arc<SharedLimiter>,
+    /// The same claims per target user over all sources (`<user id>`, ten times the per-source budget per hour).
+    pub claim_target_total_limiter: Arc<SharedLimiter>,
     /// Direct room invites per inviter (`invite:<user id>`, 20 per hour, §3.4).
     pub direct_invite_limiter: Arc<RateLimiter>,
     /// Received `room.invite` notifications per sender and recipient (10 per hour, §5.2).
@@ -362,6 +367,12 @@ impl AppState {
             federation_api_limiter: limiter(config.federation_rate_api, 60),
             federation_claim_limiter: limiter(config.federation_rate_claims, 60),
             claim_pair_limiter: shared("claim-pair", invites.0, 3600),
+            claim_target_limiter: shared("claim-target", config.e2ee_claims_per_target_per_hour, 3600),
+            claim_target_total_limiter: shared(
+                "claim-target-total",
+                config.e2ee_claims_per_target_per_hour.saturating_mul(10),
+                3600,
+            ),
             direct_invite_limiter: limiter(invites.1, 3600),
             room_invite_inbox_limiter: limiter(invites.2, 3600),
             notify_limiter: limiter(1, 60),
