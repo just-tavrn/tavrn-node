@@ -30,9 +30,9 @@ services:
     env_file: .env
     environment:
       TAVRN_DATABASE_URL: ${TAVRN_DATABASE_URL:-postgres://tavrn:${POSTGRES_PASSWORD}@db:5432/tavrn}
-      # Peer directory (docs/HANDBOOK.md "Getting listed in the directory"): the example default is the project owner's
-      # public test node; set TAVRN_REFERENCE_NODES in .env to replace it (an empty value means none).
-      TAVRN_REFERENCE_NODES: ${TAVRN_REFERENCE_NODES-tavrn.swsp.eu}
+      # Peer directory (docs/HANDBOOK.md "Getting listed in the directory"): empty by default (not listed anywhere);
+      # TAVRN_REFERENCE_NODES=tavrn.org in .env lists the node in the official directory.
+      TAVRN_REFERENCE_NODES: ${TAVRN_REFERENCE_NODES-}
     volumes:
       - ./data:/data
     depends_on:

@@ -93,8 +93,8 @@ What the compose file does:
 - **`valkey`** (commented out): only for several instances ([Scaling with Valkey](#scaling-with-valkey)).
 - **`networks`** (commented out): an IPv6 subnet for the default network, for voice over IPv6
   ([Voice and video](#voice-and-video)).
-- `TAVRN_REFERENCE_NODES` defaults to the project owner's public test node as an example; set it in `.env` to
-  replace it, or to an empty value for none ([Getting listed in the directory](#getting-listed-in-the-directory)).
+- `TAVRN_REFERENCE_NODES` is empty by default (the node is in no directory); `tavrn.org` in `.env` lists it in
+  the official directory ([Getting listed in the directory](#getting-listed-in-the-directory)).
 
 Many published UDP ports make Docker's userland proxy slow; with large ranges consider `network_mode: host`.
 
@@ -1046,8 +1046,8 @@ sends [web push](#web-push) where needed.
 ### Getting listed in the directory
 
 Nodes find each other through **reference nodes** (`TAVRN_REFERENCE_NODES`, several comma-separated are fine).
-The setting is empty by default; `deploy/.env.example` and `deploy/docker-compose.yml` set the project owner's
-public test node as an example, which you may replace or remove. Without a reference node a node neither announces
+The setting is empty by default; `tavrn.org` is the official node and reference directory, which you may use,
+replace or leave out. Without a reference node a node neither announces
 itself nor pulls a node list; its Discover page then shows only the nodes that announce themselves to it. With
 `TAVRN_DIRECTORY_LISTING=true` (the default) a node announces itself to each of them at startup, every 6 hours and
 whenever a room is listed or unlisted. The reference node verifies the announce against the node's own
