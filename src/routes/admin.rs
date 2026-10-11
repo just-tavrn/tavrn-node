@@ -152,6 +152,7 @@ pub async fn update_user(
     if let Some(d) = req.disabled {
         store::admin::set_disabled(&state.db, &user_id, d).await?;
         if d {
+            crate::sessions::revoke_all(&state, &target, None, crate::sessions::Reason::AccountDisabled).await?;
             crate::federation::remote::revoke_sessions(&state, &target, None).await?;
             // The owner's bots stop at once (APPLICATIONS.md §1.7); re-enabling the owner re-enables them.
             crate::applications::owner_disabled(&state, &target.id).await?;
@@ -260,6 +261,7 @@ pub async fn reset_second_factor(
         ));
     }
     let credentials = store::factors::reset_second_factor(&state.db, &target.id).await?;
+    crate::sessions::revoke_all(&state, &target, None, crate::sessions::Reason::SecondFactorReset).await?;
     crate::federation::remote::revoke_sessions(&state, &target, None).await?;
     store::rooms::audit(
         &state.db,
@@ -454,6 +456,7 @@ pub async fn ban(
         && let Some(target) = store::users::by_username(&state.db, username, domain).await?
     {
         store::admin::set_disabled(&state.db, &target.id, true).await?;
+        crate::sessions::revoke_all(&state, &target, None, crate::sessions::Reason::NodeBan).await?;
         crate::federation::remote::revoke_sessions(&state, &target, None).await?;
         crate::applications::owner_disabled(&state, &target.id).await?;
     }

@@ -390,8 +390,8 @@ async fn housekeeping_deletes_stale_devices_but_never_the_only_or_a_live_one() {
     for d in [&alice.session.device_id, &second.session.device_id, &bob.device_id] {
         set_last_seen(&node, d, 200).await;
     }
-    store::users::revoke_device_sessions(db, &alice.session.device_id).await.unwrap();
-    store::users::revoke_device_sessions(db, &bob.device_id).await.unwrap();
+    store::users::revoke_device_sessions(db, &alice.session.user_id, &alice.session.device_id).await.unwrap();
+    store::users::revoke_device_sessions(db, &bob.user_id, &bob.device_id).await.unwrap();
     let deleted = tavrn_node::device_cleanup::prune_stale_devices(&node.state, Utc::now()).await.unwrap();
     assert_eq!(deleted, 1);
     let left = device_ids(&node, &third.token).await;
@@ -409,7 +409,7 @@ async fn housekeeping_deletes_stale_devices_but_never_the_only_or_a_live_one() {
     let carol = off.register("carol").await;
     off.login("carol").await;
     set_last_seen(&off, &carol.device_id, 10_000).await;
-    store::users::revoke_device_sessions(&off.state.db, &carol.device_id).await.unwrap();
+    store::users::revoke_device_sessions(&off.state.db, &carol.user_id, &carol.device_id).await.unwrap();
     assert_eq!(tavrn_node::device_cleanup::prune_stale_devices(&off.state, Utc::now()).await.unwrap(), 0);
 }
 
@@ -430,4 +430,55 @@ async fn logout_can_forget_the_device() {
     let ids = device_ids(&node, alice.token()).await;
     assert!(!ids.contains(&third.device_id), "{ids:?}");
     assert_eq!(ids.len(), 2);
+}
+
+// ---------------------------------------------------------------- Login lock-out
+
+/// Only failed logins count against an account, and a locked account still lets its owner in with the right
+/// password and a valid device proof; re-authentication has its own key.
+#[tokio::test]
+async fn failed_logins_by_others_do_not_lock_the_owner_out() {
+    let node = test_node("t.local").await;
+    let alice = node.crypto_user("alice").await;
+    // Successful logins do not count: the whole budget is still there afterwards.
+    for _ in 0..3 {
+        login_with(&node, "alice", None).await;
+    }
+    let mut budget = 0;
+    while node.state.login_limiter.check("user:alice").await.is_ok() {
+        budget += 1;
+    }
+    assert_eq!(budget, 1000, "successful logins counted against the account");
+    // Locked: a password alone gets 429, a wrong password with a device proof as well.
+    let body = json!({ "username": "alice", "password": password("alice") });
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/login", None, Some(body)).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{j}");
+    let device = alice.client.device();
+    let n = nonce(&node).await;
+    let body = json!({ "username": "alice", "password": "wrong-password-1", "device": proof(device, &n) });
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/login", None, Some(body)).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{j}");
+    // The right password with a valid device proof passes.
+    let session = login_with(&node, "alice", Some(proof(device, &nonce(&node).await))).await;
+    assert_eq!(session["device_id"], alice.session.device_id.as_str(), "{session}");
+    // Sudo mode is not locked by the failed logins.
+    let (s, j) = node.post("/api/v1/auth/reauth", token(&session), json!({ "password": password("alice") })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
+
+/// A locked account tells nothing about its state: the right password with a junk device field gets 429, not
+/// `auth.account_disabled`.
+#[tokio::test]
+async fn a_locked_account_reveals_nothing_about_its_state() {
+    let node = test_node("t.local").await;
+    let admin = node.register("admin").await;
+    let carol = node.register("carol").await;
+    let (s, j) =
+        node.patch(&format!("/api/v1/admin/users/{}", carol.user_id), &admin.token, json!({ "disabled": true })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    while node.state.login_limiter.check("user:carol").await.is_ok() {}
+    let junk = json!({ "id": carol.device_id, "nonce": "made-up-nonce", "proof": "AAAA" });
+    let body = json!({ "username": "carol", "password": password("carol"), "device": junk });
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/login", None, Some(body)).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{j}");
 }

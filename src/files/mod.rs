@@ -47,7 +47,8 @@ pub const SNIFF_BYTES: usize = 64 * 1024;
 pub type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Bidirectional controls that can disguise an extension (`invoice\u{202e}txt.exe`).
-fn is_bidi_control(c: char) -> bool {
+/// Bidirectional control characters (they reorder how a name is displayed).
+pub fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{061c}')
 }
 

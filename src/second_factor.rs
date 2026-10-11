@@ -225,7 +225,7 @@ pub async fn complete(state: &AppState, pre: &PreAuth, client: &str) -> Result<A
     if !store::factors::spend_preauth(&state.db, &pre.jti, &exp).await? {
         return Err(preauth_invalid());
     }
-    start_session(state, &pre.user, &pre.device_name, client, pre.reuse_device.as_deref()).await
+    start_session(state, &pre.user, &pre.device_name, client, pre.reuse_device.as_deref(), true).await
 }
 
 /// The device of a new session: `reuse` (a device proven by a device proof) if it still is a device of `user`,
@@ -240,23 +240,26 @@ pub async fn session_device(
     if let Some(id) = reuse
         && store::users::own_device(&state.db, &user.id, id).await?.is_some()
     {
-        store::users::reuse_device(&state.db, id, client).await?;
+        store::users::reuse_device(&state.db, &user.id, id, client).await?;
         return Ok(id.to_string());
     }
     Ok(store::users::create_device(&state.db, &user.id, device_name, client).await?.id)
 }
 
-/// Session for a fully authenticated user: on the device proven at login (`reuse`) or a new one.
+/// Session for a fully authenticated user: on the device proven at login (`reuse`) or a new one. `proof`: the
+/// login just proved the account's credentials (password with the second factor, a passkey); only then does the
+/// session come with a reauth token (PROTOCOL.md §5c). A connect code exchange proves no credential and passes `false`.
 pub async fn start_session(
     state: &AppState,
     user: &UserRow,
     device_name: &str,
     client: &str,
     reuse: Option<&str>,
+    proof: bool,
 ) -> Result<AuthResponse, ApiError> {
     let device_id = session_device(state, user, device_name, client, reuse).await?;
     let tokens = auth::issue_session(state, &user.id, &device_id).await?;
-    let reauth_token = Some(crate::reauth::for_new_session(state, &user.id, &tokens).await?);
+    let reauth_token = if proof { Some(crate::reauth::for_new_session(state, &user.id, &tokens).await?) } else { None };
     Ok(AuthResponse {
         status: SessionStatus::Ok,
         user: user.to_private(),

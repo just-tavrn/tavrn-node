@@ -159,6 +159,17 @@ pub async fn set_password_reset(db: &Pool, user_id: &str, token_hash: &str, ttl_
     Ok(())
 }
 
+/// `true` if `user_id` has a reset token that has not expired yet (a new request then keeps it: repeated requests
+/// cannot invalidate the link the owner already received).
+pub async fn has_pending_password_reset(db: &Pool, user_id: &str) -> Result<bool, ApiError> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM password_resets WHERE user_id = $1 AND expires_at > $2")
+        .bind(user_id)
+        .bind(now())
+        .fetch_one(db)
+        .await?;
+    Ok(n > 0)
+}
+
 /// Redeems a reset token (single use) and returns the user ID.
 pub async fn consume_password_reset(db: &Pool, token_hash: &str) -> Result<Option<String>, ApiError> {
     let row = sqlx::query("SELECT user_id, expires_at FROM password_resets WHERE token_hash = $1")
