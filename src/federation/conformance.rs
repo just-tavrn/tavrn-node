@@ -706,12 +706,7 @@ impl<'a> Checker<'a> {
         if let Some(key) = conflict {
             let detail = format!("kid {} now names another key", key.kid);
             self.push("keys.consistent", true, (Outcome::Fail, Some(detail)));
-            if let Err(e) =
-                store::federation::set_peer_status(&self.state.db, self.domain, discovery::STATUS_KEY_CONFLICT).await
-            {
-                tracing::warn!(error = %e, "storing the key conflict failed");
-            }
-            violation(self.state, self.domain, VIOLATION_KEY_CONFLICT).await;
+            discovery::mark_key_conflict(self.state, self.domain).await;
             return true;
         }
         // The same keys on every address the domain resolves to (IPv4 and IPv6, several hosts).

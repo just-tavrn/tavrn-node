@@ -148,6 +148,9 @@ pub struct AppState {
     pub notify_limiter: Arc<RateLimiter>,
     /// Key cache refetches through `federation::keys::ensure` per remote user (1 per minute, §3.5).
     pub keys_fetch_limiter: Arc<RateLimiter>,
+    /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
+    /// FEDERATION.md §2.7): anonymous reads of a user whose home node fails cannot pile up refresh tasks.
+    pub profile_refresh_limiter: Arc<RateLimiter>,
     /// Received `node.announce` per sending domain (`domain:<domain>`, 1 per 10 minutes, FEDERATION.md §7.2).
     pub directory_announce_limiter: Arc<RateLimiter>,
     /// Public directory reads per client IP (`dir-ip:<ip>`, 120 per minute).
@@ -350,6 +353,7 @@ impl AppState {
             room_invite_inbox_limiter: limiter(invites.2, 3600),
             notify_limiter: limiter(1, 60),
             keys_fetch_limiter: limiter(1, 60),
+            profile_refresh_limiter: limiter(1, 60),
             directory_announce_limiter: limiter(directory.0, 600),
             directory_limiter: limiter(directory.1, 60),
             outbox_wakeup: Arc::new(tokio::sync::Notify::new()),

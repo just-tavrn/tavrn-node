@@ -397,6 +397,8 @@ These settings decide whether and with whom the node federates and how it takes 
 | `TAVRN_FEDERATION_RATE_CLAIMS` | `120` | KeyPackage claims per requesting node and minute (> 0). |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS_PER_DOMAIN` | `1000` | Remote users per home domain. |
+| `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` | `10` | How long a request to a peer waits for one of the peer's 4 connection slots and then one of the 64 node-wide slots before it fails (1–120). A slow peer only ever ties up its own slots. |
+| `TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS` | `1000` | Cached discovery documents of peers no signed request of which ever verified here (10–1000000). Beyond it, unsigned requests naming a new domain are refused (`503 federation.peer_limit`) before any fetch. Failed fetches are remembered for 60 seconds per domain, and peers unused for 30 days that nothing ties to the node are pruned. |
 | `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS` | `90` | Remote users without a federated login for this many days and with nothing left on this node (no memberships, friendships, blocks, messages, …) are deleted by the hourly housekeeping; `0` keeps them forever. |
 | `TAVRN_FEDERATION_NOTIFY_BANS` | `false` | `true`: tell the home node of a remote user that a room or node ban removed them from a room (`ban.notify`, information only, never the reason). |
 | `TAVRN_FEDERATION_REQUIRE_CONFORMANCE` | `false` | `true`: also refuse federated logins and inbox messages of nodes that were not checked yet or failed ([conformance checks](#conformance-checks-of-other-nodes)). |
@@ -442,6 +444,7 @@ Details: [Legal pages and GDPR](#legal-pages-and-gdpr).
 | `TAVRN_LEGAL_NOTICES` | `off` | `on` opens the public takedown notice form `/legal/notice` (captcha when configured). Notices forwarded by other nodes are accepted either way. |
 | `TAVRN_LEGAL_NOTICE_RATE_PER_HOUR` | `5` (`--dev`: 1000) | Notices per client address and hour (1–1000). |
 | `TAVRN_LEGAL_NOTICE_RETENTION_DAYS` | `1095` | Cases are kept this long after their last change (30–36500; 1095 = 3 years). |
+| `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` | `10` | Notices forwarded by other nodes accepted per sending domain and hour (1–1000); five times as many from all domains together. Only nodes this node shares users with (or lists in its directory) may forward; forwarded cases get no confirmation mail here. |
 | `TAVRN_LEGAL_REPEAT_THRESHOLD` | `3` | Actioned notices against one user after which the admin page suggests disabling the account (1–100; a suggestion only, never automatic). |
 | `TAVRN_LEGAL_COUNTER_NOTICE_DAYS` | `14` | Days the uploader may answer an actioned notice with a counter-notice (1–365). |
 | `TAVRN_LEGAL_TERMS_MODE` | `notice` | `notice`: ask once after a new version of the terms; `require`: refuse the API (`403 legal.terms_required`) until accepted (declining signs out). |
@@ -668,13 +671,21 @@ _tavrn._tcp.example.org. 3600 IN SRV 10 0 443 chat.example.org.
 
 Resolution order (FEDERATION.md §1.3 has the decision table): `https://example.org/.well-known/tavrn` first; when
 the website has no such file (404) or there is no HTTPS server on `example.org` at all, the SRV record
-(`TAVRN_FEDERATION_SRV_FALLBACK`, default on): the document is fetched from
-`https://chat.example.org:443/.well-known/tavrn` (the node serves it on its own host) and must name
-`example.org`; only then, after a 404, the direct `https://example.org/api/v1`. Other HTTP errors (5xx, 403, …)
+(`TAVRN_FEDERATION_SRV_FALLBACK`, default on): other nodes connect to `chat.example.org` port 443 but ask for
+`https://example.org:443/.well-known/tavrn` (TLS server name and `Host` are `example.org`), and the document must
+name `example.org`; only then, after a 404, the direct `https://example.org/api/v1`. Other HTTP errors (5xx, 403, …)
 are errors. Browsers cannot query DNS records, so web clients ask the node they were loaded from
 (`GET /api/v1/federation/resolve/example.org`), which runs the same order: the connect flow, invites and add links
-work with an SRV-only setup too. It relies on DNS (use DNSSEC where you can); the conformance and
-key-consistency checks still apply.
+work with an SRV-only setup too.
+
+**The SRV target must serve a certificate valid for the identity domain** (`example.org`), not only for its own
+name: a SAN entry for `example.org` (or a wildcard that covers it) on the certificate of `chat.example.org`
+suffices, and the reverse proxy must answer requests with `Host: example.org` on that port. A certificate valid only
+for `chat.example.org` is refused. The reason: DNS answers can be spoofed on the network path, and a spoofed SRV
+record must not be enough to impersonate your node; a certificate for the identity domain is. The conformance and
+key-consistency checks still apply, and a document that suddenly comes from the SRV path with none of the known
+keys is treated as a key conflict (peers block the node until their operators unblock it), so keep at least one
+old key published while you move between the well-known file and an SRV record.
 
 #### Passkeys
 
@@ -739,7 +750,7 @@ All of them are created at the first start with mode 0600:
 
 | File | What it is | If it is lost or replaced |
 |---|---|---|
-| `keys/node-<kid>.pem` | The node's Ed25519 signing keys (federation, tokens). All keys in the directory are published in `/.well-known/tavrn`; the newest one signs. | Other nodes no longer trust the node's identity. |
+| `keys/node-<kid>.pem` | The node's Ed25519 signing keys (federation, tokens). All keys in the directory are published in `/.well-known/tavrn`; the newest one signs. A generated key's `kid` is its creation date plus a random suffix (`20261011-3f9a1c`). | Other nodes no longer trust the node's identity: a node that starts without this directory generates a new key, and peers that knew the old one refuse the node until their operators unblock it (a lost key is never recovered by restarting). |
 | `keys/secrets.key` | 32 random bytes that encrypt data at rest such as the users' TOTP secrets and the credentials of [external file stores](#files-channels-on-external-stores), and the single-use values in the cache with several instances. Never rotated. | Every TOTP enrollment becomes unusable (users then need a passkey, a recovery code or an admin reset of their second factor), and files channels on external stores need their credentials entered again. |
 | `keys/storage.key` | The storage key: wraps the per-file keys of every stored file (attachments, avatars, headers, room icons, emojis, soundboard clips). `keys/storage.key.next` exists only during a [rotation](#rotating-the-storage-key). | **Every stored file is unreadable**; the node refuses to start when the file is missing or does not match the stored keys. |
 | `keys/livekit.key` | LiveKit's API key and secret (`<key>: <secret>`). | Regenerated at the next start, nothing lost. With several instances all must use the same file. |
@@ -1004,7 +1015,8 @@ Outbound federation requests go only to public addresses (private and loopback a
 The operator decides which nodes this node federates with and how much load other nodes may cause.
 
 - `TAVRN_FEDERATION_BLOCKLIST`: domains never federated with, including their subdomains. Node admins can also
-  block a node in the Federation tab of the node administration.
+  block a node in the Federation tab of the node administration. Node and room bans of a domain also cover its
+  subdomains (a ban of `evil.example` refuses `a.evil.example`).
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
   blocklist still wins.
 - Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;

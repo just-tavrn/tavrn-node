@@ -52,6 +52,8 @@ pub const MAX_SRV_TARGETS: usize = 3;
 pub const RERESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 pub const PER_PEER_CONCURRENCY: usize = 4;
 pub const TOTAL_CONCURRENCY: usize = 64;
+/// A failed or invalid discovery fetch is remembered this long per domain (§1.4).
+pub const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(60);
 
 /// What is fetched; decides the size cap and the accepted content types (§1.3 rules 5 and 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,8 +263,9 @@ pub struct Fetched {
 
 // ---------------------------------------------------------------- address checks
 
-/// `true` if `ip` is not a public unicast address (§1.3 rule 3). IPv4-mapped (`::ffff:0:0/96`) and
-/// NAT64 (`64:ff9b::/96`) addresses are checked against their embedded IPv4 address.
+/// `true` if `ip` is not a public unicast address (§1.3 rule 3). IPv4-mapped (`::ffff:0:0/96`), NAT64
+/// (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 (`2002::/16`) addresses are checked against their embedded IPv4
+/// address; IPv4-compatible (`::/96`) and Teredo (`2001::/32`) addresses are refused.
 pub fn forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => forbidden_v4(v4),
@@ -272,7 +275,8 @@ pub fn forbidden_ip(ip: IpAddr) -> bool {
 
 fn forbidden_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    a == 0 // 0.0.0.0/8
+    (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 (6to4 relay anycast)
+        || a == 0 // 0.0.0.0/8
         || a == 10 // 10.0.0.0/8
         || (a == 100 && (64..128).contains(&b)) // 100.64.0.0/10 (CGNAT)
         || a == 127 // 127.0.0.0/8
@@ -293,12 +297,18 @@ fn embedded_v4(s: &[u16; 8]) -> Ipv4Addr {
 
 fn forbidden_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64): the embedded IPv4 address decides.
+    if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..3] == [0x64, 0xff9b, 1] {
+        // ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 (NAT64) and 64:ff9b:1::/48 (local-use NAT64, RFC 8215):
+        // the embedded IPv4 address (the last 32 bits) decides.
         return forbidden_v4(embedded_v4(&s));
     }
-    ip.is_unspecified() // ::/128
-        || ip.is_loopback() // ::1/128
+    if s[0] == 0x2002 {
+        // 2002::/16 (6to4): the IPv4 address in the next 32 bits decides.
+        let v4 = Ipv4Addr::new((s[1] >> 8) as u8, (s[1] & 0xff) as u8, (s[2] >> 8) as u8, (s[2] & 0xff) as u8);
+        return forbidden_v4(v4);
+    }
+    s[..6] == [0, 0, 0, 0, 0, 0] // ::/96 (IPv4-compatible, deprecated; includes :: and ::1)
+        || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 (Teredo)
         || s[..4] == [0x100, 0, 0, 0] // 100::/64 (discard)
         || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 (documentation)
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
@@ -508,6 +518,10 @@ pub struct FederationClient {
     delegations: Mutex<HashMap<String, CachedDelegation>>,
     /// Domains whose endpoint moved: their cached document (and keys) is refetched on next use.
     stale_documents: Mutex<HashSet<String>>,
+    /// How long a request waits for a connection slot of its peer and then a node-wide one.
+    permit_timeout: Duration,
+    /// Recent failed or invalid discovery fetches per domain, with the error to answer (§1.4).
+    discovery_failures: Mutex<HashMap<String, (Instant, &'static str, String)>>,
 }
 
 impl FederationClient {
@@ -538,6 +552,8 @@ impl FederationClient {
             srv_fallback: config.federation_srv_fallback,
             delegations: Mutex::new(HashMap::new()),
             stale_documents: Mutex::new(HashSet::new()),
+            permit_timeout: Duration::from_secs(u64::from(config.federation_permit_timeout_secs.max(1))),
+            discovery_failures: Mutex::new(HashMap::new()),
         })
     }
 
@@ -571,15 +587,54 @@ impl FederationClient {
         }
     }
 
+    /// A connection slot of the peer, then a node-wide one (§1.3 rule 5): requests queued for a slow peer never hold
+    /// node-wide slots, so they cannot starve requests to every other peer. Both waits together are bounded by
+    /// `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` (then [`FetchError::Timeout`]).
     async fn permits(&self, domain: &str) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), FetchError> {
         let peer = {
             let mut map = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+            // Idle peers (no request holds or waits for a slot) are dropped: unsigned requests naming random
+            // domains cannot grow the map.
+            map.retain(|d, sem| d == domain || Arc::strong_count(sem) > 1);
             map.entry(domain.to_string()).or_insert_with(|| Arc::new(Semaphore::new(PER_PEER_CONCURRENCY))).clone()
         };
         let closed = |_| FetchError::Unreachable(domain.to_string());
-        let total = self.total.clone().acquire_owned().await.map_err(closed)?;
-        let peer = peer.acquire_owned().await.map_err(closed)?;
-        Ok((total, peer))
+        let acquire = async {
+            let peer = peer.acquire_owned().await.map_err(closed)?;
+            let total = self.total.clone().acquire_owned().await.map_err(closed)?;
+            Ok::<_, FetchError>((total, peer))
+        };
+        match tokio::time::timeout(self.permit_timeout, acquire).await {
+            Ok(permits) => permits,
+            Err(_) => {
+                tracing::warn!(domain, "no free connection slot for the peer in time");
+                Err(FetchError::Timeout(domain.to_string()))
+            }
+        }
+    }
+
+    /// The error of a failed or invalid discovery fetch of `domain` within the last [`DISCOVERY_FAILURE_TTL`].
+    pub fn recent_discovery_failure(&self, domain: &str) -> Option<ApiError> {
+        let map = self.discovery_failures.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(domain)
+            .filter(|(at, ..)| at.elapsed() < DISCOVERY_FAILURE_TTL)
+            .map(|(_, code, detail)| ApiError::BadGateway { code, detail: detail.clone() })
+    }
+
+    /// Remembers a failed or invalid discovery fetch of `domain` (a peer error, `502`; bounded: expired entries are
+    /// dropped first, and at most 10 000 domains are kept).
+    pub fn note_discovery_failure(&self, domain: &str, error: &ApiError) {
+        let ApiError::BadGateway { code, detail } = error else { return };
+        let mut map = self.discovery_failures.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (at, ..)| at.elapsed() < DISCOVERY_FAILURE_TTL);
+        if map.len() < 10_000 {
+            map.insert(domain.to_string(), (Instant::now(), code, detail.clone()));
+        }
+    }
+
+    /// Forgets a failure after a successful fetch.
+    pub fn clear_discovery_failure(&self, domain: &str) {
+        self.discovery_failures.lock().unwrap_or_else(|e| e.into_inner()).remove(domain);
     }
 
     /// The URL of `path` on `domain`: API paths on the peer's (possibly delegated) `api` endpoint, every other
@@ -797,7 +852,11 @@ impl FederationClient {
     }
 
     /// The discovery document from the SRV targets of `domain` (`None` when there is no usable record).
-    /// Targets must be node domains (no IP literals); they are vetted like any other host.
+    /// Targets must be node domains (no IP literals); they are vetted like any other host. The record only says
+    /// where to connect (§1.3): the request goes to the target's vetted addresses and port, but as
+    /// `https://<domain>:<port>/.well-known/tavrn`, so SNI, `Host` and the certificate check are for `domain`; a
+    /// target whose certificate is valid only for itself fails the TLS handshake. DNS alone never decides whose keys
+    /// these are.
     async fn srv_well_known(&self, domain: &str) -> Option<Result<Fetched, FetchError>> {
         let records = match self.srv.srv(format!("_tavrn._tcp.{domain}.")).await {
             Ok(r) => r,
@@ -812,10 +871,8 @@ impl FederationClient {
         let scheme = if self.dev { "http" } else { "https" };
         let mut last = None;
         for record in records.iter().take(MAX_SRV_TARGETS) {
-            let Ok(url) = Url::parse(&format!("{scheme}://{}:{}{WELL_KNOWN_PATH}", record.target, record.port)) else {
-                continue;
-            };
-            match self.get_url(domain, url, Kind::Discovery).await {
+            let Some(url) = srv_url(scheme, domain, record.port) else { continue };
+            match self.get_via_target(domain, url, &record.target, record.port).await {
                 Ok(fetched) => {
                     tracing::info!(domain, target = record.target, port = record.port, "discovery document via SRV");
                     return Some(Ok(fetched));
@@ -828,6 +885,31 @@ impl FederationClient {
             }
         }
         last
+    }
+
+    /// GET the discovery document `url` (on `domain`) through the vetted addresses of an SRV `target`: a client of
+    /// its own resolves `domain` to exactly those addresses, everything else (TLS name, `Host`) stays `domain`'s.
+    async fn get_via_target(&self, domain: &str, url: Url, target: &str, port: u16) -> Result<Fetched, FetchError> {
+        let addrs = self.resolver.vetted(target).await.map_err(|e| {
+            if e.downcast_ref::<AddressForbidden>().is_some() {
+                FetchError::AddressForbidden(domain.to_string())
+            } else {
+                FetchError::Unreachable(domain.to_string())
+            }
+        })?;
+        let addrs: Vec<SocketAddr> = addrs.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        let http = http_builder(&self.own_domain, &self.resolver, &self.timeouts)
+            .resolve_to_addrs(domain, &addrs)
+            .build()
+            .map_err(|_| FetchError::Unreachable(domain.to_string()))?;
+        let _permits = self.permits(domain).await?;
+        let response = http
+            .get(url)
+            .header(header::ACCEPT, Kind::Discovery.accept_header())
+            .send()
+            .await
+            .map_err(|e| classify(domain, &e))?;
+        read_get(domain, response, Kind::Discovery).await
     }
 
     /// GET a public document of a peer (the discovery document through [`Self::get_well_known`]).
@@ -1082,6 +1164,12 @@ impl FederationClient {
 
 /// Addresses of one peer fetched by [`FederationClient::get_each_address`].
 pub const MAX_ADDRESSES: usize = 8;
+
+/// The URL of the discovery document reached through an SRV record (§1.3): on the identity domain, with the
+/// record's port, so TLS and `Host` are for the domain whichever host serves it.
+pub fn srv_url(scheme: &str, domain: &str, port: u16) -> Option<Url> {
+    Url::parse(&format!("{scheme}://{domain}:{port}{WELL_KNOWN_PATH}")).ok()
+}
 
 /// The settings every client of this module shares (resolver, redirects, timeouts, no proxies).
 fn http_builder(own_domain: &str, resolver: &VettingResolver, timeouts: &Timeouts) -> reqwest::ClientBuilder {

@@ -1030,7 +1030,8 @@ pub async fn ban(
             }
         }
     } else if util::valid_domain(&subject) {
-        if subject == state.config.domain {
+        // A domain ban covers subdomains: neither the own domain nor a parent of it.
+        if store::federation::within_domain(&state.config.domain, &subject) {
             return Err(bad("ban.own_domain", "The node's own domain cannot be banned"));
         }
         // Every member of the domain (and every bot of an owner there) leaves (FEDERATION.md §3.3).

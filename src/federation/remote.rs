@@ -282,7 +282,7 @@ pub async fn apply_node_ban(state: &AppState, subject: &str) -> Result<(), ApiEr
             store::federation::user_by_address(&state.db, name, domain).await?.into_iter().collect()
         }
         Some(_) => return Ok(()),
-        None if subject != own => store::federation::users_of_domain(&state.db, subject).await?,
+        None if subject != own => store::federation::users_within_domain(&state.db, subject).await?,
         None => return Ok(()),
     };
     for user in users.into_iter().filter(|u| u.domain != *own) {

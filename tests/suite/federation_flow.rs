@@ -295,6 +295,97 @@ async fn federated_login_rejections() {
     assert_eq!(code_of(&b, &token).await, (StatusCode::UNAUTHORIZED, "federation.token_replayed".into()));
 }
 
+/// FEDERATION.md §1.3/§1.4: unsigned requests naming a stalling domain as issuer cannot starve federation with
+/// every other peer: they queue for that domain's slots (never holding node-wide ones), give up after the permit
+/// timeout, and once the fetch failed, further ones are answered from the negative cache without a fetch.
+#[tokio::test]
+async fn a_stalling_issuer_does_not_starve_other_peers() {
+    use base64::Engine;
+    use tower::ServiceExt;
+    // A host that accepts connections and never answers.
+    let stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stall_port = stall.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = stall.accept().await {
+            held.push(sock);
+        }
+    });
+    let (a, b) = two_nodes_with(
+        |_| {},
+        |c| c.federation_dev_peers.push_str(&format!(",slow.test=http://127.0.0.1:{stall_port}")),
+    )
+    .await;
+    let alice = a.register("alice").await;
+    let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+    let n = now();
+    let forged = format!(
+        "{}.{}.{}",
+        b64(json!({ "alg": "EdDSA", "typ": "JWT", "kid": "k" })),
+        b64(json!({ "iss": "slow.test", "sub": "slow.test", "aud": B, "iat": n, "exp": n + 300, "jti": util::ulid(),
+                    "typ": "s2s", "htm": "POST", "htu": "/api/v1/federation/inbox", "body_sha256": "x" })),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 64])
+    );
+    let mut flood = Vec::new();
+    for _ in 0..70 {
+        let router = b.router.clone();
+        let token = forged.clone();
+        flood.push(tokio::spawn(async move {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/federation/inbox")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            router.oneshot(req).await.unwrap().status()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Meanwhile a real peer signs in: B fetches A's document and verifies the token at once.
+    let token = a.federation_token(&alice, B).await;
+    let login = tokio::time::timeout(Duration::from_secs(4), b.federated_login(&token)).await;
+    let (s, j) = login.expect("the login of a healthy peer waited for the stalling one");
+    assert_eq!(s, StatusCode::OK, "{j}");
+    for task in flood {
+        let status = task.await.unwrap();
+        assert!(status.is_client_error() || status.is_server_error(), "{status}");
+    }
+    // The failure is remembered: the next forged request fails at once, without another fetch.
+    let started = std::time::Instant::now();
+    let (st, _, _) = b
+        .raw(Method::POST, "/api/v1/federation/inbox", &forged, &[("content-type", "application/json")], b"{}".to_vec())
+        .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY);
+    assert!(started.elapsed() < Duration::from_secs(1), "answered from the negative cache");
+}
+
+/// FEDERATION.md §1.5/§3.3: a domain ban covers the domain's subdomains, like the blocklist: a banned domain does not
+/// come back as `x.<domain>`. Other domains that merely end in the same letters are not affected.
+#[tokio::test]
+async fn domain_bans_cover_subdomains() {
+    let (_a, b) = two_nodes().await;
+    let admin = b.register("admin").await;
+    let (s, j) = b.post("/api/v1/admin/bans", &admin.token, json!({ "subject": "evil.test" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let n = now();
+    let forged = |iss: &str| {
+        b.sign(&json!({ "iss": iss, "sub": format!("mallory@{iss}"), "aud": B, "iat": n, "exp": n + 600,
+                        "jti": util::ulid(), "typ": "federation", "kind": "user", "device": util::ulid(), "pv": 1 }))
+    };
+    for banned in ["evil.test", "a.evil.test", "x.y.evil.test"] {
+        assert_eq!(
+            code_of(&b, &forged(banned)).await,
+            (StatusCode::FORBIDDEN, "federation.peer_blocked".into()),
+            "{banned}"
+        );
+    }
+    assert_ne!(code_of(&b, &forged("notevil.test")).await.1, "federation.peer_blocked");
+    let db = &b.state.db;
+    assert!(tavrn_node::store::rooms::is_banned(db, None, "mallory@a.evil.test", "a.evil.test").await.unwrap());
+    assert!(!tavrn_node::store::rooms::is_banned(db, None, "mallory@notevil.test", "notevil.test").await.unwrap());
+}
+
 #[tokio::test]
 async fn domain_policy_bans_and_bots_on_the_target() {
     let alice_claims = |a: &FedNode, dev: &str| a.sign(&federation_claims(dev));
@@ -420,6 +511,13 @@ async fn cached_documents_are_used_while_fresh_and_never_when_stale() {
         "a stale document is not used"
     );
     a.start().await;
+    // The failed fetch is remembered for a minute (§1.4): A back up is noticed once that has passed.
+    assert_eq!(
+        code_of(&b, &a.sign(&federation_claims(&dev))).await,
+        (StatusCode::BAD_GATEWAY, "federation.peer_unreachable".into()),
+        "answered from the negative cache"
+    );
+    b.state.federation.clear_discovery_failure(A); // as if the minute had passed
     assert_eq!(b.federated_login(&a.sign(&federation_claims(&dev))).await.0, StatusCode::OK);
 }
 
@@ -451,7 +549,7 @@ async fn key_rotation_is_learned_through_the_unknown_kid_refresh() {
 async fn a_kid_naming_another_key_blocks_the_peer() {
     let (mut a, b) = two_nodes().await;
     let alice = a.register("alice").await;
-    b.sign_in_from(&a, &alice).await;
+    let earlier = b.sign_in_from(&a, &alice).await;
     let kid = a.state.signing_key().kid.clone();
     let original: Vec<NodeKey> = a.state.keys.iter().cloned().collect();
     a.restart_with_keys(vec![NodeKey::generate(&kid)]).await;
@@ -461,6 +559,9 @@ async fn a_kid_naming_another_key_blocks_the_peer() {
     assert_eq!(code_of(&b, &token).await, (StatusCode::FORBIDDEN, "federation.peer_blocked".into()));
     let status = sql_text(&b, "SELECT status FROM federation_peers WHERE domain = $1", A).await;
     assert_eq!(status.as_deref(), Some("key_conflict"));
+    // Sessions of the peer's users that existed before the conflict end with the block (§2.5).
+    let (s, _) = b.get_auth("/api/v1/users/me", &earlier.token).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the earlier federated session ended");
     // Stays blocked even with the original key back, until an operator decides.
     a.restart_with_keys(original).await;
     let alice = a.login("alice").await;
@@ -516,6 +617,23 @@ async fn set_avatar(a: &FedNode, alice: &common::Session, bytes: &[u8], mime: &s
     )
     .await;
     sha
+}
+
+/// Anonymous profile reads of a remote user start at most one background refresh per user and minute: reads of a
+/// user whose home node fails cannot pile up refresh tasks.
+#[tokio::test]
+async fn profile_reads_start_at_most_one_refresh_per_minute() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    a.stop().await;
+    let id = sql_text(&b, "SELECT id FROM users WHERE username = $1 AND domain = 'a.test'", "alice").await.unwrap();
+    for _ in 0..5 {
+        let (s, _) = b.req(axum::http::Method::GET, "/api/v1/users/alice@a.test/profile", None, None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    assert!(b.state.profile_refresh_limiter.check(&id).is_err(), "the first read took this minute's refresh");
+    assert!(b.state.profile_refresh_limiter.check("someone-else").is_ok());
 }
 
 #[tokio::test]

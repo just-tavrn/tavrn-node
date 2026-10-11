@@ -15,13 +15,52 @@ use super::{is_unique_violation, users::USER_COLS};
 
 // ---------------------------------------------------------------- domain policy
 
-/// Node-wide ban of a whole domain (`POST /admin/bans` with a domain subject).
+/// The ban subjects that cover `domain` (FEDERATION.md §1.5, §3.3): the domain itself and its parent domains with
+/// at least two labels (`a.evil.example` → `a.evil.example`, `evil.example`), at most 10.
+pub fn covering_domains(domain: &str) -> Vec<String> {
+    let mut out = vec![domain.to_string()];
+    let mut rest = domain;
+    while let Some((_, parent)) = rest.split_once('.') {
+        if !parent.contains('.') || out.len() >= 10 {
+            break;
+        }
+        out.push(parent.to_string());
+        rest = parent;
+    }
+    out
+}
+
+/// Is `domain` the domain `subject` or one of its subdomains?
+pub fn within_domain(domain: &str, subject: &str) -> bool {
+    domain == subject || domain.strip_suffix(subject).is_some_and(|head| head.ends_with('.'))
+}
+
+/// Node-wide ban of a whole domain or a parent domain (`POST /admin/bans` with a domain subject).
 pub async fn domain_banned(db: &Pool, domain: &str) -> Result<bool, ApiError> {
-    let row = sqlx::query("SELECT 1 AS x FROM bans WHERE room_id IS NULL AND subject = $1 LIMIT 1")
-        .bind(domain)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.is_some())
+    let subjects = covering_domains(domain);
+    let list = (1..=subjects.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
+    let sql = format!("SELECT 1 AS x FROM bans WHERE room_id IS NULL AND subject IN ({list}) LIMIT 1");
+    let mut q = sqlx::query(&sql);
+    for subject in &subjects {
+        q = q.bind(subject);
+    }
+    Ok(q.fetch_optional(db).await?.is_some())
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    #[test]
+    fn bans_cover_subdomains_only() {
+        assert_eq!(covering_domains("a.evil.example"), vec!["a.evil.example", "evil.example"]);
+        assert_eq!(covering_domains("evil.example"), vec!["evil.example"]);
+        assert_eq!(covering_domains(&format!("{}x.example", "a.".repeat(20))).len(), 10);
+        assert!(within_domain("a.evil.example", "evil.example"));
+        assert!(within_domain("evil.example", "evil.example"));
+        assert!(!within_domain("notevil.example", "evil.example"));
+        assert!(!within_domain("example", "evil.example"));
+    }
 }
 
 // ---------------------------------------------------------------- peers
@@ -51,25 +90,57 @@ pub async fn peer_status(db: &Pool, domain: &str) -> Result<Option<String>, ApiE
     Ok(row.map(|r| r.try_get::<String, _>("status")).transpose()?)
 }
 
-/// Stores a freshly fetched, valid document (status stays as it is).
+/// Stores a freshly fetched, valid document and where it came from (`well_known` or `srv`); the status stays as
+/// it is.
 pub async fn upsert_peer(
     db: &Pool,
     domain: &str,
     document: &str,
     fetched_at: &str,
     expires_at: &str,
+    source: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4",
+        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, source) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4, source = $5",
     )
     .bind(domain)
     .bind(document)
     .bind(fetched_at)
     .bind(expires_at)
+    .bind(source)
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Where the cached document of a peer came from (`None`: no row, or cached before the source was recorded).
+pub async fn peer_source(db: &Pool, domain: &str) -> Result<Option<String>, ApiError> {
+    let row =
+        sqlx::query("SELECT source FROM federation_peers WHERE domain = $1").bind(domain).fetch_optional(db).await?;
+    Ok(row.map(|r| r.try_get::<Option<String>, _>("source")).transpose()?.flatten())
+}
+
+/// Records that a signed request of the peer verified with its keys (at most one write per peer and day).
+pub async fn mark_peer_verified(db: &Pool, domain: &str, now: &str, cutoff: &str) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE federation_peers SET verified_at = $1 WHERE domain = $2 AND (verified_at IS NULL OR verified_at < $3)",
+    )
+    .bind(now)
+    .bind(domain)
+    .bind(cutoff)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Cached peers no signed request of which ever verified here (known only from unverified requests or from this
+/// node's own lookups).
+pub async fn count_unverified_peers(db: &Pool) -> Result<i64, ApiError> {
+    let n: i64 = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM federation_peers WHERE verified_at IS NULL")
+        .fetch_one(db)
+        .await?;
+    Ok(n)
 }
 
 /// Marks a peer (creating a row if needed, with an empty, expired document).
@@ -677,6 +748,21 @@ pub async fn revoke_remote_sessions(
 }
 
 /// Users whose home domain is `domain`, and bots whose owner's home domain is `domain`.
+/// Users of `domain` and of its subdomains (and bots whose owner is one), the users a domain ban covers.
+pub async fn users_within_domain(db: &Pool, domain: &str) -> Result<Vec<UserRow>, ApiError> {
+    let cols: Vec<String> = USER_COLS.split(',').map(|c| format!("u.{}", c.trim())).collect();
+    let rows: Vec<UserRow> = sqlx::query_as(&format!(
+        "SELECT {} FROM users u LEFT JOIN users o ON o.id = u.owner_id
+         WHERE u.domain = $1 OR o.domain = $1 OR u.domain LIKE $2 OR o.domain LIKE $2",
+        cols.join(", ")
+    ))
+    .bind(domain)
+    .bind(format!("%.{domain}"))
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn users_of_domain(db: &Pool, domain: &str) -> Result<Vec<UserRow>, ApiError> {
     let cols: Vec<String> = USER_COLS.split(',').map(|c| format!("u.{}", c.trim())).collect();
     Ok(sqlx::query_as(&format!(
@@ -845,10 +931,14 @@ pub struct FederationPrune {
     pub targets: u64,
     /// Push hints older than the inbox window and expired invitations.
     pub hints_and_invites: u64,
+    /// Cached peers unused for 30 days that nothing ties to this node.
+    pub peers: u64,
 }
 
 /// Drops spent `jti`s after their expiry, inbox ids and push hints after 7 days, expired invitations and
-/// federation targets after 30 days.
+/// federation targets after 30 days, and cached peer documents (with their key history) not fetched for 30 days
+/// when no user of the domain is known here, no local user signed in there, the directory does not list it and it
+/// is not blocked (FEDERATION.md §1.4).
 pub async fn prune(db: &Pool, now: &str, seen_cutoff: &str, targets_cutoff: &str) -> Result<FederationPrune, ApiError> {
     let replay =
         sqlx::query("DELETE FROM federation_replay WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
@@ -865,5 +955,18 @@ pub async fn prune(db: &Pool, now: &str, seen_cutoff: &str, targets_cutoff: &str
     let hints = super::invites::prune_hints(db, seen_cutoff).await?;
     let invites =
         sqlx::query("DELETE FROM user_invites WHERE expires_at < $1").bind(now).execute(db).await?.rows_affected();
-    Ok(FederationPrune { replay, inbox_seen, targets, hints_and_invites: hints + invites })
+    let unused = "SELECT domain FROM federation_peers p WHERE p.fetched_at < $1 AND p.status = 'ok'
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE u.domain = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM federation_targets t WHERE t.target = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM directory_nodes d WHERE d.domain = p.domain)";
+    sqlx::query(&format!("DELETE FROM federation_peer_keys WHERE domain IN ({unused})"))
+        .bind(targets_cutoff)
+        .execute(db)
+        .await?;
+    let peers = sqlx::query(&format!("DELETE FROM federation_peers WHERE domain IN ({unused})"))
+        .bind(targets_cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(FederationPrune { replay, inbox_seen, targets, hints_and_invites: hints + invites, peers })
 }

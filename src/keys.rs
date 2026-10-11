@@ -155,7 +155,9 @@ pub fn read_key_file(path: &Path) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>
     Ok(zeroize::Zeroizing::new(secret))
 }
 
-/// `kid` from the current date, e.g. `20261004`. Rotations on the same day append a number.
+/// `kid` from the current date plus a random suffix, e.g. `20261004-3f9a1c` (FEDERATION.md §1.2): a node that
+/// restores a backup without its key directory and generates a new key on the same day never repeats a `kid` its
+/// peers know with another key (which they would treat as a key conflict). Sorting by `kid` still sorts by date.
 fn current_kid() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // Days since epoch → date without an external crate (algorithm by Howard Hinnant).
@@ -170,7 +172,9 @@ fn current_kid() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}{m:02}{d:02}")
+    let mut suffix = [0u8; 3];
+    crate::util::fill_random(&mut suffix);
+    format!("{y:04}{m:02}{d:02}-{}", suffix.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 #[cfg(test)]
@@ -256,9 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn current_kid_looks_like_a_date() {
+    fn current_kid_is_a_date_with_a_random_suffix() {
         let kid = current_kid();
-        assert_eq!(kid.len(), 8);
-        assert!(kid.starts_with("20"));
+        assert_eq!(kid.len(), 15, "{kid}");
+        assert!(kid.starts_with("20") && kid.as_bytes()[8] == b'-', "{kid}");
+        assert!(kid[9..].chars().all(|c| c.is_ascii_hexdigit()), "{kid}");
+        assert_ne!(current_kid(), current_kid(), "two keys of the same day differ");
     }
 }

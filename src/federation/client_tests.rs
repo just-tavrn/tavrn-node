@@ -255,6 +255,19 @@ fn forbidden_address_ranges() {
         "febf::1",
         "ff02::1",
         "ff00::",
+        // 6to4 relays (192.88.99.0/24), IPv4-compatible (::/96), 6to4 with an internal IPv4 address (2002::/16),
+        // Teredo (2001::/32) and local-use NAT64 (64:ff9b:1::/48) with an internal IPv4 address.
+        "192.88.99.1",
+        "::7f00:1",
+        "::a00:1",
+        "::808:808",
+        "2002:7f00:1::",
+        "2002:a00:1::1",
+        "2002:a9fe:a9fe::1",
+        "2001::1",
+        "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+        "64:ff9b:1::a00:1",
+        "64:ff9b:1:ffff::7f00:1",
     ];
     for ip in forbidden {
         assert!(forbidden_ip(ip.parse().unwrap()), "{ip} must be refused");
@@ -284,6 +297,10 @@ fn forbidden_address_ranges() {
         "64:ff9b::808:808",
         "2001:db9::1",
         "fec0::1",
+        // Transition addresses that embed a public IPv4 address stay usable; other 2001:: blocks are not Teredo.
+        "2002:808:808::1",
+        "64:ff9b:1::808:808",
+        "2001:4860:4860::8888",
     ];
     for ip in public {
         assert!(!forbidden_ip(ip.parse().unwrap()), "{ip} is public");
@@ -1038,3 +1055,48 @@ fn document_and_delegation_lifetimes() {
     use super::discovery::ttl;
     assert_eq!((ttl(None), ttl(Some(10)), ttl(Some(900)), ttl(Some(86_400))), (300, 300, 900, 3600));
 }
+
+#[test]
+fn srv_documents_are_requested_on_the_identity_domain() {
+    // The SRV record says where to connect, never whose certificate counts: the URL (hence SNI, `Host` and the
+    // certificate check) is the identity domain with the record's port.
+    let url = srv_url("https", "home.example", 8448).unwrap();
+    assert_eq!(url.as_str(), "https://home.example:8448/.well-known/tavrn");
+    assert_eq!(url.host_str(), Some("home.example"));
+}
+
+#[tokio::test]
+async fn an_srv_target_is_asked_for_the_identity_domain() {
+    // The target sees `Host: srv.test:<port>` although it was reached through `target.test`'s address.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = seen.clone();
+    let doc = delegating_doc("srv.test", "http://target.test:1");
+    let app = Router::new().route(
+        "/.well-known/tavrn",
+        get(move |headers: axum::http::HeaderMap| {
+            let record = record.clone();
+            let doc = doc.clone();
+            async move {
+                let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+                record.lock().unwrap().push(host);
+                Json(doc)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let lookup = MapLookup::with(&[("target.test", &["127.0.0.1"])]);
+    let srv = MapSrv::with("_tavrn._tcp.srv.test.", &[("target.test", port)]);
+    let c = delegation_client("", true, lookup, srv, true);
+    let (_, source) = c.get_well_known("srv.test").await.unwrap();
+    assert_eq!(source, DelegationSource::Srv);
+    assert_eq!(*seen.lock().unwrap(), vec![format!("srv.test:{port}")]);
+}
+
+/// The TLS negative case needs a server with a certificate for the target only, which this test harness cannot
+/// provide (no TLS test helpers). It is covered by construction: the request URL is the identity domain
+/// ([`srv_documents_are_requested_on_the_identity_domain`]) and rustls checks the certificate against the URL's host.
+#[tokio::test]
+#[ignore = "needs a TLS server with a certificate for the SRV target only; no TLS helpers in the test harness"]
+async fn an_srv_target_with_a_certificate_only_for_itself_is_refused() {}
