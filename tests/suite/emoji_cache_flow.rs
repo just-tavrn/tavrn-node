@@ -306,7 +306,7 @@ async fn a_fetch_beyond_the_total_cap_evicts_the_oldest_copies() {
     let node = test_node_with("t.local", |c| {
         c.federation_allow_private = true;
         c.federation_dev_peers = format!("fake.test=http://127.0.0.1:{port},other.test=http://127.0.0.1:{port}");
-        c.media_cache_max_bytes_per_host = 10 * UNIT;
+        c.media_cache_max_bytes_per_host = 3 * UNIT;
         c.media_cache_max_bytes = 3 * UNIT;
     })
     .await;
