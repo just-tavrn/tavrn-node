@@ -48,6 +48,11 @@ building tavrn-web). The token never ends up in a layer: the Dockerfile reads it
 
 ## Verifying an image
 
+Release and `edge` images are one manifest list for `linux/amd64` and `linux/arm64`: `docker pull` picks the
+host's architecture, and `docker buildx imagetools inspect ghcr.io/just-tavrn/tavrn-node:<version>` lists the list's
+digest and both platform images. Both are built on an amd64 runner; the arm64 binaries (tavrn-node, ffmpeg) are
+cross-compiled, not emulated, and LiveKit comes from its official arm64 image.
+
 Every release image carries BuildKit's SLSA provenance and SBOM in the registry. Release images built after the
 repository went public also carry GitHub's build provenance for their digest (GitHub's Free plan has no artifact
 attestations for private repositories, so `release.yml` skips that job until the public switch; the release notes
@@ -59,7 +64,8 @@ docker buildx imagetools inspect ghcr.io/just-tavrn/tavrn-node:<version> --forma
 ```
 
 The first proves that `release.yml` of this repository built the digest from the tagged commit on a GitHub-hosted
-runner; the second shows the build's inputs (the Dockerfile's base images, all pinned by digest, and the
+runner (the attestation's subject is the manifest list's digest, which `gh attestation verify` resolves the tag to;
+verify the tag or that digest, not the digest of one platform's image); the second shows the build's inputs (the Dockerfile's base images, all pinned by digest, and the
 `TAVRN_WEB_REF` commit of tavrn-web). Pin the digest in your compose file (`image:
 ghcr.io/just-tavrn/tavrn-node:<version>@sha256:…`) to run exactly what you verified.
 

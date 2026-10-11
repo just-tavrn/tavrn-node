@@ -39,7 +39,7 @@ needs a few open ports, and SMTP and Valkey are optional.
 
 | What | Details |
 |---|---|
-| **A Linux host with Docker** | Docker Engine with the Compose plugin. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
+| **A Linux host with Docker** | Docker Engine with the Compose plugin, on x86-64 (`amd64`) or 64-bit ARM (`arm64`, for example Ampere or Graviton servers): the image is published for both and `docker pull` picks the right one. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
 | **A domain** | `TAVRN_DOMAIN` is the identity of the node and part of every address (`alice@chat.example.org`). Addresses cannot be renamed later, so choose it with care. The node may run on another host than its identity domain ([delegation](#identity-domain-and-node-host-delegation)). |
 | **A reverse proxy with TLS** | Any proxy that terminates TLS and passes WebSockets: examples for Caddy, nginx, Nginx Proxy Manager, Traefik, Apache and HAProxy ship with the repository. The node speaks plain HTTP only and never terminates TLS; nodes federate over HTTPS only. See [Reverse proxy and TLS](#reverse-proxy-and-tls). |
 | **PostgreSQL** | The compose file runs `postgres:17-alpine` next to the node; any existing PostgreSQL server or managed service works too (`TAVRN_DATABASE_URL`). SQLite exists only for development (`--dev`). See [Database](#database). |
