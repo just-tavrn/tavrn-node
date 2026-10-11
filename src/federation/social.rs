@@ -607,7 +607,7 @@ pub async fn handle(
                         json!({ "conversation_id": conversation_id, "node": iss, "from": from,
                                 "started_at": started_at, "group": group, "via": via }),
                     );
-                    // A user without a connection here rings by web push (PROTOCOL.md §6d).
+                    // The ring also goes out by web push, also while connected (PROTOCOL.md §6d).
                     let settings = crate::notifications::load(&state.db, &to.id).await?;
                     let effective = settings.effective(None, &conversation_id, &util::now());
                     if !effective.muted && effective.mode != crate::notifications::Mode::Nothing {
