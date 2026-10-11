@@ -426,3 +426,25 @@ async fn large_frames_close_the_socket() {
     .await;
     assert_eq!(closed, Ok(true));
 }
+
+/// REVIEW: connecting counts against the general per-user limit (close 4002 `rate_limited` beyond it).
+#[tokio::test]
+async fn review_connecting_counts_against_the_user_limit() {
+    let node = common::test_node_with("t.local", |c| c.rate_user_per_minute = 1000).await;
+    let alice = node.register("alice").await;
+    let url = serve(&node).await;
+    let limiter = node.state.user_api_limiter.clone().unwrap();
+    while limiter.check(&format!("user:{}", alice.user_id)).is_ok() {}
+    let mut ws = connect(&url).await;
+    ws.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap() {
+            Message::Close(Some(f)) => {
+                assert_eq!((u16::from(f.code), f.reason.as_str()), (4002, "rate_limited"));
+                break;
+            }
+            Message::Close(None) => unreachable!("close without a code"),
+            _ => {}
+        }
+    }
+}
