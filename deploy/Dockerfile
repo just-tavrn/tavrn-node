@@ -16,13 +16,22 @@
 #
 # `read_token` is the secret the organization's docker-publish workflow passes (TAVRN_READ_PAT);
 # `TAVRN_WEB_TOKEN`, if given, is used for the web stage instead. README.md "Container image" has the details.
+#
+# Several architectures (linux/amd64, linux/arm64): every stage that compiles runs on the build machine
+# ($BUILDPLATFORM) and cross-compiles for the target ($TARGETPLATFORM), so an arm64 image builds on an amd64 host
+# without emulating the compilers; only the small runtime stage (apt-get) runs emulated (QEMU via binfmt):
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile --secret id=read_token,env=GH_TOKEN .
+#
+# A plain `docker build` builds for the host's own architecture exactly as before (no cross toolchain involved).
 
 ARG TAVRN_WEB_SOURCE=git
 
 # Every base image is pinned by digest (Dependabot keeps tag and digest current); the tag says which release it is.
 
 # ---- Web client from the tavrn-web repository ------------------------------------
-FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web-git
+# The bundle is the same for every architecture: built once, on the build machine.
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -56,13 +65,36 @@ COPY web/dist/ /dist/
 FROM web-${TAVRN_WEB_SOURCE} AS web
 
 # ---- Build the server -----------------------------------------------------------
-FROM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS server
+# Runs on the build machine. For another target architecture it installs Debian's cross gcc and the Rust target
+# and writes /cross.env (cargo's target, linker and the C compiler of the -sys crates: ring, the bundled SQLite,
+# the vendored OpenSSL); for the host's own architecture there is no /cross.env and cargo builds natively.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS server
+ARG BUILDARCH
+ARG TARGETARCH
 WORKDIR /src
 # cargo fetches the private git dependency tavrn-crypto (and its protocol submodule) with the git CLI.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # Parallel compile jobs (empty: one per CPU); lower it on machines with little memory.
 ARG BUILD_JOBS=
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY rust-toolchain.toml ./
+RUN set -eu; \
+    if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      case "$TARGETARCH" in \
+        amd64) arch=x86_64; machine=x86-64 ;; \
+        arm64) arch=aarch64; machine="ARM aarch64" ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+      esac; \
+      gnu="$arch-linux-gnu"; triple="$arch-unknown-linux-gnu"; var="$(echo "$triple" | tr a-z- A-Z_)"; pkg="$(echo "$gnu" | tr _ -)"; \
+      apt-get update && apt-get install -y --no-install-recommends "gcc-$pkg" "g++-$pkg" "libc6-dev-$TARGETARCH-cross" \
+      && rm -rf /var/lib/apt/lists/*; \
+      rustup toolchain install && rustup target add "$triple"; \
+      { echo "export CARGO_BUILD_TARGET=$triple"; \
+        echo "export CARGO_TARGET_${var}_LINKER=$gnu-gcc"; \
+        echo "export CC_$(echo "$triple" | tr - _)=$gnu-gcc CXX_$(echo "$triple" | tr - _)=$gnu-g++ AR_$(echo "$triple" | tr - _)=$gnu-ar"; \
+        echo "ELF_MACHINE='$machine'"; } > /cross.env; \
+      cat /cross.env; \
+    fi
+COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY migrations migrations
 COPY templates templates
@@ -74,36 +106,65 @@ RUN test -f web/dist/index.html || { echo "no web client bundle (web/dist/index.
 RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/src/target,id=tavrn-node-target-$TARGETARCH \
     set -eu; \
     token="$(cat /run/secrets/read_token 2>/dev/null || cat /run/secrets/TAVRN_WEB_TOKEN 2>/dev/null || true)"; \
     if [ -n "$token" ]; then \
       export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.https://x-access-token:${token}@github.com/just-tavrn/.insteadOf" \
              GIT_CONFIG_VALUE_0="https://github.com/just-tavrn/"; \
     fi; \
-    cargo build --release --locked -p tavrn-node ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} && cp target/release/tavrn-node /tavrn-node
+    ELF_MACHINE=; if [ -f /cross.env ]; then . /cross.env; fi; \
+    cargo build --release --locked -p tavrn-node ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} \
+    && cp "target/${CARGO_BUILD_TARGET:-.}/release/tavrn-node" /tavrn-node \
+    && if [ -n "$ELF_MACHINE" ]; then file -b /tavrn-node && file -b /tavrn-node | grep -q "^ELF 64-bit LSB pie executable, $ELF_MACHINE,"; fi
 
 # ---- Static ffmpeg for the media pipeline (src/media.rs) ------------------------------
 # Only what the pipeline needs: image and short-video decoders, WebP encoding, file/pipe I/O. No network
 # protocols, no devices, no other muxers: a small static binary instead of Debian's ffmpeg with its
 # ~100 shared libraries. Keep the versions in sync with `just ffmpeg-install` (tests, development).
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
+# Runs on the build machine; for another target architecture libwebp and ffmpeg are cross-compiled with Debian's
+# cross gcc against the target's zlib (dpkg multiarch), and the result is checked with `file` instead of being run.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
+ARG BUILDARCH
+ARG TARGETARCH
 ARG FFMPEG_VERSION=8.0
 ARG FFMPEG_SHA256=b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e
 ARG LIBWEBP_VERSION=1.6.0
 ARG LIBWEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config ca-certificates curl xz-utils zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
+# /cross.env: empty for a native build; the cross prefix and configure flags otherwise.
+RUN set -eu; \
+    if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config ca-certificates curl xz-utils zlib1g-dev; \
+      : > /cross.env; \
+    else \
+      case "$TARGETARCH" in \
+        amd64) arch=x86_64; machine=x86-64 ;; \
+        arm64) arch=aarch64; machine="ARM aarch64" ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+      esac; \
+      gnu="$arch-linux-gnu"; \
+      dpkg --add-architecture "$TARGETARCH"; \
+      apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config ca-certificates curl xz-utils file \
+        "gcc-$(echo "$gnu" | tr _ -)" "libc6-dev-$TARGETARCH-cross" "zlib1g-dev:$TARGETARCH"; \
+      { echo "CROSS=$gnu-"; \
+        echo "WEBP_CROSS='--host=$gnu'"; \
+        echo "FFMPEG_CROSS='--enable-cross-compile --arch=$arch --target-os=linux --cross-prefix=$gnu- --pkg-config=pkg-config'"; \
+        echo "ELF_MACHINE='$machine'"; } > /cross.env; \
+      cat /cross.env; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-RUN curl -fsSLo webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}.tar.gz" \
+RUN set -eu; CROSS=; WEBP_CROSS=; . /cross.env; \
+    curl -fsSLo webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}.tar.gz" \
     && echo "${LIBWEBP_SHA256}  webp.tar.gz" | sha256sum -c - \
     && tar xzf webp.tar.gz && cd "libwebp-${LIBWEBP_VERSION}" \
-    && ./configure --prefix=/opt/deps --disable-shared --enable-static --disable-png --disable-jpeg --disable-tiff --disable-gif --disable-wic --disable-gl --disable-sdl \
+    && ./configure $WEBP_CROSS --prefix=/opt/deps --disable-shared --enable-static --disable-png --disable-jpeg --disable-tiff --disable-gif --disable-wic --disable-gl --disable-sdl \
     && make -j"$(nproc)" && make install
-RUN curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+RUN set -eu; CROSS=; FFMPEG_CROSS=; ELF_MACHINE=; . /cross.env; \
+    curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
     && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
     && tar xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
-    && PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig ./configure --prefix=/opt/ffmpeg \
+    && PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig ./configure $FFMPEG_CROSS --prefix=/opt/ffmpeg \
        --pkg-config-flags=--static --extra-ldflags=-static --enable-static --disable-shared \
        --disable-everything --disable-autodetect --disable-network --disable-doc --disable-debug \
        --disable-ffplay --disable-ffprobe --disable-avdevice --enable-small \
@@ -115,14 +176,22 @@ RUN curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSI
        --enable-encoder=libwebp,libwebp_anim \
        --enable-muxer=webp,null \
        --enable-filter=scale,crop,fps,format,null,setsar \
-    && make -j"$(nproc)" && make install && strip /opt/ffmpeg/bin/ffmpeg \
-    && /opt/ffmpeg/bin/ffmpeg -hide_banner -encoders | grep -q libwebp_anim
+    && make -j"$(nproc)" && make install && "${CROSS}strip" /opt/ffmpeg/bin/ffmpeg \
+    && if [ -z "$ELF_MACHINE" ]; then \
+         /opt/ffmpeg/bin/ffmpeg -hide_banner -encoders | grep -q libwebp_anim; \
+       else \
+         grep -q "define CONFIG_LIBWEBP_ANIM_ENCODER 1" config_components.h \
+         && file -b /opt/ffmpeg/bin/ffmpeg \
+         && file -b /opt/ffmpeg/bin/ffmpeg | grep -q "^ELF 64-bit LSB executable, $ELF_MACHINE, .*, statically linked,"; \
+       fi
 
 # ---- LiveKit binary ---------------------------------------------------------
 # Pinned; keep in sync with livekit_version in the justfile and LIVEKIT_VERSION in .github/workflows/ci.yml.
+# The digest is the multi-architecture index: the stage resolves to the target's image (amd64 or arm64).
 FROM livekit/livekit-server:v1.13.8@sha256:ad961c9b4b064298cc08d618d772671f7c783e036001388079fa813929cc357e AS livekit
 
 # ---- Runtime image ---------------------------------------------------------
+# The only stage of the target architecture that runs commands (emulated in a cross build): keep it small.
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \

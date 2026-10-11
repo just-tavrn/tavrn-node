@@ -25,7 +25,7 @@ media). The node speaks plain HTTP; a reverse proxy in front terminates TLS.
 
 ## Quick start (Docker Compose)
 
-Requirements: a Linux host with Docker, a domain pointing to it, and a reverse proxy with TLS (examples for Caddy,
+Requirements: a Linux host (x86-64 or 64-bit ARM) with Docker, a domain pointing to it, and a reverse proxy with TLS (examples for Caddy,
 nginx, Nginx Proxy Manager, Traefik, Apache and HAProxy in `deploy/`; the node never terminates TLS itself). For voice and video, a UDP port range
 and one TCP port must be reachable from the internet.
 
@@ -154,8 +154,9 @@ the server is touched. `just test-pg-clean` drops every `t_*` database at once (
 
 ### Container image
 
-Releases are published as `ghcr.io/just-tavrn/tavrn-node:<version>` (tags `X.Y.Z`, `X.Y`, `latest`). To build
-the image yourself:
+Releases are published as `ghcr.io/just-tavrn/tavrn-node:<version>` (tags `X.Y.Z`, `X.Y`, `latest`) for
+`linux/amd64` and `linux/arm64` (one manifest list; `docker pull` picks the host's architecture). To build the image
+yourself:
 
 ```sh
 GH_TOKEN=$(gh auth token) docker build -f deploy/Dockerfile -t tavrn-node:dev \
@@ -169,6 +170,11 @@ of the build context instead. The token (secret `read_token`, or `TAVRN_WEB_TOKE
 needed while the repositories are private: cargo fetches `tavrn-crypto` with it and the web stage clones
 tavrn-web. It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
 `just docker-build git v0.1.0`).
+
+A plain `docker build` builds for the host's own architecture. For another one, or both at once, use buildx
+with `--platform linux/amd64,linux/arm64`: the Rust and ffmpeg stages run on the build host and cross-compile
+(Debian's cross gcc), so only the small runtime stage needs QEMU (`docker run --privileged --rm tonistiigi/binfmt
+--install arm64` once, if `docker buildx ls` lists no `linux/arm64`).
 
 ## Security
 
