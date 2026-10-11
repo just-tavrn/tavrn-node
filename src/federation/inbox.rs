@@ -299,6 +299,24 @@ async fn process(state: &AppState, iss: &str, envelope: &Envelope) -> Result<&'s
     if !store::federation::mark_seen(&state.db, iss, &envelope.id, &envelope.kind).await? {
         return Ok("duplicate");
     }
+    let result = handle(state, iss, envelope, recipient, action).await;
+    // A failure on this node's side (5xx) is retried by the sender: the retry must not count as a duplicate.
+    if let Err(e) = &result
+        && e.status().is_server_error()
+    {
+        store::federation::unmark_seen(&state.db, iss, &envelope.id).await?;
+    }
+    result
+}
+
+/// The handling of a new (not yet seen) message.
+async fn handle(
+    state: &AppState,
+    iss: &str,
+    envelope: &Envelope,
+    recipient: Option<Recipient>,
+    action: Action,
+) -> Result<&'static str, ApiError> {
     if recipient.is_none() {
         return Ok("ignored");
     }
@@ -386,13 +404,16 @@ async fn devices_changed(state: &AppState, user: &UserRow) -> Result<(), ApiErro
 /// the user's own sessions, and ask MLS groups to remove the now unattested leaves.
 async fn identity_changed(state: &AppState, user: &UserRow, key: &str, reset_at: &str) -> Result<(), ApiError> {
     let previous = store::users::by_id(&state.db, &user.id).await?.and_then(|u| u.identity_pubkey);
-    store::federation::set_remote_identity(&state.db, &user.id, key, reset_at).await?;
-    // The security log of the rooms here: a reset is never a rotation. The entry also records the reset on the
-    // user's memberships here (ENCRYPTION.md §7b); without a cached key there is no entry, but the reset still counts.
-    match previous.as_deref() {
-        Some(p) if p != key => crate::welcome::key_changed(state, user, false).await,
-        None => crate::history::key_reset(state, user, &util::now()).await,
-        Some(_) => {}
+    // The new key and the reset's history window on the user's memberships here (ENCRYPTION.md §7b) in one
+    // transaction, failing closed: if it cannot be recorded, the message is refused and the home node retries; no
+    // automatic share of the old range can reach the new key in between.
+    let changed = previous.as_deref() != Some(key);
+    let now = util::now();
+    store::federation::reset_remote_identity(&state.db, &user.id, key, reset_at, changed.then_some(now.as_str()))
+        .await?;
+    // The security log of the rooms here: a reset is never a rotation (without a cached key there is no entry).
+    if changed && previous.is_some() {
+        crate::welcome::key_changed(state, user, false).await;
     }
     store::federation::invalidate_keys(&state.db, &user.id).await?;
     if let Err(e) = super::keys::refresh(state, user).await {

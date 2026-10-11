@@ -590,14 +590,27 @@ pub async fn invalidate_keys(db: &Pool, user_id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Mirrors the identity key announced by the user's home node.
-pub async fn set_remote_identity(db: &Pool, user_id: &str, key: &str, reset_at: &str) -> Result<(), ApiError> {
+/// A remote user's identity changed (`identity.changed`, FEDERATION.md §5.2): the new key and reset time, and with
+/// `reset_window_at` the start of the user's history window on every membership here (ENCRYPTION.md §7b), in one
+/// transaction: the key change is never recorded without its window.
+pub async fn reset_remote_identity(
+    db: &Pool,
+    user_id: &str,
+    key: &str,
+    reset_at: &str,
+    reset_window_at: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut tx = db.begin().await?;
     sqlx::query("UPDATE users SET identity_pubkey = $1, identity_reset_at = $2 WHERE id = $3")
         .bind(key)
         .bind(reset_at)
         .bind(user_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    if let Some(at) = reset_window_at {
+        super::history::mark_key_reset_tx(&mut tx, user_id, at).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -786,6 +799,12 @@ pub async fn user_by_address(db: &Pool, username: &str, domain: &str) -> Result<
 // ---------------------------------------------------------------- inbox
 
 /// Records an inbox message id of `iss`; `false` if it was seen before (duplicate).
+/// Forgets a seen inbox message whose handling failed on this node's side, so the sender's retry is handled again.
+pub async fn unmark_seen(db: &Pool, iss: &str, id: &str) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM federation_inbox_seen WHERE iss = $1 AND id = $2").bind(iss).bind(id).execute(db).await?;
+    Ok(())
+}
+
 pub async fn mark_seen(db: &Pool, iss: &str, id: &str, kind: &str) -> Result<bool, ApiError> {
     let r = sqlx::query("INSERT INTO federation_inbox_seen (iss, id, type, seen_at) VALUES ($1, $2, $3, $4)")
         .bind(iss)
