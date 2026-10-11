@@ -151,6 +151,10 @@ pub enum FetchError {
     Unreachable(String),
     #[error("{0} does not answer in time")]
     Timeout(String),
+    /// No free connection slot on this node in time: local load, not a failure of the peer (never negatively
+    /// cached).
+    #[error("This node is busy, the request to {0} was not sent")]
+    Busy(String),
     #[error("The answer from {0} is too large")]
     TooLarge(String),
     #[error("The answer from {0} has an unexpected content type")]
@@ -171,7 +175,7 @@ impl FetchError {
     /// Network errors, timeouts, 408, 429 and 5xx are worth retrying (§5.3); everything else is final.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::Unreachable(_) | Self::Timeout(_) => true,
+            Self::Unreachable(_) | Self::Timeout(_) | Self::Busy(_) => true,
             Self::Status { status, .. } | Self::Refused { status, .. } => matches!(status, 408 | 429) || *status >= 500,
             _ => false,
         }
@@ -201,6 +205,7 @@ impl FetchError {
             Self::AddressForbidden(_) => "address_forbidden".into(),
             Self::Unreachable(_) => "unreachable".into(),
             Self::Timeout(_) => "timeout".into(),
+            Self::Busy(_) => "busy".into(),
             Self::TooLarge(_) => "too_large".into(),
             Self::ContentType(_) => "content_type".into(),
             Self::Redirect(_) => "redirect".into(),
@@ -216,6 +221,7 @@ impl FetchError {
             Self::Disabled => ApiError::Forbidden { code: "federation.disabled", detail },
             Self::Blocked(_) => ApiError::Forbidden { code: "federation.peer_blocked", detail },
             Self::DomainInvalid => ApiError::BadRequest { code: "federation.domain_invalid", detail },
+            Self::Busy(_) => ApiError::Unavailable { code: "federation.busy", detail },
             Self::AddressForbidden(_) => ApiError::BadGateway { code: "federation.address_forbidden", detail },
             Self::TooLarge(_) | Self::ContentType(_) | Self::Invalid(..) => {
                 ApiError::BadGateway { code: "federation.peer_invalid", detail }
@@ -264,8 +270,8 @@ pub struct Fetched {
 // ---------------------------------------------------------------- address checks
 
 /// `true` if `ip` is not a public unicast address (§1.3 rule 3). IPv4-mapped (`::ffff:0:0/96`), NAT64
-/// (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 (`2002::/16`) addresses are checked against their embedded IPv4
-/// address; IPv4-compatible (`::/96`) and Teredo (`2001::/32`) addresses are refused.
+/// (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are checked against their embedded IPv4 address;
+/// IPv4-compatible (`::/96`), Teredo (`2001::/32`) and local-use NAT64 (`64:ff9b:1::/48`) addresses are refused.
 pub fn forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => forbidden_v4(v4),
@@ -297,9 +303,8 @@ fn embedded_v4(s: &[u16; 8]) -> Ipv4Addr {
 
 fn forbidden_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..3] == [0x64, 0xff9b, 1] {
-        // ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 (NAT64) and 64:ff9b:1::/48 (local-use NAT64, RFC 8215):
-        // the embedded IPv4 address (the last 32 bits) decides.
+    if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64): the embedded IPv4 address decides.
         return forbidden_v4(embedded_v4(&s));
     }
     if s[0] == 0x2002 {
@@ -309,6 +314,7 @@ fn forbidden_v6(ip: Ipv6Addr) -> bool {
     }
     s[..6] == [0, 0, 0, 0, 0, 0] // ::/96 (IPv4-compatible, deprecated; includes :: and ::1)
         || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 (Teredo)
+        || s[..3] == [0x64, 0xff9b, 1] // 64:ff9b:1::/48 (local-use NAT64, RFC 8215: the operator's own mapping)
         || s[..4] == [0x100, 0, 0, 0] // 100::/64 (discard)
         || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 (documentation)
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
@@ -520,6 +526,8 @@ pub struct FederationClient {
     stale_documents: Mutex<HashSet<String>>,
     /// How long a request waits for a connection slot of its peer and then a node-wide one.
     permit_timeout: Duration,
+    /// Slots for discovery fetches of unknown issuers of requests not verified yet (§1.4).
+    unverified_discovery: Arc<Semaphore>,
     /// Recent failed or invalid discovery fetches per domain, with the error to answer (§1.4).
     discovery_failures: Mutex<HashMap<String, (Instant, &'static str, String)>>,
 }
@@ -554,6 +562,7 @@ impl FederationClient {
             stale_documents: Mutex::new(HashSet::new()),
             permit_timeout: Duration::from_secs(u64::from(config.federation_permit_timeout_secs.max(1))),
             discovery_failures: Mutex::new(HashMap::new()),
+            unverified_discovery: Arc::new(Semaphore::new(config.federation_discovery_slots.max(1) as usize)),
         })
     }
 
@@ -589,7 +598,7 @@ impl FederationClient {
 
     /// A connection slot of the peer, then a node-wide one (§1.3 rule 5): requests queued for a slow peer never hold
     /// node-wide slots, so they cannot starve requests to every other peer. Both waits together are bounded by
-    /// `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` (then [`FetchError::Timeout`]).
+    /// `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` (then [`FetchError::Busy`]).
     async fn permits(&self, domain: &str) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), FetchError> {
         let peer = {
             let mut map = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
@@ -608,9 +617,15 @@ impl FederationClient {
             Ok(permits) => permits,
             Err(_) => {
                 tracing::warn!(domain, "no free connection slot for the peer in time");
-                Err(FetchError::Timeout(domain.to_string()))
+                Err(FetchError::Busy(domain.to_string()))
             }
         }
+    }
+
+    /// A slot for the discovery fetch of an unknown issuer whose request is not verified yet; `None` when all
+    /// `TAVRN_FEDERATION_DISCOVERY_SLOTS` are taken (never waits).
+    pub fn try_unverified_discovery(&self) -> Option<OwnedSemaphorePermit> {
+        self.unverified_discovery.clone().try_acquire_owned().ok()
     }
 
     /// The error of a failed or invalid discovery fetch of `domain` within the last [`DISCOVERY_FAILURE_TTL`].

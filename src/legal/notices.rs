@@ -1553,18 +1553,20 @@ pub async fn decide_counter(
 pub const KIND: &str = "legal.notice";
 
 /// Admission of a `legal.notice` from `iss`, checked before the message counts as received (so a refused one can
-/// be sent again): only from a node with federation history here (users of it known here, local users signed in
-/// there, or listed in the directory; `403 legal.forward_refused`), at most `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` per domain and five times as
-/// many from all domains per hour (`429`).
+/// be sent again): only from a node with federation history here (users of it known here for at least a day, local
+/// users signed in there, or listed in the directory; `403 legal.forward_refused`), at most
+/// `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` per registrable domain (subdomains share it) and five times as many from all
+/// domains per hour (`429`).
 pub async fn admit_inbound(state: &AppState, iss: &str) -> Result<(), ApiError> {
-    if !store::federation::has_history(&state.db, iss).await? {
+    let known_before = util::format_time(chrono::Utc::now() - chrono::Duration::days(1));
+    if !store::federation::has_history(&state.db, iss, &known_before).await? {
         tracing::warn!(sender = iss, "forwarded legal notice refused: no federation history with the sender");
         return Err(ApiError::Forbidden {
             code: "legal.forward_refused",
             detail: "This node forwards notices only between nodes that share users".into(),
         });
     }
-    state.legal_inbound_limiter.check_all(&[iss.to_string()]).await?;
+    state.legal_inbound_limiter.check_all(&[store::federation::parent_domain(iss).to_string()]).await?;
     state.legal_inbound_total_limiter.check_all(&["all".to_string()]).await
 }
 

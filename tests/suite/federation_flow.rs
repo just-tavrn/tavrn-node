@@ -317,6 +317,10 @@ async fn a_stalling_issuer_does_not_starve_other_peers() {
     )
     .await;
     let alice = a.register("alice").await;
+    // A is a peer B knows (an earlier sign-in) whose cached document expired: the next sign-in needs a fetch
+    // through the shared connection slots, which the flood must not have taken.
+    b.sign_in_from(&a, &alice).await;
+    sql_exec(&b, "UPDATE federation_peers SET expires_at = $1 WHERE domain = $2", &[&util::in_seconds(-1), A]).await;
     let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
     let n = now();
     let forged = format!(
@@ -1344,8 +1348,9 @@ async fn peers_from_the_directory_do_not_count_against_the_unverified_peer_cap()
     assert_eq!(s, StatusCode::OK, "the first sign-in of a new peer: {j}");
 }
 
-/// FEDERATION.md §1.3 rule 5: unsigned requests naming many *different* stalling domains (a wildcard DNS name of
-/// the attacker) cannot starve federation with every other peer either.
+/// FEDERATION.md §1.3 rule 5, §1.4: unsigned requests naming many *different* stalling domains (a wildcard DNS name
+/// of the attacker) cannot starve federation with the peers this node knows either: fetches for unknown issuers
+/// run in their own few slots, and requests beyond them are refused at once (`503 federation.busy`).
 #[tokio::test]
 async fn stalling_issuers_on_many_domains_do_not_starve_other_peers() {
     use base64::Engine;
@@ -1361,6 +1366,10 @@ async fn stalling_issuers_on_many_domains_do_not_starve_other_peers() {
     let peers: String = (0..70).map(|i| format!(",s{i}.slow.test=http://127.0.0.1:{stall_port}")).collect();
     let (a, b) = two_nodes_with(|_| {}, |c| c.federation_dev_peers.push_str(&peers)).await;
     let alice = a.register("alice").await;
+    // A is a peer B knows (an earlier sign-in) whose cached document expired: the next sign-in needs a fetch
+    // through the shared connection slots, which the flood must not have taken.
+    b.sign_in_from(&a, &alice).await;
+    sql_exec(&b, "UPDATE federation_peers SET expires_at = $1 WHERE domain = $2", &[&util::in_seconds(-1), A]).await;
     let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
     let n = now();
     let mut flood = Vec::new();
@@ -1388,9 +1397,14 @@ async fn stalling_issuers_on_many_domains_do_not_starve_other_peers() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let token = a.federation_token(&alice, B).await;
     let login = tokio::time::timeout(Duration::from_secs(4), b.federated_login(&token)).await;
-    for task in flood {
-        task.abort();
-    }
     let (s, j) = login.expect("the login of a healthy peer waited for the stalling ones");
     assert_eq!(s, StatusCode::OK, "{j}");
+    let mut busy = 0;
+    for task in flood {
+        let status = tokio::time::timeout(Duration::from_millis(100), task).await;
+        if matches!(status, Ok(Ok(s)) if s == StatusCode::SERVICE_UNAVAILABLE) {
+            busy += 1;
+        }
+    }
+    assert!(busy >= 70 - 12, "requests beyond the discovery slots are refused at once: {busy}");
 }

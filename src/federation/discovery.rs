@@ -142,27 +142,45 @@ async fn document_for(state: &AppState, domain: &str, unverified: bool) -> Resul
         state.federation.seed_delegation(domain, row.document.as_bytes(), left.unwrap_or(0));
         return Ok(doc);
     }
-    if unverified {
-        if let Some(e) = state.federation.recent_discovery_failure(domain) {
-            return Err(e);
-        }
-        if row.is_none()
-            && store::federation::count_unverified_peers(&state.db).await?
-                >= i64::from(state.config.federation_max_unverified_peers)
-        {
-            tracing::warn!(domain, "unverified peer limit reached, request refused before any fetch");
-            return Err(ApiError::Unavailable {
-                code: "federation.peer_limit",
-                detail: "This node accepts requests from no further unknown nodes at the moment".into(),
-            });
-        }
+    if !unverified {
+        return fetch(state, domain).await;
     }
-    fetch(state, domain).await
+    if let Some(e) = state.federation.recent_discovery_failure(domain) {
+        return Err(e);
+    }
+    if row.is_some() {
+        return fetch(state, domain).await;
+    }
+    // An issuer this node knows nothing of, named by a request nobody verified yet.
+    if store::federation::count_unverified_peers(&state.db).await?
+        >= i64::from(state.config.federation_max_unverified_peers)
+    {
+        tracing::warn!(domain, "unverified peer limit reached, request refused before any fetch");
+        return Err(ApiError::Unavailable {
+            code: "federation.peer_limit",
+            detail: "This node accepts requests from no further unknown nodes at the moment".into(),
+        });
+    }
+    // A few such fetches at a time, never waiting: requests naming many slow domains leave the other connection
+    // slots to the peers this node knows.
+    let Some(_slot) = state.federation.try_unverified_discovery() else {
+        tracing::warn!(domain, "no free discovery slot for an unknown issuer, request refused");
+        return Err(ApiError::Unavailable {
+            code: "federation.busy",
+            detail: "This node is busy, please retry later".into(),
+        });
+    };
+    fetch_with(state, domain, Some("request")).await
 }
 
 /// Fetches, validates and caches the document of `domain`. A failure is remembered for 60 seconds (§1.4).
 pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiError> {
-    let result = fetch_inner(state, domain).await;
+    fetch_with(state, domain, None).await
+}
+
+/// [`fetch`], recording `origin` when the peer's row is created.
+async fn fetch_with(state: &AppState, domain: &str, origin: Option<&str>) -> Result<PeerDocument, ApiError> {
+    let result = fetch_inner(state, domain, origin).await;
     match &result {
         Ok(_) => state.federation.clear_discovery_failure(domain),
         // Only peer errors (502) are remembered; a block is final until an operator acts anyway.
@@ -171,7 +189,7 @@ pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiEr
     result
 }
 
-async fn fetch_inner(state: &AppState, domain: &str) -> Result<PeerDocument, ApiError> {
+async fn fetch_inner(state: &AppState, domain: &str, origin: Option<&str>) -> Result<PeerDocument, ApiError> {
     let started = Instant::now();
     let (fetched, source) = match state.federation.get_well_known(domain).await {
         Ok(f) => f,
@@ -231,6 +249,7 @@ async fn fetch_inner(state: &AppState, domain: &str) -> Result<PeerDocument, Api
         &util::format_time(now),
         &util::format_time(now + chrono::Duration::seconds(ttl as i64)),
         source_name,
+        origin,
     )
     .await?;
     tracing::info!(

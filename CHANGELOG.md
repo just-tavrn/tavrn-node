@@ -43,6 +43,9 @@ First public release of the node and its container image.
 - Forwarded legal notices need federation history and are limited per sending domain and in total
   (`TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR`); they send no confirmation mail to the address the sender named.
 - Profile reads start at most one background refresh per remote user and minute.
+- Discovery fetches for unknown issuers of unverified requests run in their own slots
+  (`TAVRN_FEDERATION_DISCOVERY_SLOTS`), so floods naming many slow domains leave the shared slots to known peers.
+- Ring pushes naming a caller of a third node carry `via`.
 - A remote user's identity reset is recorded together with its history window or not at all (the home node retries).
 - Assigning a role is limited to roles whose permissions the actor holds; override deny bits and upload categories are
   limited to what the actor holds.

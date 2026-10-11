@@ -401,6 +401,10 @@ pub struct Config {
     /// verified request from them so far): at most this many cached documents (10–1000000, default 1000); unused
     /// rows are pruned after 30 days.
     pub federation_max_unverified_peers: u32,
+    /// Discovery fetches at the same time for issuers of requests whose signature cannot be checked yet and for
+    /// which this node has no cached document (1–64, default 12): beyond it such requests are refused at once
+    /// (`503 federation.busy`), so unsigned requests naming many slow domains keep most connection slots free.
+    pub federation_discovery_slots: u32,
     /// Refuse federated logins and inbox messages of peers whose latest conformance result is neither
     /// `pass` nor `warn`, including peers not checked yet (FEDERATION.md §9.4).
     pub federation_require_conformance: bool,
@@ -645,6 +649,7 @@ impl Default for Config {
             federation_max_remote_users_per_domain: 1000,
             federation_permit_timeout_secs: 10,
             federation_max_unverified_peers: 1000,
+            federation_discovery_slots: 12,
             federation_require_conformance: false,
             federation_remote_user_retention_days: 90,
             federation_notify_bans: false,
@@ -1350,6 +1355,9 @@ impl Config {
         }
         if !(10..=1_000_000).contains(&self.federation_max_unverified_peers) {
             problems.push("TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS must be between 10 and 1000000".into());
+        }
+        if !(1..=64).contains(&self.federation_discovery_slots) {
+            problems.push("TAVRN_FEDERATION_DISCOVERY_SLOTS must be between 1 and 64".into());
         }
         if !self.dev_misbehave.trim().is_empty() {
             if !self.dev {
@@ -2346,10 +2354,12 @@ mod tests {
         assert_eq!((c.federation_rate_api, c.federation_rate_claims), (3000, 120));
         assert_eq!((c.federation_max_remote_users, c.federation_max_remote_users_per_domain), (10_000, 1000));
         assert_eq!((c.federation_permit_timeout_secs, c.federation_max_unverified_peers), (10, 1000));
+        assert_eq!(c.federation_discovery_slots, 12);
         assert_eq!(c.legal_notice_inbound_per_hour, 10);
         for (bad, var) in [
             (Config { federation_permit_timeout_secs: 0, ..prod() }, "TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS"),
             (Config { federation_max_unverified_peers: 9, ..prod() }, "TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS"),
+            (Config { federation_discovery_slots: 65, ..prod() }, "TAVRN_FEDERATION_DISCOVERY_SLOTS"),
             (Config { legal_notice_inbound_per_hour: 0, ..prod() }, "TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR"),
         ] {
             assert!(bad.validate().unwrap_err().problems.iter().any(|p| p.contains(var)), "{var}");

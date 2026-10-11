@@ -611,7 +611,15 @@ pub async fn handle(
                     let settings = crate::notifications::load(&state.db, &to.id).await?;
                     let effective = settings.effective(None, &conversation_id, &util::now());
                     if !effective.muted && effective.mode != crate::notifications::Mode::Nothing {
-                        crate::push::hint(state, &to.id, iss, &conversation_id, None, false, Some(&from));
+                        crate::push::hint(
+                            state,
+                            &to.id,
+                            iss,
+                            &conversation_id,
+                            None,
+                            false,
+                            Some((&from, via.is_some())),
+                        );
                     }
                 }
                 CallHint::End => {
