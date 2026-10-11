@@ -458,6 +458,41 @@ async fn push_service_answers_remove_or_hold_back_subscriptions() {
     s.fake.settle(&busy.path, 1).await;
 }
 
+/// FEDERATION.md §5.2: a ring hint naming a caller of a third node is pushed with `via` (the node that named the
+/// caller), so the notification never presents the caller as verified.
+#[tokio::test]
+async fn a_ring_naming_a_third_node_caller_is_pushed_with_via() {
+    let node = test_node_with_limit(2).await;
+    let fake = FakePushService::start().await;
+    let bob_session = node.register("bob").await;
+    let browser = Browser::new(&fake, "ok/bob");
+    subscribe(&node, &bob_session, &browser).await;
+    let bob = store::users::by_id(&node.state.db, &bob_session.user_id).await.unwrap().unwrap();
+    store::federation::touch_target(&node.state.db, &bob.id, &bob_session.device_id, "b.test").await.unwrap();
+    let ring = Incoming::Notify {
+        conversation_id: tavrn_node::util::ulid(),
+        room_id: None,
+        mention: false,
+        everyone: false,
+        call: Some(tavrn_node::federation::social::CallHint::Ring {
+            from: "carol@c.test".into(),
+            started_at: tavrn_node::util::now(),
+            group: false,
+        }),
+    };
+    let r =
+        tavrn_node::federation::social::handle(&node.state, "b.test", "b.test", &bob, &tavrn_node::util::now(), ring)
+            .await
+            .unwrap();
+    assert_eq!(r, "handled");
+    let got = fake.wait(&browser.path, 1).await;
+    let p = browser.open(&got[0]);
+    assert_eq!(
+        (p["type"].as_str(), p["sender"].as_str(), p["via"].as_str()),
+        (Some("call"), Some("carol@c.test"), Some("b.test"))
+    );
+}
+
 #[tokio::test]
 async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     let node = test_node_with_limit(2).await;
@@ -509,6 +544,7 @@ async fn forwarded_hints_and_call_rings_push_and_the_limit_per_minute_holds() {
     let got = fake.wait(&browser.path, 2).await;
     let p = browser.open(&got[1]);
     assert_eq!((p["type"].as_str(), p["sender"].as_str()), (Some("call"), Some("carol@b.test")));
+    assert_eq!(p["via"], Value::Null, "b.test vouches for its own user");
     assert_eq!(got[1].headers["ttl"], "45");
     // TAVRN_PUSH_MAX_PER_MINUTE=2: a third push of another conversation within the minute is dropped.
     let third = Incoming::Notify {

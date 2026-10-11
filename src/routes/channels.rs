@@ -854,19 +854,27 @@ pub async fn set_override(
     let subject_type = validate::one_of("subject_type", &req.subject_type, &["role", "member"])?;
     // The actor's permissions where the override applies: an override can only be set with `manage_roles` there,
     // and grants only what the actor holds there (permissions.md step 4 and "Hierarchy").
+    // The upload categories the actor can use there bound those an override may hand out or take away.
+    let overrides = store::rooms::overrides_of_room(&state.db, &room_id).await?;
     let held = match target_type.as_str() {
         "category" => {
             match store::rooms::categories(&state.db, &room_id).await?.into_iter().find(|c| c.id == req.target_id) {
-                Some(category) => Some(category_perms(&state, &access, &category).await?),
+                Some(category) => Some((
+                    category_perms(&state, &access, &category).await?,
+                    access::upload_categories_at(&access, Some(&category.id), None, &overrides, &auth.user.id),
+                )),
                 None => None,
             }
         }
         _ => match access::channel_in_room(&state, &room_id, &req.target_id).await {
-            Ok(channel) => Some(access::channel_perms(&state, &access, &channel, &auth.user.id).await?),
+            Ok(channel) => Some((
+                access::channel_perms(&state, &access, &channel, &auth.user.id).await?,
+                access::channel_upload_categories_with(&access, &channel, &overrides, &auth.user.id),
+            )),
             Err(_) => None,
         },
     };
-    let Some(held) = held else {
+    let Some((held, held_uploads)) = held else {
         return Err(access::not_found("Target", "override.target_not_found"));
     };
     access::require(held, p::VIEW_CHANNEL | p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
@@ -906,11 +914,24 @@ pub async fn set_override(
     if upload_allow.unwrap_or(0) & upload_deny.unwrap_or(0) != 0 {
         return Err(bad("override.conflict", "An upload category cannot be allowed and denied at once"));
     }
-    // Nobody can grant themselves more permissions through an override than they have.
-    if !access.is_owner && !access.is_node_admin && allow & !held != 0 {
+    // Nobody can grant more permissions through an override than they have, nor take away from others what they
+    // do not hold themselves; the same for upload categories (permissions.md "Hierarchy"). Only what changes counts:
+    // bits of the stored override (set by someone above) may stay while the actor edits the bits they hold.
+    let stored = overrides.iter().find(|o| {
+        o.target_type == target_type
+            && o.target_id == req.target_id
+            && o.subject_type == subject_type
+            && o.subject_id == req.subject_id
+    });
+    let (old_allow, old_deny, old_up_allow, old_up_deny) =
+        stored.map_or((0, 0, 0, 0), |o| (o.allow as u64, o.deny as u64, o.upload_allow as u64, o.upload_deny as u64));
+    let changed = (allow ^ old_allow) | (deny ^ old_deny);
+    let changed_uploads =
+        (upload_allow.unwrap_or(old_up_allow) ^ old_up_allow) | (upload_deny.unwrap_or(old_up_deny) ^ old_up_deny);
+    if !access.is_owner && !access.is_node_admin && (changed & !held != 0 || changed_uploads & !held_uploads != 0) {
         return Err(ApiError::Forbidden {
             code: "override.escalation",
-            detail: "You can only grant permissions you have yourself".into(),
+            detail: "You can only grant or deny permissions and upload categories you have yourself".into(),
         });
     }
     store::rooms::set_override(

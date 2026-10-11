@@ -150,6 +150,9 @@ pub struct AppState {
     pub notify_limiter: Arc<RateLimiter>,
     /// Key cache refetches through `federation::keys::ensure` per remote user (1 per minute, §3.5).
     pub keys_fetch_limiter: Arc<RateLimiter>,
+    /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
+    /// FEDERATION.md §2.7): anonymous reads of a user whose home node fails cannot pile up refresh tasks.
+    pub profile_refresh_limiter: Arc<RateLimiter>,
     /// Received `node.announce` per sending domain (`domain:<domain>`, 1 per 10 minutes, FEDERATION.md §7.2).
     pub directory_announce_limiter: Arc<RateLimiter>,
     /// Public directory reads per client IP (`dir-ip:<ip>`, 120 per minute).
@@ -239,6 +242,10 @@ pub struct AppState {
     pub admin_limiter: Arc<RateLimiter>,
     /// Takedown notices per client IP (`notice-ip:<ip>`, `TAVRN_LEGAL_NOTICE_RATE_PER_HOUR` per hour).
     pub legal_notice_limiter: Arc<SharedLimiter>,
+    /// Notices forwarded by other nodes per sending domain (`<domain>`, `TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR` per
+    /// hour) and from all domains together (five times as many).
+    pub legal_inbound_limiter: Arc<SharedLimiter>,
+    pub legal_inbound_total_limiter: Arc<SharedLimiter>,
     /// Status-link lookups (notices, account deletions) per client IP (`lookup-ip:<ip>`, 60 per hour).
     pub legal_lookup_limiter: Arc<SharedLimiter>,
     /// Access tokens issued before this Unix time are expired. Only development nodes move it
@@ -359,6 +366,7 @@ impl AppState {
             room_invite_inbox_limiter: limiter(invites.2, 3600),
             notify_limiter: limiter(1, 60),
             keys_fetch_limiter: limiter(1, 60),
+            profile_refresh_limiter: limiter(1, 60),
             directory_announce_limiter: limiter(directory.0, 600),
             directory_limiter: limiter(directory.1, 60),
             outbox_wakeup: Arc::new(tokio::sync::Notify::new()),
@@ -400,6 +408,8 @@ impl AppState {
             subscription_wakeup: Arc::new(tokio::sync::Notify::new()),
             admin_limiter: limiter(if config.dev { 100_000 } else { 600 }, 60),
             legal_notice_limiter: shared("legal-notice", config.legal_notice_rate_per_hour, 3600),
+            legal_inbound_limiter: shared("legal-inbound", config.legal_notice_inbound_per_hour, 3600),
+            legal_inbound_total_limiter: shared("legal-inbound-all", config.legal_notice_inbound_per_hour * 5, 3600),
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),

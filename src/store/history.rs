@@ -280,10 +280,23 @@ pub async fn set_policy(db: &Pool, channel_id: &str, policy: &str) -> Result<(),
 /// restore is dropped) and every encrypted group of those rooms records its current epoch as the user's reset
 /// epoch. Returns the number of memberships.
 pub async fn mark_key_reset(db: &Pool, user_id: &str, at: &str) -> Result<u64, ApiError> {
+    let mut tx = db.begin().await?;
+    let n = mark_key_reset_tx(&mut tx, user_id, at).await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// [`mark_key_reset`] inside the caller's transaction: the reset itself records its window, so a reset never
+/// commits without it (ENCRYPTION.md §7b).
+pub async fn mark_key_reset_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    user_id: &str,
+    at: &str,
+) -> Result<u64, ApiError> {
     let n = sqlx::query("UPDATE room_members SET key_reset_at = $1, history_restored_at = NULL WHERE user_id = $2")
         .bind(at)
         .bind(user_id)
-        .execute(db)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
     // `WHERE` before `ON CONFLICT`: SQLite needs it to parse an upsert from a SELECT.
@@ -296,7 +309,7 @@ pub async fn mark_key_reset(db: &Pool, user_id: &str, at: &str) -> Result<u64, A
          ON CONFLICT (conversation_id, user_id) DO UPDATE SET epoch = excluded.epoch",
     )
     .bind(user_id)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(n)
 }

@@ -827,15 +827,16 @@ async fn insert_invite(
     })
 }
 
-/// Members of a room whose home domain is `domain`, and bots whose owner's home domain is `domain`.
+/// Members of a room whose home domain is `domain` or one of its subdomains, and bots whose owner is one of them.
 pub async fn members_of_domain(db: &Pool, room_id: &str, domain: &str) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(
         "SELECT m.user_id AS id FROM room_members m JOIN users u ON u.id = m.user_id
          LEFT JOIN users o ON o.id = u.owner_id
-         WHERE m.room_id = $1 AND (u.domain = $2 OR o.domain = $2)",
+         WHERE m.room_id = $1 AND (u.domain = $2 OR o.domain = $2 OR u.domain LIKE $3 OR o.domain LIKE $3)",
     )
     .bind(room_id)
     .bind(domain)
+    .bind(format!("%.{domain}"))
     .fetch_all(db)
     .await?;
     rows.iter().map(|r| r.try_get::<String, _>("id").map_err(Into::into)).collect()
@@ -915,8 +916,23 @@ pub async fn invites_of_room(db: &Pool, room_id: &str) -> Result<Vec<Invite>, Ap
     Ok(rows.into_iter().map(|i| Invite { direct: i.user.is_some(), ..i }).collect())
 }
 
-pub async fn use_invite(db: &Pool, code: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE invites SET uses = uses + 1 WHERE code = $1").bind(code).execute(db).await?;
+/// Claims one use of an invite atomically: `false` if it is used up or expired (also when several people redeem the
+/// last use at the same moment, only one of them gets it).
+pub async fn claim_invite(db: &Pool, code: &str, now: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query(
+        "UPDATE invites SET uses = uses + 1
+         WHERE code = $1 AND (max_uses = 0 OR uses < max_uses) AND (expires_at IS NULL OR expires_at > $2)",
+    )
+    .bind(code)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Gives back a use claimed by [`claim_invite`] (the join failed after the claim).
+pub async fn release_invite(db: &Pool, code: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE invites SET uses = uses - 1 WHERE code = $1 AND uses > 0").bind(code).execute(db).await?;
     Ok(())
 }
 
@@ -929,17 +945,19 @@ pub async fn delete_invite(db: &Pool, room_id: &str, code: &str) -> Result<bool,
     Ok(r.rows_affected() > 0)
 }
 
-/// Checks room bans (room_id) and node bans (NULL) for the user ID and its domain.
+/// Checks room bans (room_id) and node bans (NULL) for the user's address, its domain and the parent domains (a
+/// domain ban covers the subdomains, FEDERATION.md §3.3).
 pub async fn is_banned(db: &Pool, room_id: Option<&str>, address: &str, domain: &str) -> Result<bool, ApiError> {
-    let row = sqlx::query(
-        "SELECT 1 AS x FROM bans WHERE (room_id IS NULL OR room_id = $1) AND (subject = $2 OR subject = $3) LIMIT 1",
-    )
-    .bind(room_id)
-    .bind(address)
-    .bind(domain)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.is_some())
+    let domains = super::federation::covering_domains(domain);
+    let list = (3..3 + domains.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT 1 AS x FROM bans WHERE (room_id IS NULL OR room_id = $1) AND (subject = $2 OR subject IN ({list})) LIMIT 1"
+    );
+    let mut q = sqlx::query(&sql).bind(room_id).bind(address);
+    for d in &domains {
+        q = q.bind(d);
+    }
+    Ok(q.fetch_optional(db).await?.is_some())
 }
 
 pub async fn add_ban(
