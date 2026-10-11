@@ -80,11 +80,12 @@ jobs:
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
 
   # GitHub's build provenance for the pushed image (`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node:<version>
-  # --repo just-tavrn/tavrn-node`, docs/GITHUB.md "Verifying an image").
+  # --repo just-tavrn/tavrn-node`, docs/GITHUB.md "Verifying an image"). Artifact attestations need a public repository
+  # on GitHub's Free plan: skipped while the repository is private, and the release goes on without it.
   attest:
     name: Build provenance attestation
     needs: image
-    if: ${{ vars.CI_ENABLED == 'true' }}
+    if: ${{ vars.CI_ENABLED == 'true' && !github.event.repository.private }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -99,7 +100,7 @@ jobs:
   release:
     name: GitHub release
     needs: [version, image, attest]
-    if: ${{ vars.CI_ENABLED == 'true' }}
+    if: ${{ always() && vars.CI_ENABLED == 'true' && needs.version.result == 'success' && needs.image.result == 'success' && (needs.attest.result == 'success' || needs.attest.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,6 +111,7 @@ jobs:
           DIGEST: ${{ needs.image.outputs.digest }}
           WEB_REF: ${{ vars.TAVRN_WEB_REF }}
           WEB_SHA: ${{ needs.version.outputs.web-sha }}
+          ATTESTED: ${{ needs.attest.result }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           notes="$(mktemp)"
@@ -117,8 +119,10 @@ jobs:
             echo "Container image: \`ghcr.io/just-tavrn/tavrn-node:${version}\` (\`${DIGEST}\`)"
             echo
             echo "Web client: tavrn-web \`${WEB_REF}\` (\`${WEB_SHA}\`). Upgrade notes: README.md (\"Upgrading\")."
-            echo
-            echo "Verify the image: \`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+            if [ "$ATTESTED" = success ]; then
+              echo
+              echo "Verify the image: \`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+            fi
           } > "$notes"
           # A pre-release is never "latest" for the website's download page.
           prerelease=()
