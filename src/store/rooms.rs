@@ -915,8 +915,23 @@ pub async fn invites_of_room(db: &Pool, room_id: &str) -> Result<Vec<Invite>, Ap
     Ok(rows.into_iter().map(|i| Invite { direct: i.user.is_some(), ..i }).collect())
 }
 
-pub async fn use_invite(db: &Pool, code: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE invites SET uses = uses + 1 WHERE code = $1").bind(code).execute(db).await?;
+/// Claims one use of an invite atomically: `false` if it is used up or expired (also when several people redeem the
+/// last use at the same moment, only one of them gets it).
+pub async fn claim_invite(db: &Pool, code: &str, now: &str) -> Result<bool, ApiError> {
+    let r = sqlx::query(
+        "UPDATE invites SET uses = uses + 1
+         WHERE code = $1 AND (max_uses = 0 OR uses < max_uses) AND (expires_at IS NULL OR expires_at > $2)",
+    )
+    .bind(code)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Gives back a use claimed by [`claim_invite`] (the join failed after the claim).
+pub async fn release_invite(db: &Pool, code: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE invites SET uses = uses - 1 WHERE code = $1 AND uses > 0").bind(code).execute(db).await?;
     Ok(())
 }
 

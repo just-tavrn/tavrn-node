@@ -243,6 +243,18 @@ pub fn channel_upload_categories_with(
     overrides: &[OverrideRow],
     user_id: &str,
 ) -> crate::uploads::Categories {
+    upload_categories_at(access, channel.category_id.as_deref(), Some(&channel.id), overrides, user_id)
+}
+
+/// Upload categories of the member at the layers of a category and (optionally) a channel in it: for a category
+/// alone (`channel_id` `None`) what holds in its channels before their own overrides.
+pub fn upload_categories_at(
+    access: &RoomAccess,
+    category_id: Option<&str>,
+    channel_id: Option<&str>,
+    overrides: &[OverrideRow],
+    user_id: &str,
+) -> crate::uploads::Categories {
     use crate::uploads;
     let layer = |target_type: &str, target_id: Option<&str>| -> Vec<(permissions::Override, u64, u64)> {
         overrides
@@ -251,8 +263,7 @@ pub fn channel_upload_categories_with(
             .map(|o| (o.to_eval(), o.upload_allow as u64, o.upload_deny as u64))
             .collect()
     };
-    let (category_layer, own_layer) =
-        (layer("category", channel.category_id.as_deref()), layer("channel", Some(&channel.id)));
+    let (category_layer, own_layer) = (layer("category", category_id), layer("channel", channel_id));
     fn to_upload(l: &[(permissions::Override, u64, u64)]) -> Vec<crate::uploads::UploadOverride<'_>> {
         l.iter().map(|(e, allow, deny)| crate::uploads::UploadOverride::of(e, *allow, *deny)).collect()
     }

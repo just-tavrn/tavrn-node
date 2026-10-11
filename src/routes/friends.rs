@@ -337,6 +337,10 @@ pub async fn block_user(state: &AppState, auth_user: &UserRow, other: &UserRow, 
     }
     // Presence is hidden between the two from now on.
     crate::presence::hide_between(state, auth_user, other);
+    // A running call of their DM ends: blocks always win (PROTOCOL.md §8a).
+    if let Some(dm) = store::social::dm_by_key(&state.db, &store::social::dm_key(&auth_user.id, &other.id)).await? {
+        crate::calls::end(state, &dm.id, crate::calls::EndReason::Ended).await;
+    }
     Ok(())
 }
 
