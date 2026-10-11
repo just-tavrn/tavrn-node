@@ -4890,6 +4890,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tavrn-crypto"
 version = "0.1.0"
+source = "git+https://github.com/just-tavrn/tavrn-crypto?rev=864fd4a2707f9fba00574ab283299864bc3b79c0#864fd4a2707f9fba00574ab283299864bc3b79c0"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.23.1",
