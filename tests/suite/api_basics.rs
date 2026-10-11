@@ -55,11 +55,10 @@ async fn non_api_paths_fall_back_to_web_client_or_404() {
     if resp.status() == StatusCode::OK {
         assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/html");
         let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
-        assert!(
-            csp.contains("frame-src https://challenges.cloudflare.com https://*.challenges.cloudflare.com"),
-            "{csp}"
-        );
-        assert!(csp.contains("frame-ancestors 'none'"));
+        // The Turnstile hosts are allowed only when a captcha is configured (security_headers below).
+        assert!(!csp.contains("challenges.cloudflare.com"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
     }
 }
 
