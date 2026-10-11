@@ -639,11 +639,20 @@ pub async fn join_by_invite(
         return Err(crate::applications::bot_forbidden());
     }
     let was_member = store::rooms::member(&state.db, &room.id, &auth.user.id).await?.is_some();
-    let detail = join(&state, &auth.user, &room, body.map(|b| b.accept_rules).unwrap_or(false)).await?;
-    if !was_member {
-        store::rooms::use_invite(&state.db, &invite.code).await?;
+    // The use is claimed before the join (atomically, so a limited invite admits exactly as many people as it
+    // allows) and given back when the join fails.
+    if !was_member && !store::rooms::claim_invite(&state.db, &invite.code, &now()).await? {
+        return Err(ApiError::NotFound { code: "invite.invalid", what: "Invite".into() });
     }
-    Ok(Json(detail))
+    match join(&state, &auth.user, &room, body.map(|b| b.accept_rules).unwrap_or(false)).await {
+        Ok(detail) => Ok(Json(detail)),
+        Err(e) => {
+            if !was_member {
+                store::rooms::release_invite(&state.db, &invite.code).await?;
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Leave a room (owners must transfer or delete it first).
@@ -785,6 +794,18 @@ pub async fn update_member(
                 return Err(ApiError::Forbidden {
                     code: "role.hierarchy",
                     detail: format!("The role '{}' is above your highest role", role.name),
+                });
+            }
+            // Assigning a role grants its bits: only bits the actor holds (permissions.md "Hierarchy"), for other
+            // members and for the actor themselves alike. Roles the member already holds are not granted anew.
+            if !access.is_owner
+                && !access.is_node_admin
+                && !current.contains(&id)
+                && role.perms() & !access.room_perms != 0
+            {
+                return Err(ApiError::Forbidden {
+                    code: "role.escalation",
+                    detail: format!("The role '{}' carries permissions you do not have yourself", role.name),
                 });
             }
             if !clean.contains(&id) {
@@ -1009,7 +1030,8 @@ pub async fn ban(
             }
         }
     } else if util::valid_domain(&subject) {
-        if subject == state.config.domain {
+        // A domain ban covers subdomains: neither the own domain nor a parent of it.
+        if store::federation::within_domain(&state.config.domain, &subject) {
             return Err(bad("ban.own_domain", "The node's own domain cannot be banned"));
         }
         // Every member of the domain (and every bot of an owner there) leaves (FEDERATION.md §3.3).
@@ -1378,9 +1400,21 @@ pub async fn purge(
             if extra.filter_hash != filter_hash {
                 return Err(bad("moderation.confirm_mismatch", "The filter changed after the preview"));
             }
-            let deleted = crate::routes::messages::purge_with_blobs(&state, &filter).await?;
+            // Channel by channel: each `message.purge` names one channel and reaches only its viewers, so no member
+            // learns of channels hidden from them (PROTOCOL.md §6).
+            let mut deleted = 0;
+            for channel_id in &filter.conversation_ids {
+                let one = PurgeFilter {
+                    conversation_ids: vec![channel_id.clone()],
+                    author_id: filter.author_id.clone(),
+                    from: filter.from.clone(),
+                    to: filter.to.clone(),
+                };
+                let n = crate::routes::messages::purge_with_blobs(&state, &one).await?;
+                deleted += n;
+                state.hub.room(&room_id, "message.purge", serde_json::json!({ "room_id": room_id, "conversation_ids": [channel_id], "author_id": filter.author_id, "from": filter.from, "to": filter.to, "deleted": n }));
+            }
             store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "moderation.purge", "", "", serde_json::json!({ "deleted": deleted, "channels": filter.conversation_ids, "author_id": filter.author_id, "from": filter.from, "to": filter.to })).await?;
-            state.hub.room(&room_id, "message.purge", serde_json::json!({ "room_id": room_id, "conversation_ids": filter.conversation_ids, "author_id": filter.author_id, "from": filter.from, "to": filter.to, "deleted": deleted }));
             Ok(Json(PurgeResponse { dry_run: false, messages: deleted, confirm_token: None }))
         }
     }

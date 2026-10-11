@@ -2,6 +2,10 @@
 # and X-Forwarded-For through. Voice media does not go through Caddy: publish TAVRN_RTC_UDP_PORT_RANGE (UDP)
 # directly to the tavrn container.
 chat.example.org {
+    # Caddy sends no HSTS by itself: browsers then never try plain HTTP for this domain again.
+    header Strict-Transport-Security "max-age=63072000"
+    # The metrics endpoint is for the monitoring inside your network, not for the public (docs/HANDBOOK.md).
+    respond /metrics 404
     reverse_proxy 127.0.0.1:8080
     request_body {
         max_size 100MB

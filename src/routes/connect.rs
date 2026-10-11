@@ -199,7 +199,8 @@ fn challenge_invalid() -> ApiError {
 }
 
 /// One-time code for the web client of another node or a native app (connect flow, FEDERATION.md §8). Needs a full
-/// session of a local user; remote users get `federation.local_only`. With `origin` the page redirects the code to
+/// session of a local user and, because the code becomes a new session, a reauth token (`Tavrn-Reauth`, PROTOCOL.md
+/// §5c; not for an `unlock` session); remote users get `federation.local_only`. With `origin` the page redirects the code to
 /// that web client; with `session_id` the node keeps it, and the optional `sealed_unlock`, for the app's next poll of
 /// its app session. An `unlock` session issues no code: its own user sends `sealed_unlock` and gets `204`.
 #[utoipa::path(post, path = "/api/v1/auth/connect/code", security(("bearer" = [])), request_body = ConnectCodeRequest,
@@ -209,6 +210,7 @@ fn challenge_invalid() -> ApiError {
 pub async fn connect_code(
     State(state): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     ApiJson(req): ApiJson<ConnectCodeRequest>,
 ) -> Result<Response, ApiError> {
     if auth.is_remote() {
@@ -230,13 +232,15 @@ pub async fn connect_code(
         return Err(connect_sessions::sealed_unlock_invalid());
     }
     if let Some(id) = session_id {
-        return app_session_code(&state, &auth, id, challenge, sealed_unlock).await;
+        return app_session_code(&state, &auth, &headers, id, challenge, sealed_unlock).await;
     }
     let origin = req.origin.as_deref().unwrap_or_default().trim();
     if !valid_origin(origin, state.config.dev) {
         return Err(origin_invalid());
     }
     let challenge = challenge.filter(|c| valid_challenge(c)).ok_or_else(challenge_invalid)?;
+    // The code becomes a new long-lived session: a fresh proof of the credentials, not just a session (§5c).
+    crate::reauth::require(&state, &auth, &headers).await?;
     state.federation_token_limiter.check_all(&[format!("connect:{}", auth.device_id)]).await?;
     let host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
     let code = util::random_token(32);
@@ -271,6 +275,7 @@ fn user_mismatch() -> ApiError {
 async fn app_session_code(
     state: &AppState,
     auth: &AuthUser,
+    headers: &HeaderMap,
     session_id: &str,
     challenge: Option<&str>,
     sealed_unlock: Option<&str>,
@@ -289,6 +294,8 @@ async fn app_session_code(
         tracing::info!(device = auth.device_id, "unlock material stored for an app session");
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
+    // The code signs the app in (a new long-lived session): a fresh proof of the credentials (PROTOCOL.md §5c).
+    crate::reauth::require(state, auth, headers).await?;
     state.federation_token_limiter.check_all(&[format!("connect:{}", auth.device_id)]).await?;
     let code = util::random_token(32);
     state
@@ -499,9 +506,16 @@ pub async fn connect_token(
         return Err(code_invalid());
     }
     let reuse = crate::device_proof::verify_opt(&state, &user, req.device.as_ref()).await?;
-    let session =
-        second_factor::start_session(&state, &user, &pending.device_name, &client_header(&headers), reuse.as_deref())
-            .await?;
+    // No credential was proven here (the code came from an existing session): no reauth token (PROTOCOL.md §5c).
+    let session = second_factor::start_session(
+        &state,
+        &user,
+        &pending.device_name,
+        &client_header(&headers),
+        reuse.as_deref(),
+        false,
+    )
+    .await?;
     let (reason, meta) = if pending.app_session {
         ("app", serde_json::json!({ "ip": ip, "device": session.tokens.device_id, "device_name": pending.device_name }))
     } else {

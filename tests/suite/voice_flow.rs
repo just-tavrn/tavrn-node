@@ -1450,3 +1450,42 @@ async fn my_voice_is_empty_when_voice_is_disabled() {
     let (st, j) = v.node.get_auth("/api/v1/users/me/voice", &v.alice.token).await;
     assert_eq!((st, j), (StatusCode::OK, json!({ "rooms": [] })));
 }
+
+// ---------------------------------------------------------------- revocations
+
+/// A disabled or node-banned account leaves every voice channel at once; a logout removes only that device.
+#[tokio::test]
+async fn ended_sessions_leave_voice() {
+    for how in ["disable", "ban", "logout", "logout_other"] {
+        let v = setup().await;
+        let phone = v.node.login("bob").await;
+        v.join(&v.bob).await;
+        v.connected(&v.bob).await;
+        assert_eq!(v.participants(&v.alice).await.len(), 1);
+        let mut rx = v.node.state.hub.subscribe();
+        let (s, j) = match how {
+            "disable" => {
+                v.node
+                    .patch(
+                        &format!("/api/v1/admin/users/{}", v.bob.user_id),
+                        &v.alice.token,
+                        json!({ "disabled": true }),
+                    )
+                    .await
+            }
+            "ban" => v.node.post("/api/v1/admin/bans", &v.alice.token, json!({ "subject": "bob@t.local" })).await,
+            "logout" => v.node.post("/api/v1/auth/logout", &v.bob.token, json!({})).await,
+            _ => v.node.post("/api/v1/auth/logout", &phone.token, json!({})).await,
+        };
+        assert!(s.is_success(), "{how}: {s} {j}");
+        if how == "logout_other" {
+            // Another device of bob signs out: his voice device stays.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(v.participants(&v.alice).await.len(), 1, "{how}");
+            continue;
+        }
+        let ev = next_event(&mut rx, "voice.state").await;
+        assert_eq!(ev["participants"], json!([]), "{how}");
+        assert!(v.participants(&v.alice).await.is_empty(), "{how}");
+    }
+}

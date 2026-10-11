@@ -8,6 +8,10 @@
 //! checked content type and format), stores them as a blob and keeps the copy while it is used. Deletion at the
 //! origin does not reach the copies (messages stay readable); housekeeping evicts copies unused for
 //! `TAVRN_MEDIA_CACHE_UNUSED_DAYS` and node admins purge single copies.
+//!
+//! The routes need no session, so the cache is bounded: fetches (cache misses) are limited per client address
+//! (IPv6 by prefix), the copies of one origin host by `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST` and all copies by
+//! `TAVRN_MEDIA_CACHE_MAX_BYTES`; beyond a cap the least recently used copies go.
 
 use std::time::Duration;
 
@@ -70,8 +74,16 @@ fn not_found() -> ApiError {
     ApiError::NotFound { code: "media.remote_not_found", what: "File".into() }
 }
 
-/// The copy of `origin_id` from `host`, fetched on the first request.
-pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str) -> Result<Cached, ApiError> {
+/// Cache misses (fetches from other nodes) per client address and minute; development nodes allow more.
+pub fn miss_limit(dev: bool) -> u32 {
+    if dev { 10_000 } else { 60 }
+}
+
+/// The total cap is enforced at most this often per instance (and by housekeeping); the per-host cap at every fetch.
+const TOTAL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The copy of `origin_id` from `host`, fetched on the first request; a fetch counts against `ip`'s miss budget.
+pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str, ip: &str) -> Result<Cached, ApiError> {
     if !crate::emoji::valid_host(host) || !federation::valid_node_domain(host.split(':').next().unwrap_or(host)) {
         return Err(crate::validate::bad("media.host_invalid", "host must be a node domain"));
     }
@@ -94,6 +106,7 @@ pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str)
         sqlx::query("DELETE FROM remote_emoji_cache WHERE id = $1").bind(&id).execute(&state.db).await?;
     }
     federation::check_policy(state, host).await?;
+    state.media_miss_limiter.check_all(&[format!("miss:{ip}")])?;
     let fetched =
         tokio::time::timeout(FETCH_TIMEOUT, state.federation.get(host, &kind.path(origin_id), kind.fetch_kind()))
             .await
@@ -139,11 +152,75 @@ pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str)
         // Another request stored it first: keep that copy.
         state.storage.delete(&id).await;
         if crate::store::is_unique_violation(&e) {
-            return Box::pin(get(state, kind, host, origin_id)).await;
+            return Box::pin(get(state, kind, host, origin_id, ip)).await;
         }
         return Err(e.into());
     }
+    enforce_host_cap(state, host, &id).await?;
+    if state
+        .media_cache_checked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none_or(|t| t.elapsed() >= TOTAL_CHECK_INTERVAL)
+    {
+        *state.media_cache_checked.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        enforce_total_cap(state).await?;
+    }
     Ok(Cached { id, mime, data: fetched.body })
+}
+
+/// Deletes the least recently used copies of `host` (never `keep`, the copy just stored) until the host is within
+/// `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST`; returns how many.
+pub async fn enforce_host_cap(state: &AppState, host: &str, keep: &str) -> Result<u64, ApiError> {
+    let cap = i64::try_from(state.config.media_cache_max_bytes_per_host).unwrap_or(i64::MAX);
+    let used: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM remote_emoji_cache WHERE origin_host = $1",
+    )
+    .bind(host)
+    .fetch_one(&state.db)
+    .await?;
+    evict_oldest(
+        state,
+        used - cap,
+        "SELECT id, size FROM remote_emoji_cache WHERE origin_host = $1 AND id <> $2 ORDER BY used_at, id LIMIT 100",
+        &[host, keep],
+    )
+    .await
+}
+
+/// Deletes the least recently used copies of all hosts until the cache is within `TAVRN_MEDIA_CACHE_MAX_BYTES`;
+/// returns how many.
+pub async fn enforce_total_cap(state: &AppState) -> Result<u64, ApiError> {
+    let cap = i64::try_from(state.config.media_cache_max_bytes).unwrap_or(i64::MAX);
+    let used: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM remote_emoji_cache")
+        .fetch_one(&state.db)
+        .await?;
+    evict_oldest(state, used - cap, "SELECT id, size FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100", &[]).await
+}
+
+/// Deletes copies in the order of `query` (oldest use first, pages of at most 100) until `excess` bytes are freed.
+async fn evict_oldest(state: &AppState, mut excess: i64, query: &str, binds: &[&str]) -> Result<u64, ApiError> {
+    let mut deleted = 0;
+    while excess > 0 {
+        let mut q = sqlx::query_as::<_, (String, i64)>(query);
+        for b in binds {
+            q = q.bind(*b);
+        }
+        let page = q.fetch_all(&state.db).await?;
+        if page.is_empty() {
+            break;
+        }
+        for (id, size) in page {
+            if excess <= 0 {
+                break;
+            }
+            sqlx::query("DELETE FROM remote_emoji_cache WHERE id = $1").bind(&id).execute(&state.db).await?;
+            state.storage.delete(&id).await;
+            excess -= size.max(1);
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 async fn touch(state: &AppState, id: &str, used_at: &str) -> Result<(), ApiError> {

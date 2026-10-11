@@ -123,9 +123,17 @@ pub fn validate(domain: &str, body: &[u8]) -> Result<PeerDocument, &'static str>
 /// The peer's current, validated document: from the cache while fresh, otherwise fetched. A cached copy is
 /// also refetched once the peer's endpoint moved (the federation client found a new one after a failure).
 pub async fn document(state: &AppState, domain: &str) -> Result<PeerDocument, ApiError> {
+    document_for(state, domain, false).await
+}
+
+/// [`document`] for checking the signature of a request that names `domain` as its issuer (§1.4): before the
+/// signature is checked anyone can name any domain, so a recent failure is answered from the negative cache and a
+/// domain this node has no row for counts against the cap of unverified peers.
+async fn document_for(state: &AppState, domain: &str, unverified: bool) -> Result<PeerDocument, ApiError> {
     super::check_policy(state, domain).await?;
+    let row = store::federation::peer(&state.db, domain).await?;
     if !state.federation.take_stale_document(domain)
-        && let Some(row) = store::federation::peer(&state.db, domain).await?
+        && let Some(row) = &row
         && row.status == STATUS_OK
         && row.expires_at > util::now()
         && let Ok(doc) = validate(domain, row.document.as_bytes())
@@ -134,11 +142,54 @@ pub async fn document(state: &AppState, domain: &str) -> Result<PeerDocument, Ap
         state.federation.seed_delegation(domain, row.document.as_bytes(), left.unwrap_or(0));
         return Ok(doc);
     }
-    fetch(state, domain).await
+    if !unverified {
+        return fetch(state, domain).await;
+    }
+    if let Some(e) = state.federation.recent_discovery_failure(domain) {
+        return Err(e);
+    }
+    if row.is_some() {
+        return fetch(state, domain).await;
+    }
+    // An issuer this node knows nothing of, named by a request nobody verified yet.
+    if store::federation::count_unverified_peers(&state.db).await?
+        >= i64::from(state.config.federation_max_unverified_peers)
+    {
+        tracing::warn!(domain, "unverified peer limit reached, request refused before any fetch");
+        return Err(ApiError::Unavailable {
+            code: "federation.peer_limit",
+            detail: "This node accepts requests from no further unknown nodes at the moment".into(),
+        });
+    }
+    // A few such fetches at a time, never waiting: requests naming many slow domains leave the other connection
+    // slots to the peers this node knows.
+    let Some(_slot) = state.federation.try_unverified_discovery() else {
+        tracing::warn!(domain, "no free discovery slot for an unknown issuer, request refused");
+        return Err(ApiError::Unavailable {
+            code: "federation.busy",
+            detail: "This node is busy, please retry later".into(),
+        });
+    };
+    fetch_with(state, domain, Some("request")).await
 }
 
-/// Fetches, validates and caches the document of `domain`.
+/// Fetches, validates and caches the document of `domain`. A failure is remembered for 60 seconds (§1.4).
 pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiError> {
+    fetch_with(state, domain, None).await
+}
+
+/// [`fetch`], recording `origin` when the peer's row is created.
+async fn fetch_with(state: &AppState, domain: &str, origin: Option<&str>) -> Result<PeerDocument, ApiError> {
+    let result = fetch_inner(state, domain, origin).await;
+    match &result {
+        Ok(_) => state.federation.clear_discovery_failure(domain),
+        // Only peer errors (502) are remembered; a block is final until an operator acts anyway.
+        Err(e) => state.federation.note_discovery_failure(domain, e),
+    }
+    result
+}
+
+async fn fetch_inner(state: &AppState, domain: &str, origin: Option<&str>) -> Result<PeerDocument, ApiError> {
     let started = Instant::now();
     let (fetched, source) = match state.federation.get_well_known(domain).await {
         Ok(f) => f,
@@ -167,10 +218,24 @@ pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiEr
                 kid = key.kid,
                 "federation key conflict: a kid now names another key, peer blocked"
             );
-            store::federation::set_peer_status(&state.db, domain, STATUS_KEY_CONFLICT).await?;
-            super::conformance::violation(state, domain, super::conformance::VIOLATION_KEY_CONFLICT).await;
-            return Err(super::peer_blocked(domain));
+            return Err(key_conflict(state, domain).await);
         }
+    }
+    // A document from another source than before (well-known → SRV or back) with none of the keys seen before
+    // looks exactly like a takeover; a real move keeps a key during the change (§1.2, §1.4).
+    let source_name = source_name(source);
+    if let Some(previous) = store::federation::peer_source(&state.db, domain).await?
+        && previous != source_name
+        && !known.is_empty()
+        && !doc.keys.iter().any(|k| known.iter().any(|(kid, x)| kid == &k.kid && x == &k.x))
+    {
+        tracing::error!(
+            domain,
+            from = previous,
+            to = source_name,
+            "federation key conflict: the document moved to another source with an entirely new key set, peer blocked"
+        );
+        return Err(key_conflict(state, domain).await);
     }
     for key in &doc.keys {
         store::federation::add_peer_key(&state.db, domain, &key.kid, &key.x).await?;
@@ -183,6 +248,8 @@ pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiEr
         &body,
         &util::format_time(now),
         &util::format_time(now + chrono::Duration::seconds(ttl as i64)),
+        source_name,
+        origin,
     )
     .await?;
     tracing::info!(
@@ -195,22 +262,60 @@ pub async fn fetch(state: &AppState, domain: &str) -> Result<PeerDocument, ApiEr
     Ok(doc)
 }
 
-/// The key `kid` of `domain`, fetched only from that domain's own document. An unknown `kid` refetches
-/// the document once (at most every 5 minutes per peer), then fails with `federation.token_invalid`.
+/// The stored name of a document source.
+fn source_name(source: super::client::DelegationSource) -> &'static str {
+    match source {
+        super::client::DelegationSource::Srv => "srv",
+        _ => "well_known",
+    }
+}
+
+/// Blocks the peer after a key conflict (`status = key_conflict` until an operator decides), records the violation
+/// (§9.4) and ends the federated sessions of its users here (§2.5). Returns the error for the request.
+pub async fn key_conflict(state: &AppState, domain: &str) -> ApiError {
+    mark_key_conflict(state, domain).await;
+    super::peer_blocked(domain)
+}
+
+/// The side effects of [`key_conflict`]; failures are logged.
+pub async fn mark_key_conflict(state: &AppState, domain: &str) {
+    if let Err(e) = store::federation::set_peer_status(&state.db, domain, STATUS_KEY_CONFLICT).await {
+        tracing::warn!(error = %e, domain, "storing the key conflict failed");
+    }
+    super::conformance::violation(state, domain, super::conformance::VIOLATION_KEY_CONFLICT).await;
+    if let Err(e) = super::conformance::end_sessions(state, domain).await {
+        tracing::warn!(error = %e, domain, "ending the sessions of a conflicting peer failed");
+    }
+}
+
+/// The key `kid` of `domain`, fetched only from that domain's own document, to check the signature of a request
+/// naming `domain` as its issuer. An unknown `kid` refetches the document once (at most every 5 minutes per
+/// peer), then fails with `federation.token_invalid`.
 pub async fn key_for(state: &AppState, domain: &str, kid: &str) -> Result<VerifyingKey, ApiError> {
-    let doc = document(state, domain).await?;
+    let doc = document_for(state, domain, true).await?;
     if let Some(key) = doc.key(kid) {
         return Ok(key);
     }
     let now = Utc::now();
     let cutoff = util::format_time(now - chrono::Duration::seconds(KID_REFRESH_SECS));
-    if store::federation::claim_kid_refresh(&state.db, domain, &util::format_time(now), &cutoff).await? {
+    if state.federation.recent_discovery_failure(domain).is_none()
+        && store::federation::claim_kid_refresh(&state.db, domain, &util::format_time(now), &cutoff).await?
+    {
         tracing::info!(domain, "unknown kid, refetching the document");
         if let Some(key) = fetch(state, domain).await?.key(kid) {
             return Ok(key);
         }
     }
     Err(super::tokens::token_invalid())
+}
+
+/// Records that a signed request of `domain` verified with its keys (§1.4: the peer is no longer unverified).
+pub async fn verified(state: &AppState, domain: &str) {
+    let now = Utc::now();
+    let cutoff = util::format_time(now - chrono::Duration::days(1));
+    if let Err(e) = store::federation::mark_peer_verified(&state.db, domain, &util::format_time(now), &cutoff).await {
+        tracing::debug!(error = %e, domain, "peer verification not recorded");
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +340,44 @@ mod tests {
 
     fn check(v: &Value) -> Result<PeerDocument, &'static str> {
         validate("a.example", v.to_string().as_bytes())
+    }
+
+    /// The protocol's reference values (`testvectors/federation_node.json`): the valid document passes, every
+    /// invalid one is refused with the published reason, and the node and listing tokens verify with the published
+    /// key and are reproduced byte for byte by this node's signer.
+    #[test]
+    fn the_published_discovery_and_token_vectors() {
+        let v: Value = serde_json::from_str(include_str!("../../protocol/testvectors/federation_node.json")).unwrap();
+        let domain = v["discovery"]["for_domain"].as_str().unwrap();
+        let doc = validate(domain, v["discovery"]["valid"].to_string().as_bytes()).unwrap();
+        let x = v["signing_key"]["x"].as_str().unwrap();
+        assert_eq!(doc.keys[0].x, x);
+        for case in v["discovery"]["invalid"].as_array().unwrap() {
+            let reason = case["reason"].as_str().unwrap();
+            assert_eq!(validate(domain, case["document"].to_string().as_bytes()).err(), Some(reason), "{reason}");
+        }
+        let seed: [u8; 32] =
+            URL_SAFE_NO_PAD.decode(v["signing_key"]["seed"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        assert_eq!(URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()), x);
+        let kid = v["signing_key"]["kid"].as_str().unwrap();
+        assert_eq!(doc.key(kid), Some(signing.verifying_key()));
+        for name in ["s2s_token", "listing_token"] {
+            let token = v[name]["token"].as_str().unwrap();
+            assert_eq!(crate::jwt::sign(&signing, kid, &v[name]["claims"]).unwrap(), token, "{name} reproduced");
+            assert_eq!(crate::jwt::peek_kid(token).unwrap(), kid);
+            let (signed, sig) = token.rsplit_once('.').unwrap();
+            let sig = ed25519_dalek::Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
+            doc.key(kid).unwrap().verify_strict(signed.as_bytes(), &sig).unwrap();
+            let mut tampered = signed.to_string();
+            tampered.push('A');
+            assert!(doc.key(kid).unwrap().verify_strict(tampered.as_bytes(), &sig).is_err(), "{name}");
+        }
+        let s2s = &v["s2s_token"];
+        let hash = crate::federation::tokens::body_sha256(s2s["body"].as_str().unwrap().as_bytes());
+        assert_eq!(hash, s2s["body_sha256"].as_str().unwrap());
+        assert_eq!(s2s["claims"]["body_sha256"].as_str().unwrap(), hash);
+        assert_ne!(crate::federation::tokens::body_sha256(b"{}"), hash, "another body, another hash");
     }
 
     #[test]

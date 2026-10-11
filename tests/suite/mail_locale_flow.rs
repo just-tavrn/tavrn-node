@@ -38,6 +38,8 @@ async fn verify(node: &TestNode) {
 }
 
 async fn forgot(node: &TestNode, account: &str) -> (String, String, String) {
+    // A pending reset link would be kept (no new mail): every call here starts without one.
+    sqlx::query("DELETE FROM password_resets").execute(&node.state.db).await.unwrap();
     let (s, _) =
         node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": account }))).await;
     assert_eq!(s, StatusCode::NO_CONTENT);

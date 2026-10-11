@@ -39,7 +39,7 @@ impl SharedLimiter {
     /// `Ok(())` or `Err(seconds until the next attempt)`.
     pub async fn check(&self, key: &str) -> Result<(), u32> {
         let Some(cluster) = &self.cluster else { return self.local.check(key) };
-        let key = if key.len() > MAX_KEY { crate::util::sha256_b64(key) } else { key.to_string() };
+        let key = self.cache_key(key);
         match cluster.cache().hit(&cluster.key(&format!("rl:{}:{key}", self.name)), self.window).await {
             Ok((n, left)) if n > u64::from(self.max) => {
                 Err(u32::try_from(left.as_secs()).unwrap_or(u32::MAX).saturating_add(1))
@@ -48,6 +48,28 @@ impl SharedLimiter {
             Err(e) => {
                 tracing::warn!(limiter = self.name, error = %e, "shared rate limit unavailable, counting on this instance");
                 self.local.check(&key)
+            }
+        }
+    }
+
+    /// The key in the cache: client addresses normalised (`auth::normalize_key`), long keys hashed.
+    fn cache_key(&self, key: &str) -> String {
+        let key = crate::auth::normalize_key(key);
+        if key.len() > MAX_KEY { crate::util::sha256_b64(&key) } else { key.into_owned() }
+    }
+
+    /// Like [`SharedLimiter::check`] without counting: `Err(seconds)` while `key` is at or over its limit.
+    pub async fn peek(&self, key: &str) -> Result<(), u32> {
+        let Some(cluster) = &self.cluster else { return self.local.peek(key) };
+        let key = self.cache_key(key);
+        match cluster.cache().get(&cluster.key(&format!("rl:{}:{key}", self.name))).await {
+            Ok(Some(n)) if n.trim().parse::<u64>().is_ok_and(|n| n >= u64::from(self.max)) => {
+                Err(u32::try_from(self.window.as_secs()).unwrap_or(u32::MAX).saturating_add(1))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(limiter = self.name, error = %e, "shared rate limit unavailable, counting on this instance");
+                self.local.peek(&key)
             }
         }
     }
@@ -103,5 +125,17 @@ mod tests {
             la.check(&long).await.unwrap();
         }
         assert!(lb.check(&long).await.is_err());
+        // Peeking counts nothing, on both instances.
+        let pa = SharedLimiter::new("peek", 2, Duration::from_secs(60), &a);
+        let pb = SharedLimiter::new("peek", 2, Duration::from_secs(60), &b);
+        assert!(pa.peek("user:x").await.is_ok());
+        pa.check("user:x").await.unwrap();
+        pb.check("user:x").await.unwrap();
+        assert!(pa.peek("user:x").await.is_err(), "at the limit on the other instance as well");
+        assert!(pb.peek("user:y").await.is_ok());
+        // Addresses of one IPv6 /64 share a counter.
+        let v6 = SharedLimiter::new("v6", 1, Duration::from_secs(60), &a);
+        v6.check("ip:2001:db8::1").await.unwrap();
+        assert!(v6.check("ip:2001:db8::2").await.is_err());
     }
 }

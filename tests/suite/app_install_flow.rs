@@ -952,3 +952,59 @@ async fn installation_routes_check_permissions_for_local_and_remote_callers() {
     let (s, _) = b.get_auth("/api/v1/applications/me/installations", &rb).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
+
+/// FEDERATION.md §2.6: the home node's verified token decides the account kind. A stub created on the target before
+/// the bot ever signed in there (here by a friend request) is a plain user row: the bot's federated login makes it
+/// a bot with its owner, so the bot rules apply (bots enter rooms only through an installation).
+#[tokio::test]
+async fn a_stub_of_a_remote_bot_becomes_a_bot_at_its_first_sign_in() {
+    let (a, b) = federation::two_nodes().await;
+    let alice = a.register("alice").await;
+    let helper = bot(&a, &alice, json!({ "name": "Helper", "public": true }), Some(&["messages:read"])).await;
+    let carol = b.register("carol").await;
+    let (s, j) = b
+        .post("/api/v1/users/me/friends/requests", &carol.token, json!({ "user": helper.address(federation::A) }))
+        .await;
+    assert!(s.is_success() || s == StatusCode::FORBIDDEN, "the request may be refused, the stub stays: {s} {j}");
+    let stub: (String,) = sqlx::query_as("SELECT kind FROM users WHERE username = $1 AND domain = $2")
+        .bind(&helper.username)
+        .bind(federation::A)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(stub.0, "user", "the stub as the friend request created it");
+
+    let remote = b.sign_in_from_bot(&a, &helper.secret).await;
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT kind, owner_id FROM users WHERE username = $1 AND domain = $2")
+            .bind(&helper.username)
+            .bind(federation::A)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "bot");
+    assert!(row.1.is_some(), "the owner is known");
+    let room = b.plaintext_room(&carol.token, "Room").await;
+    let (_, invite) =
+        b.post(&format!("/api/v1/rooms/{}/invites", room["id"].as_str().unwrap()), &carol.token, json!({})).await;
+    let (s, j) =
+        b.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &remote, json!({})).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a bot joins only through an installation: {j}");
+}
+
+/// The reverse is refused: a bot account here never becomes a user through a token naming another kind (that
+/// would lift the bot rules).
+#[tokio::test]
+async fn a_bot_account_is_never_turned_into_a_user() {
+    let (a, b) = federation::two_nodes().await;
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    sqlx::query("UPDATE users SET kind = 'bot' WHERE username = 'alice' AND domain = $1")
+        .bind(federation::A)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let token = a.federation_token(&alice, federation::B).await;
+    let (s, j) = b.federated_login(&token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("federation.kind_mismatch")), "{j}");
+}

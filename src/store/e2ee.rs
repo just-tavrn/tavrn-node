@@ -46,6 +46,9 @@ pub async fn reset_identity(db: &Pool, user_id: &str, key: &str) -> Result<Strin
     sqlx::query("DELETE FROM secret_storage WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
     // A reset starts a new chain at generation 0 (the key derived from the new master secret, §9a).
     sqlx::query("DELETE FROM identity_continuity WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
+    // The history window starts anew at the reset (ENCRYPTION.md §7b), in the same transaction: no automatic share
+    // of the old range can reach the account between the reset and a later bookkeeping step.
+    super::history::mark_key_reset_tx(&mut tx, user_id, &ts).await?;
     tx.commit().await?;
     Ok(ts)
 }
@@ -646,4 +649,21 @@ pub async fn put_backup(
             }
         }
     }
+}
+
+/// Whether `requester` is a legitimate claimer of `target`'s KeyPackages (ENCRYPTION.md §3.2): friends, members of a
+/// common room, or members of a common DM or group DM.
+pub async fn claim_related(db: &Pool, requester: &str, target: &str) -> Result<bool, ApiError> {
+    Ok(sqlx::query(
+        "SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM friends WHERE user_id = $1 AND friend_id = $2)
+         OR EXISTS (SELECT 1 FROM room_members a JOIN room_members b ON b.room_id = a.room_id
+                    WHERE a.user_id = $1 AND b.user_id = $2)
+         OR EXISTS (SELECT 1 FROM conversation_members a JOIN conversation_members b
+                    ON b.conversation_id = a.conversation_id WHERE a.user_id = $1 AND b.user_id = $2)",
+    )
+    .bind(requester)
+    .bind(target)
+    .fetch_optional(db)
+    .await?
+    .is_some())
 }

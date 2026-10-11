@@ -28,6 +28,9 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const CLOSE_RESTART: u16 = 4000;
 pub const CLOSE_AUTH: u16 = 4001;
 pub const CLOSE_PROTOCOL: u16 = 4002;
+/// Largest client frame and message: the client's operations are small JSON objects; a larger frame is refused
+/// before it is buffered (also before the hello).
+pub const MAX_FRAME: usize = 64 * 1024;
 /// Typing operations of one connection closer together than this are dropped (clients send every 3 s).
 pub const TYPING_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -58,7 +61,7 @@ enum ClientOp {
 }
 
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(64 * 1024).on_upgrade(move |socket| run(state, socket))
+    ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| run(state, socket))
 }
 
 async fn close(mut socket: WebSocket, code: u16, reason: &str) {
@@ -80,6 +83,17 @@ async fn run(state: AppState, mut socket: WebSocket) {
         Err(ApiError::Unauthorized { code }) => return close(socket, CLOSE_AUTH, code).await,
         Err(_) => return close(socket, CLOSE_AUTH, "auth.token_invalid").await,
     };
+    // The general per-user limit applies to connecting as to every other request (`TAVRN_RATE_USER_PER_MINUTE`).
+    if let Some(limiter) = &state.user_api_limiter
+        && limiter.check_all(&[format!("user:{}", auth.user.id)]).is_err()
+    {
+        return close(socket, CLOSE_PROTOCOL, "rate_limited").await;
+    }
+    // At most `TAVRN_WS_MAX_SOCKETS_PER_USER` connections per user (app tokens have their own cap).
+    let cap = state.config.ws_max_sockets_per_user as usize;
+    if cap > 0 && auth.app.is_none() && state.hub.connections_of(&auth.user.id) >= cap {
+        return close(socket, CLOSE_PROTOCOL, "too_many_connections").await;
+    }
     // No date of birth yet (PROTOCOL.md §5e): no events; the client reconnects after adding it.
     if crate::age::needs_date_of_birth(&state, &auth.user) {
         return close(socket, CLOSE_PROTOCOL, "age.status_required").await;
@@ -138,7 +152,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
     // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`).
     visible.know(&state, &rooms, &auth.user.id).await;
     let (mut sink, mut stream) = socket.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut ping = tokio::time::interval(state.ws_ping);
     ping.tick().await;
     let mut missed_pongs = 0u8;
     let mut last_typing: Option<tokio::time::Instant> = None;
@@ -160,6 +174,10 @@ async fn run(state: AppState, mut socket: WebSocket) {
                                 typing(&state, &auth, &rooms, room_id, channel_id, conversation_id).await;
                             }
                             Ok(ClientOp::Ack { conversation_id, message_id }) => {
+                                // The same limit as `PUT …/read`; acks over it are dropped silently.
+                                if state.read_limiter.check_all(&[format!("read:{}", auth.user.id)]).is_err() {
+                                    continue;
+                                }
                                 if let Err(e) = crate::routes::read::advance(&state, &auth.user, &conversation_id, &message_id).await {
                                     tracing::debug!(error = %e, "read marker could not be set");
                                 }
@@ -251,12 +269,40 @@ async fn run(state: AppState, mut socket: WebSocket) {
                 break;
             }
             _ = ping.tick() => {
+                // A belt for the `session.revoked` event: the session must still be live at every ping.
+                if !still_authorized(&state, &auth).await {
+                    let frame = axum::extract::ws::CloseFrame { code: CLOSE_AUTH, reason: "session revoked".into() };
+                    let _ = sink.send(WsMessage::Close(Some(frame))).await;
+                    break;
+                }
                 missed_pongs += 1;
                 if missed_pongs > 2 || sink.send(WsMessage::Text(json!({ "op": "ping" }).to_string().into())).await.is_err() {
                     break;
                 }
             }
         }
+    }
+}
+
+/// `false` once a local user's device has no live session any more or the account is disabled (checked at every
+/// ping; database errors keep the connection).
+async fn still_authorized(state: &AppState, auth: &AuthUser) -> bool {
+    if auth.app.is_some() || auth.user.domain != state.config.domain {
+        // App tokens end with their expiry or revocation; remote sessions through `session.revoked` (FEDERATION.md §2.9).
+        return true;
+    }
+    match crate::sessions::device_live(state, &auth.device_id).await {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "session check at ping failed");
+            return true;
+        }
+    }
+    match store::users::by_id(&state.db, &auth.user.id).await {
+        Ok(Some(u)) => u.disabled_at.is_none(),
+        Ok(None) => false,
+        Err(_) => true,
     }
 }
 
@@ -299,16 +345,22 @@ async fn typing(
             );
         }
         (None, None, Some(conversation_id)) if crate::util::is_ulid(&conversation_id) => {
-            match store::social::member_ids(&state.db, &conversation_id).await {
-                Ok(members) if members.contains(&auth.user.id) => {
-                    state.hub.users(
-                        members,
-                        "typing",
-                        json!({ "conversation_id": conversation_id, "user_id": auth.user.id }),
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::debug!(error = %e, "typing notice not deliverable"),
+            // Typing is writing (PROTOCOL.md §8a): never across a block, never from a member who has not accepted
+            // the request yet, and never to such a member.
+            let conv = match crate::access::direct(state, &conversation_id, &auth.user.id).await {
+                Ok(conv) => conv,
+                Err(_) => return,
+            };
+            if crate::routes::messages::check_direct_write(state, auth, &conv).await.is_err() {
+                return;
+            }
+            if let crate::access::ConvKind::Direct { member_ids, requested, .. } = conv.kind {
+                let active: Vec<String> = member_ids.into_iter().filter(|m| !requested.contains(m)).collect();
+                state.hub.users(
+                    active,
+                    "typing",
+                    json!({ "conversation_id": conversation_id, "user_id": auth.user.id }),
+                );
             }
         }
         _ => {}

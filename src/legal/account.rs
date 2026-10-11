@@ -291,9 +291,7 @@ async fn erase_personal(state: &AppState, user: &UserRow) -> Result<(), ApiError
     for device in &devices {
         crate::e2ee::device_removed(state, user, device).await?;
     }
-    if !devices.is_empty() {
-        state.hub.devices(devices.clone(), crate::federation::inbox::SESSION_REVOKED_EVENT, json!({}));
-    }
+    crate::sessions::revoke_devices(state, user, &devices, crate::sessions::Reason::AccountDeleted).await?;
     for table in [
         "sessions",
         "devices",
