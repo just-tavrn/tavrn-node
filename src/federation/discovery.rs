@@ -328,8 +328,7 @@ mod tests {
     /// key and are reproduced byte for byte by this node's signer.
     #[test]
     fn the_published_discovery_and_token_vectors() {
-        let v: Value =
-            serde_json::from_str(include_str!("../../protocol/testvectors/federation_node.json")).expect("vectors");
+        let v: Value = serde_json::from_str(include_str!("../../protocol/testvectors/federation_node.json")).unwrap();
         let domain = v["discovery"]["for_domain"].as_str().unwrap();
         let doc = validate(domain, v["discovery"]["valid"].to_string().as_bytes()).unwrap();
         let x = v["signing_key"]["x"].as_str().unwrap();
