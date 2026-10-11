@@ -1279,3 +1279,118 @@ async fn outbox_envelopes_are_well_formed() {
     let ulid_time = chrono::DateTime::<chrono::Utc>::from(ulid::Ulid::from_string(&id).unwrap().datetime());
     assert_eq!(body["at"], util::format_time(ulid_time), "`at` is the ULID time");
 }
+
+// ---------------------------------------------------------------- review of the federation hardening
+
+/// FEDERATION.md §1.4: a document that now comes from another source (here: SRV before, the well-known now) is
+/// accepted when it keeps a known key (a real move), and is a key conflict when it shares none (a takeover); the
+/// conflict ends the peer's sessions.
+#[tokio::test]
+async fn a_document_from_another_source_without_a_known_key_is_a_key_conflict() {
+    let (mut a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    let earlier = b.sign_in_from(&a, &alice).await;
+    let original: Vec<NodeKey> = a.state.keys.iter().cloned().collect();
+    let past = util::in_seconds(-1);
+    sql_exec(&b, "UPDATE federation_peers SET source = 'srv', expires_at = $1", &[&past]).await;
+    let mut moved = original.clone();
+    moved.push(NodeKey::generate("zz-moved"));
+    a.restart_with_keys(moved).await;
+    let alice = a.login("alice").await;
+    let token = a.federation_token(&alice, B).await;
+    let (s, j) = b.federated_login(&token).await;
+    assert_eq!(s, StatusCode::OK, "a move that keeps a key: {j}");
+    let source = sql_text(&b, "SELECT source FROM federation_peers WHERE domain = $1", A).await;
+    assert_eq!(source.as_deref(), Some("well_known"));
+
+    sql_exec(&b, "UPDATE federation_peers SET source = 'srv', expires_at = $1", &[&past]).await;
+    a.restart_with_keys(vec![NodeKey::generate("zzz-takeover")]).await;
+    let alice = a.login("alice").await;
+    let token = a.federation_token(&alice, B).await;
+    assert_eq!(code_of(&b, &token).await, (StatusCode::FORBIDDEN, "federation.peer_blocked".into()));
+    let status = sql_text(&b, "SELECT status FROM federation_peers WHERE domain = $1", A).await;
+    assert_eq!(status.as_deref(), Some("key_conflict"));
+    let (s, _) = b.get_auth("/api/v1/users/me", &earlier.token).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the earlier federated session ended");
+}
+
+/// FEDERATION.md §1.4: the cap is for peers known *only from unverified requests*. Peers this node looked up itself
+/// (here: listed in its directory) must not lock out the first signed request of a new, honest peer.
+#[tokio::test]
+async fn peers_from_the_directory_do_not_count_against_the_unverified_peer_cap() {
+    let (a, b) = two_nodes_with(|_| {}, |c| c.federation_max_unverified_peers = 10).await;
+    let alice = a.register("alice").await;
+    let now = util::now();
+    for i in 0..10 {
+        let d = format!("listed{i}.example");
+        sql_exec(
+            &b,
+            "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, source)
+             VALUES ($1, '{}', $2, $2, 'well_known')",
+            &[&d, &now],
+        )
+        .await;
+        sql_exec(
+            &b,
+            "INSERT INTO directory_nodes (domain, name, description, software_name, software_version, capabilities,
+             registration, source, first_seen, last_seen) VALUES ($1, 'n', '', 'tavrn-node', '0', '[]', 'open', 'relay', $2, $2)",
+            &[&d, &now],
+        )
+        .await;
+    }
+    sql_exec(&b, "DELETE FROM federation_peers WHERE domain = $1", &[A]).await;
+    let token = a.federation_token(&alice, B).await;
+    let (s, j) = b.federated_login(&token).await;
+    assert_eq!(s, StatusCode::OK, "the first sign-in of a new peer: {j}");
+}
+
+/// FEDERATION.md §1.3 rule 5: unsigned requests naming many *different* stalling domains (a wildcard DNS name of
+/// the attacker) cannot starve federation with every other peer either.
+#[tokio::test]
+async fn stalling_issuers_on_many_domains_do_not_starve_other_peers() {
+    use base64::Engine;
+    use tower::ServiceExt;
+    let stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stall_port = stall.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = stall.accept().await {
+            held.push(sock);
+        }
+    });
+    let peers: String = (0..70).map(|i| format!(",s{i}.slow.test=http://127.0.0.1:{stall_port}")).collect();
+    let (a, b) = two_nodes_with(|_| {}, |c| c.federation_dev_peers.push_str(&peers)).await;
+    let alice = a.register("alice").await;
+    let b64 = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+    let n = now();
+    let mut flood = Vec::new();
+    for i in 0..70 {
+        let iss = format!("s{i}.slow.test");
+        let forged = format!(
+            "{}.{}.{}",
+            b64(json!({ "alg": "EdDSA", "typ": "JWT", "kid": "k" })),
+            b64(json!({ "iss": iss, "sub": iss, "aud": B, "iat": n, "exp": n + 300, "jti": util::ulid(),
+                        "typ": "s2s", "htm": "POST", "htu": "/api/v1/federation/inbox", "body_sha256": "x" })),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 64])
+        );
+        let router = b.router.clone();
+        flood.push(tokio::spawn(async move {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/federation/inbox")
+                .header("authorization", format!("Bearer {forged}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            router.oneshot(req).await.unwrap().status()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let token = a.federation_token(&alice, B).await;
+    let login = tokio::time::timeout(Duration::from_secs(4), b.federated_login(&token)).await;
+    for task in flood {
+        task.abort();
+    }
+    let (s, j) = login.expect("the login of a healthy peer waited for the stalling ones");
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
