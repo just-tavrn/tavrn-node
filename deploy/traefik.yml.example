@@ -1,0 +1,53 @@
+# Traefik (v3) in front of tavrn, as a dynamic configuration file (file provider). Traefik passes WebSockets
+# (/api/v1/ws, voice signaling under /rtc) and sets X-Forwarded-For/-Proto by itself; it does not limit request
+# bodies unless the buffering middleware is used. Certificates come from Traefik's ACME resolver (here "letsencrypt",
+# defined in the static configuration). Voice media does not go through Traefik: publish TAVRN_RTC_UDP_PORT_RANGE
+# (UDP) directly to the tavrn container.
+http:
+  routers:
+    tavrn:
+      rule: "Host(`chat.example.org`)"
+      entryPoints: [websecure]
+      service: tavrn
+      middlewares: [tavrn-hsts]
+      tls:
+        certResolver: letsencrypt
+    # The metrics endpoint is for the monitoring inside your network, not for the public (docs/HANDBOOK.md).
+    tavrn-metrics:
+      rule: "Host(`chat.example.org`) && Path(`/metrics`)"
+      entryPoints: [websecure]
+      service: tavrn
+      middlewares: [tavrn-metrics-internal]
+      priority: 100
+      tls:
+        certResolver: letsencrypt
+    tavrn-http:
+      rule: "Host(`chat.example.org`)"
+      entryPoints: [web]
+      service: tavrn
+      middlewares: [tavrn-https]
+  middlewares:
+    tavrn-hsts:
+      headers:
+        stsSeconds: 63072000
+    tavrn-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+    tavrn-metrics-internal:
+      ipAllowList:
+        sourceRange: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+  services:
+    tavrn:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"   # or http://tavrn:8080 on a shared Docker network
+# Static configuration (traefik.yml) that goes with it:
+#   entryPoints:
+#     web: { address: ":80" }
+#     websecure:
+#       address: ":443"
+#       forwardedHeaders: { trustedIPs: ["127.0.0.1/32"] }   # only if another proxy is in front of Traefik
+#   certificatesResolvers:
+#     letsencrypt: { acme: { email: admin@example.org, storage: /acme.json, tlsChallenge: {} } }
+#   providers: { file: { filename: /etc/traefik/dynamic.yml } }
