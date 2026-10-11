@@ -33,6 +33,9 @@ pub struct UserInvite {
     pub conversation: Option<Value>,
     /// Address of the inviting user.
     pub inviter: String,
+    /// Set when the inviter is a user of a third node (neither `node` nor this node): `node` named them, but cannot
+    /// vouch for them, so their identity is unverified (FEDERATION.md §5.2). Clients show "via <node>".
+    pub via: Option<String>,
     /// Rooms: the invite code for `POST /invites/{code}/join` on `node`.
     pub invite_code: Option<String>,
     pub received_at: String,
@@ -46,6 +49,7 @@ pub struct UserInviteList {
 
 pub fn view(row: &UserInviteRow) -> UserInvite {
     let summary: Value = serde_json::from_str(&row.summary).unwrap_or(Value::Null);
+    let via = summary.get("via").and_then(Value::as_str).map(String::from);
     let (room, conversation) = if row.kind == "room" { (Some(summary), None) } else { (None, Some(summary)) };
     UserInvite {
         id: row.id.clone(),
@@ -54,6 +58,7 @@ pub fn view(row: &UserInviteRow) -> UserInvite {
         room,
         conversation,
         inviter: row.inviter.clone(),
+        via,
         invite_code: row.invite_code.clone(),
         received_at: row.received_at.clone(),
         expires_at: row.expires_at.clone(),

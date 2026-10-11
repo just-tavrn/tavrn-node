@@ -507,6 +507,10 @@ pub async fn handle(
             if state.room_invite_inbox_limiter.check(&format!("{iss}|{}", to.id)).is_err() {
                 return Ok("rate_limited");
             }
+            let mut room = room;
+            if third_party(state, iss, from) {
+                room["via"] = json!(iss);
+            }
             store_invite(state, to, "room", iss, &room_id, &room, from, Some(&invite_code), &expires_at).await?;
             Ok("stored")
         }
@@ -530,7 +534,13 @@ pub async fn handle(
             // The recipient's home node decides: friends always, others by the recipient's
             // setting under this node's bound; shared rooms are those of this node and those the hosting
             // node vouches for.
-            let inviter = known(state, from).await?;
+            // An inviter of a third node is only named by the sending node, which cannot vouch for them: a
+            // stranger whatever the relationship here, and the invitation names the node it came through.
+            let unverified = third_party(state, iss, from);
+            let inviter = if unverified { None } else { known(state, from).await? };
+            if unverified {
+                conversation["via"] = json!(iss);
+            }
             let friends = match &inviter {
                 Some(inviter) => store::social::are_friends(&state.db, &to.id, &inviter.id).await?,
                 None => false,
@@ -589,11 +599,13 @@ pub async fn handle(
                     {
                         return Ok("blocked");
                     }
+                    // A caller of a third node is named by the hosting node only: the ring says so (`via`).
+                    let via = third_party(state, iss, &from).then_some(iss);
                     state.hub.users(
                         vec![to.id.clone()],
                         "call.ring",
                         json!({ "conversation_id": conversation_id, "node": iss, "from": from,
-                                "started_at": started_at, "group": group }),
+                                "started_at": started_at, "group": group, "via": via }),
                     );
                     // A user without a connection here rings by web push (PROTOCOL.md §6d).
                     let settings = crate::notifications::load(&state.db, &to.id).await?;
@@ -637,6 +649,10 @@ pub async fn handle(
             Ok("stored")
         }
         Incoming::BanNotify { room, scope } => {
+            // Only from a node the user signed in on: nobody else can have banned them there.
+            if !present_on(state, Some(to), iss).await? {
+                return Ok("not_member");
+            }
             state.hub.users(vec![to.id.clone()], "ban.notify", json!({ "room": room, "scope": scope }));
             Ok("handled")
         }
@@ -653,6 +669,12 @@ pub async fn vouches(state: &AppState, iss: &str, address: &str) -> Result<bool,
         return Ok(true);
     }
     present_on(state, store::users::by_username(&state.db, name, domain).await?.as_ref(), iss).await
+}
+
+/// Is `address` a user of a third node, neither of the sending node `iss` nor of this one? `iss` can name such a
+/// user (a member of a group it hosts) but cannot vouch for them: their identity is unverified here.
+fn third_party(state: &AppState, iss: &str, address: &str) -> bool {
+    util::parse_address(address).is_none_or(|(_, domain)| domain != iss && domain != state.config.domain)
 }
 
 /// Has the local user signed in on `node` (a member of something there)?

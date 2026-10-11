@@ -674,6 +674,8 @@ async fn notices_about_federated_content_are_forwarded_to_its_node() {
     let admin_a = a.register("admina").await;
     let admin_b = b.register("adminb").await;
     let carol = b.register("carol").await;
+    // B accepts forwarded notices only from nodes it shares users with: A's admin takes part on B.
+    b.sign_in_from(&a, &admin_a).await;
     let room = b.plaintext_room(&carol.token, "B room").await;
     let room_id = room["id"].as_str().unwrap();
     let channel = TestNode::text_channel(&room);
@@ -711,4 +713,33 @@ async fn notices_about_federated_content_are_forwarded_to_its_node() {
     let incomplete = json!({ "case_id": tavrn_node::util::ulid(), "basis": "copyright" });
     let err = tavrn_node::legal::notices::receive(&b.state, "a.test", &incomplete).await.unwrap_err();
     assert_eq!(err.code(), "federation.payload_invalid");
+    // The reporter's address came from A: B sends no confirmation (A confirmed the notice itself).
+    let mails = b.state.mailer.outbox.lock().unwrap().clone();
+    assert!(mails.is_empty(), "{mails:?}");
+}
+
+/// A forwarded notice opens a case that must be kept for years and names an address chosen by the sender: only nodes
+/// with federation history may forward, within a per-domain and a node-wide hourly budget.
+#[tokio::test]
+async fn forwarded_notices_need_federation_history_and_are_limited() {
+    let (a, b) = two_nodes_with(|_| {}, |c| c.legal_notice_inbound_per_hour = 2).await;
+    let admin_a = a.register("admina").await;
+    let payload = || {
+        let mut n = notice("https://b.test/");
+        n["case_id"] = json!(tavrn_node::util::ulid());
+        n["reporter"] =
+            json!({ "name": "Rita Reporter", "email": "victim@example.org", "address": "Street 1", "phone": "" });
+        n
+    };
+    let err = tavrn_node::legal::notices::admit_inbound(&b.state, "a.test").await.unwrap_err();
+    assert_eq!(err.code(), "legal.forward_refused", "no shared users yet");
+    b.sign_in_from(&a, &admin_a).await;
+    for _ in 0..2 {
+        tavrn_node::legal::notices::admit_inbound(&b.state, "a.test").await.unwrap();
+        tavrn_node::legal::notices::receive(&b.state, "a.test", &payload()).await.unwrap();
+    }
+    let err = tavrn_node::legal::notices::admit_inbound(&b.state, "a.test").await.unwrap_err();
+    assert_eq!(err.code(), "rate_limited", "the third notice of the hour");
+    let mails = b.state.mailer.outbox.lock().unwrap().clone();
+    assert!(mails.iter().all(|(to, _, _)| to != "victim@example.org"), "no mail to the named address: {mails:?}");
 }

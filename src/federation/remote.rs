@@ -129,6 +129,7 @@ async fn login_inner(
         None => None,
     };
     let user = ensure_remote_user(state, &t.username, &t.domain, &t.kind, owner_id.as_deref()).await?;
+    let user = reconcile_kind(state, user, &t.kind, owner_id.as_deref()).await?;
     if user.disabled_at.is_some() {
         return Err(ApiError::Unauthorized { code: "auth.account_disabled" });
     }
@@ -172,6 +173,36 @@ async fn login_inner(
     };
     let user = store::users::by_id(&state.db, &user.id).await?.unwrap_or(user);
     Ok(FederatedLogin { user, tokens, session_expires_at })
+}
+
+/// The verified token of the home node decides what the account is (FEDERATION.md §2.6). A row created earlier
+/// as a stub (by a friend request, a block or an invitation) is a `user` without owner: a bot signing in with it
+/// becomes a bot here, with its owner, so bot scopes, the bot route table, "no bots" and owner bans apply. The
+/// reverse (a bot row presented as a user) would lift those limits and is refused (`federation.kind_mismatch`).
+async fn reconcile_kind(
+    state: &AppState,
+    user: UserRow,
+    kind: &str,
+    owner_id: Option<&str>,
+) -> Result<UserRow, ApiError> {
+    if user.kind == kind && user.owner_id.as_deref() == owner_id {
+        return Ok(user);
+    }
+    if user.kind == "bot" && kind != "bot" {
+        tracing::warn!(user = user.address(), kind, "federated login refused: a bot account presented as another kind");
+        return Err(ApiError::Forbidden {
+            code: "federation.kind_mismatch",
+            detail: "The account kind does not match the account known here".into(),
+        });
+    }
+    tracing::info!(
+        user = user.address(),
+        from = user.kind,
+        to = kind,
+        "remote account kind or owner updated from the home node's token"
+    );
+    store::federation::set_remote_kind(&state.db, &user.id, kind, owner_id).await?;
+    Ok(store::users::by_id(&state.db, &user.id).await?.unwrap_or(user))
 }
 
 /// The users row of `username@domain`, created (within the quotas) if it does not exist yet.

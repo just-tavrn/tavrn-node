@@ -293,6 +293,9 @@ async fn process(state: &AppState, iss: &str, envelope: &Envelope) -> Result<&'s
         return super::announce::receive(state, iss, &envelope.id, &envelope.payload).await;
     }
     let action = parse_action(&envelope.kind, iss, &envelope.payload)?;
+    if let Action::LegalNotice = action {
+        crate::legal::notices::admit_inbound(state, iss).await?;
+    }
     if !store::federation::mark_seen(&state.db, iss, &envelope.id, &envelope.kind).await? {
         return Ok("duplicate");
     }
