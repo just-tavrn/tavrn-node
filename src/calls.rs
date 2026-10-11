@@ -304,7 +304,7 @@ pub async fn start(state: &AppState, conversation_id: &str, caller: &UserRow, gr
         "started_at": call.started_at, "group": group,
     });
     state.hub.users(ring.iter().map(|(id, _)| id.clone()).collect(), "call.ring", &ring_event);
-    // Local members without a connection ring by web push (PROTOCOL.md §6d; the sender checks the connection).
+    // Local members ring by web push too, also while connected (PROTOCOL.md §6d, `push::deliver_to_user`).
     for m in members.iter().filter(|m| m.id != caller.id && m.domain == state.config.domain) {
         crate::push::call(state, conversation_id, &m.id, &caller.id, group);
     }

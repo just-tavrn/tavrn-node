@@ -11,6 +11,10 @@
 //!   that this node receives as the user's home node, after the user's settings were applied: [`hint`];
 //! - other features (`custom`): a notice for one user, coalesced like messages.
 //!
+//! Call rings (the local ones and those of hints) are the exception to "no open WebSocket": they go out while the user
+//! is connected, too, because a phone keeps the WebSocket of a frozen background tab open; the service worker shows
+//! a ring only while no page of the client is visible.
+//!
 //! Content: for encrypted conversations the payload names the conversation, its room/channel/group name and the
 //! sender's display name, never ciphertext or plaintext. For unencrypted conversations a preview of at most
 //! [`PREVIEW_CHARS`] characters is added only when the user turned on `global.push_text` (default off). The payload
@@ -555,9 +559,7 @@ async fn run_call(
     caller_id: &str,
     group: bool,
 ) -> Result<(), ApiError> {
-    if crate::presence::is_online(state, user_id) {
-        return Ok(());
-    }
+    // Rings push even while the user is connected (see `deliver_to_user`).
     let Some(row) = store::social::conversation(&state.db, conversation_id).await? else { return Ok(()) };
     let settings = crate::notifications::load(&state.db, user_id).await?;
     let effective = settings.effective(None, conversation_id, &util::now());
@@ -580,6 +582,9 @@ async fn run_call(
 }
 
 /// Applies the limits and sends `payload` to every deliverable subscription of a local user without a connection.
+/// Call rings (`ring`) go out while the user is connected, too: a phone keeps the WebSocket of a frozen background
+/// tab open, so a connection does not mean the ring is heard; the service worker shows a ring only while no page of
+/// the client is visible (PROTOCOL.md §6d).
 async fn deliver_to_user(
     state: &AppState,
     user_id: &str,
@@ -587,7 +592,7 @@ async fn deliver_to_user(
     ring: bool,
     payload: PushPayload,
 ) -> Result<(), ApiError> {
-    if crate::presence::is_online(state, user_id) {
+    if !ring && crate::presence::is_online(state, user_id) {
         return Ok(());
     }
     let subscriptions = store::push::deliverable(&state.db, user_id).await?;

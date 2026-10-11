@@ -32,6 +32,10 @@ First public release of the node and its container image.
 
 - A registration that fails (missing e-mail, captcha, password, username, date of birth, terms) no longer uses up
   the invite: the invite is redeemed in the transaction that creates the account.
+- Call rings are pushed also while the user has an open WebSocket (local calls and ring hints of other nodes): a
+  phone keeps the connection of a frozen background tab open, so a connection did not mean the ring was heard. The
+  web client's service worker shows a ring only while no page of the client is visible. Messages still push only
+  without a connection.
 
 ### Security
 
