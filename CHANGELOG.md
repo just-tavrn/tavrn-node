@@ -82,4 +82,10 @@ First public release of the node and its container image.
 - An identity reset records the history window of the account's memberships in the reset's own transaction.
 - KeyPackage claims for a user by requesters who share no room, DM or friendship with them count against a budget per
   source (this node or one other node) and target user (`TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR`, default 60).
+- Release images are built GitHub-hosted without any build cache, from a tavrn-web release tag (a branch fails the
+  release), by a reusable workflow pinned by commit, and carry a GitHub build provenance attestation.
+- The `edge` image is built on GitHub-hosted runners only, never on the shared self-hosted runners.
+- The Dockerfile pins every base image by digest; CI and the `just` install recipes check livekit-server and ffmpeg
+  downloads against pinned checksums, and the CI Valkey is pinned by digest.
+- The publication check prints only file and line of a private match, never the matching text.
 
