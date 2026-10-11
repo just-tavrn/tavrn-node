@@ -66,7 +66,7 @@ jobs:
     if: ${{ vars.CI_ENABLED == 'true' }}
     # Pinned by commit: a later change of the reusable workflow never reaches a release unreviewed (just-tavrn/.github
     # docs/GITHUB.md "Reusable workflows in release paths" has the bump procedure).
-    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@986b804e27987dfac8f5568ae1370cc78e1c2c13 # main of 2026-10-11
+    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@ad56b708acd531e04a72414d0f66ac7e50235ab7 # main of 2026-10-12
     permissions:
       contents: read
       packages: write
