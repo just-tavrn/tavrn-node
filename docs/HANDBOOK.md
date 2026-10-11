@@ -1265,8 +1265,11 @@ users learn about new messages, mentions and calls while no tab of the web clien
 
 How it behaves:
 
-- **When**: a push is only sent when the user has no open connection to the node. Besides
-  `TAVRN_PUSH_MAX_PER_MINUTE` there is at most one push per conversation and user every 30 seconds.
+- **When**: a push is only sent when the user has no open connection to the node, except for incoming calls: call
+  rings are pushed also while a connection is open (a phone keeps the connection of a frozen background tab open),
+  and the web client's service worker shows them only while no page of the client is visible. Besides
+  `TAVRN_PUSH_MAX_PER_MINUTE` there is at most one push per conversation and user every 30 seconds (call rings
+  excepted).
 - **Content**: push payloads are encrypted end-to-end to the browser (RFC 8291); the push services only see
   ciphertext. For **encrypted conversations** a push never contains message content, only the conversation, its
   name and the sender's display name. For **unencrypted conversations** it carries a text preview (at most 120
