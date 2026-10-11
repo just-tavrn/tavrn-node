@@ -307,6 +307,13 @@ pub async fn login(
             return Err(failed());
         }
     };
+    // The proven device travels in the pre-auth token to the session issued after the second factor.
+    let reuse = crate::device_proof::verify_opt(&state, &user, req.device.as_ref()).await?;
+    // A locked account key lets only the right password together with a valid device proof through, before
+    // anything about the account's state is told.
+    if let Some(retry_after_secs) = locked.filter(|_| reuse.is_none()) {
+        return Err(ApiError::RateLimited { retry_after_secs });
+    }
     if user.deleted_at.is_some() {
         return Err(ApiError::Unauthorized { code: "auth.account_deleted" });
     }
@@ -320,12 +327,6 @@ pub async fn login(
         });
     }
     let device = device_name(req.device_name.as_deref(), "Device");
-    // The proven device travels in the pre-auth token to the session issued after the second factor.
-    let reuse = crate::device_proof::verify_opt(&state, &user, req.device.as_ref()).await?;
-    // A locked account key lets only the right password together with a valid device proof through.
-    if let Some(retry_after_secs) = locked.filter(|_| reuse.is_none()) {
-        return Err(ApiError::RateLimited { retry_after_secs });
-    }
     if !store::factors::has_factor(&state.db, &user.id).await? {
         let token = second_factor::issue_preauth(&state, &user.id, Stage::Enroll, &device, reuse.as_deref())?;
         return Ok(Json(enrollment_required(token)));

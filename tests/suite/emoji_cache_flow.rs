@@ -296,3 +296,39 @@ async fn the_cache_is_capped_per_host_and_in_total_and_misses_are_limited() {
     let (s, _, _) = get_with(r, &format!("/api/v1/emojis/{last}/image?host=fake.test"), &[]).await;
     assert_eq!(s, StatusCode::OK);
 }
+
+/// The total cap is enforced by the fetching request itself (at most every 10 seconds per instance), not only by
+/// housekeeping.
+#[tokio::test]
+async fn a_fetch_beyond_the_total_cap_evicts_the_oldest_copies() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let port = serve(fake_origin(hits.clone())).await;
+    let node = test_node_with("t.local", |c| {
+        c.federation_allow_private = true;
+        c.federation_dev_peers = format!("fake.test=http://127.0.0.1:{port},other.test=http://127.0.0.1:{port}");
+        c.media_cache_max_bytes_per_host = 10 * UNIT;
+        c.media_cache_max_bytes = 3 * UNIT;
+    })
+    .await;
+    let r = &node.router;
+    let mut first = String::new();
+    for i in 0..3 {
+        let id = tavrn_node::util::ulid();
+        if i == 0 {
+            first = id.clone();
+        }
+        assert_eq!(get_with(r, &format!("/api/v1/emojis/{id}/image?host=fake.test"), &[]).await.0, StatusCode::OK);
+    }
+    assert_eq!(cached_rows(&node).await, 3);
+    // The next check is due (as 10 seconds later).
+    *node.state.media_cache_checked.lock().unwrap() = None;
+    let id = tavrn_node::util::ulid();
+    assert_eq!(get_with(r, &format!("/api/v1/emojis/{id}/image?host=other.test"), &[]).await.0, StatusCode::OK);
+    assert_eq!(cached_rows(&node).await, 3, "the oldest copy went in the same request");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_emoji_cache WHERE origin_id = $1")
+        .bind(&first)
+        .fetch_one(&node.state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the least recently used one");
+}

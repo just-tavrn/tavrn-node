@@ -2153,6 +2153,9 @@ These are the problems operators run into most often, each with its cause and fi
 | Other nodes cannot reach yours, or the directory does not list it | `https://<TAVRN_DOMAIN>/.well-known/tavrn` must be reachable with a valid certificate; with delegation check the proxy rule or SRV record; a static copy may be stale after a key change. `TAVRN_DIRECTORY_LISTING` must be on. |
 | A peer answers `503 federation.conformance_pending` or your node is blocked by a peer | Conformance checks; run `tavrn-node doctor --peer <domain>` and see [Conformance checks](#conformance-checks-of-other-nodes). |
 | No e-mails arrive | Run `tavrn-node send-test-mail you@example.org`; check `TAVRN_SMTP_URL` and `TAVRN_SMTP_FROM`. |
+| "Forgot password" answers `503 mail.unavailable` | The node has no `TAVRN_SMTP_URL`, so it sends no reset links (they would only end up in the log). Configure SMTP, or reset the user's second factor or account as a node admin. |
+| Users are signed out with `401 auth.session_revoked` (WebSocket close `4001`) | The device's sessions ended: logout, a password change or reset, the device was removed, or a node admin disabled, banned or reset the account. Expected; the client signs in again. |
+| WebSockets close with `4002 too_many_connections` | The user holds more than `TAVRN_WS_MAX_SOCKETS_PER_USER` connections on this instance (many tabs or a client reconnecting in a loop). |
 | SSO login fails | Run `tavrn-node check-config`: it checks the issuer and prints the redirect URI to register; the issuer must match exactly (Authentik with the trailing slash). |
 | Avatars or animated images are refused, `503 media.busy` | ffmpeg missing (`TAVRN_MEDIA_FFMPEG`) or too many conversions at once (`TAVRN_MEDIA_WORKERS`). |
 | Webhook posts fail with `409 webhook.pending_key` or `400 webhook.sealed_required` | See [Webhooks in end-to-end encrypted channels](#webhooks-in-end-to-end-encrypted-channels). |

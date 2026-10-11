@@ -152,7 +152,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
     // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`).
     visible.know(&state, &rooms, &auth.user.id).await;
     let (mut sink, mut stream) = socket.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut ping = tokio::time::interval(state.ws_ping);
     ping.tick().await;
     let mut missed_pongs = 0u8;
     let mut last_typing: Option<tokio::time::Instant> = None;
