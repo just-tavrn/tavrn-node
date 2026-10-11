@@ -323,6 +323,45 @@ mod tests {
         validate("a.example", v.to_string().as_bytes())
     }
 
+    /// The protocol's reference values (`testvectors/federation_node.json`): the valid document passes, every
+    /// invalid one is refused with the published reason, and the node and listing tokens verify with the published
+    /// key and are reproduced byte for byte by this node's signer.
+    #[test]
+    fn the_published_discovery_and_token_vectors() {
+        let v: Value =
+            serde_json::from_str(include_str!("../../protocol/testvectors/federation_node.json")).expect("vectors");
+        let domain = v["discovery"]["for_domain"].as_str().unwrap();
+        let doc = validate(domain, v["discovery"]["valid"].to_string().as_bytes()).unwrap();
+        let x = v["signing_key"]["x"].as_str().unwrap();
+        assert_eq!(doc.keys[0].x, x);
+        for case in v["discovery"]["invalid"].as_array().unwrap() {
+            let reason = case["reason"].as_str().unwrap();
+            assert_eq!(validate(domain, case["document"].to_string().as_bytes()).err(), Some(reason), "{reason}");
+        }
+        let seed: [u8; 32] =
+            URL_SAFE_NO_PAD.decode(v["signing_key"]["seed"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        assert_eq!(URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()), x);
+        let kid = v["signing_key"]["kid"].as_str().unwrap();
+        assert_eq!(doc.key(kid), Some(signing.verifying_key()));
+        for name in ["s2s_token", "listing_token"] {
+            let token = v[name]["token"].as_str().unwrap();
+            assert_eq!(crate::jwt::sign(&signing, kid, &v[name]["claims"]).unwrap(), token, "{name} reproduced");
+            assert_eq!(crate::jwt::peek_kid(token).unwrap(), kid);
+            let (signed, sig) = token.rsplit_once('.').unwrap();
+            let sig = ed25519_dalek::Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
+            doc.key(kid).unwrap().verify_strict(signed.as_bytes(), &sig).unwrap();
+            let mut tampered = signed.to_string();
+            tampered.push('A');
+            assert!(doc.key(kid).unwrap().verify_strict(tampered.as_bytes(), &sig).is_err(), "{name}");
+        }
+        let s2s = &v["s2s_token"];
+        let hash = crate::federation::tokens::body_sha256(s2s["body"].as_str().unwrap().as_bytes());
+        assert_eq!(hash, s2s["body_sha256"].as_str().unwrap());
+        assert_eq!(s2s["claims"]["body_sha256"].as_str().unwrap(), hash);
+        assert_ne!(crate::federation::tokens::body_sha256(b"{}"), hash, "another body, another hash");
+    }
+
     #[test]
     fn valid_document_passes() {
         let d = check(&doc()).unwrap();

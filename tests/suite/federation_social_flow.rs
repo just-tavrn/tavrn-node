@@ -472,6 +472,41 @@ async fn ban_notices_come_only_from_nodes_the_user_signed_in_on() {
     assert_eq!(event(&mut alice_ws, "ban.notify").await["room"]["node"], B);
 }
 
+/// ENCRYPTION.md §7b: a remote user's identity reset is recorded together with its history window, failing
+/// closed. When the window cannot be recorded, nothing is: the key stays as it was, the message is refused (`5xx`)
+/// and not remembered as seen, so the home node's retry is handled again.
+#[tokio::test]
+async fn a_remote_identity_reset_is_recorded_with_its_window_or_not_at_all() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    let key = |db: &tavrn_node::db::Pool| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT identity_pubkey FROM users WHERE username = 'alice' AND domain = 'a.test'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let before = key(&b.state.db).await;
+    sqlx::query("DROP TABLE history_reset_epochs").execute(&b.state.db).await.unwrap();
+    let new_key = tavrn_node::keys::NodeKey::generate("k").public_info().x;
+    let payload = json!({ "identity_public_key": new_key, "identity_reset_at": tavrn_node::util::now() });
+    let (st, _) = inbox(&a, &b, "identity.changed", "alice@a.test", B, payload).await;
+    assert!(st.is_server_error(), "{st}");
+    assert_eq!(key(&b.state.db).await, before, "the key change was not recorded without its window");
+    let seen: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM federation_inbox_seen WHERE type = 'identity.changed'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(seen, 0, "a retry is handled again");
+}
+
 // ---------------------------------------------------------------- notify and revocations
 
 #[tokio::test]
