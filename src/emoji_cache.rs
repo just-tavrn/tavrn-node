@@ -173,10 +173,12 @@ pub async fn get(state: &AppState, kind: CacheKind, host: &str, origin_id: &str,
 /// `TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST`; returns how many.
 pub async fn enforce_host_cap(state: &AppState, host: &str, keep: &str) -> Result<u64, ApiError> {
     let cap = i64::try_from(state.config.media_cache_max_bytes_per_host).unwrap_or(i64::MAX);
-    let used: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache WHERE origin_host = $1")
-        .bind(host)
-        .fetch_one(&state.db)
-        .await?;
+    let used: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM remote_emoji_cache WHERE origin_host = $1",
+    )
+    .bind(host)
+    .fetch_one(&state.db)
+    .await?;
     evict_oldest(
         state,
         used - cap,
@@ -190,8 +192,9 @@ pub async fn enforce_host_cap(state: &AppState, host: &str, keep: &str) -> Resul
 /// returns how many.
 pub async fn enforce_total_cap(state: &AppState) -> Result<u64, ApiError> {
     let cap = i64::try_from(state.config.media_cache_max_bytes).unwrap_or(i64::MAX);
-    let used: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache").fetch_one(&state.db).await?;
+    let used: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM remote_emoji_cache")
+        .fetch_one(&state.db)
+        .await?;
     evict_oldest(state, used - cap, "SELECT id, size FROM remote_emoji_cache ORDER BY used_at, id LIMIT 100", &[]).await
 }
 

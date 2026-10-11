@@ -261,11 +261,13 @@ async fn the_cache_is_capped_per_host_and_in_total_and_misses_are_limited() {
     let size = |host: &'static str| {
         let db = node.state.db.clone();
         async move {
-            sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(size), 0) FROM remote_emoji_cache WHERE origin_host = $1")
-                .bind(host)
-                .fetch_one(&db)
-                .await
-                .unwrap()
+            sqlx::query_scalar::<_, i64>(
+                "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM remote_emoji_cache WHERE origin_host = $1",
+            )
+            .bind(host)
+            .fetch_one(&db)
+            .await
+            .unwrap()
         }
     };
     let mut last = String::new();
