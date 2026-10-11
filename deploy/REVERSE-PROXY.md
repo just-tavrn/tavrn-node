@@ -1,11 +1,13 @@
 # Running behind a reverse proxy
 
-The reverse proxy guide (TLS, WebSockets, nginx, Caddy and Nginx Proxy Manager, TURN over TLS, delegation of an
-identity domain) is now part of the operator handbook: [Reverse proxy and TLS](../docs/HANDBOOK.md#reverse-proxy-and-tls).
-The examples stay here: [`nginx.conf.example`](nginx.conf.example) and [`Caddyfile.example`](Caddyfile.example).
+The reverse proxy guide (TLS, WebSockets, TURN over TLS, delegation of an identity domain) is part of the operator
+handbook: [Reverse proxy and TLS](../docs/HANDBOOK.md#reverse-proxy-and-tls). The examples live here:
+[`Caddyfile.example`](Caddyfile.example), [`nginx.conf.example`](nginx.conf.example),
+[`traefik.yml.example`](traefik.yml.example), [`apache.conf.example`](apache.conf.example) and
+[`haproxy.cfg.example`](haproxy.cfg.example); Nginx Proxy Manager is configured in its web interface.
 
 - [What the proxy must do](../docs/HANDBOOK.md#what-the-proxy-must-do)
-- [Nginx Proxy Manager (Portainer)](../docs/HANDBOOK.md#nginx-proxy-manager-portainer)
+- [Examples](../docs/HANDBOOK.md#examples) (Caddy, nginx, [Nginx Proxy Manager](../docs/HANDBOOK.md#nginx-proxy-manager), Traefik, Apache, HAProxy)
 - TURN: [TURN over TLS through the proxy](../docs/HANDBOOK.md#turn-over-tls-through-the-proxy),
   [TURN (optional, for strict networks)](../docs/HANDBOOK.md#turn-optional-for-strict-networks)
 - Voice ports and addresses: [Voice and video](../docs/HANDBOOK.md#voice-and-video),

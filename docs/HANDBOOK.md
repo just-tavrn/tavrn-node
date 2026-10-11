@@ -41,7 +41,7 @@ needs a few open ports, and SMTP and Valkey are optional.
 |---|---|
 | **A Linux host with Docker** | Docker Engine with the Compose plugin. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
 | **A domain** | `TAVRN_DOMAIN` is the identity of the node and part of every address (`alice@chat.example.org`). Addresses cannot be renamed later, so choose it with care. The node may run on another host than its identity domain ([delegation](#identity-domain-and-node-host-delegation)). |
-| **A reverse proxy with TLS** | nginx, Caddy, Traefik or Nginx Proxy Manager. The node speaks plain HTTP only and never terminates TLS; nodes federate over HTTPS only. See [Reverse proxy and TLS](#reverse-proxy-and-tls). |
+| **A reverse proxy with TLS** | Any proxy that terminates TLS and passes WebSockets: examples for Caddy, nginx, Nginx Proxy Manager, Traefik, Apache and HAProxy ship with the repository. The node speaks plain HTTP only and never terminates TLS; nodes federate over HTTPS only. See [Reverse proxy and TLS](#reverse-proxy-and-tls). |
 | **PostgreSQL** | The compose file runs `postgres:17-alpine` next to the node; any existing PostgreSQL server or managed service works too (`TAVRN_DATABASE_URL`). SQLite exists only for development (`--dev`). See [Database](#database). |
 | **A data volume** | `./data`, mounted at `/data`: the node's keys and the uploaded files. Back it up together with the database ([Keys and backups](#keys-and-backups)). |
 | **Ports for voice** | A UDP range (default `61000-61100`) and one TCP port (default `7881`) reachable from the internet, published 1:1 to the container and forwarded by the router. Optional: UDP `3478` for TURN, and TURN over TLS on 443 through the proxy. Voice can be switched off (`TAVRN_VOICE_ENABLED=false`). See [Voice and video](#voice-and-video). |
@@ -537,24 +537,26 @@ not published at all). `/api/v1/voice/webhook` receives LiveKit's events from in
 from outside are rejected unless signed with the node's LiveKit secret, so the proxy does not need to block it
 (it may).
 
-### nginx and Caddy
+### Examples
 
-Ready-made configurations for nginx and Caddy cover everything the node needs from its proxy.
+Any reverse proxy that meets the list above works. The repository ships complete examples; each one terminates TLS,
+redirects HTTP to HTTPS, sends HSTS, passes the WebSockets through, forwards the client's address, allows 100 MB
+bodies and keeps `/metrics` off the public internet. Replace `chat.example.org` and the upstream address
+(`127.0.0.1:8080` for a published port, `tavrn:8080` on a shared Docker network).
 
-Complete examples are in the repository:
-
-- [`deploy/nginx.conf.example`](../deploy/nginx.conf.example): HTTPS server with HTTP/2 and HSTS,
-  `client_max_body_size 100m`, `proxy_pass http://127.0.0.1:8080` with `Host`, `X-Forwarded-For`,
-  `X-Forwarded-Proto`, the WebSocket headers (`Upgrade $http_upgrade`, `Connection "upgrade"`) and
-  `proxy_read_timeout 3600s`, plus the HTTP → HTTPS redirect. Certificates e.g. via certbot.
-- [`deploy/Caddyfile.example`](../deploy/Caddyfile.example): `reverse_proxy 127.0.0.1:8080` with automatic
-  certificates, a 100 MB body limit, HSTS (`header Strict-Transport-Security "max-age=63072000"`, Caddy sends none by
-  itself) and `respond /metrics 404`; Caddy passes WebSockets and `X-Forwarded-For` by itself.
+| Proxy | Example | Notes |
+|---|---|---|
+| Caddy | [`deploy/Caddyfile.example`](../deploy/Caddyfile.example) | Automatic certificates. Caddy passes WebSockets and `X-Forwarded-For` by itself; the example adds HSTS (Caddy sends none by default), the body limit and `respond /metrics 404`. |
+| nginx | [`deploy/nginx.conf.example`](../deploy/nginx.conf.example) | `proxy_pass` with `Host`, `X-Forwarded-For`, `X-Forwarded-Proto`, the WebSocket headers (`Upgrade`, `Connection "upgrade"`), `proxy_read_timeout 3600s`, `client_max_body_size 100m`, HSTS, HTTP/2 and the redirect. Certificates e.g. via certbot. |
+| Nginx Proxy Manager | [below](#nginx-proxy-manager) | The same nginx settings through its web interface. |
+| Traefik (v3) | [`deploy/traefik.yml.example`](../deploy/traefik.yml.example) | A dynamic configuration (file provider) with the router, an HSTS middleware, the HTTPS redirect and an `ipAllowList` for `/metrics`; the ACME resolver and entry points belong to the static configuration (commented at the end). Traefik sets the forwarded headers itself and has no body limit unless the buffering middleware is used. The same routers and middlewares work as Docker labels. |
+| Apache httpd (2.4.47+) | [`deploy/apache.conf.example`](../deploy/apache.conf.example) | `ProxyPass … upgrade=websocket timeout=3600` (mod_proxy_http tunnels the WebSockets, no mod_proxy_wstunnel needed), `ProxyPreserveHost On`, `X-Forwarded-Proto`, `LimitRequestBody`, HSTS, `Require ip` on `/metrics`. |
+| HAProxy (2.x) | [`deploy/haproxy.cfg.example`](../deploy/haproxy.cfg.example) | `option forwardfor`, `timeout tunnel 1h` for the WebSockets, the redirect, HSTS and a `deny` for `/metrics` from outside; HAProxy streams bodies and limits nothing. |
 
 Several instances: list every instance as an upstream (nginx `upstream`, Caddy `reverse_proxy` with several
-upstreams), see [Load balancer](#load-balancer).
+upstreams, a Traefik service with several servers, HAProxy `server` lines), see [Load balancer](#load-balancer).
 
-### Nginx Proxy Manager (Portainer)
+#### Nginx Proxy Manager
 
 Nginx Proxy Manager is configured in its web interface with one proxy host and two advanced settings.
 
@@ -572,9 +574,9 @@ Create a proxy host:
 
 Under "Advanced" add: `client_max_body_size 100m;` and `proxy_read_timeout 3600s;`
 
-If NPM shares a Docker network with the tavrn container, `tavrn` does not need a published TCP port (remove the
-`8080` entry in `docker-compose.yml` and attach the tavrn service to NPM's network). The media ports (UDP range,
-TCP 7881, optionally TURN) stay published on the host.
+If the proxy shares a Docker network with the tavrn container, `tavrn` does not need a published TCP port (remove
+the `8080` entry in `docker-compose.yml` and attach the tavrn service to the proxy's network). The media ports (UDP
+range, TCP 7881, optionally TURN) stay published on the host. The same applies to any proxy that runs as a container.
 
 ### TURN over TLS through the proxy
 
@@ -603,8 +605,10 @@ To share port 443 with the web server, route by name with `ssl_preread` in a `st
 goes to a TLS-terminating stream server on an internal port, everything else to the HTTPS server. Clients always use
 port 443 (LiveKit announces `turns:<domain>:443`). Nginx Proxy Manager: a *Stream* (TCP) listening on 443 of an
 address its proxy hosts do not use, with an SSL certificate for the TURN domain (stream SSL needs a recent NPM
-release), forwarding to `tavrn:5349`. Without a TLS-terminating stream proxy, leave `TAVRN_RTC_TURN_TLS_PORT=0` and
-use TURN over UDP. The rest of TURN is in [Voice and video](#turn-optional-for-strict-networks).
+release), forwarding to `tavrn:5349`. Traefik: a TCP router with `HostSNI` of the TURN domain and `tls: {}` to a TCP
+service on `tavrn:5349`. HAProxy: a `listen` in `mode tcp` with `bind :443 ssl crt <turn certificate>` on the TURN
+address and `server tavrn 127.0.0.1:5349`. Without a TLS-terminating stream proxy, leave `TAVRN_RTC_TURN_TLS_PORT=0`
+and use TURN over UDP. The rest of TURN is in [Voice and video](#turn-optional-for-strict-networks).
 
 ### Identity domain and node host (delegation)
 
