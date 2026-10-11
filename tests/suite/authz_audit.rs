@@ -699,3 +699,300 @@ async fn moving_a_channel_into_a_granting_category_needs_manage_roles() {
     let (s, j) = node.patch(&channel, &alice.token, json!({ "category_id": cat })).await;
     assert_eq!(s, StatusCode::OK, "{j}");
 }
+
+/// permissions.md "Hierarchy": members "only grant permissions they hold themselves". Assigning a role is granting
+/// its bits: a manager below the role's position still cannot hand out (to others or to themselves) a role that
+/// carries bits they lack. The owner can.
+#[tokio::test]
+async fn role_assignment_grants_only_bits_the_actor_holds() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let carol = node.register("carol").await;
+    let (room_id, _) = room_with(&node, &alice, &[&bob, &carol]).await;
+    let bans = role(&node, &alice.token, &room_id, "Bans", &[p::BAN_MEMBERS], 2).await;
+    let helper = role(&node, &alice.token, &room_id, "Helper", &[p::VIEW_CHANNEL], 1).await;
+    let mods = role(&node, &alice.token, &room_id, "Mod", &[p::MANAGE_ROLES], 5).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&mods]).await.0, StatusCode::OK);
+
+    let (s, j) = assign(&node, &bob.token, &room_id, &carol.user_id, &[&bans]).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "role.escalation"), "to another member: {j}");
+    let (s, j) = assign(&node, &bob.token, &room_id, &bob.user_id, &[&mods, &bans]).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "role.escalation"), "to themselves: {j}");
+    // Bits the manager holds stay assignable.
+    let (s, j) = assign(&node, &bob.token, &room_id, &carol.user_id, &[&helper]).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    // The owner may hand out any role.
+    let (s, j) = assign(&node, &alice.token, &room_id, &carol.user_id, &[&bans]).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    // A role the member already holds may stay in the list of a manager who lacks its bits (it is not granted anew).
+    let (s, j) = assign(&node, &bob.token, &room_id, &carol.user_id, &[&bans, &helper]).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
+
+/// A limited invite admits exactly as many people as it allows, also when they redeem it at the same moment (the
+/// use is claimed before the join, not counted after it).
+#[tokio::test]
+async fn a_single_use_invite_admits_one_member_under_concurrent_joins() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (s, invite) =
+        node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({ "max_uses": 1 })).await;
+    assert_eq!(s, StatusCode::CREATED, "{invite}");
+    let join = format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap());
+    let mut users = Vec::new();
+    for i in 0..8 {
+        users.push(node.register(&format!("joiner{i}")).await);
+    }
+    let results = futures::future::join_all(users.iter().map(|u| node.post(&join, &u.token, json!({})))).await;
+    let ok = results.iter().filter(|(s, _)| *s == StatusCode::OK).count();
+    assert_eq!(ok, 1, "{results:?}");
+    for (s, j) in results.iter().filter(|(s, _)| *s != StatusCode::OK) {
+        assert_eq!((*s, code(j)), (StatusCode::NOT_FOUND, "invite.invalid"), "{j}");
+    }
+    let (_, members) = node.get_auth(&format!("/api/v1/rooms/{room_id}/members"), &alice.token).await;
+    assert_eq!(members.as_array().unwrap().len(), 2, "the owner and one joiner: {members}");
+}
+
+/// Sends a DM `typing` op over a WebSocket of `token` and returns the users the hub delivered it to (empty: it went
+/// nowhere).
+async fn dm_typing_reaches(node: &TestNode, token: &str, conversation_id: &str) -> Vec<String> {
+    use futures::SinkExt;
+    let mut rx = node.state.hub.subscribe();
+    let ws = crate::suite::ws_flow::serve(node).await;
+    let mut sock = crate::suite::ws_flow::hello(&ws, token).await;
+    sock.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({ "op": "typing", "conversation_id": conversation_id }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut to = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if ev.kind == "typing"
+            && let tavrn_node::hub::Scope::Users(users) = &ev.scope
+        {
+            to.extend(users.iter().cloned());
+        }
+    }
+    to
+}
+
+/// PROTOCOL.md §8a: blocks always win and a requested member has not joined yet. Typing in a DM is writing: a
+/// blocked person's typing reaches nobody, a requested member's typing is not sent, and the members' typing does
+/// not reach the requested member either.
+#[tokio::test]
+async fn dm_typing_respects_blocks_and_message_requests() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let carol = node.register("carol").await;
+    node.befriend(&alice, &bob).await;
+    let (s, c) = node.post("/api/v1/conversations", &alice.token, json!({ "kind": "dm", "members": ["bob"] })).await;
+    assert!(s.is_success(), "{c}");
+    let dm = c["id"].as_str().unwrap().to_string();
+    assert!(dm_typing_reaches(&node, &bob.token, &dm).await.contains(&alice.user_id), "typing works between friends");
+    let (s, j) = node.post("/api/v1/users/me/blocks", &alice.token, json!({ "user": "bob" })).await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(dm_typing_reaches(&node, &bob.token, &dm).await, Vec::<String>::new(), "blocked: nobody");
+
+    // A message request: carol writes to alice, who has not accepted.
+    room_with(&node, &carol, &[&alice]).await;
+    let (s, c) = node.post("/api/v1/conversations", &carol.token, json!({ "kind": "dm", "members": ["alice"] })).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+    assert_eq!(c["pending"], json!(["alice@t.local"]), "{c}");
+    let req = c["id"].as_str().unwrap().to_string();
+    assert_eq!(dm_typing_reaches(&node, &alice.token, &req).await, Vec::<String>::new(), "requested member");
+    let to = dm_typing_reaches(&node, &carol.token, &req).await;
+    assert!(!to.contains(&alice.user_id), "the requester's typing does not reach the requested member: {to:?}");
+}
+
+/// PROTOCOL.md §8a: blocks always win, also for calls. Blocking ends a running call of the DM, and a blocked person
+/// cannot (re)join a call.
+#[tokio::test]
+async fn blocking_ends_the_dm_call_and_blocked_users_cannot_join() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    node.befriend(&alice, &bob).await;
+    let (s, c) = node.post("/api/v1/conversations", &alice.token, json!({ "kind": "dm", "members": ["bob"] })).await;
+    assert!(s.is_success(), "{c}");
+    let id = c["id"].as_str().unwrap().to_string();
+    let (s, j) = node.post(&format!("/api/v1/conversations/{id}/call/start"), &alice.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(node.state.calls.is_active(&id));
+    let (s, j) = node.post("/api/v1/users/me/blocks", &alice.token, json!({ "user": "bob" })).await;
+    assert!(s.is_success(), "{j}");
+    assert!(!node.state.calls.is_active(&id), "the block ended the call");
+    let (s, j) = node.post(&format!("/api/v1/conversations/{id}/call/join"), &bob.token, json!({})).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "dm.blocked"), "{j}");
+}
+
+/// permissions.md "Hierarchy" and bit 8: overrides set "only permissions you hold". Taking a permission away from
+/// others (a deny bit) and the upload categories of an override count too: a manager cannot deny what they do not
+/// hold, nor allow (or deny) upload categories they cannot use there.
+#[tokio::test]
+async fn overrides_deny_and_upload_categories_stay_within_the_actor_s_own() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel_id = TestNode::text_channel(&room);
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    let (s, j) =
+        node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node
+        .patch(
+            &format!("/api/v1/rooms/{room_id}/roles/{everyone}"),
+            &alice.token,
+            json!({ "allowed_upload_categories": ["images"] }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let mods = role(&node, &alice.token, &room_id, "Mod", &[p::MANAGE_ROLES], 5).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&mods]).await.0, StatusCode::OK);
+    let path = format!("/api/v1/rooms/{room_id}/overrides");
+    let body = |subject_type: &str, subject: &str, deny: u64, extra: Value| {
+        let mut b = json!({ "target_type": "channel", "target_id": channel_id, "subject_type": subject_type,
+                            "subject_id": subject, "allow": "0", "deny": deny.to_string() });
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        b
+    };
+
+    let (s, j) = node.put(&path, &bob.token, body("role", &everyone, p::MANAGE_MESSAGES, json!({}))).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "deny of a bit bob lacks: {j}");
+    let (s, j) =
+        node.put(&path, &bob.token, body("member", &bob.user_id, 0, json!({ "upload_allow": ["archives"] }))).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "upload category bob lacks: {j}");
+    let (s, j) = node.put(&path, &bob.token, body("role", &everyone, 0, json!({ "upload_deny": ["video"] }))).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "deny of a category bob lacks: {j}");
+    // What bob holds stays possible; the owner may do anything.
+    let (s, j) = node
+        .put(&path, &bob.token, body("role", &everyone, p::SEND_MESSAGES, json!({ "upload_deny": ["images"] })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node
+        .put(&path, &alice.token, body("role", &everyone, p::MANAGE_MESSAGES, json!({ "upload_allow": ["archives"] })))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
+
+/// PROTOCOL.md §6 audiences: a purge over several channels must not name, to a member, the channels hidden from
+/// them. Each channel's `message.purge` reaches that channel's viewers only.
+#[tokio::test]
+async fn purge_events_name_only_channels_the_member_can_view() {
+    use futures::StreamExt;
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, general) = room_with(&node, &alice, &[&bob]).await;
+    let (s, ch) = node
+        .post(&format!("/api/v1/rooms/{room_id}/channels"), &alice.token, json!({ "kind": "text", "name": "staff" }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{ch}");
+    let secret = ch["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE conversations SET encrypted = 0 WHERE id = $1")
+        .bind(&secret)
+        .execute(&node.state.db)
+        .await
+        .unwrap();
+    let everyone = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &alice.token).await.1["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["is_everyone"] == true)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, j) = node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            &alice.token,
+            json!({ "target_type": "channel", "target_id": secret, "subject_type": "role", "subject_id": everyone, "allow": "0", "deny": common::perms(&[p::VIEW_CHANNEL]) }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(node.send(&alice.token, &room_id, &secret, "staff only").await.0, StatusCode::CREATED);
+    assert_eq!(node.send(&alice.token, &room_id, &general, "hello all").await.0, StatusCode::CREATED);
+
+    let ws = crate::suite::ws_flow::serve(&node).await;
+    let mut bob_ws = crate::suite::ws_flow::hello(&ws, &bob.token).await;
+    let path = format!("/api/v1/rooms/{room_id}/moderation/purge");
+    let (s, preview) = node.post(&path, &alice.token, json!({ "author_id": alice.user_id })).await;
+    assert_eq!(s, StatusCode::OK, "{preview}");
+    let (s, j) = node
+        .post(&path, &alice.token, json!({ "author_id": alice.user_id, "confirm_token": preview["confirm_token"] }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let mut named = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+    while let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+        tokio::time::timeout_at(deadline, bob_ws.next()).await
+    {
+        let v: Value = serde_json::from_str(&t).unwrap();
+        if v["type"] == "message.purge" {
+            named.extend(v["data"]["conversation_ids"].as_array().unwrap().iter().cloned());
+        }
+    }
+    assert!(named.contains(&json!(general)), "bob learns of the purge in the channel he sees: {named:?}");
+    assert!(!named.contains(&json!(secret)), "but never of the hidden channel: {named:?}");
+}
+
+/// `manage_webhooks` is channel-scoped (permissions.md): the room-wide list shows a manager only the webhooks of the
+/// channels they can view and manage, never those of a channel hidden from them.
+#[tokio::test]
+async fn the_room_webhook_list_leaves_out_hidden_channels() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, general) = room_with(&node, &alice, &[&bob]).await;
+    let hooks = role(&node, &alice.token, &room_id, "Hooks", &[p::MANAGE_WEBHOOKS], 1).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&hooks]).await.0, StatusCode::OK);
+    let (s, ch) = node
+        .post(&format!("/api/v1/rooms/{room_id}/channels"), &alice.token, json!({ "kind": "text", "name": "staff" }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{ch}");
+    let secret = ch["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE conversations SET encrypted = 0 WHERE id = $1")
+        .bind(&secret)
+        .execute(&node.state.db)
+        .await
+        .unwrap();
+    for (channel, name) in [(&general, "public hook"), (&secret, "staff hook")] {
+        let (s, j) = node
+            .post(
+                &format!("/api/v1/rooms/{room_id}/channels/{channel}/webhooks"),
+                &alice.token,
+                json!({ "name": name }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{j}");
+    }
+    let (s, j) = node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            &alice.token,
+            json!({ "target_type": "channel", "target_id": secret, "subject_type": "role", "subject_id": hooks, "allow": "0", "deny": common::perms(&[p::VIEW_CHANNEL]) }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, list) = node.get_auth(&format!("/api/v1/rooms/{room_id}/webhooks"), &bob.token).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    let names: Vec<&str> = list.as_array().unwrap().iter().map(|w| w["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["public hook"], "{list}");
+    let (_, list) = node.get_auth(&format!("/api/v1/rooms/{room_id}/webhooks"), &alice.token).await;
+    assert_eq!(list.as_array().unwrap().len(), 2, "the owner sees both: {list}");
+}

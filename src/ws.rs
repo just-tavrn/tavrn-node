@@ -299,16 +299,22 @@ async fn typing(
             );
         }
         (None, None, Some(conversation_id)) if crate::util::is_ulid(&conversation_id) => {
-            match store::social::member_ids(&state.db, &conversation_id).await {
-                Ok(members) if members.contains(&auth.user.id) => {
-                    state.hub.users(
-                        members,
-                        "typing",
-                        json!({ "conversation_id": conversation_id, "user_id": auth.user.id }),
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::debug!(error = %e, "typing notice not deliverable"),
+            // Typing is writing (PROTOCOL.md §8a): never across a block, never from a member who has not accepted
+            // the request yet, and never to such a member.
+            let conv = match crate::access::direct(state, &conversation_id, &auth.user.id).await {
+                Ok(conv) => conv,
+                Err(_) => return,
+            };
+            if crate::routes::messages::check_direct_write(state, auth, &conv).await.is_err() {
+                return;
+            }
+            if let crate::access::ConvKind::Direct { member_ids, requested, .. } = conv.kind {
+                let active: Vec<String> = member_ids.into_iter().filter(|m| !requested.contains(m)).collect();
+                state.hub.users(
+                    active,
+                    "typing",
+                    json!({ "conversation_id": conversation_id, "user_id": auth.user.id }),
+                );
             }
         }
         _ => {}
