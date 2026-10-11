@@ -611,20 +611,27 @@ async fn claims_about_local_users_need_their_session_on_the_sending_node() {
     assert_eq!(st, StatusCode::ACCEPTED, "{code}");
 }
 
-/// S2S claims share the per-target claim budget with local claims (ENCRYPTION.md §4.5): rotating requester names of
-/// the sending node do not get past it.
+/// S2S claims count against a budget per requesting node and target (ENCRYPTION.md §3.2): rotating requester names
+/// of one node do not get past it, but that node's exhausted budget blocks neither claims arriving from elsewhere (here:
+/// local ones) nor the target's friends on the same node.
 #[tokio::test]
-async fn s2s_claims_count_against_the_target_users_budget() {
+async fn s2s_claims_are_budgeted_per_requesting_node() {
     let (a, b) = two_nodes().await;
     let carol = b.register("carol").await;
-    let claim = json!({ "user": "carol@b.test", "requester": "alice@a.test" });
-    let (st, code) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
+    let path = "/api/v1/federation/key-packages/claim";
+    let (st, code) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "x1@a.test" }), false).await;
     assert_eq!(st, StatusCode::OK, "{code}");
-    while b.state.claim_target_limiter.check(&carol.user_id).await.is_ok() {}
-    let claim = json!({ "user": "carol@b.test", "requester": "someone-else@a.test" });
-    let (st, _) = s2s(&a, &b, "/api/v1/federation/key-packages/claim", claim, false).await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a new requester name does not reset the budget");
+    while b.state.claim_target_limiter.check(&format!("a.test|{}", carol.user_id)).await.is_ok() {}
+    let (st, _) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "x2@a.test" }), false).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a new requester name does not reset the node's budget");
     let dave = b.register("dave").await;
-    let (st, _) = b.post("/api/v1/users/carol/key-packages/claim", &dave.token, json!({})).await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "local claims share the budget");
+    let (st, j) = b.post("/api/v1/users/carol/key-packages/claim", &dave.token, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "local claims have their own budget: {j}");
+    // alice@a.test is carol's friend: her claims are not limited by the strangers of her node.
+    let alice = a.register("alice").await;
+    b.sign_in_from(&a, &alice).await;
+    let stub = tavrn_node::store::federation::user_by_address(&b.state.db, "alice", "a.test").await.unwrap().unwrap();
+    tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &stub.id).await.unwrap();
+    let (st, code) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "alice@a.test" }), false).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
 }

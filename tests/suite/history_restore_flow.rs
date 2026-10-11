@@ -268,6 +268,33 @@ async fn the_reset_itself_records_the_history_window() {
     assert_eq!(st, StatusCode::CREATED, "{j}");
 }
 
+/// The owner-driven reset of a bot (`store::applications::clear_identity`, APPLICATIONS.md §3.4) records the history
+/// window of the bot's memberships in the same transaction as well: `key_reset_at` and the reset epoch of every group.
+#[tokio::test]
+async fn the_bot_reset_records_the_history_window() {
+    let node = test_node(DOMAIN).await;
+    let mut alice = node.crypto_user("alice").await;
+    let room = node.create_room(alice.token(), "Bots").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = TestNode::text_channel(&room);
+    node.create_group(&mut alice, &channel).await;
+    let member = node.crypto_user("botlike").await;
+    join(&node, alice.token(), &room_id, member.token()).await;
+    let reset_at =
+        tavrn_node::store::applications::clear_identity(&node.state.db, &member.session.user_id).await.unwrap();
+    let marked: Option<String> =
+        sqlx::query_scalar("SELECT key_reset_at FROM room_members WHERE room_id = $1 AND user_id = $2")
+            .bind(&room_id)
+            .bind(&member.session.user_id)
+            .fetch_one(&node.state.db)
+            .await
+            .unwrap();
+    assert_eq!(marked.as_deref(), Some(reset_at.as_str()));
+    let epoch =
+        tavrn_node::store::history::reset_epoch(&node.state.db, &channel, &member.session.user_id).await.unwrap();
+    assert_eq!(epoch, Some(0));
+}
+
 #[tokio::test]
 async fn a_rotation_is_no_reset_and_a_new_membership_starts_without_one() {
     let s = setup().await;

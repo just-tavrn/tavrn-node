@@ -571,7 +571,7 @@ pub async fn claim_key_packages(
             }
             if target.id != auth.user.id {
                 state.claim_pair_limiter.check_all(&[format!("{}|{}", auth.user.address(), target.address())]).await?;
-                e2ee::claim_budget(&state, &target).await?;
+                e2ee::claim_budget(&state, "local", &auth.user.address(), &target).await?;
             }
             crate::federation::claims::claim_local(&state, &target).await?
         }
