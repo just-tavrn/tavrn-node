@@ -4,7 +4,7 @@ use crate::common;
 
 use axum::http::{Method, StatusCode};
 use common::{test_node, test_node_with};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[tokio::test]
 async fn admin_routes_require_node_admin() {
@@ -62,6 +62,83 @@ async fn account_invites_gate_registration() {
     let (_, log) = node.get_auth("/api/v1/admin/audit-log", &admin.token).await;
     let actions: Vec<&str> = log.as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
     assert!(actions.contains(&"admin.invite_create") && actions.contains(&"user.register"), "{actions:?}");
+}
+
+async fn invite_uses(node: &common::TestNode, admin: &str, code: &str) -> i64 {
+    let (_, list) = node.get_auth("/api/v1/admin/invites", admin).await;
+    list.as_array().unwrap().iter().find(|i| i["code"] == code).unwrap()["uses"].as_i64().unwrap()
+}
+
+/// A registration that fails (missing e-mail, captcha, password, taken username, ...) must not use up the invite:
+/// the invite is redeemed only together with the account, in one transaction.
+#[tokio::test]
+async fn failed_registration_keeps_the_invite() {
+    let mut node = test_node_with("t.local", |c| {
+        c.registration = tavrn_node::config::Registration::Invite;
+        c.email = tavrn_node::config::EmailMode::Required;
+        c.smtp_url = Some("smtp://x".into());
+        c.captcha_provider = tavrn_node::config::CaptchaProvider::Turnstile;
+        c.turnstile_site_key = Some("site".into());
+        c.turnstile_secret_key = Some("secret".into());
+        c.captcha_register = true;
+    })
+    .await;
+    node.state.captcha = tavrn_node::captcha::CaptchaVerifier::Static { accept: "good".into() };
+    node.router = tavrn_node::app::router(node.state.clone());
+
+    // The first account bootstraps the node (no invite needed).
+    let body = |name: &str, invite: Option<&str>| {
+        json!({ "username": name, "date_of_birth": "1990-01-01", "password": "password-long-enough",
+                "email": format!("{name}@example.org"), "captcha_token": "good", "invite": invite })
+    };
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(body("admin", None))).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let (_, confirmed) = node.enroll_totp(j["preauth_token"].as_str().unwrap()).await;
+    let admin = confirmed["session"]["access_token"].as_str().unwrap().to_string();
+    let (s, inv) = node.post("/api/v1/admin/invites", &admin, json!({ "max_uses": 1 })).await;
+    assert_eq!(s, StatusCode::CREATED, "{inv}");
+    let code = inv["code"].as_str().unwrap().to_string();
+
+    // Bob's otherwise valid registration with one field changed.
+    let bob = |field: &str, value: Value| {
+        let mut b = body("bob", Some(&code));
+        b[field] = value;
+        b
+    };
+    let attempts: Vec<(&str, Value, StatusCode, &str)> = vec![
+        ("no e-mail", bob("email", Value::Null), StatusCode::BAD_REQUEST, "auth.email_required"),
+        ("invalid e-mail", bob("email", json!("nope")), StatusCode::BAD_REQUEST, "auth.email_invalid"),
+        ("no captcha", bob("captcha_token", Value::Null), StatusCode::BAD_REQUEST, "auth.captcha_required"),
+        ("wrong captcha", bob("captcha_token", json!("bad")), StatusCode::BAD_REQUEST, "auth.captcha_invalid"),
+        ("weak password", bob("password", json!("short")), StatusCode::BAD_REQUEST, "auth.password_weak"),
+        ("bad username", body("-x-", Some(&code)), StatusCode::BAD_REQUEST, "auth.username_invalid"),
+        ("no date of birth", bob("date_of_birth", Value::Null), StatusCode::BAD_REQUEST, "validation.date_of_birth"),
+        ("too young", bob("date_of_birth", json!("2024-01-01")), StatusCode::FORBIDDEN, "age.below_minimum"),
+        ("long display name", bob("display_name", json!("x".repeat(65))), StatusCode::BAD_REQUEST, "validation.length"),
+        // The INSERT fails on the unique name: the invite use rolls back with it.
+        ("taken username", body("admin", Some(&code)), StatusCode::CONFLICT, "auth.username_taken"),
+    ];
+    for (what, attempt, status, err) in attempts {
+        let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(attempt)).await;
+        assert_eq!(s, status, "{what}: {j}");
+        assert_eq!(j["code"], err, "{what}");
+        assert_eq!(invite_uses(&node, &admin, &code).await, 0, "{what} must not use the invite");
+    }
+
+    // The same code still works, exactly once.
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(body("bob", Some(&code)))).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert_eq!(invite_uses(&node, &admin, &code).await, 1);
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(body("carol", Some(&code)))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
+    assert_eq!(j["code"], "auth.invite_invalid");
+    assert_eq!(invite_uses(&node, &admin, &code).await, 1);
+    // An unknown code is refused the same way; neither attempt created an account.
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/register", None, Some(body("carol", Some("wrong")))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{j}");
+    assert_eq!(j["code"], "auth.invite_invalid");
+    let (_, overview) = node.get_auth("/api/v1/admin/overview", &admin).await;
+    assert_eq!(overview["users"], 2, "{overview}");
 }
 
 #[tokio::test]

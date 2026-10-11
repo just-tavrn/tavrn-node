@@ -25,7 +25,10 @@ First public release of the node and its container image.
   templates, message retention, metrics, legal tooling (takedown notices), clustering with Valkey, the operator
   handbook and deployment examples (Docker Compose, reverse proxies).
 
-### Security
+### Fixed
+
+- A registration that fails (missing e-mail, captcha, password, username, date of birth, terms) no longer uses up
+  the invite: the invite is redeemed in the transaction that creates the account.
 
 ### Security
 

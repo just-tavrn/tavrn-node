@@ -66,7 +66,24 @@ pub struct NewLocalUser<'a> {
 
 /// Creates a local account. `Err(Conflict)` if the name is already taken.
 pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, ApiError> {
+    create_local_with_invite(db, u, None).await
+}
+
+/// Creates a local account and, with `invite`, redeems one use of that account invite in the same transaction:
+/// `403 auth.invite_invalid` if the invite is unknown, expired or used up (no account is created), `409
+/// auth.username_taken` if the name is taken (the invite use rolls back). A failed registration never uses an invite.
+pub async fn create_local_with_invite(
+    db: &Pool,
+    u: NewLocalUser<'_>,
+    invite: Option<&str>,
+) -> Result<UserRow, ApiError> {
     let id = ulid();
+    let mut tx = db.begin().await?;
+    if let Some(code) = invite
+        && !super::admin::consume_invite(&mut *tx, code).await?
+    {
+        return Err(super::admin::invite_invalid());
+    }
     let result = sqlx::query(
         "INSERT INTO users (id, username, domain, display_name, kind, password_hash, email, is_node_admin, created_at, date_of_birth)
          VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9)",
@@ -80,15 +97,17 @@ pub async fn create_local(db: &Pool, u: NewLocalUser<'_>) -> Result<UserRow, Api
     .bind(u.is_node_admin as i64)
     .bind(now())
     .bind(u.date_of_birth)
-    .execute(db)
+    .execute(&mut *tx)
     .await;
     match result {
         Ok(_) => {}
+        // Dropping the transaction rolls the invite use back.
         Err(e) if super::is_unique_violation(&e) => {
             return Err(ApiError::conflict("auth.username_taken", "This username is already taken"));
         }
         Err(e) => return Err(e.into()),
     }
+    tx.commit().await?;
     by_id(db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("user not found after INSERT")))
 }
 
@@ -632,5 +651,48 @@ mod tests {
         let ids: Vec<String> = members_of_room(&db, "r").await.unwrap().into_iter().map(|u| u.id).collect();
         assert_eq!(ids, ["u1", "u3"]);
         assert!(members_of_room(&db, "nope").await.unwrap().is_empty());
+    }
+
+    fn new_user(username: &str) -> NewLocalUser<'_> {
+        NewLocalUser {
+            username,
+            domain: "d",
+            display_name: username,
+            password_hash: "hash",
+            email: None,
+            is_node_admin: false,
+            date_of_birth: Some("1990-01-01"),
+        }
+    }
+
+    async fn invite_uses(db: &Pool, code: &str) -> i64 {
+        crate::store::admin::invite_by_code(db, code).await.unwrap().unwrap().uses
+    }
+
+    #[tokio::test]
+    async fn create_local_with_invite_redeems_the_invite_only_with_the_account() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let admin = create_local(&db, new_user("admin")).await.unwrap();
+        let invite = crate::store::admin::create_invite(&db, &admin.id, "", 1, None).await.unwrap();
+        let code = invite.code.as_str();
+
+        // Unknown code: no account, nothing used.
+        let err = create_local_with_invite(&db, new_user("bob"), Some("wrong")).await.unwrap_err();
+        assert_eq!(err.code(), "auth.invite_invalid");
+        assert!(by_username(&db, "bob", "d").await.unwrap().is_none());
+        // Taken name: the invite use rolls back with the failed INSERT.
+        let err = create_local_with_invite(&db, new_user("admin"), Some(code)).await.unwrap_err();
+        assert_eq!(err.code(), "auth.username_taken");
+        assert_eq!(invite_uses(&db, code).await, 0);
+        // Success uses the invite once; then it is used up and creates nothing.
+        let bob = create_local_with_invite(&db, new_user("bob"), Some(code)).await.unwrap();
+        assert_eq!(bob.username, "bob");
+        assert_eq!(invite_uses(&db, code).await, 1);
+        let err = create_local_with_invite(&db, new_user("carol"), Some(code)).await.unwrap_err();
+        assert_eq!(err.code(), "auth.invite_invalid");
+        assert!(by_username(&db, "carol", "d").await.unwrap().is_none());
+        assert_eq!(invite_uses(&db, code).await, 1);
+        // Without an invite the account is simply created.
+        create_local_with_invite(&db, new_user("dave"), None).await.unwrap();
     }
 }

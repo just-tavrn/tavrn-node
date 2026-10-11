@@ -132,13 +132,24 @@ pub async fn invite_by_code(db: &Pool, code: &str) -> Result<Option<AccountInvit
 }
 
 /// Checks and consumes an invite atomically; `false` if invalid, expired or used up.
-pub async fn consume_invite(db: &Pool, code: &str) -> Result<bool, ApiError> {
+/// Redeems one use of an account invite (atomic: the use count never exceeds `max_uses`); `false` if the code is
+/// unknown, expired or used up. Registration calls it inside the transaction that creates the account
+/// ([`super::users::create_local_with_invite`]), so a failed registration never uses an invite.
+pub async fn consume_invite<'e, E>(executor: E, code: &str) -> Result<bool, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let r = sqlx::query("UPDATE account_invites SET uses = uses + 1 WHERE code = $1 AND (max_uses = 0 OR uses < max_uses) AND (expires_at IS NULL OR expires_at > $2)")
         .bind(code)
         .bind(now())
-        .execute(db)
+        .execute(executor)
         .await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// `403 auth.invite_invalid`.
+pub fn invite_invalid() -> ApiError {
+    ApiError::Forbidden { code: "auth.invite_invalid", detail: "Invite invalid, expired or used up".into() }
 }
 
 pub async fn delete_invite(db: &Pool, code: &str) -> Result<bool, ApiError> {
