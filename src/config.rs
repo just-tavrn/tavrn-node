@@ -294,6 +294,10 @@ pub struct Config {
     /// Cached copies of other nodes' emojis and clips are evicted after this many days without use;
     /// 0 = never.
     pub media_cache_unused_days: u32,
+    /// Total size of the cached copies of other nodes' emojis and clips; the least recently used go first.
+    pub media_cache_max_bytes: u64,
+    /// Size of the cached copies from one origin node; its least recently used copies go first.
+    pub media_cache_max_bytes_per_host: u64,
     /// Files channels may use external WebDAV/S3 stores (`TAVRN_FILES_EXTERNAL`, default off, FILES.md §5).
     pub files_external: Switch,
     /// External stores may be on private, loopback or link-local addresses and use plain http
@@ -382,6 +386,12 @@ pub struct Config {
     pub federation_remote_bots: bool,
     /// API requests per user and minute (every authenticated route; `0` = off, the default in development mode).
     pub rate_user_per_minute: u32,
+    /// Argon2 password hashes and checks running at once (`0` = twice the CPU cores, at least 2).
+    pub password_hash_concurrency: u32,
+    /// IPv6 client addresses share their per-address rate limits by this prefix length (32–128; 64 = one /64).
+    pub rate_limit_ipv6_prefix: u8,
+    /// WebSocket connections one user may hold at once (`0` = unlimited).
+    pub ws_max_sockets_per_user: u32,
     /// Federated logins per remote domain and minute.
     pub federation_rate_logins: u32,
     /// Inbox messages per remote domain and minute.
@@ -588,6 +598,8 @@ impl Default for Config {
             files_channels: Switch::On,
             files_channels_max_bytes: 0,
             media_cache_unused_days: 365,
+            media_cache_max_bytes: 2 * 1024 * 1024 * 1024,
+            media_cache_max_bytes_per_host: 64 * 1024 * 1024,
             files_external: Switch::Off,
             files_external_private: Switch::Off,
             gif_provider: GifProvider::None,
@@ -627,6 +639,9 @@ impl Default for Config {
             federation_dev_peers: String::new(),
             federation_remote_bots: true,
             rate_user_per_minute: 1200,
+            password_hash_concurrency: 0,
+            rate_limit_ipv6_prefix: 64,
+            ws_max_sockets_per_user: 20,
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
@@ -812,6 +827,12 @@ impl Config {
 
         self.validate_public_url(&mut problems);
         self.validate_cache(&mut problems);
+        if !(32..=128).contains(&self.rate_limit_ipv6_prefix) {
+            problems.push("TAVRN_RATE_LIMIT_IPV6_PREFIX must be between 32 and 128".into());
+        }
+        if self.media_cache_max_bytes_per_host > self.media_cache_max_bytes {
+            problems.push("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST cannot exceed TAVRN_MEDIA_CACHE_MAX_BYTES".into());
+        }
 
         if self.listen.parse::<std::net::SocketAddr>().is_err() {
             problems.push(format!("TAVRN_LISTEN='{}' is not a valid address (e.g. 0.0.0.0:8080)", self.listen));
@@ -2524,6 +2545,19 @@ mod tests {
             jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
             jail.set_env("TAVRN_RATE_USER_PER_MINUTE", "90");
             assert_eq!(Config::load(false).unwrap().rate_user_per_minute, 90);
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "56");
+            jail.set_env("TAVRN_PASSWORD_HASH_CONCURRENCY", "3");
+            jail.set_env("TAVRN_WS_MAX_SOCKETS_PER_USER", "5");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES", "1048576");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST", "65536");
+            let c = Config::load(false).unwrap();
+            assert_eq!((c.rate_limit_ipv6_prefix, c.password_hash_concurrency, c.ws_max_sockets_per_user), (56, 3, 5));
+            assert_eq!((c.media_cache_max_bytes, c.media_cache_max_bytes_per_host), (1_048_576, 65_536));
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "16");
+            assert!(Config::load(false).unwrap_err().to_string().contains("TAVRN_RATE_LIMIT_IPV6_PREFIX"));
+            jail.set_env("TAVRN_RATE_LIMIT_IPV6_PREFIX", "64");
+            jail.set_env("TAVRN_MEDIA_CACHE_MAX_BYTES_PER_HOST", "2097152");
+            assert!(Config::load(false).unwrap_err().to_string().contains("PER_HOST"));
             Ok(())
         });
     }

@@ -98,6 +98,8 @@ pub struct AppState {
     /// Link previews (`TAVRN_UNFURL`); `None` when switched off.
     pub unfurl: Option<Arc<crate::unfurl::Unfurler>>,
     pub login_limiter: Arc<SharedLimiter>,
+    /// Password reset mails per account (`forgot-user:<id>`, 3 per hour).
+    pub forgot_limiter: Arc<SharedLimiter>,
     pub register_limiter: Arc<SharedLimiter>,
     /// KeyPackage claims per claiming user (`claim:<user id>`).
     pub claim_limiter: Arc<RateLimiter>,
@@ -188,6 +190,10 @@ pub struct AppState {
     pub purge_limiter: Arc<RateLimiter>,
     /// The unauthenticated emoji and sound proxy (`?host=`, remote fetches) per address (`ip:<address>`).
     pub media_proxy_limiter: Arc<RateLimiter>,
+    /// Fetches of the emoji and sound proxy from other nodes (cache misses) per client address (`miss:<ip>`).
+    pub media_miss_limiter: Arc<RateLimiter>,
+    /// When this instance last enforced `TAVRN_MEDIA_CACHE_MAX_BYTES` (`emoji_cache`).
+    pub media_cache_checked: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Whiteboard sessions and ephemeral audiences (`whiteboard.rs`).
     pub whiteboards: Arc<crate::whiteboard::Whiteboards>,
     /// Ephemeral events per sender (`eph:<user id>`, 30 per second, also in development).
@@ -242,6 +248,12 @@ pub struct AppState {
     pub push: Arc<crate::push::Push>,
     /// Counters and gauges of `GET /metrics` (`metrics.rs`).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Local devices whose session was found live recently (`sessions::device_live`).
+    pub live_sessions: Arc<crate::sessions::LiveCache>,
+    /// Heartbeat of WebSockets (`ws::PING_INTERVAL`; tests shorten it to watch the session re-check).
+    pub ws_ping: Duration,
+    /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
+    pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -311,6 +323,7 @@ impl AppState {
         cluster: Arc<crate::cache::Cluster>,
         push: Arc<crate::push::Push>,
     ) -> anyhow::Result<Self> {
+        crate::auth::set_ipv6_rate_prefix(config.rate_limit_ipv6_prefix);
         let mailer = Mailer::from_config(&config);
         let captcha = CaptchaVerifier::from_config(&config);
         let gifs = GifClient::from_config(&config);
@@ -364,6 +377,8 @@ impl AppState {
             files_limiter: limiter(if config.dev { 1000 } else { 120 }, 60),
             purge_limiter: limiter(if config.dev { 1000 } else { 10 }, 60),
             media_proxy_limiter: limiter(if config.dev { 10_000 } else { 600 }, 60),
+            media_miss_limiter: limiter(crate::emoji_cache::miss_limit(config.dev), 60),
+            media_cache_checked: Arc::default(),
             whiteboards: Arc::new(crate::whiteboard::Whiteboards::default()),
             ephemeral_limiter: limiter(crate::whiteboard::EVENTS_PER_SECOND, 1),
             // Autosave every 30 s plus manual saves, thumbnails and renames.
@@ -389,6 +404,12 @@ impl AppState {
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            live_sessions: Arc::default(),
+            ws_ping: crate::ws::PING_INTERVAL,
+            password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
+                0 => crate::auth::default_hash_concurrency(),
+                n => n as usize,
+            })),
             push,
             metrics: Arc::new(crate::metrics::Metrics::new(SOFTWARE_VERSION, cluster.is_shared())),
             app_connections: Arc::new(crate::applications::Connections::new(&cluster)),
@@ -414,6 +435,7 @@ impl AppState {
             unfurl,
             mailer,
             login_limiter: shared("login", login_max, 60),
+            forgot_limiter: shared("forgot-user", 3, 3600),
             register_limiter: shared("register", register_max, 600),
             claim_limiter: limiter(e2ee.0, 60),
             key_package_limiter: limiter(e2ee.1, 60),
@@ -459,9 +481,14 @@ pub fn cors() -> CorsLayer {
         .max_age(Duration::from_secs(600))
 }
 
+/// `Permissions-Policy` of every response.
+pub const PERMISSIONS_POLICY: &str = "camera=(self), microphone=(self), display-capture=(self), geolocation=(), \
+     payment=(), usb=(), serial=(), hid=(), bluetooth=(), midi=(), accelerometer=(), gyroscope=(), magnetometer=()";
+
 pub fn router(state: AppState) -> Router {
     let request_id = HeaderName::from_static("x-request-id");
-    // Uploads may be as large as the node limit; all other routes check their bodies themselves (JSON ≤ 64 KB via validation).
+    // Uploads may be as large as the node limit. JSON routes are bounded by axum's default body limit (2 MiB) or a
+    // smaller `DefaultBodyLimit` of their own; byte routes check their sizes themselves.
     let body_limit =
         (state.config.upload_ceiling() as usize).max(routes::mls::MLS_BODY_LIMIT).max(crate::media::MAX_INPUT_BYTES)
             + 64 * 1024;
@@ -988,6 +1015,12 @@ pub fn router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("referrer-policy"),
             axum::http::HeaderValue::from_static("no-referrer"),
+        ))
+        // Camera, microphone and screen capture only for the node's own pages (voice, video, screen sharing);
+        // every other powerful feature off.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("permissions-policy"),
+            axum::http::HeaderValue::from_static(PERMISSIONS_POLICY),
         ))
         .layer(cors())
         // Several instances: voice, call and whiteboard requests go to the leader (`cache::relay`).

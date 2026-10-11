@@ -24,3 +24,26 @@ First public release of the node and its container image.
 - **Operators**: moderation with reports and evidence, auto-moderation, web push, localized mails with replaceable
   templates, message retention, metrics, legal tooling (takedown notices), clustering with Valkey, the operator
   handbook and deployment examples (Docker Compose, reverse proxies).
+
+### Security
+
+- The connect flow no longer issues a re-authentication token, and a connect code needs one.
+- Logout, password change or reset, device removal, disabling, second-factor reset and node bans end access tokens,
+  WebSockets, voice and calls of the affected devices at once.
+- Removing a device id that belongs to another account no longer ends that account's sessions.
+- Linking or unlinking a single sign-on identity needs a re-authentication token.
+- The cache of other nodes' emojis and clips is capped in total and per origin node, and its fetches are limited per
+  client address; the federation client's per-peer map stays bounded.
+- Password hashing runs off the request threads behind a concurrency limit; per-address limits group IPv6 clients by
+  prefix; the in-memory rate limiter evicts lazily.
+- Only failed logins count against an account, and the right password with a valid device proof passes a locked
+  account; re-authentication and identity reset have their own limits.
+- Password reset mails are limited per account and a pending reset link stays valid.
+- WebSocket connections count against the per-user limit, are capped per user, rate-limit read markers and refuse
+  frames over 64 KiB.
+- Media conversions use only the probed video stream and refuse inputs with several.
+- Uploads are classified by their sanitized name; bidirectional control characters are stripped from file names.
+- Without SMTP, production nodes log no mail bodies, keep no outbox and answer password reset requests with
+  `503 mail.unavailable`.
+- The web client's CSP no longer allows font hosts, names the captcha hosts only when a captcha is configured and
+  forbids plugins; every response carries a Permissions-Policy; the Caddy example sends HSTS and hides `/metrics`.

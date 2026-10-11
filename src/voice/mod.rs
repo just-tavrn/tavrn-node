@@ -523,6 +523,53 @@ pub async fn run_effect(state: &AppState, effect: crate::cache::VoiceEffect) {
         E::CloseChannel { room_id, channel_id } => close_channel(state, &room_id, &channel_id).await,
         E::CloseRoom { room_id } => close_room(state, &room_id).await,
         E::LeaveCall { conversation_id, user_id } => crate::calls::drop_member(state, &conversation_id, &user_id).await,
+        E::DisconnectEverywhere { user_id, devices } => disconnect_everywhere(state, &user_id, devices).await,
+    }
+}
+
+/// Removes a user's devices (`devices`, or all of them) from every voice channel and every DM call of the node: their
+/// sessions ended (logout, password change, device removal) or the account was disabled or banned.
+pub async fn disconnect_everywhere(state: &AppState, user_id: &str, devices: Option<Vec<String>>) {
+    if hand_to_leader(state, || crate::cache::VoiceEffect::DisconnectEverywhere {
+        user_id: user_id.into(),
+        devices: devices.clone(),
+    }) {
+        return;
+    }
+    let chosen = |identity: &String| {
+        devices.as_ref().is_none_or(|d| parse_identity(identity).is_some_and(|(_, dev)| d.iter().any(|x| x == dev)))
+    };
+    let mut changed = Vec::new();
+    let keys = state.voice.participants().keys();
+    for key in keys {
+        let identities: Vec<String> =
+            state.voice.participants().identities_of(&key, user_id).into_iter().filter(chosen).collect();
+        let mut visible = false;
+        for identity in &identities {
+            visible |= state.voice.participants().remove(&key, identity);
+            remove_from_livekit(state, &key, identity).await;
+        }
+        if visible && !changed.contains(&key) {
+            changed.push(key);
+        }
+    }
+    publish(state, &changed).await;
+    for conversation_id in state.calls.active() {
+        let key = crate::calls::key(&conversation_id);
+        let identities: Vec<String> =
+            state.calls.participants().identities_of(&key, user_id).into_iter().filter(chosen).collect();
+        if identities.is_empty() {
+            continue;
+        }
+        for identity in &identities {
+            state.calls.participants().remove(&key, identity);
+            if let Some(rooms) = state.voice.rooms()
+                && let Err(e) = rooms.remove_participant(&crate::calls::room_name(&conversation_id), identity).await
+            {
+                tracing::debug!(error = %e, identity, "LiveKit participant of the call not removed (not connected?)");
+            }
+        }
+        crate::calls::after_change(state, &conversation_id).await;
     }
 }
 

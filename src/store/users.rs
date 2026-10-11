@@ -341,8 +341,8 @@ pub async fn own_device(db: &Pool, user_id: &str, device_id: &str) -> Result<Opt
 
 /// A new session continues an existing device (device proof at login, PROTOCOL.md §5b): the device's other
 /// sessions end (the client replaced their tokens), `client` and `last_seen_at` are updated.
-pub async fn reuse_device(db: &Pool, device_id: &str, client: &str) -> Result<(), ApiError> {
-    revoke_device_sessions(db, device_id).await?;
+pub async fn reuse_device(db: &Pool, user_id: &str, device_id: &str, client: &str) -> Result<(), ApiError> {
+    revoke_device_sessions(db, user_id, device_id).await?;
     sqlx::query("UPDATE devices SET client = $1, last_seen_at = $2 WHERE id = $3")
         .bind(client)
         .bind(now())
@@ -380,14 +380,20 @@ pub async fn revoke_session(db: &Pool, id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub async fn revoke_device_sessions(db: &Pool, device_id: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND revoked_at IS NULL")
-        .bind(now())
-        .bind(device_id)
-        .execute(db)
-        .await?;
+/// Revokes the sessions of `device_id` and drops its push subscriptions, only if it is a device of `user_id` (a
+/// device id of another account changes nothing).
+pub async fn revoke_device_sessions(db: &Pool, user_id: &str, device_id: &str) -> Result<(), ApiError> {
+    let r =
+        sqlx::query("UPDATE sessions SET revoked_at = $1 WHERE device_id = $2 AND user_id = $3 AND revoked_at IS NULL")
+            .bind(now())
+            .bind(device_id)
+            .bind(user_id)
+            .execute(db)
+            .await?;
     // A signed-out device gets no more pushes (PROTOCOL.md §6d).
-    crate::store::push::delete_for_device(db, device_id).await?;
+    if r.rows_affected() > 0 || own_device(db, user_id, device_id).await?.is_some() {
+        crate::store::push::delete_for_device(db, device_id).await?;
+    }
     Ok(())
 }
 

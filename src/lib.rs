@@ -54,6 +54,7 @@ pub mod reports;
 pub mod routes;
 pub mod search;
 pub mod second_factor;
+pub mod sessions;
 pub mod storage;
 pub mod store;
 pub mod subscriptions;

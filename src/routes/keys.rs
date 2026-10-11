@@ -606,15 +606,13 @@ pub async fn reset_identity(
     auth: AuthUser,
     ApiJson(req): ApiJson<IdentityResetRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state.login_limiter.check_all(&[format!("user:{}", auth.user.username)]).await?;
+    state.login_limiter.check_all(&[format!("identity-reset:{}", auth.user.id)]).await?;
     let ok = match (req.reauth_token.as_deref(), req.password.as_deref().filter(|p| !p.is_empty())) {
         (Some(token), _) => {
             state.oidc.as_ref().is_some_and(|o| o.take_reauth(token, &auth.user.id))
                 || crate::reauth::valid(&state, &auth, token).await?
         }
-        (None, Some(password)) => {
-            auth.user.password_hash.as_deref().is_some_and(|h| auth::verify_password(password, h))
-        }
+        (None, Some(password)) => auth::verify(&state, password, auth.user.password_hash.as_deref()).await?,
         (None, None) => {
             if !crate::reauth::header_valid(&state, &auth, &headers).await? {
                 return Err(crate::reauth::required(&state, &auth.user).await);
