@@ -27,3 +27,8 @@ regexes = ['''^BTBZMqHH6r4Tts7J_aSIgg$''']
 [[allowlists]]
 description = "Throwaway P-256 key of the vapid key file format test (src/push/crypto.rs); it protects nothing"
 regexes = ['''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyfWPiYE''']
+
+[[allowlists]]
+description = "The example Sec-WebSocket-Key of RFC 6455 section 1.3 (raw handshake test in tests/suite/ws_flow.rs)"
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
