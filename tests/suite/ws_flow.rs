@@ -230,9 +230,10 @@ async fn an_open_socket_gets_the_events_of_a_room_its_user_creates_later() {
     }
 }
 
-/// Waits (at most a ping interval) for the socket to close and returns the close code; events before it are skipped.
+/// Waits (at most 5 seconds, far below the 30-second heartbeat: the `session.revoked` event must close it, not the
+/// re-check at the next ping) for the socket to close and returns the close code; events before it are skipped.
 async fn closed_with(ws: &mut Socket) -> Option<u16> {
-    let deadline = tokio::time::Instant::now() + tavrn_node::ws::PING_INTERVAL + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => return None,
@@ -408,23 +409,34 @@ async fn acks_over_the_read_limit_are_dropped() {
     assert!(tavrn_node::store::messages::read_marker(db, &channel, &alice.user_id).await.unwrap().is_none());
 }
 
-/// Frames larger than 64 KiB are refused, also before the hello.
+/// A frame header announcing more than 64 KiB is refused as soon as it is read, before the hello and before any
+/// payload is buffered (with only the message limit the node would wait for the payload until the hello timeout).
 #[tokio::test]
-async fn large_frames_close_the_socket() {
+async fn an_announced_large_frame_is_refused_before_its_payload() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let node = test_node("t.local").await;
     let url = serve(&node).await;
-    let mut ws = connect(&url).await;
-    let _ = ws.send(Message::Text("x".repeat(100 * 1024).into())).await;
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
-                Some(Ok(_)) => {}
-            }
-        }
-    })
-    .await;
-    assert_eq!(closed, Ok(true));
+    let addr = url.trim_start_matches("ws://").split('/').next().unwrap().to_string();
+    let mut tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let handshake = format!(
+        "GET /api/v1/ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    tcp.write_all(handshake.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tcp.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 101"), "upgraded");
+    // A masked text frame announcing 1 MiB (64-bit length), then no payload at all.
+    let mut header = vec![0x81u8, 0xFF];
+    header.extend_from_slice(&(1u64 << 20).to_be_bytes());
+    header.extend_from_slice(&[1, 2, 3, 4]);
+    tcp.write_all(&header).await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(3), tcp.read(&mut buf)).await;
+    match answer {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => assert_eq!(buf[0] & 0x0F, 0x8, "a close frame, got {:?}", &buf[..n.min(8)]),
+        Err(_) => unreachable!("the node waited for the payload of an oversized frame"),
+    }
 }
 
 /// REVIEW: connecting counts against the general per-user limit (close 4002 `rate_limited` beyond it).
@@ -445,6 +457,41 @@ async fn review_connecting_counts_against_the_user_limit() {
             }
             Message::Close(None) => unreachable!("close without a code"),
             _ => {}
+        }
+    }
+}
+
+/// The heartbeat re-checks the session as a belt: a session that ended without the event (here: revoked directly in
+/// the database) closes the socket at the next ping.
+#[tokio::test]
+async fn the_heartbeat_closes_a_socket_whose_session_ended() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let mut state = node.state.clone();
+    state.ws_ping = Duration::from_millis(400);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = tavrn_node::app::router(state);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut ws = hello(&format!("ws://{addr}/api/v1/ws"), &alice.token).await;
+    assert_eq!(answer_pings(&mut ws, 1500).await, None, "open while the session lives");
+    tavrn_node::store::users::revoke_device_sessions(&node.state.db, &alice.user_id, &alice.device_id).await.unwrap();
+    node.state.live_sessions.forget(std::slice::from_ref(&alice.device_id));
+    assert_eq!(answer_pings(&mut ws, 3000).await, Some(4001), "closed at the next ping");
+}
+
+/// Answers the node's pings for `ms`; the close code if the socket closes meanwhile.
+async fn answer_pings(ws: &mut Socket, ms: u64) -> Option<u16> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return None,
+            Ok(None | Some(Err(_))) => return Some(0),
+            Ok(Some(Ok(Message::Close(frame)))) => return Some(frame.map(|f| u16::from(f.code)).unwrap_or(0)),
+            Ok(Some(Ok(Message::Text(t)))) if t.contains("\"op\":\"ping\"") => {
+                ws.send(Message::Text(json!({ "op": "pong" }).to_string().into())).await.unwrap();
+            }
+            Ok(Some(Ok(_))) => {}
         }
     }
 }

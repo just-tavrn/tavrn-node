@@ -465,3 +465,20 @@ async fn failed_logins_by_others_do_not_lock_the_owner_out() {
     let (s, j) = node.post("/api/v1/auth/reauth", token(&session), json!({ "password": password("alice") })).await;
     assert_eq!(s, StatusCode::OK, "{j}");
 }
+
+/// A locked account tells nothing about its state: the right password with a junk device field gets 429, not
+/// `auth.account_disabled`.
+#[tokio::test]
+async fn a_locked_account_reveals_nothing_about_its_state() {
+    let node = test_node("t.local").await;
+    let admin = node.register("admin").await;
+    let carol = node.register("carol").await;
+    let (s, j) =
+        node.patch(&format!("/api/v1/admin/users/{}", carol.user_id), &admin.token, json!({ "disabled": true })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    while node.state.login_limiter.check("user:carol").await.is_ok() {}
+    let junk = json!({ "id": carol.device_id, "nonce": "made-up-nonce", "proof": "AAAA" });
+    let body = json!({ "username": "carol", "password": password("carol"), "device": junk });
+    let (s, j) = node.req(Method::POST, "/api/v1/auth/login", None, Some(body)).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{j}");
+}

@@ -250,6 +250,8 @@ pub struct AppState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Local devices whose session was found live recently (`sessions::device_live`).
     pub live_sessions: Arc<crate::sessions::LiveCache>,
+    /// Heartbeat of WebSockets (`ws::PING_INTERVAL`; tests shorten it to watch the session re-check).
+    pub ws_ping: Duration,
     /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
     pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
@@ -403,6 +405,7 @@ impl AppState {
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             live_sessions: Arc::default(),
+            ws_ping: crate::ws::PING_INTERVAL,
             password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
                 0 => crate::auth::default_hash_concurrency(),
                 n => n as usize,
