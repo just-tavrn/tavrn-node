@@ -915,9 +915,20 @@ pub async fn set_override(
         return Err(bad("override.conflict", "An upload category cannot be allowed and denied at once"));
     }
     // Nobody can grant more permissions through an override than they have, nor take away from others what they
-    // do not hold themselves; the same for upload categories (permissions.md "Hierarchy").
-    let uploads = upload_allow.unwrap_or(0) | upload_deny.unwrap_or(0);
-    if !access.is_owner && !access.is_node_admin && ((allow | deny) & !held != 0 || uploads & !held_uploads != 0) {
+    // do not hold themselves; the same for upload categories (permissions.md "Hierarchy"). Only what changes counts:
+    // bits of the stored override (set by someone above) may stay while the actor edits the bits they hold.
+    let stored = overrides.iter().find(|o| {
+        o.target_type == target_type
+            && o.target_id == req.target_id
+            && o.subject_type == subject_type
+            && o.subject_id == req.subject_id
+    });
+    let (old_allow, old_deny, old_up_allow, old_up_deny) =
+        stored.map_or((0, 0, 0, 0), |o| (o.allow as u64, o.deny as u64, o.upload_allow as u64, o.upload_deny as u64));
+    let changed = (allow ^ old_allow) | (deny ^ old_deny);
+    let changed_uploads =
+        (upload_allow.unwrap_or(old_up_allow) ^ old_up_allow) | (upload_deny.unwrap_or(old_up_deny) ^ old_up_deny);
+    if !access.is_owner && !access.is_node_admin && (changed & !held != 0 || changed_uploads & !held_uploads != 0) {
         return Err(ApiError::Forbidden {
             code: "override.escalation",
             detail: "You can only grant or deny permissions and upload categories you have yourself".into(),

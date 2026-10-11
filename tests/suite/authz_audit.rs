@@ -996,3 +996,45 @@ async fn the_room_webhook_list_leaves_out_hidden_channels() {
     let (_, list) = node.get_auth(&format!("/api/v1/rooms/{room_id}/webhooks"), &alice.token).await;
     assert_eq!(list.as_array().unwrap().len(), 2, "the owner sees both: {list}");
 }
+
+/// Editing an existing override: only the bits and categories that change must be the actor's own. Bits a higher
+/// member put there may stay while a manager edits the bits they hold, but the manager cannot drop them either.
+#[tokio::test]
+async fn editing_an_override_checks_only_what_changes() {
+    use tavrn_node::permissions as p;
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let (room_id, channel_id) = room_with(&node, &alice, &[&bob]).await;
+    let mods = role(&node, &alice.token, &room_id, "Mod", &[p::MANAGE_ROLES, p::SEND_MESSAGES], 5).await;
+    let helper = role(&node, &alice.token, &room_id, "Helper", &[], 1).await;
+    assert_eq!(assign(&node, &alice.token, &room_id, &bob.user_id, &[&mods]).await.0, StatusCode::OK);
+    let path = format!("/api/v1/rooms/{room_id}/overrides");
+    let body = |deny: &[u64]| {
+        json!({ "target_type": "channel", "target_id": channel_id, "subject_type": "role", "subject_id": helper,
+                "allow": "0", "deny": common::perms(deny) })
+    };
+    let (s, j) = node.put(&path, &alice.token, body(&[p::MANAGE_MESSAGES])).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node.put(&path, &bob.token, body(&[p::MANAGE_MESSAGES, p::SEND_MESSAGES])).await;
+    assert_eq!(s, StatusCode::OK, "bob adds a bit he holds and keeps the owner's: {j}");
+    let (s, j) = node.put(&path, &bob.token, body(&[p::SEND_MESSAGES])).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "override.escalation"), "dropping a bit bob lacks: {j}");
+}
+
+/// FEDERATION.md §2.5: a peer blocked by its status loses the API access of its users'
+/// existing sessions at once, by the per-request check alone (no session is revoked here).
+#[tokio::test]
+async fn a_blocked_peer_s_sessions_stop_working_by_the_status_check() {
+    let (a, b) = common::federation::two_nodes().await;
+    let alice = a.register("alice").await;
+    let remote = b.sign_in_from(&a, &alice).await;
+    let (s, _) = b.get_auth("/api/v1/users/me", &remote.token).await;
+    assert_eq!(s, StatusCode::OK);
+    sqlx::query("UPDATE federation_peers SET status = 'key_conflict' WHERE domain = 'a.test'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let (s, _) = b.get_auth("/api/v1/users/me", &remote.token).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the session is live, the peer is not");
+}

@@ -268,6 +268,8 @@ fn forbidden_address_ranges() {
         "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         "64:ff9b:1::a00:1",
         "64:ff9b:1:ffff::7f00:1",
+        "64:ff9b:1::808:808",
+        "64:ff9b:1:abcd::1",
     ];
     for ip in forbidden {
         assert!(forbidden_ip(ip.parse().unwrap()), "{ip} must be refused");
@@ -297,9 +299,9 @@ fn forbidden_address_ranges() {
         "64:ff9b::808:808",
         "2001:db9::1",
         "fec0::1",
-        // Transition addresses that embed a public IPv4 address stay usable; other 2001:: blocks are not Teredo.
+        // 6to4 with a public IPv4 address stays usable; other 2001:: blocks are not Teredo, 64:ff9b:2:: is no NAT64.
         "2002:808:808::1",
-        "64:ff9b:1::808:808",
+        "64:ff9b:2::1",
         "2001:4860:4860::8888",
     ];
     for ip in public {

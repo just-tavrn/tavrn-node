@@ -30,6 +30,15 @@ pub fn covering_domains(domain: &str) -> Vec<String> {
     out
 }
 
+/// The registrable domain of a node domain, approximated by its last two labels (`a.evil.example` →
+/// `evil.example`): per-domain budgets that must not multiply with wildcard subdomains are counted on it.
+pub fn parent_domain(domain: &str) -> &str {
+    match domain.rmatch_indices('.').nth(1) {
+        Some((i, _)) => &domain[i + 1..],
+        None => domain,
+    }
+}
+
 /// Is `domain` the domain `subject` or one of its subdomains?
 pub fn within_domain(domain: &str, subject: &str) -> bool {
     domain == subject || domain.strip_suffix(subject).is_some_and(|head| head.ends_with('.'))
@@ -60,6 +69,8 @@ mod domain_tests {
         assert!(within_domain("evil.example", "evil.example"));
         assert!(!within_domain("notevil.example", "evil.example"));
         assert!(!within_domain("example", "evil.example"));
+        assert_eq!(parent_domain("a.b.evil.example"), "evil.example");
+        assert_eq!(parent_domain("evil.example"), "evil.example");
     }
 }
 
@@ -91,7 +102,7 @@ pub async fn peer_status(db: &Pool, domain: &str) -> Result<Option<String>, ApiE
 }
 
 /// Stores a freshly fetched, valid document and where it came from (`well_known` or `srv`); the status stays as
-/// it is.
+/// it is. `origin` (`request`: created to check an unverified request) is set only when the row is created.
 pub async fn upsert_peer(
     db: &Pool,
     domain: &str,
@@ -99,9 +110,11 @@ pub async fn upsert_peer(
     fetched_at: &str,
     expires_at: &str,
     source: &str,
+    origin: Option<&str>,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, source) VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO federation_peers (domain, document, fetched_at, expires_at, source, origin)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (domain) DO UPDATE SET document = $2, fetched_at = $3, expires_at = $4, source = $5",
     )
     .bind(domain)
@@ -109,6 +122,7 @@ pub async fn upsert_peer(
     .bind(fetched_at)
     .bind(expires_at)
     .bind(source)
+    .bind(origin)
     .execute(db)
     .await?;
     Ok(())
@@ -134,12 +148,18 @@ pub async fn mark_peer_verified(db: &Pool, domain: &str, now: &str, cutoff: &str
     Ok(())
 }
 
-/// Cached peers no signed request of which ever verified here (known only from unverified requests or from this
-/// node's own lookups).
+/// Cached peers known only from requests whose signature never verified (FEDERATION.md §1.4): created to check such
+/// a request, never verified since, and with no users, sign-ins or directory entry here. Peers this node looked up
+/// itself (directory, relays, its users' actions) never count.
 pub async fn count_unverified_peers(db: &Pool) -> Result<i64, ApiError> {
-    let n: i64 = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM federation_peers WHERE verified_at IS NULL")
-        .fetch_one(db)
-        .await?;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM federation_peers p WHERE p.origin = 'request' AND p.verified_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE u.domain = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM federation_targets t WHERE t.target = p.domain)
+         AND NOT EXISTS (SELECT 1 FROM directory_nodes d WHERE d.domain = p.domain)",
+    )
+    .fetch_one(db)
+    .await?;
     Ok(n)
 }
 
@@ -235,15 +255,17 @@ pub async fn target_domains(db: &Pool, user_id: &str) -> Result<Vec<String>, Api
     rows.iter().map(|r| Ok(r.try_get("target")?)).collect()
 }
 
-/// Does this node have federation history with `domain`: users of it known here, local users who signed in there,
-/// or the node listed in this node's directory?
-pub async fn has_history(db: &Pool, domain: &str) -> Result<bool, ApiError> {
+/// Does this node have federation history with `domain`: users of it known here since before `known_before` (a stub
+/// the sender itself just caused, for example by a friend request, does not count), local users who signed in
+/// there, or the node listed in this node's directory?
+pub async fn has_history(db: &Pool, domain: &str, known_before: &str) -> Result<bool, ApiError> {
     let row = sqlx::query(
-        "SELECT 1 AS x FROM users WHERE domain = $1
+        "SELECT 1 AS x FROM users WHERE domain = $1 AND created_at < $2
          UNION ALL SELECT 1 AS x FROM federation_targets WHERE target = $1
          UNION ALL SELECT 1 AS x FROM directory_nodes WHERE domain = $1 LIMIT 1",
     )
     .bind(domain)
+    .bind(known_before)
     .fetch_optional(db)
     .await?;
     Ok(row.is_some())
