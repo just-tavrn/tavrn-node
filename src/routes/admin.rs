@@ -446,7 +446,7 @@ pub async fn ban(
     if util::parse_address(&subject).is_none() && !util::valid_domain(&subject) {
         return Err(bad("ban.subject_invalid", "Specify: alice@domain or domain"));
     }
-    if subject == state.config.domain || subject == admin.user.address() {
+    if store::federation::within_domain(&state.config.domain, &subject) || subject == admin.user.address() {
         return Err(bad("ban.own", "Your own domain or your own account cannot be banned"));
     }
     if let Some((username, domain)) = util::parse_address(&subject)
