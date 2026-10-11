@@ -148,3 +148,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.ed25519-dalek]
 opt-level = 3
+
+# WIP (local wave only, dropped at integration): the crypto core from the local worktree.
+[patch."https://github.com/just-tavrn/tavrn-crypto"]
+tavrn-crypto = { path = "/home/baton/tavrn-split/tavrn-crypto/.claude/worktrees/crypto-ds" }

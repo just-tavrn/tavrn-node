@@ -181,7 +181,9 @@ pub async fn list_cutoff(state: &AppState, conv: &Conv, user: &UserRow) -> Resul
 
 /// The user's identity key changed without continuity (a reset, ENCRYPTION.md §9; called with the welcome
 /// channel's `system.key_changed { rotated: false }`): every membership here gets `key_reset_at`, every encrypted
-/// group of those rooms records the reset epoch. Failures are logged (the key change already happened).
+/// group of those rooms records the reset epoch. A reset of a local account is recorded in the reset's own
+/// transaction already (`store::e2ee::reset_identity`), so this only moves the mark to the announcement; for a
+/// remote user it is the record. Failures are logged (the key change already happened).
 pub async fn key_reset(state: &AppState, user: &UserRow, at: &str) {
     if let Err(e) = store::history::mark_key_reset(&state.db, &user.id, at).await {
         tracing::warn!(error = %e, user = user.address(), "key reset not recorded on the memberships");

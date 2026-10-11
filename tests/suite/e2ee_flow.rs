@@ -377,3 +377,50 @@ async fn capability_body_limits_and_json_errors() {
     let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(problem["code"], "request.too_large");
 }
+
+/// KeyPackage claims for a user by requesters who share nothing with them count against a budget per source and
+/// target (`TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR`, ENCRYPTION.md §3.2): sybils on this node cannot drain the user's
+/// KeyPackages, and they cannot lock out the user's room-mates, friends, DM partners or the user themselves.
+#[tokio::test]
+async fn claims_of_unrelated_requesters_are_budgeted_per_source_and_target() {
+    let node = common::test_node_with(DOMAIN, |c| c.e2ee_claims_per_target_per_hour = 2).await;
+    let bob = node.crypto_user("bob").await;
+    let _carol = node.crypto_user("carol").await;
+    let claim = |token: String, user: &'static str| {
+        let node = &node;
+        async move { node.post(&format!("/api/v1/users/{user}/key-packages/claim"), &token, json!({})).await }
+    };
+    for name in ["dave", "erin"] {
+        let s = node.register(name).await;
+        let (st, j) = claim(s.token.clone(), "bob").await;
+        assert_eq!(st, StatusCode::OK, "{j}");
+    }
+    let frank = node.register("frank").await;
+    let (st, j) = claim(frank.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a third unrelated requester exceeds the budget: {j}");
+    let (st, j) = claim(frank.token.clone(), "carol").await;
+    assert_eq!(st, StatusCode::OK, "other targets keep their own budget: {j}");
+    let (st, j) = claim(bob.session.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::OK, "own claims do not count: {j}");
+
+    // A room-mate, a friend and a DM partner still claim.
+    let room = node.create_room(bob.token(), "Club").await;
+    let room_id = room["id"].as_str().unwrap();
+    let mate = node.register("mate").await;
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), bob.token(), json!({})).await;
+    let code = invite["code"].as_str().unwrap();
+    let (st, j) = node.post(&format!("/api/v1/invites/{code}/join"), &mate.token, json!({})).await;
+    assert!(st.is_success(), "{j}");
+    let (st, j) = claim(mate.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::OK, "a room-mate is not limited by strangers: {j}");
+    let friend = node.register("friend").await;
+    node.befriend(&bob.session, &friend).await;
+    let (st, j) = claim(friend.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::OK, "a friend is not limited by strangers: {j}");
+    let partner = node.register("partner").await;
+    node.befriend(&bob.session, &partner).await;
+    node.create_dm(&partner, &bob.session).await;
+    tavrn_node::store::social::remove_friendship(&node.state.db, &bob.session.user_id, &partner.user_id).await.unwrap();
+    let (st, j) = claim(partner.token.clone(), "bob").await;
+    assert_eq!(st, StatusCode::OK, "a DM partner is not limited by strangers: {j}");
+}

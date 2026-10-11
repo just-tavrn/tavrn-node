@@ -174,12 +174,13 @@ pub async fn post_commit(
     }
     let mut ds = DsGroup::import_state(&group.ds_state)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("DS state unreadable: {e}")))?;
+    let roster_before = ds.roster().map_err(|e| ApiError::Internal(anyhow::anyhow!("DS roster unreadable: {e}")))?;
     let summary = match ds.process_commit(&commit, &gi) {
         Ok(s) => s,
         Err(CryptoError::StaleEpoch | CryptoError::FutureEpoch) => return Err(epoch_conflict(group.epoch)),
         Err(e) => return Err(invalid(&e)),
     };
-    let welcome_devices = authorize(&state, &conv, &auth, &device_key, &summary).await?;
+    let welcome_devices = authorize(&state, &conv, &auth, &device_key, &summary, &roster_before).await?;
     match (&welcome, welcome_devices.is_empty()) {
         (None, false) => return Err(bad("mls.welcome_missing", "A commit adding devices needs a Welcome")),
         (Some(_), true) => return Err(bad("mls.invalid", "Welcome without new devices")),
@@ -232,6 +233,7 @@ async fn authorize(
     auth: &AuthUser,
     device_key: &[u8; 32],
     summary: &tavrn_crypto::ds::CommitSummary,
+    roster_before: &[tavrn_crypto::RosterEntry],
 ) -> Result<Vec<String>, ApiError> {
     // Rule 1: the committer is the session's attested device with its attested key (for a remote user:
     // the home device id and the key published by the home node).
@@ -239,9 +241,19 @@ async fn authorize(
     if summary.committer.identity != me || &summary.committer.signature_key != device_key {
         return Err(forbidden("The commit is not from this device"));
     }
-    // Rule 2: an external join (entitlement checked by the route) removes at most its own old leaf.
-    if summary.external_join && (!summary.added.is_empty() || summary.removed.iter().any(|r| r != &me)) {
-        return Err(forbidden("An external join may only replace its own old device"));
+    // Rule 2: an external join (entitlement checked by the route) removes at most its own old leaf, and it must
+    // remove every leaf that carries its key: a device is in the group at most once. A leaf with its identity but
+    // another key is an unattested ghost (rule 4 lets any member remove it); OpenMLS joins do not remove it.
+    if summary.external_join {
+        if !summary.added.is_empty() || summary.removed.iter().any(|r| r != &me) {
+            return Err(forbidden("An external join may only replace its own old device"));
+        }
+        let stale = roster_before.iter().any(|leaf| {
+            leaf.signature_key == summary.committer.signature_key && !summary.removed_leaves.contains(leaf)
+        });
+        if stale {
+            return Err(forbidden("An external join must remove the old leaf of this device"));
+        }
     }
     // Rule 3: added devices are attested devices of entitled users.
     let mut added_devices = Vec::new();
@@ -259,17 +271,19 @@ async fn authorize(
         added_devices.push(device_id);
     }
     // Rule 4: removed leaves belong to the committer's user, to users no longer entitled, or to
-    // deleted / unattested devices.
-    for removed in &summary.removed {
-        let Some((address, _)) = removed.split_once('/') else { continue };
+    // deleted / unattested devices, or carry a key other than the attested key of the device they name.
+    for removed in &summary.removed_leaves {
+        let Some((address, _)) = removed.identity.split_once('/') else { continue };
         if address == auth.user.address() {
             continue;
         }
-        if let Some((user, _, _)) = resolve_device(state, removed).await?
+        if let Some((user, _, key)) = resolve_device(state, &removed.identity).await?
+            && key == removed.signature_key
             && access::user_entitled(state, conv, &user).await?
         {
             return Err(forbidden(format!(
-                "{removed} is an attested device of an entitled member; the node governs membership"
+                "{} is an attested device of an entitled member; the node governs membership",
+                removed.identity
             )));
         }
     }

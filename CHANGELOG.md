@@ -75,4 +75,11 @@ First public release of the node and its container image.
 - DM typing and call joins respect blocks and message requests; blocking ends a running DM call.
 - The room-wide webhook list and purge events leave out channels hidden from the member.
 - Generated node signing keys get a `kid` of the date plus a random suffix, so a restored node never repeats one.
+- An external join must remove every leaf that carries the joining device's key; a device is in an MLS group at most
+  once.
+- A member may remove a leaf whose key is not the attested key of the device it names.
+- The delivery service refuses commits that change a leaf's identity or leave two leaves with the same key.
+- An identity reset records the history window of the account's memberships in the reset's own transaction.
+- KeyPackage claims for a user by requesters who share no room, DM or friendship with them count against a budget per
+  source (this node or one other node) and target user (`TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR`, default 60).
 
