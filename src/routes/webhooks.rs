@@ -265,9 +265,22 @@ pub async fn list_room(
     if !access.has(p::MANAGE_WEBHOOKS) {
         return Err(manage_forbidden());
     }
+    // `manage_webhooks` is channel-scoped: only the webhooks of channels the caller can view and manage.
+    let channels = store::rooms::channels(&state.db, &room_id).await?;
+    let overrides = store::rooms::overrides_of_room(&state.db, &room_id).await?;
+    let manages = |channel_id: &str| {
+        channels.iter().find(|c| c.id == channel_id).is_some_and(|c| {
+            p::has(
+                access::channel_perms_with(&access, c, &overrides, &auth.user.id),
+                p::VIEW_CHANNEL | p::MANAGE_WEBHOOKS,
+            )
+        })
+    };
     let mut out = Vec::new();
     for w in store::webhooks::of_room(&state.db, &room_id).await? {
-        out.push(wh::view(&state, &w).await?);
+        if manages(&w.channel_id) {
+            out.push(wh::view(&state, &w).await?);
+        }
     }
     Ok(Json(out))
 }

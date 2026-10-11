@@ -121,6 +121,10 @@ pub struct PushPayload {
     /// Display name of the author or caller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
+    /// A ring hint whose caller is a user of a third node: the node that named them (`node`), which cannot vouch
+    /// for them (FEDERATION.md §5.2). Clients show the caller as unverified, "via" that node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     /// Preview of an unencrypted message (only with `push_text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -150,6 +154,8 @@ pub enum Job {
         room_id: Option<String>,
         mention: bool,
         call: Option<String>,
+        /// The caller of a ring is a user of a third node, named by `node` only.
+        via: bool,
     },
     /// A notice of another feature for one user, coalesced per `conversation_id` when given.
     Notice { user_id: String, payload: PushPayload },
@@ -280,7 +286,7 @@ pub fn call(state: &AppState, conversation_id: &str, user_id: &str, caller_id: &
 }
 
 /// A `notify` hint for a conversation on `node` that the user's settings let through (FEDERATION.md §5.2); `call`
-/// is the caller's address of a ring hint.
+/// is the caller's address of a ring hint and whether the caller is a user of a third node (shown "via" `node`).
 pub fn hint(
     state: &AppState,
     user_id: &str,
@@ -288,7 +294,7 @@ pub fn hint(
     conversation_id: &str,
     room_id: Option<&str>,
     mention: bool,
-    call: Option<&str>,
+    call: Option<(&str, bool)>,
 ) {
     state.push.queue(Job::Hint {
         user_id: user_id.to_string(),
@@ -296,7 +302,8 @@ pub fn hint(
         conversation_id: conversation_id.to_string(),
         room_id: room_id.map(String::from),
         mention,
-        call: call.map(String::from),
+        call: call.map(|(caller, _)| caller.to_string()),
+        via: call.is_some_and(|(_, via)| via),
     });
 }
 
@@ -353,7 +360,7 @@ async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
         Job::Call { conversation_id, user_id, caller_id, group } => {
             run_call(state, &conversation_id, &user_id, &caller_id, group).await
         }
-        Job::Hint { user_id, node, conversation_id, room_id, mention, call } => {
+        Job::Hint { user_id, node, conversation_id, room_id, mention, call, via } => {
             let kind = match (&call, &room_id, mention) {
                 (Some(_), _, _) => Kind::Call,
                 (None, Some(_), true) => Kind::Mention,
@@ -362,6 +369,7 @@ async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
             };
             let payload = PushPayload {
                 kind: Some(kind),
+                via: (via && call.is_some()).then(|| node.clone()),
                 node,
                 local: false,
                 conversation_kind: Some(if room_id.is_some() { "channel" } else { "direct" }.into()),

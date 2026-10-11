@@ -27,6 +27,8 @@ First public release of the node and its container image.
 
 ### Security
 
+### Security
+
 - The connect flow no longer issues a re-authentication token, and a connect code needs one.
 - Logout, password change or reset, device removal, disabling, second-factor reset and node bans end access tokens,
   WebSockets, voice and calls of the affected devices at once.
@@ -47,3 +49,30 @@ First public release of the node and its container image.
   `503 mail.unavailable`.
 - The web client's CSP no longer allows font hosts, names the captcha hosts only when a captcha is configured and
   forbids plugins; every response carries a Permissions-Policy; the Caddy example sends HSTS and hides `/metrics`.
+- A discovery document found through an SRV record is requested for the identity domain: the target must present a
+  certificate valid for that domain. A document from another source with none of the known keys is a key conflict.
+- A key conflict or an operator block ends the peer's federated sessions at once.
+- Requests to a slow peer no longer hold node-wide connection slots (`TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS`); failed
+  discovery is remembered for a minute; peers known only from unverified requests are capped
+  (`TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS`) and pruned after 30 days unused.
+- The address filter refuses further IPv6 transition ranges (6to4, local-use NAT64, IPv4-compatible, Teredo) and
+  192.88.99.0/24.
+- Node and room domain bans cover subdomains.
+- A remote stub takes kind and owner from the first federated login's verified token; a bot is never turned into a
+  user.
+- Inviters and callers of third nodes are treated as unverified: never a friend, always a request, shown with `via`.
+- `ban.notify` is only delivered to users who signed in on the sending node.
+- Forwarded legal notices need federation history and are limited per sending domain and in total
+  (`TAVRN_LEGAL_NOTICE_INBOUND_PER_HOUR`); they send no confirmation mail to the address the sender named.
+- Profile reads start at most one background refresh per remote user and minute.
+- Discovery fetches for unknown issuers of unverified requests run in their own slots
+  (`TAVRN_FEDERATION_DISCOVERY_SLOTS`), so floods naming many slow domains leave the shared slots to known peers.
+- Ring pushes naming a caller of a third node carry `via`.
+- A remote user's identity reset is recorded together with its history window or not at all (the home node retries).
+- Assigning a role is limited to roles whose permissions the actor holds; override deny bits and upload categories are
+  limited to what the actor holds.
+- A limited invite admits exactly as many people as it allows, also under concurrent joins.
+- DM typing and call joins respect blocks and message requests; blocking ends a running DM call.
+- The room-wide webhook list and purge events leave out channels hidden from the member.
+- Generated node signing keys get a `kid` of the date plus a random suffix, so a restored node never repeats one.
+

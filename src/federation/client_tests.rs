@@ -255,6 +255,21 @@ fn forbidden_address_ranges() {
         "febf::1",
         "ff02::1",
         "ff00::",
+        // 6to4 relays (192.88.99.0/24), IPv4-compatible (::/96), 6to4 with an internal IPv4 address (2002::/16),
+        // Teredo (2001::/32) and local-use NAT64 (64:ff9b:1::/48) with an internal IPv4 address.
+        "192.88.99.1",
+        "::7f00:1",
+        "::a00:1",
+        "::808:808",
+        "2002:7f00:1::",
+        "2002:a00:1::1",
+        "2002:a9fe:a9fe::1",
+        "2001::1",
+        "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+        "64:ff9b:1::a00:1",
+        "64:ff9b:1:ffff::7f00:1",
+        "64:ff9b:1::808:808",
+        "64:ff9b:1:abcd::1",
     ];
     for ip in forbidden {
         assert!(forbidden_ip(ip.parse().unwrap()), "{ip} must be refused");
@@ -284,6 +299,10 @@ fn forbidden_address_ranges() {
         "64:ff9b::808:808",
         "2001:db9::1",
         "fec0::1",
+        // 6to4 with a public IPv4 address stays usable; other 2001:: blocks are not Teredo, 64:ff9b:2:: is no NAT64.
+        "2002:808:808::1",
+        "64:ff9b:2::1",
+        "2001:4860:4860::8888",
     ];
     for ip in public {
         assert!(!forbidden_ip(ip.parse().unwrap()), "{ip} is public");
@@ -1049,4 +1068,201 @@ async fn the_per_peer_map_stays_bounded() {
     }
     let len = c.peer_entries();
     assert!(len <= 1024, "per_peer holds {len} entries");
+}
+
+#[test]
+fn srv_documents_are_requested_on_the_identity_domain() {
+    // The SRV record says where to connect, never whose certificate counts: the URL (hence SNI, `Host` and the
+    // certificate check) is the identity domain with the record's port.
+    let url = srv_url("https", "home.example", 8448).unwrap();
+    assert_eq!(url.as_str(), "https://home.example:8448/.well-known/tavrn");
+    assert_eq!(url.host_str(), Some("home.example"));
+}
+
+#[tokio::test]
+async fn an_srv_target_is_asked_for_the_identity_domain() {
+    // The target sees `Host: srv.test:<port>` although it was reached through `target.test`'s address.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = seen.clone();
+    let doc = delegating_doc("srv.test", "http://target.test:1");
+    let app = Router::new().route(
+        "/.well-known/tavrn",
+        get(move |headers: axum::http::HeaderMap| {
+            let record = record.clone();
+            let doc = doc.clone();
+            async move {
+                let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+                record.lock().unwrap().push(host);
+                Json(doc)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let lookup = MapLookup::with(&[("target.test", &["127.0.0.1"])]);
+    let srv = MapSrv::with("_tavrn._tcp.srv.test.", &[("target.test", port)]);
+    let c = delegation_client("", true, lookup, srv, true);
+    let (_, source) = c.get_well_known("srv.test").await.unwrap();
+    assert_eq!(source, DelegationSource::Srv);
+    assert_eq!(*seen.lock().unwrap(), vec![format!("srv.test:{port}")]);
+}
+
+// ---------------------------------------------------------------- the SRV certificate rule over real TLS
+
+/// Self-signed CA, leaves for one DNS name and a TLS server that records the SNI of every handshake (OpenSSL, already
+/// a dependency of the node).
+mod srv_tls {
+    use super::*;
+    use openssl::{
+        asn1::Asn1Time,
+        bn::BigNum,
+        ec::{EcGroup, EcKey},
+        hash::MessageDigest,
+        nid::Nid,
+        pkey::{PKey, Private},
+        ssl::{NameType, SslAcceptor, SslMethod},
+        x509::{
+            X509, X509Name, X509NameBuilder,
+            extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+        },
+    };
+
+    type Pair = (X509, PKey<Private>);
+
+    fn key() -> PKey<Private> {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
+    }
+
+    fn name(cn: &str) -> X509Name {
+        let mut n = X509NameBuilder::new().unwrap();
+        n.append_entry_by_text("CN", cn).unwrap();
+        n.build()
+    }
+
+    fn base(
+        subject: &str,
+        issuer: &openssl::x509::X509NameRef,
+        serial: u32,
+        key: &PKey<Private>,
+    ) -> openssl::x509::X509Builder {
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        b.set_serial_number(&BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap()).unwrap();
+        b.set_subject_name(&name(subject)).unwrap();
+        b.set_issuer_name(issuer).unwrap();
+        b.set_pubkey(key).unwrap();
+        b.set_not_before(&Asn1Time::from_unix(chrono::Utc::now().timestamp() - 3600).unwrap()).unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(2).unwrap()).unwrap();
+        b
+    }
+
+    pub fn ca() -> Pair {
+        let k = key();
+        let mut b = base("tavrn test CA", &name("tavrn test CA"), 1, &k);
+        b.append_extension(BasicConstraints::new().critical().ca().build().unwrap()).unwrap();
+        b.append_extension(KeyUsage::new().critical().key_cert_sign().crl_sign().build().unwrap()).unwrap();
+        b.sign(&k, MessageDigest::sha256()).unwrap();
+        (b.build(), k)
+    }
+
+    pub fn leaf(ca: &Pair, dns: &str) -> Pair {
+        let k = key();
+        let mut b = base(dns, ca.0.subject_name(), 2, &k);
+        b.append_extension(BasicConstraints::new().build().unwrap()).unwrap();
+        b.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
+        let san = SubjectAlternativeName::new().dns(dns).build(&b.x509v3_context(Some(&ca.0), None)).unwrap();
+        b.append_extension(san).unwrap();
+        b.sign(&ca.1, MessageDigest::sha256()).unwrap();
+        (b.build(), k)
+    }
+
+    /// A TLS server on 127.0.0.1 presenting `cert`; records the SNI of every handshake and answers `{}`.
+    pub fn server(cert: Pair) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let sni = Arc::new(Mutex::new(Vec::new()));
+        let mut acc = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acc.set_private_key(&cert.1).unwrap();
+        acc.set_certificate(&cert.0).unwrap();
+        let record = sni.clone();
+        acc.set_servername_callback(move |ssl, _| {
+            record.lock().unwrap().push(ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string());
+            Ok(())
+        });
+        let acc = acc.build();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let acc = acc.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let Ok(mut tls) = acc.accept(stream) else { return };
+                    let (mut buf, mut req) = ([0u8; 4096], Vec::new());
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match tls.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = tls.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                    );
+                    let _ = tls.shutdown();
+                });
+            }
+        });
+        (port, sni)
+    }
+}
+
+/// FEDERATION.md §1.3: the node's own SRV path (not development mode, TLS) opens the TLS session to the target's
+/// address with the identity domain as server name, so the certificate is checked for the domain.
+#[tokio::test]
+async fn the_srv_target_is_greeted_with_the_identity_domain_as_tls_server_name() {
+    let ca = srv_tls::ca();
+    let (port, sni) = srv_tls::server(srv_tls::leaf(&ca, "target.test"));
+    let lookup = MapLookup::with(&[("target.test", &["127.0.0.1"])]);
+    let srv = MapSrv::with("_tavrn._tcp.srv.test.", &[("target.test", port)]);
+    let mut cfg = config("", true);
+    cfg.dev = false;
+    cfg.federation_srv_fallback = true;
+    let timeouts = Timeouts {
+        connect: Duration::from_millis(800),
+        total: Duration::from_millis(1500),
+        inbox: Duration::from_millis(1500),
+    };
+    let c = FederationClient::with_options(&cfg, ClientOptions { timeouts, lookup, srv }).unwrap();
+    // `srv.test` itself does not resolve (no HTTPS server): the SRV record is consulted.
+    let err = c.get_well_known("srv.test").await.unwrap_err();
+    assert!(matches!(err, FetchError::Unreachable(_)), "a certificate the node does not trust: {err:?}");
+    assert_eq!(*sni.lock().unwrap(), vec!["srv.test".to_string()], "SNI is the identity domain, never the target");
+}
+
+/// The request the node builds for an SRV target (`srv_url` on the identity domain, the target's address pinned with
+/// `resolve_to_addrs`) passes only with a certificate valid for the identity domain; one valid only for the target is
+/// refused, although the former request shape (the target's own name) would have accepted it.
+#[tokio::test]
+async fn a_certificate_valid_only_for_the_srv_target_is_refused() {
+    let ca = srv_tls::ca();
+    let (only_target, _) = srv_tls::server(srv_tls::leaf(&ca, "target.test"));
+    let (for_domain, _) = srv_tls::server(srv_tls::leaf(&ca, "srv.test"));
+    let root = reqwest::Certificate::from_der(&ca.0.to_der().unwrap()).unwrap();
+    let client = |host: &str, port: u16| {
+        reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(root.clone())
+            .resolve_to_addrs(host, &[SocketAddr::from(([127, 0, 0, 1], port))])
+            .no_proxy()
+            .build()
+            .unwrap()
+    };
+    let url = srv_url("https", "srv.test", only_target).unwrap();
+    let refused = client("srv.test", only_target).get(url).send().await;
+    assert!(refused.is_err(), "a certificate only for the target: {refused:?}");
+    let url = srv_url("https", "srv.test", for_domain).unwrap();
+    assert_eq!(client("srv.test", for_domain).get(url).send().await.unwrap().status(), 200);
+    let old = reqwest::Url::parse(&format!("https://target.test:{only_target}/.well-known/tavrn")).unwrap();
+    assert_eq!(client("target.test", only_target).get(old).send().await.unwrap().status(), 200);
 }
