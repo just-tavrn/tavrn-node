@@ -48,8 +48,10 @@ building tavrn-web). The token never ends up in a layer: the Dockerfile reads it
 
 ## Verifying an image
 
-Every release image carries two attestations: BuildKit's SLSA provenance and SBOM in the registry, and GitHub's
-build provenance for its digest (the release notes print the digest and the command):
+Every release image carries BuildKit's SLSA provenance and SBOM in the registry. Release images built after the
+repository went public also carry GitHub's build provenance for their digest (GitHub's Free plan has no artifact
+attestations for private repositories, so `release.yml` skips that job until the public switch; the release notes
+print the command when it ran):
 
 ```sh
 gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node:<version> --repo just-tavrn/tavrn-node
