@@ -67,12 +67,19 @@ async fn blocking_hash<T: Send + 'static>(
     state: &AppState,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, ApiError> {
-    let _permit = state
+    let permit = state
         .password_hashing
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("password hashing closed: {e}")))?;
-    tokio::task::spawn_blocking(f).await.map_err(|e| ApiError::Internal(anyhow::anyhow!("password hashing: {e}")))
+    // The blocking task holds the slot: a cancelled request (client gone) cannot free it while Argon2 still runs.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("password hashing: {e}")))
 }
 
 /// [`hash_password`] off the async runtime (see [`blocking_hash`]).
