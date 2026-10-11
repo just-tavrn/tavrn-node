@@ -110,11 +110,20 @@ docker-build web="auto" ref="main":
 livekit-install:
     #!/usr/bin/env bash
     set -euo pipefail
-    case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; armv7l) arch=armv7 ;; *) echo "unsupported architecture $(uname -m)"; exit 1 ;; esac
+    # SHA-256 of the release archives (update them with livekit_version: the release's checksums.txt).
+    case "$(uname -m)" in
+      x86_64) arch=amd64 sum=059f6de65da11a57400e4646027da705d592ce42acb48c08570a397df446f869 ;;
+      aarch64|arm64) arch=arm64 sum=39883cb07f370057692139fcf500a763cfedae1e9934bd8a1815a144e2127bd2 ;;
+      armv7l) arch=armv7 sum=ccc859fea666a8f21444d27bff8e0e74f8f51ae4bb5bb37cb8e4073fbaaeed5d ;;
+      *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
+    esac
     dir="${LIVEKIT_INSTALL_DIR:-$HOME/.local/bin}"
     mkdir -p "$dir"
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-    curl -fsSL "https://github.com/livekit/livekit/releases/download/v{{livekit_version}}/livekit_{{livekit_version}}_linux_${arch}.tar.gz" | tar -xz -C "$tmp" livekit-server
+    file="livekit_{{livekit_version}}_linux_${arch}.tar.gz"
+    curl -fsSLo "$tmp/$file" "https://github.com/livekit/livekit/releases/download/v{{livekit_version}}/$file"
+    echo "$sum  $tmp/$file" | sha256sum -c --quiet - || { echo "livekit-server download does not match its checksum"; exit 1; }
+    tar -xzf "$tmp/$file" -C "$tmp" livekit-server
     install -m 0755 "$tmp/livekit-server" "$dir/livekit-server"
     "$dir/livekit-server" --version
     case ":$PATH:" in *":$dir:"*) ;; *) echo "Add $dir to PATH (or set TAVRN_LIVEKIT_BINARY=$dir/livekit-server)" ;; esac
@@ -125,11 +134,19 @@ ffmpeg-install:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v ffmpeg >/dev/null && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libwebp_anim; then ffmpeg -hide_banner -version | head -1; exit 0; fi
-    case "$(uname -m)" in x86_64) arch=linux64 ;; aarch64|arm64) arch=linuxarm64 ;; *) echo "unsupported architecture $(uname -m)"; exit 1 ;; esac
+    # A dated BtbN build (the month-end builds stay available) checked against its SHA-256; the same as ci.yml.
+    release=autobuild-2026-09-30-13-08
+    case "$(uname -m)" in
+      x86_64) file=ffmpeg-n8.1.3-9-g29e619e767-linux64-gpl-8.1.tar.xz sum=97ce978979194b5cf7e06a5e68020dbdaa7a4f3294c5452b6a1bc347100dbb79 ;;
+      aarch64|arm64) file=ffmpeg-n8.1.3-9-g29e619e767-linuxarm64-gpl-8.1.tar.xz sum=10523d1e0be6b3ce62a9708cc50815c4b5eb5f36ae147fbe2afeecda6f2d6845 ;;
+      *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
+    esac
     dir="${FFMPEG_INSTALL_DIR:-$HOME/.local/bin}"
     mkdir -p "$dir"
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${arch}-gpl.tar.xz" | tar -xJ -C "$tmp" --strip-components=2 --wildcards '*/bin/ffmpeg'
+    curl -fsSLo "$tmp/$file" "https://github.com/BtbN/FFmpeg-Builds/releases/download/$release/$file"
+    echo "$sum  $tmp/$file" | sha256sum -c --quiet - || { echo "ffmpeg download does not match its checksum"; exit 1; }
+    tar -xJf "$tmp/$file" -C "$tmp" --strip-components=2 --wildcards '*/bin/ffmpeg'
     install -m 0755 "$tmp/ffmpeg" "$dir/ffmpeg"
     "$dir/ffmpeg" -hide_banner -version | head -1
     case ":$PATH:" in *":$dir:"*) ;; *) echo "Add $dir to PATH (or set TAVRN_MEDIA_FFMPEG=$dir/ffmpeg)" ;; esac

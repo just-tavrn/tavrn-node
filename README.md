@@ -163,7 +163,8 @@ GH_TOKEN=$(gh auth token) docker build -f deploy/Dockerfile -t tavrn-node:dev \
 ```
 
 The Dockerfile builds the web client from tavrn-web at the build argument `TAVRN_WEB_REF` (default `main`; a
-branch, tag or commit). With `--build-arg TAVRN_WEB_SOURCE=local` it embeds a prebuilt bundle from `web/dist/`
+branch, tag or commit; release images use a tavrn-web release tag, and docs/GITHUB.md "Verifying an image" shows how
+to check an image's provenance). With `--build-arg TAVRN_WEB_SOURCE=local` it embeds a prebuilt bundle from `web/dist/`
 of the build context instead. The token (secret `read_token`, or `TAVRN_WEB_TOKEN` for the web stage only) is
 needed while the repositories are private: cargo fetches `tavrn-crypto` with it and the web stage clones
 tavrn-web. It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
