@@ -255,7 +255,8 @@ async fn password_reset_requests_keep_the_pending_link_and_are_limited_per_accou
         )
         .await;
     assert_eq!(s, StatusCode::CREATED);
-    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'dora'").fetch_one(&node.state.db).await.unwrap();
+    let user_id: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'dora'").fetch_one(&node.state.db).await.unwrap();
     tavrn_node::store::users::set_email_verified(&node.state.db, &user_id).await.unwrap();
     let mails = || node.state.mailer.outbox.lock().unwrap().iter().filter(|m| m.1.contains("password")).count();
     let forgot = || node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": "dora" })));
@@ -269,7 +270,12 @@ async fn password_reset_requests_keep_the_pending_link_and_are_limited_per_accou
     }
     assert_eq!(mails(), 1, "no new mail, the first link stays the valid one");
     let (s, j) = node
-        .req(Method::POST, "/api/v1/auth/reset-password", None, Some(json!({ "token": link, "new_password": "new-password-123" })))
+        .req(
+            Method::POST,
+            "/api/v1/auth/reset-password",
+            None,
+            Some(json!({ "token": link, "new_password": "new-password-123" })),
+        )
         .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
     // Once it is used, new links come again, at most three per hour.

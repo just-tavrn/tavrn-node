@@ -387,7 +387,11 @@ async fn password_change_revokes_other_devices() {
         node.req(Method::POST, "/api/v1/auth/refresh", None, Some(json!({ "refresh_token": second_refresh }))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "the second device is signed out");
     let (s, j) = node.get_auth("/api/v1/users/me", &second_token).await;
-    assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.session_revoked")), "its access token ends at once");
+    assert_eq!(
+        (s, j["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("auth.session_revoked")),
+        "its access token ends at once"
+    );
 
     // Remove devices
     let (_, devices) = node.get_auth("/api/v1/users/me/devices", &alice.token).await;
@@ -413,7 +417,8 @@ async fn the_runtime_stays_responsive_while_logins_are_checked() {
         let router = node.router.clone();
         logins.push(tokio::spawn(async move {
             use tower::ServiceExt;
-            let body = json!({ "username": if i % 2 == 0 { "alice" } else { "nobody" }, "password": "wrong-password-123" });
+            let body =
+                json!({ "username": if i % 2 == 0 { "alice" } else { "nobody" }, "password": "wrong-password-123" });
             let req = axum::http::Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/auth/login")

@@ -1465,7 +1465,13 @@ async fn ended_sessions_leave_voice() {
         let mut rx = v.node.state.hub.subscribe();
         let (s, j) = match how {
             "disable" => {
-                v.node.patch(&format!("/api/v1/admin/users/{}", v.bob.user_id), &v.alice.token, json!({ "disabled": true })).await
+                v.node
+                    .patch(
+                        &format!("/api/v1/admin/users/{}", v.bob.user_id),
+                        &v.alice.token,
+                        json!({ "disabled": true }),
+                    )
+                    .await
             }
             "ban" => v.node.post("/api/v1/admin/bans", &v.alice.token, json!({ "subject": "bob@t.local" })).await,
             "logout" => v.node.post("/api/v1/auth/logout", &v.bob.token, json!({})).await,

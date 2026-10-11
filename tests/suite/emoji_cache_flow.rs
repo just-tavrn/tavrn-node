@@ -288,7 +288,8 @@ async fn the_cache_is_capped_per_host_and_in_total_and_misses_are_limited() {
 
     // Misses over the per-address budget: 429; cached copies are still served.
     while node.state.media_miss_limiter.check("miss:unknown").is_ok() {}
-    let (s, _, body) = get_with(r, &format!("/api/v1/emojis/{}/image?host=fake.test", tavrn_node::util::ulid()), &[]).await;
+    let (s, _, body) =
+        get_with(r, &format!("/api/v1/emojis/{}/image?host=fake.test", tavrn_node::util::ulid()), &[]).await;
     assert_eq!((s, code(&body).as_deref()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
     let (s, _, _) = get_with(r, &format!("/api/v1/emojis/{last}/image?host=fake.test"), &[]).await;
     assert_eq!(s, StatusCode::OK);

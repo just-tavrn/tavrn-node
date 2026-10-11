@@ -576,7 +576,10 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             }
             match crate::emoji_cache::enforce_total_cap(&state).await {
                 Ok(0) => {}
-                Ok(n) => tracing::info!(copies = n, "Cached emojis and clips of other nodes evicted (TAVRN_MEDIA_CACHE_MAX_BYTES)"),
+                Ok(n) => tracing::info!(
+                    copies = n,
+                    "Cached emojis and clips of other nodes evicted (TAVRN_MEDIA_CACHE_MAX_BYTES)"
+                ),
                 Err(e) => tracing::warn!(error = %e, "Media cache cap failed"),
             }
             let (acked, old) = (
