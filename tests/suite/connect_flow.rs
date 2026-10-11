@@ -814,3 +814,15 @@ async fn a_connect_code_needs_a_reauth_token() {
     let (s, j) = a.post("/api/v1/auth/connect/code", &alice.token, body).await;
     assert_eq!(s, StatusCode::OK, "{j}");
 }
+
+/// REVIEW: an app session (`session_id`, a `login` session) mints a new long-lived session too: it needs a reauth
+/// token like the `origin` variant.
+#[tokio::test]
+async fn review_an_app_session_code_needs_a_reauth_token() {
+    let a = test_node(A).await;
+    let alice = a.register("alice").await;
+    let id = new_session(&a, "Desktop app").await;
+    a.forget_reauth(&alice.token);
+    let (s, j) = confirm(&a, &alice.token, json!({ "session_id": id })).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("auth.reauth_required")), "{j}");
+}

@@ -437,3 +437,32 @@ async fn the_runtime_stays_responsive_while_logins_are_checked() {
         assert_eq!(l.await.unwrap(), StatusCode::UNAUTHORIZED);
     }
 }
+
+/// REVIEW: the hashing slot belongs to the hash, not to the request: a login whose request is cancelled (client gone,
+/// timeout) keeps its slot until Argon2 has finished on the blocking pool, so cancelled requests cannot run more
+/// hashes at once than `TAVRN_PASSWORD_HASH_CONCURRENCY`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_a_cancelled_login_keeps_its_hashing_slot_until_the_hash_ends() {
+    let node = test_node_with("t.local", |c| c.password_hash_concurrency = 1).await;
+    node.register("alice").await;
+    let router = node.router.clone();
+    let task = tokio::spawn(async move {
+        use tower::ServiceExt;
+        let body = json!({ "username": "alice", "password": "wrong-password-123" });
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        router.oneshot(req).await.unwrap().status()
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while node.state.password_hashing.available_permits() == 1 {
+        assert!(std::time::Instant::now() < deadline, "the login never started hashing");
+        tokio::task::yield_now().await;
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(node.state.password_hashing.available_permits(), 0, "the hash still runs: its slot stays taken");
+}
