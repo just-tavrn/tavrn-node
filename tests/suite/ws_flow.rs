@@ -38,7 +38,7 @@ async fn silent(ws: &mut Socket, ms: u64) -> bool {
 /// The next frame, skipping presence updates (presence_flow.rs tests those).
 async fn next_json(ws: &mut Socket) -> Value {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap() {
+        match common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap() {
             Message::Text(t) => {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if v["type"] != "presence.update" {
@@ -230,10 +230,11 @@ async fn an_open_socket_gets_the_events_of_a_room_its_user_creates_later() {
     }
 }
 
-/// Waits (at most 5 seconds, far below the 30-second heartbeat: the `session.revoked` event must close it, not the
-/// re-check at the next ping) for the socket to close and returns the close code; events before it are skipped.
+/// Waits (at most 5 seconds scaled by `TAVRN_TEST_TIMEOUT_FACTOR`, still far below the 30-second heartbeat: the
+/// `session.revoked` event must close it, not the re-check at the next ping) for the socket to close and returns the
+/// close code; events before it are skipped.
 async fn closed_with(ws: &mut Socket) -> Option<u16> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => return None,
@@ -373,7 +374,11 @@ async fn sockets_per_user_are_capped() {
     let mut third = connect(&url).await;
     third.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), third.next()).await.unwrap().unwrap().unwrap() {
+        match common::within(Duration::from_secs(5), "the close of the third socket", third.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
             Message::Close(Some(f)) => {
                 assert_eq!((u16::from(f.code), f.reason.as_str()), (4002, "too_many_connections"));
                 break;
@@ -384,7 +389,12 @@ async fn sockets_per_user_are_capped() {
     }
     let _c = hello(&url, &bob.token).await; // per user
     drop(_a);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The node notices the closed socket on its own time: wait for it, not for a fixed delay.
+    common::wait_until(Duration::from_secs(5), "the closed socket frees its place", || {
+        let open = node.state.hub.connections_of(&alice.user_id);
+        async move { open < 2 }
+    })
+    .await;
     let _d = hello(&url, &alice.token).await; // a closed socket frees its place
 }
 
@@ -450,7 +460,7 @@ async fn review_connecting_counts_against_the_user_limit() {
     let mut ws = connect(&url).await;
     ws.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap() {
+        match common::within(Duration::from_secs(5), "the close of the socket", ws.next()).await.unwrap().unwrap() {
             Message::Close(Some(f)) => {
                 assert_eq!((u16::from(f.code), f.reason.as_str()), (4002, "rate_limited"));
                 break;
@@ -477,7 +487,8 @@ async fn the_heartbeat_closes_a_socket_whose_session_ended() {
     assert_eq!(answer_pings(&mut ws, 1500).await, None, "open while the session lives");
     tavrn_node::store::users::revoke_device_sessions(&node.state.db, &alice.user_id, &alice.device_id).await.unwrap();
     node.state.live_sessions.forget(std::slice::from_ref(&alice.device_id));
-    assert_eq!(answer_pings(&mut ws, 3000).await, Some(4001), "closed at the next ping");
+    let next_ping = u64::try_from(common::timeout(Duration::from_secs(3)).as_millis()).unwrap();
+    assert_eq!(answer_pings(&mut ws, next_ping).await, Some(4001), "closed at the next ping");
 }
 
 /// Answers the node's pings for `ms`; the close code if the socket closes meanwhile.

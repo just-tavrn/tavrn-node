@@ -217,18 +217,18 @@ pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub async fn ws(node: &FedNode, token: &str) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(node.ws_url()).await.unwrap();
     ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
-    let ready = ws.next().await.unwrap().unwrap();
+    let ready = super::within(Duration::from_secs(5), "the WebSocket's ready", ws.next()).await.unwrap().unwrap();
     assert!(ready.to_text().unwrap().contains("\"ready\""), "{ready:?}");
     ws
 }
 
-/// Waits (at most 5 s) for the next event of `kind` and returns its data.
+/// Waits (at most 5 s, scaled by `TAVRN_TEST_TIMEOUT_FACTOR`) for the next event of `kind` and returns its data.
 pub async fn event(ws: &mut Ws, kind: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = super::deadline(Duration::from_secs(5));
     loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
             .await
-            .expect("the expected event did not arrive within 5 s")
+            .unwrap_or_else(|_| panic!("no {kind} event within {:?}", super::timeout(Duration::from_secs(5))))
             .unwrap()
             .unwrap();
         let Ok(text) = msg.to_text() else { continue };

@@ -61,6 +61,60 @@ pub fn password(username: &str) -> String {
     format!("password-{username}-123")
 }
 
+/// `TAVRN_TEST_TIMEOUT_FACTOR`: how much slower than a developer machine this one may be (default 1; the
+/// self-hosted CI runners set 3). It scales every limit a test WAITS for something to happen ([`timeout`],
+/// [`within`], [`deadline`]), never a fixed delay and never a "nothing arrives within" window. A positive number;
+/// anything else stops the test run with a clear message instead of silently falling back.
+pub fn timeout_factor() -> f64 {
+    static FACTOR: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FACTOR.get_or_init(|| match parse_timeout_factor(std::env::var("TAVRN_TEST_TIMEOUT_FACTOR").ok().as_deref()) {
+        Ok(f) => f,
+        Err(e) => panic!("{e}"),
+    })
+}
+
+/// The factor of `TAVRN_TEST_TIMEOUT_FACTOR` (`None` or empty: 1).
+pub fn parse_timeout_factor(value: Option<&str>) -> Result<f64, String> {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(1.0) };
+    match v.parse::<f64>() {
+        Ok(f) if f.is_finite() && f > 0.0 && f <= 100.0 => Ok(f),
+        _ => Err(format!("TAVRN_TEST_TIMEOUT_FACTOR={v:?} is not a number between 0 and 100")),
+    }
+}
+
+/// `base` (the limit on a developer machine) scaled by [`timeout_factor`].
+pub fn timeout(base: std::time::Duration) -> std::time::Duration {
+    base.mul_f64(timeout_factor())
+}
+
+/// The instant [`timeout`]`(base)` from now, for a loop that waits for several frames.
+pub fn deadline(base: std::time::Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + timeout(base)
+}
+
+/// Awaits `fut` for at most [`timeout`]`(base)`; fails the test naming `what` (the awaited condition) after that.
+pub async fn within<T>(base: std::time::Duration, what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    let limit = timeout(base);
+    match tokio::time::timeout(limit, fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{what}: not within {limit:?} (TAVRN_TEST_TIMEOUT_FACTOR={})", timeout_factor()),
+    }
+}
+
+/// Polls `cond` every 20 ms until it holds; fails the test naming `what` after [`timeout`]`(base)`.
+pub async fn wait_until<F: std::future::Future<Output = bool>>(
+    base: std::time::Duration,
+    what: &str,
+    mut cond: impl FnMut() -> F,
+) {
+    within(base, what, async {
+        while !cond().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
@@ -379,4 +433,20 @@ pub async fn body_json(resp: Response<Body>) -> Value {
 
 pub fn perms(bits: &[u64]) -> String {
     bits.iter().fold(0u64, |a, b| a | b).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_timeout_factor;
+
+    #[test]
+    fn the_timeout_factor_is_a_positive_number_and_defaults_to_one() {
+        assert_eq!(parse_timeout_factor(None), Ok(1.0));
+        assert_eq!(parse_timeout_factor(Some(" ")), Ok(1.0));
+        assert_eq!(parse_timeout_factor(Some("3")), Ok(3.0));
+        assert_eq!(parse_timeout_factor(Some("1.5")), Ok(1.5));
+        for bad in ["0", "-2", "3x", "NaN", "inf", "1000"] {
+            assert!(parse_timeout_factor(Some(bad)).is_err(), "{bad}");
+        }
+    }
 }
