@@ -51,6 +51,9 @@ First public release of the node and its container image.
 - Only failed logins count against an account, and the right password with a valid device proof passes a locked
   account; re-authentication and identity reset have their own limits.
 - Password reset mails are limited per account and a pending reset link stays valid.
+- `POST /auth/forgot-password` and `POST /auth/verify-email/resend` hand the mail to a background task after storing
+  the token, so they answer as fast for an account that gets a mail as for an unknown one: with a slow SMTP relay the
+  response time no longer tells which accounts or addresses exist.
 - WebSocket connections count against the per-user limit, are capped per user, rate-limit read markers and refuse
   frames over 64 KiB.
 - Media conversions use only the probed video stream and refuse inputs with several.

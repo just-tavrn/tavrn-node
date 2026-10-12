@@ -3,7 +3,10 @@
 //! production nodes only note that a mail was not sent (never its body, which may carry a token). The texts are localized
 //! templates (`mail_templates.rs`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
@@ -99,6 +102,24 @@ pub struct Mailer {
     dev: bool,
     /// Most recently sent mails (recipient, subject, body); development mode and tests only (mails carry tokens).
     pub outbox: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// Mails handed to [`Mailer::send_in_background`] whose delivery has not finished yet.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Counts one background delivery while it lives; dropped also when the task panics or is cancelled.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Mailer {
@@ -119,7 +140,25 @@ impl Mailer {
             transport,
             dev: config.dev,
             outbox: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Runs `send` (a delivery) in a background task, so the request that triggered it answers without waiting for
+    /// the SMTP relay. Account mails go this way: a request that sends a mail must take as long as one that does not,
+    /// or the response time tells which accounts exist. Delivery errors are logged by the mailer itself; a panic ends
+    /// only the task.
+    pub fn send_in_background(&self, send: impl std::future::Future<Output = ()> + Send + 'static) {
+        let in_flight = InFlight::new(&self.in_flight);
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            send.await;
+        });
+    }
+
+    /// Background deliveries not finished yet (tests wait for 0 before they look at the outbox).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     pub fn smtp_enabled(&self) -> bool {
@@ -237,7 +276,7 @@ fn build_transport(s: &SmtpSettings) -> Option<AsyncSmtpTransport<Tokio1Executor
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     #[test]
@@ -272,6 +311,30 @@ mod tests {
         assert_eq!(m.from, "noreply@tavrn.org");
         m.send_test("a@b.c").await.unwrap();
         assert!(m.outbox.lock().unwrap()[0].2.contains("https://app.tavrn.org"));
+    }
+
+    #[tokio::test]
+    async fn background_deliveries_are_counted_until_they_end_also_after_a_panic() {
+        let config =
+            Config { domain: "t.local".into(), database_url: "postgres://x".into(), dev: true, ..Config::default() };
+        let m = Mailer::from_config(&config);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let sender = m.clone();
+        m.send_in_background(async move {
+            let _ = wait.await;
+            sender.send_test("a@b.c").await.unwrap();
+        });
+        m.send_in_background(async { panic!("a broken delivery") });
+        assert_eq!(m.in_flight(), 2);
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            if m.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(m.in_flight(), 0, "the delivery ended and the panic released its count");
+        assert_eq!(m.outbox.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

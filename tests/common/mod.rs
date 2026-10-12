@@ -177,6 +177,15 @@ pub async fn test_node_with(domain: &str, tweak: impl FnOnce(&mut Config)) -> Te
 }
 
 impl TestNode {
+    /// The outbox (recipient, subject, body) once every mail handed to a background task is delivered.
+    pub async fn mails(&self) -> Vec<(String, String, String)> {
+        wait_until(std::time::Duration::from_secs(10), "background mails delivered", || async {
+            self.state.mailer.in_flight() == 0
+        })
+        .await;
+        self.state.mailer.outbox.lock().unwrap().clone()
+    }
+
     pub async fn get(&self, path: &str) -> Response<Body> {
         self.router.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap()
     }
@@ -438,6 +447,49 @@ pub async fn body_json(resp: Response<Body>) -> Value {
 
 pub fn perms(bits: &[u64]) -> String {
     bits.iter().fold(0u64, |a, b| a | b).to_string()
+}
+
+/// A local SMTP server that waits `delay` before it greets each connection, then accepts every mail: a slow relay
+/// for tests that measure what a request waits for. Returns its `TAVRN_SMTP_URL`.
+pub async fn slow_smtp(delay: std::time::Duration) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                write.write_all(b"220 slow.test ESMTP\r\n").await?;
+                let mut in_data = false;
+                while let Some(line) = lines.next_line().await? {
+                    let reply: &[u8] = if in_data {
+                        if line != "." {
+                            continue;
+                        }
+                        in_data = false;
+                        b"250 queued\r\n"
+                    } else {
+                        match line.get(..4).map(str::to_ascii_uppercase).as_deref() {
+                            Some("DATA") => {
+                                in_data = true;
+                                b"354 go ahead\r\n"
+                            }
+                            Some("QUIT") => {
+                                write.write_all(b"221 bye\r\n").await?;
+                                break;
+                            }
+                            _ => b"250 ok\r\n",
+                        }
+                    };
+                    write.write_all(reply).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            });
+        }
+    });
+    format!("smtp://127.0.0.1:{port}")
 }
 
 #[cfg(test)]

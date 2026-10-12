@@ -43,7 +43,8 @@ async fn forgot(node: &TestNode, account: &str) -> (String, String, String) {
     let (s, _) =
         node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": account }))).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    last_mail(node)
+    // The reset mail is delivered after the answer.
+    node.mails().await.last().unwrap().clone()
 }
 
 #[tokio::test]
