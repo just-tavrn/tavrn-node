@@ -38,6 +38,9 @@ pub struct NodeInfo {
     /// Message retention of this node in days (`TAVRN_RETENTION_DAYS`, PROTOCOL.md §7f; 0 = messages are kept). Rooms
     /// can only shorten it.
     pub message_retention_days: u32,
+    /// Files channels may keep their files on this node (`TAVRN_FILES_INTERNAL`, FILES.md §5); `false`: a files
+    /// channel takes uploads only once it has an external store.
+    pub files_internal: bool,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,
     /// WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain), which clients pass
@@ -85,6 +88,7 @@ pub async fn get_node(State(state): State<AppState>) -> Result<Json<NodeInfo>, c
             .unwrap_or_default(),
         preview_auto_max_bytes: c.preview_auto_max_bytes,
         message_retention_days: c.retention_days,
+        files_internal: c.files_internal.on(),
         voice: VoiceInfo {
             enabled: c.voice_enabled,
             max_bitrate_kbps: c.voice_max_bitrate_kbps,

@@ -37,6 +37,9 @@ pub struct Policies {
     pub camera: ScreensharePolicy,
     /// Largest image (bytes) clients load as a preview without a click (`TAVRN_PREVIEW_AUTO_MAX_BYTES`).
     pub preview_auto_max_bytes: u64,
+    /// Files channels may keep their files on the node (`TAVRN_FILES_INTERNAL`); `false`: a files channel takes
+    /// uploads only once it has an external store (FILES.md §5).
+    pub files_internal: bool,
 }
 
 impl Policies {
@@ -148,6 +151,7 @@ pub fn build_from(c: &crate::config::Config, keys: &[crate::keys::NodeKey]) -> W
             screenshare: Policies::screenshare(c),
             camera: Policies::camera(c),
             preview_auto_max_bytes: c.preview_auto_max_bytes,
+            files_internal: c.files_internal.on(),
         },
         directory_listing: c.directory_listing,
         age: crate::age::info(c),

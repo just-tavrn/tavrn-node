@@ -202,11 +202,16 @@ impl Setup {
 }
 
 async fn setup(external: Switch, private: Switch) -> Setup {
-    let node = test_node_with(DOMAIN, |c| {
+    setup_with(|c| {
         c.files_external = external;
         c.files_external_private = private;
     })
-    .await;
+    .await
+}
+
+/// A node configured by `tweak`, Alice's room and an unencrypted files channel in it.
+async fn setup_with(tweak: impl FnOnce(&mut tavrn_node::config::Config)) -> Setup {
+    let node = test_node_with(DOMAIN, tweak).await;
     let alice = node.register("alice").await;
     let room = node.create_room(&alice.token, "R").await;
     let room_id = room["id"].as_str().unwrap().to_string();
@@ -670,4 +675,131 @@ async fn authz_stored_secrets_never_go_to_another_server() {
     let (_, j) = s.backend(json!({ "kind": "webdav", "url": elsewhere, "username": DAV_USER, "password": "" })).await;
     assert_ne!(j["kind"].as_str(), Some("webdav"), "moved with the stored password: {j}");
     assert!(other.store.lock().unwrap().collections.is_empty(), "nothing was created with the stored password");
+}
+
+// ---------------------------------------------------------------- Node policy: external stores only
+
+/// A node on external stores only (`TAVRN_FILES_INTERNAL=off`, tavrn-node#45).
+async fn external_only(quota: u64) -> Setup {
+    setup_with(|c| {
+        c.files_internal = Switch::Off;
+        c.files_external = Switch::On;
+        c.files_external_private = Switch::On;
+        c.files_channels_max_bytes = quota;
+    })
+    .await
+}
+
+/// `TAVRN_FILES_INTERNAL=off` (FILES.md §5): a new files channel has no store (`backend: "none"`) and takes no
+/// uploads and no folders until an external store is set; the node's own storage cannot be chosen; the policy is
+/// published in `GET /node` and the discovery document.
+#[tokio::test]
+async fn without_internal_storage_files_channels_need_an_external_store() {
+    let (m, port) = mock(Flavor::WebDav).await;
+    let s = external_only(0).await;
+
+    // The policy for clients, before the first upload.
+    let (st, node) = s.node.req(Method::GET, "/api/v1/node", None, None).await;
+    assert_eq!((st, node["files_internal"].as_bool()), (StatusCode::OK, Some(false)), "{node}");
+    let (_, doc) = s.node.req(Method::GET, "/.well-known/tavrn", None, None).await;
+    assert_eq!(doc["policies"]["files_internal"], false, "{doc}");
+
+    // The channel exists without a store.
+    let (st, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!(st, StatusCode::OK, "{usage}");
+    assert_eq!(
+        (usage["backend"].as_str(), usage["can_upload"].as_bool(), usage["enabled"].as_bool()),
+        (Some("none"), Some(false), Some(true)),
+        "{usage}"
+    );
+    let (_, info) = s.node.get_auth(&format!("{}/backend", s.base()), &s.alice.token).await;
+    assert_eq!(
+        (info["kind"].as_str(), info["internal_allowed"].as_bool(), info["external_allowed"].as_bool()),
+        (Some("none"), Some(false), Some(true)),
+        "{info}"
+    );
+
+    // Every way onto the node's storage is refused.
+    let refused = |(st, j): (StatusCode, Value), what: &str| {
+        assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("files.internal_disabled")), "{what}: {j}");
+    };
+    refused(s.up("a.txt", b"hello").await, "upload");
+    refused(
+        s.node.post(&format!("{}/folders", s.base()), &s.alice.token, json!({ "name": "Docs" })).await,
+        "new folder",
+    );
+    refused(s.backend(json!({ "kind": "internal" })).await, "PUT backend internal");
+    refused(s.test(Some(json!({ "kind": "internal" }))).await, "test internal");
+    refused(s.test(None).await, "test of the stored (no) store");
+    let (_, list) = s.node.get_auth(&s.base(), &s.alice.token).await;
+    assert_eq!(list["entries"].as_array().map(Vec::len), Some(0), "nothing was stored: {list}");
+
+    // An external store: uploads and folders work, the store holds the bytes.
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &s.channel, port).await;
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!((usage["backend"].as_str(), usage["can_upload"].as_bool()), (Some("webdav"), Some(true)), "{usage}");
+    let (st, folder) = s.node.post(&format!("{}/folders", s.base()), &s.alice.token, json!({ "name": "Docs" })).await;
+    assert_eq!(st, StatusCode::CREATED, "{folder}");
+    let data = sample(150_000);
+    let (st, f) = s.up("big.dat", &data).await;
+    assert_eq!(st, StatusCode::CREATED, "unlimited without TAVRN_FILES_CHANNELS_MAX_BYTES: {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    assert_eq!(objects_under(&m, &s.channel), 1);
+    assert_eq!(s.down(&fid, None).await, (StatusCode::OK, data));
+
+    // Emptied again, the channel still cannot move to the node's storage.
+    s.node.delete(&format!("{}/{fid}", s.base()), &s.alice.token).await;
+    let store = m.clone();
+    let channel = s.channel.clone();
+    eventually(|| objects_under(&store, &channel) == 0).await;
+    refused(s.backend(json!({ "kind": "internal" })).await, "PUT backend internal after the store");
+
+    // A node with its own storage (the default) says so.
+    let d = setup(Switch::Off, Switch::Off).await;
+    let (_, node) = d.node.req(Method::GET, "/api/v1/node", None, None).await;
+    assert_eq!(node["files_internal"], true, "{node}");
+    let (_, doc) = d.node.req(Method::GET, "/.well-known/tavrn", None, None).await;
+    assert_eq!(doc["policies"]["files_internal"], true);
+    let (_, usage) = d.node.get_auth(&format!("{}/usage", d.base()), &d.alice.token).await;
+    assert_eq!(usage["backend"], "internal", "{usage}");
+    let (_, info) = d.node.get_auth(&format!("{}/backend", d.base()), &d.alice.token).await;
+    assert_eq!((info["kind"].as_str(), info["internal_allowed"].as_bool()), (Some("internal"), Some(true)));
+}
+
+/// With `TAVRN_FILES_INTERNAL=off` the channel quota (`files_channels.max_bytes`) limits the external stores only
+/// when the operator sets it.
+#[tokio::test]
+async fn without_internal_storage_the_quota_applies_only_when_set() {
+    let (_m, port) = mock(Flavor::WebDav).await;
+    let s = external_only(100_000).await;
+    webdav_for(&s.node, &s.alice.token, &s.room_id, &s.channel, port).await;
+    let (st, j) = s.up("big.dat", &sample(150_000)).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("files.quota_exceeded")), "{j}");
+    let (st, j) = s.up("small.dat", &sample(50_000)).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+}
+
+/// A node switched to `TAVRN_FILES_INTERNAL=off` keeps the files its channels hold already: they are listed,
+/// downloaded, renamed and deleted as before, but the channel takes no new uploads until it moved to an external
+/// store (possible once it is empty, FILES.md §5).
+#[tokio::test]
+async fn switching_internal_storage_off_keeps_the_existing_files() {
+    let mut s = setup(Switch::On, Switch::On).await;
+    let (st, f) = s.up("old.txt", b"kept on the node").await;
+    assert_eq!(st, StatusCode::CREATED, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+
+    let off = tavrn_node::config::Config { files_internal: Switch::Off, ..(*s.node.state.config).clone() };
+    s.node.state.config = Arc::new(off);
+    s.node.router = tavrn_node::app::router(s.node.state.clone());
+
+    assert_eq!(s.down(&fid, None).await, (StatusCode::OK, b"kept on the node".to_vec()));
+    let (st, j) = s.node.patch(&format!("{}/{fid}", s.base()), &s.alice.token, json!({ "name": "renamed.txt" })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) = s.up("new.txt", b"x").await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("files.internal_disabled")), "{j}");
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!((usage["backend"].as_str(), usage["files"].as_i64()), (Some("none"), Some(1)), "{usage}");
+    let (st, _) = s.node.delete(&format!("{}/{fid}", s.base()), &s.alice.token).await;
+    assert_eq!(st, StatusCode::OK);
 }

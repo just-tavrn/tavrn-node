@@ -334,6 +334,7 @@ marked "entitlement" above are the node defaults; node admins extend them per us
 | `TAVRN_FILES_CHANNELS` | `on` | `files_channels.enabled`: files channels may be created (`on`/`off`). |
 | `TAVRN_FILES_CHANNELS_MAX_BYTES` | `0` | `files_channels.max_bytes`, storage per files channel. |
 | `TAVRN_FILES_EXTERNAL` | `off` | Files channels on external WebDAV/S3 stores (protocol: FILES.md §5). |
+| `TAVRN_FILES_INTERNAL` | `on` | `off`: files channels on external stores only; the node keeps no files of files channels (needs `TAVRN_FILES_EXTERNAL=on`, see [Files channels on external stores](#files-channels-on-external-stores)). |
 | `TAVRN_FILES_EXTERNAL_PRIVATE` | `off` | `on` also allows external stores on private, loopback or link-local addresses and plain `http` (stores in the LAN); this disables the SSRF protection for them. |
 
 ### Media, previews and search
@@ -981,6 +982,24 @@ node proxies uploads and downloads as streams and keeps the folder tree in its d
   (below) pauses.
 - A channel can move to another store only while it is empty; credentials and `encrypt_files` can change at any
   time. Backend changes and connection tests are limited to 20 per user and 10 minutes.
+
+**External stores only.** `TAVRN_FILES_INTERNAL=off` (default `on`; needs `TAVRN_FILES_EXTERNAL=on`, otherwise
+the node does not start and `check-config` names the problem) keeps the files of files channels off the node: large
+shared folders live on the members' own WebDAV or S3 stores, attachments in chats stay on the node as before.
+
+- A new files channel is created without a store. Until its managers choose a WebDAV or S3 store in the channel
+  settings ("Storage"), uploads and new folders answer `403 files.internal_disabled`; the clients show "choose a
+  store first" instead of the upload button. The node's own storage cannot be chosen (`403
+  files.internal_disabled`).
+- Clients see the policy before the first upload: `files_internal: false` in `GET /api/v1/node` and
+  `policies.files_internal` in the discovery document.
+- **The quota**: `TAVRN_FILES_CHANNELS_MAX_BYTES` (and plans and grants of `files_channels.max_bytes`) limits the
+  external stores too, but only when you set it; the default `0` is unlimited. A small quota to keep files off the
+  node is no longer needed: remove it when you switch, or the members' stores are capped by it.
+- **Switching an existing node**: channels that already keep files on the node keep them (listing, downloads,
+  renames, moves and deletes work), but take no new uploads; once such a channel is empty its managers can move it
+  to an external store. Thumbnails of encrypted channels (at most 1 MiB each) stay on the node, as for every
+  external channel.
 
 Deleting a files channel or a room deletes the files in the node's storage at once. Objects on an external store are
 deleted in the background with the credentials stored for the channel; when the store is unreachable they wait in a

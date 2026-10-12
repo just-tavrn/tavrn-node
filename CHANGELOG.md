@@ -27,6 +27,11 @@ First public release of the node and its container image.
 - **Container image for `linux/amd64` and `linux/arm64`**: one manifest list per tag (`edge` and the releases), so
   the node runs natively on ARM servers; the arm64 image is cross-compiled on the amd64 build host, and a plain
   `docker build` still builds for the host's own architecture.
+- **Files channels on external stores only** (`TAVRN_FILES_INTERNAL=off`, protocol FILES.md §5): the node keeps no
+  files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
+  (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
+  chosen. `GET /node` and the discovery document carry `files_internal`. The channel quota then limits the external
+  stores only when it is set, so no small quota is needed to keep files off the node.
 
 ### Fixed
 

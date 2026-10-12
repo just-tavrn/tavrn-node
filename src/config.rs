@@ -304,6 +304,9 @@ pub struct Config {
     pub media_cache_max_bytes_per_host: u64,
     /// Files channels may use external WebDAV/S3 stores (`TAVRN_FILES_EXTERNAL`, default off, FILES.md §5).
     pub files_external: Switch,
+    /// Files channels may keep their files on the node's own storage (`TAVRN_FILES_INTERNAL`, default on). `off`:
+    /// a files channel takes uploads only once it has an external store (FILES.md §5); needs `files_external`.
+    pub files_internal: Switch,
     /// External stores may be on private, loopback or link-local addresses and use plain http
     /// (`TAVRN_FILES_EXTERNAL_PRIVATE`, default off: SSRF protection).
     pub files_external_private: Switch,
@@ -624,6 +627,7 @@ impl Default for Config {
             media_cache_max_bytes: 2 * 1024 * 1024 * 1024,
             media_cache_max_bytes_per_host: 64 * 1024 * 1024,
             files_external: Switch::Off,
+            files_internal: Switch::On,
             files_external_private: Switch::Off,
             gif_provider: GifProvider::None,
             gif_api_key: None,
@@ -1129,6 +1133,12 @@ impl Config {
     }
 
     fn validate_entitlements(&self, problems: &mut Vec<String>) {
+        if !self.files_internal.on() && !self.files_external.on() {
+            problems.push(
+                "TAVRN_FILES_INTERNAL=off needs TAVRN_FILES_EXTERNAL=on: files channels would have nowhere to keep their files"
+                    .into(),
+            );
+        }
         if self.upload_max_bytes_ceiling != 0 && self.upload_max_bytes_ceiling < self.upload_max_bytes {
             problems.push("TAVRN_UPLOAD_MAX_BYTES_CEILING must be 0 or at least TAVRN_UPLOAD_MAX_BYTES".into());
         }
@@ -2426,6 +2436,7 @@ mod tests {
             assert_eq!(c.stream_max_height, 720);
             assert_eq!(c.files_channels, Switch::Off);
             assert_eq!(c.files_external, Switch::Off, "external stores are off by default");
+            assert_eq!(c.files_internal, Switch::On, "the node's own storage is on by default");
             assert_eq!(c.upload_ceiling(), 104_857_600);
             assert_eq!(c.emoji_max_personal, 20);
             assert_eq!(c.sounds_max_personal, 10);
@@ -2438,6 +2449,23 @@ mod tests {
             Ok(())
         });
         assert_eq!(Config::default().upload_ceiling(), Config::default().upload_max_bytes);
+    }
+
+    #[test]
+    fn files_on_external_stores_only_needs_external_stores() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            jail.set_env("TAVRN_FILES_INTERNAL", "off");
+            let err = Config::load(false).unwrap_err().to_string();
+            assert!(err.contains("TAVRN_FILES_INTERNAL=off needs TAVRN_FILES_EXTERNAL=on"), "{err}");
+            jail.set_env("TAVRN_FILES_EXTERNAL", "on");
+            let c = Config::load(false).unwrap();
+            assert_eq!((c.files_internal, c.files_external), (Switch::Off, Switch::On));
+            let printed = serde_json::to_string(&c).unwrap();
+            assert!(printed.contains("\"files_internal\":\"off\""), "check-config shows the policy: {printed}");
+            Ok(())
+        });
     }
 
     #[test]
