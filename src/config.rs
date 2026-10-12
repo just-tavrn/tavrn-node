@@ -193,6 +193,10 @@ pub struct Config {
     /// `TAVRN_WEBAUTHN_RP_ID`: relying party id of passkeys (default: the identity domain). Must be the host
     /// of the WebAuthn origin or a parent domain of it, so passkeys survive a move of the app host.
     pub webauthn_rp_id: Option<String>,
+    /// `TAVRN_WEBAUTHN_APP_ORIGINS`: WebAuthn origins of the node's own apps besides the web origin (comma-separated,
+    /// each `android:apk-key-hash:<base64url SHA-256 of the signing certificate>`), PROTOCOL.md §5a.4. Accepted for
+    /// registrations and assertions and published as `webauthn.origins`. Empty: only the web origin.
+    pub webauthn_app_origins: String,
 
     /// `postgres://…`; in development mode also `sqlite://…`.
     pub database_url: String,
@@ -571,6 +575,7 @@ impl Default for Config {
             public_url: None,
             webauthn_origin: None,
             webauthn_rp_id: None,
+            webauthn_app_origins: String::new(),
             database_url: String::new(),
             cache_url: None,
             instance_id: None,
@@ -1040,6 +1045,13 @@ impl Config {
                 "TAVRN_WEBAUTHN_ORIGIN='{origin}' is invalid: http(s)://<host>[:port] without path expected"
             ));
             return;
+        }
+        for origin in split_list(&self.webauthn_app_origins) {
+            if !valid_app_origin(&origin) {
+                problems.push(format!(
+                    "TAVRN_WEBAUTHN_APP_ORIGINS contains the invalid entry '{origin}': android:apk-key-hash:<base64url of the SHA-256 of the signing certificate, 43 characters> expected"
+                ));
+            }
         }
         let rp_id = self.webauthn_rp_id();
         if !crate::util::valid_domain(&rp_id) || !(rp_id.contains('.') || self.dev) {
@@ -1552,6 +1564,24 @@ impl Config {
             .unwrap_or_else(|| self.public_url())
     }
 
+    /// The app origins of `TAVRN_WEBAUTHN_APP_ORIGINS` (validated at start), without duplicates, in their order.
+    pub fn webauthn_app_origins(&self) -> Vec<String> {
+        let mut origins: Vec<String> = Vec::new();
+        for origin in split_list(&self.webauthn_app_origins) {
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        origins
+    }
+
+    /// Every origin the node accepts for WebAuthn: the web origin first, then the app origins (`webauthn.origins`,
+    /// PROTOCOL.md §5a.4).
+    pub fn webauthn_origins(&self) -> Vec<String> {
+        let web = self.webauthn_origin();
+        std::iter::once(web.clone()).chain(self.webauthn_app_origins().into_iter().filter(|o| *o != web)).collect()
+    }
+
     /// WebAuthn relying party id: `TAVRN_WEBAUTHN_RP_ID` or the identity domain.
     pub fn webauthn_rp_id(&self) -> String {
         self.webauthn_rp_id
@@ -1629,6 +1659,19 @@ fn valid_webauthn_origin(origin: &str) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
         && !origin.contains('#')
+}
+
+/// Prefix of an Android app's WebAuthn origin (PROTOCOL.md §5a.4).
+pub const ANDROID_ORIGIN_PREFIX: &str = "android:apk-key-hash:";
+
+/// An app origin of `TAVRN_WEBAUTHN_APP_ORIGINS`: `android:apk-key-hash:` and the base64url (no padding) of a
+/// SHA-256 (32 bytes, 43 characters). iOS origins are not specified yet.
+fn valid_app_origin(origin: &str) -> bool {
+    use base64::Engine as _;
+    origin.strip_prefix(ANDROID_ORIGIN_PREFIX).is_some_and(|hash| {
+        hash.len() == 43
+            && base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(hash).is_ok_and(|bytes| bytes.len() == 32)
+    })
 }
 
 /// WebAuthn rule: the relying party id must be the origin's host or a registrable parent domain of it.
@@ -2063,6 +2106,52 @@ mod tests {
         ] {
             let c = Config { webauthn_origin: Some(bad.into()), ..prod() };
             assert!(c.validate().unwrap_err().problems[0].contains("TAVRN_WEBAUTHN_ORIGIN"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn webauthn_app_origins_are_validated_and_listed_after_the_web_origin() {
+        // Fake hashes: 32 bytes of zeros and of 0x04 (`android:apk-key-hash:` + 43 base64url characters).
+        let hash = "A".repeat(43);
+        let debug = format!("{}A", "B".repeat(42));
+        assert_eq!(
+            prod().webauthn_origins(),
+            vec!["https://chat.example.org".to_string()],
+            "default: the web origin only"
+        );
+        assert!(prod().webauthn_app_origins().is_empty());
+        let c = Config {
+            webauthn_app_origins: format!(
+                " android:apk-key-hash:{hash} , android:apk-key-hash:{debug},android:apk-key-hash:{hash}"
+            ),
+            ..prod()
+        };
+        c.validate().unwrap();
+        assert_eq!(
+            c.webauthn_origins(),
+            vec![
+                "https://chat.example.org".to_string(),
+                format!("android:apk-key-hash:{hash}"),
+                format!("android:apk-key-hash:{debug}"),
+            ],
+            "web origin first, app origins in their order, without duplicates"
+        );
+        for bad in [
+            "https://chat.example.org".to_string(),
+            "android:apk-key-hash:".to_string(),
+            format!("android:apk-key-hash:{hash}="),
+            format!("android:apk-key-hash:{}", &hash[1..]),
+            format!("android:apk-key-hash:{}+", &hash[1..]),
+            format!("android:apk-key-hash:{}/A", &hash[2..]),
+            format!("android:apk-key-hash:{}B", &hash[1..]),
+            "android:apk-key-hash:A4:5B:00:11".to_string(),
+            "ios:bundle-id:org.tavrn.app".to_string(),
+            format!("Android:apk-key-hash:{hash}"),
+        ] {
+            let c = Config { webauthn_app_origins: format!("android:apk-key-hash:{hash},{bad}"), ..prod() };
+            let err = c.validate().unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{bad}: {err}");
+            assert!(err.problems[0].contains("TAVRN_WEBAUTHN_APP_ORIGINS"), "{bad}: {err}");
         }
     }
 

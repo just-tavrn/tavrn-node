@@ -165,6 +165,7 @@ and sessions work and the minimum age.
 | `TAVRN_CAPTCHA_LOGIN` | `false` | Require the captcha at login (only with a provider). |
 | `TAVRN_WEBAUTHN_ORIGIN` | the public URL | Origin of the web client for passkeys. Override only for development and tests (e.g. `http://localhost:5173`). |
 | `TAVRN_WEBAUTHN_RP_ID` | `TAVRN_DOMAIN` | Relying party id of passkeys; must be the host of the origin or a parent domain of it, otherwise the node refuses to start. Changing it later invalidates every registered passkey ([Passkeys](#passkeys)). |
+| `TAVRN_WEBAUTHN_APP_ORIGINS` | empty | WebAuthn origins of your own apps besides the web origin, comma-separated: `android:apk-key-hash:<base64url SHA-256 of the signing certificate>` per Android signing key. Lets the Android app use passkeys in the app ([Passkeys in the apps](#passkeys-in-the-apps)); published as `webauthn.origins`. Invalid entries stop the start. |
 | `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). A revocation (logout, password change or reset, device removal, an admin disabling the account or resetting its second factor, a node ban, account deletion) ends the access tokens and WebSockets of the affected devices at once (`401 auth.session_revoked`, close code 4001), and their voice and call connections; the node checks the session behind a token at most every 5 seconds per device and instance. |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
 | `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route and WebSocket connect (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
@@ -708,6 +709,38 @@ later move to `app.example.org` keeps every passkey. A public URL on an unrelate
 relying party id later invalidates all registered passkeys (users sign in with TOTP or a recovery code and
 register them again). The node publishes the id as `webauthn.rp_id` (`GET /api/v1/node`, `/.well-known/tavrn`), so
 clients use it for the assertions they build themselves (unlocking the secret storage with a passkey).
+
+#### Passkeys in the apps
+
+A browser puts the page's origin (the public URL) into every passkey ceremony. The Android app's webview (Android
+14 and newer) puts the **app's** origin there instead: `android:apk-key-hash:<hash>`, the base64url (no padding) of
+the SHA-256 of the certificate the APK is signed with. The node refuses those ceremonies unless the origin is in
+`TAVRN_WEBAUTHN_APP_ORIGINS`; the app then signs in through the browser (as before) and says that the node does not
+accept the app's passkeys yet. With the origin configured, registering a passkey, signing in with it and
+unlocking the encrypted messages with it work inside the app. The relying party id does not change, so a passkey
+made in the app also works in the browser and the other way round.
+
+The node publishes every accepted origin as `webauthn.origins` (`GET /api/v1/node`, `/.well-known/tavrn`), the web
+origin first; the app compares its own origin with that list. `check-config` prints the setting, and the node
+refuses to start with an entry that is not `android:apk-key-hash:` and 43 base64url characters.
+
+Deriving the value from the certificate's SHA-256 fingerprint (hex, with or without colons, as `keytool -list -v`,
+`apksigner verify --print-certs` or the release workflow's `ANDROID_CERT_SHA256` print it):
+
+```sh
+fp='<the SHA-256 fingerprint, 64 hex digits, e.g. AB:CD:…>'
+printf '%s' "$fp" | tr -d ': ' | xxd -r -p | base64 -w0 | tr '+/' '-_' | tr -d '='; echo
+# prints 43 characters → TAVRN_WEBAUTHN_APP_ORIGINS=android:apk-key-hash:<those 43 characters>
+```
+
+Android also requires the relying party's domain to vouch for the app: `https://<relying party id>/.well-known/
+assetlinks.json` must list the app's package with `delegate_permission/common.get_login_creds` and the **same**
+fingerprint (there in the colon-separated hex form). Every signing key is its own origin: list the release key, and
+add a debug or a store's re-signing key only where such builds should use passkeys. Removing an origin later only
+stops new ceremonies from that app; registered passkeys keep working in the browser.
+
+The desktop apps need no entry: they run passkeys through the operating system (Windows) with the node's web
+origin, or through the browser.
 
 Everything else that builds absolute URLs (mail links, invite and application add links, the OIDC redirect URI
 `<public URL>/api/v1/auth/oidc/callback`, the LiveKit signaling URL, `turn.<public host>`) uses the public URL.
@@ -2162,6 +2195,7 @@ These are the problems operators run into most often, each with its cause and fi
 | The node refuses to start because of `storage.key` | The file is missing or does not belong to this database. Restore `keys/` from the same backup as the database; never let the node create a new one ([Keys and backups](#keys-and-backups)). |
 | `database migration failed (schema newer than the binary? …)` | An older image against a newer database: start the newer image again, or restore the backup taken before the upgrade ([Upgrade and rollback](#upgrade-and-rollback)). |
 | The node refuses to start because of `TAVRN_WEBAUTHN_RP_ID` | The public URL's host is not covered by the relying party id; see [Passkeys](#passkeys). |
+| The Android app says "This node does not accept the app's passkeys yet" | `TAVRN_WEBAUTHN_APP_ORIGINS` lacks the app's origin (the hash of the key the installed APK is signed with), or `assetlinks.json` of the relying party id does not list that key; see [Passkeys in the apps](#passkeys-in-the-apps). |
 | Rate limits or bans hit everybody at once | The proxy's address is not in `TAVRN_TRUSTED_PROXIES`, so every request seems to come from the proxy. Add it. |
 | Uploads fail with `413` | The proxy's body limit is below `TAVRN_UPLOAD_MAX_BYTES` (nginx `client_max_body_size`, Caddy `request_body max_size`). |
 | The web client loads but never connects or keeps reconnecting | WebSockets are not passed through (`Upgrade`/`Connection` headers, "Websockets Support" in NPM) or the proxy's read timeout is short. |

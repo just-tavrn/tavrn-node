@@ -421,15 +421,19 @@ pub async fn use_recovery_code(state: &AppState, user_id: &str, code: &str) -> R
 // ---------------------------------------------------------------- WebAuthn
 
 /// The relying party: id = `TAVRN_WEBAUTHN_RP_ID` (default: the identity domain), origin =
-/// `TAVRN_WEBAUTHN_ORIGIN` (default: the public URL).
+/// `TAVRN_WEBAUTHN_ORIGIN` (default: the public URL), plus the apps' origins of `TAVRN_WEBAUTHN_APP_ORIGINS`
+/// (PROTOCOL.md §5a.4). webauthn-rs compares such opaque origins (`android:apk-key-hash:…`) exactly.
 pub fn build_webauthn(config: &Config) -> anyhow::Result<Webauthn> {
     let origin = Url::parse(&config.webauthn_origin())?;
     let rp_id = config.webauthn_rp_id();
-    let builder = WebauthnBuilder::new(&rp_id, &origin)
+    let mut builder = WebauthnBuilder::new(&rp_id, &origin)
         .map_err(|e| anyhow::anyhow!("invalid WebAuthn configuration: {e}"))?
         .rp_name(&config.name)
         // Development: the Vite dev server and the node run on different ports.
         .allow_any_port(config.dev);
+    for app in config.webauthn_app_origins() {
+        builder = builder.append_allowed_origin(&Url::parse(&app)?);
+    }
     builder.build().map_err(|e| anyhow::anyhow!("invalid WebAuthn configuration: {e}"))
 }
 

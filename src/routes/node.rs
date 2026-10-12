@@ -40,8 +40,9 @@ pub struct NodeInfo {
     pub message_retention_days: u32,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,
-    /// WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain): clients pass it
-    /// as `rpId` on the assertions they build themselves (PROTOCOL.md §5a.4).
+    /// WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain), which clients pass
+    /// as `rpId` on the assertions they build themselves, and the accepted origins (web origin first, then the
+    /// apps' origins: an app offers in-app passkeys only while its origin is listed), PROTOCOL.md §5a.4.
     pub webauthn: crate::routes::wellknown::WebauthnInfo,
     /// Date of birth and age gates (`age.v1`, PROTOCOL.md §5e).
     pub age: crate::age::AgeInfo,
