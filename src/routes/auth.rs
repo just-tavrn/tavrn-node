@@ -111,34 +111,29 @@ pub async fn register(
     let cfg = &state.config;
     state.captcha.check(cfg.captcha_required(CaptchaAction::Register), req.captcha_token.as_deref(), &ip).await?;
 
-    match cfg.registration {
+    let is_first = store::users::count_local(&state.db, &cfg.domain).await? == 0;
+    // The invite is checked and redeemed only together with the account (below): a request that fails any other
+    // check must not use it up.
+    let invite = match cfg.registration {
         Registration::Closed => {
             return Err(ApiError::Forbidden {
                 code: "auth.registration_closed",
                 detail: "This node does not accept new accounts".into(),
             });
         }
-        Registration::Invite => {
-            // The first account is always allowed (bootstrap), after that only with a valid account invite.
-            let first = store::users::count_local(&state.db, &cfg.domain).await? == 0;
-            if !first {
-                let code = req.invite.as_deref().map(str::trim).unwrap_or("");
-                if code.is_empty() {
-                    return Err(ApiError::Forbidden {
-                        code: "auth.invite_required",
-                        detail: "Registration by invite only".into(),
-                    });
-                }
-                if !store::admin::consume_invite(&state.db, code).await? {
-                    return Err(ApiError::Forbidden {
-                        code: "auth.invite_invalid",
-                        detail: "Invite invalid, expired or used up".into(),
-                    });
-                }
+        // The first account is always allowed (bootstrap), after that only with a valid account invite.
+        Registration::Invite if !is_first => {
+            let code = req.invite.as_deref().map(str::trim).unwrap_or("");
+            if code.is_empty() {
+                return Err(ApiError::Forbidden {
+                    code: "auth.invite_required",
+                    detail: "Registration by invite only".into(),
+                });
             }
+            Some(code)
         }
-        Registration::Open => {}
-    }
+        Registration::Invite | Registration::Open => None,
+    };
 
     let username = req.username.trim().to_lowercase();
     if !util::valid_username(&username) {
@@ -187,10 +182,10 @@ pub async fn register(
         _ => {}
     }
 
-    let is_first = store::users::count_local(&state.db, &cfg.domain).await? == 0;
     let is_admin = is_first || cfg.admin_users().iter().any(|a| a == &username);
     let password_hash = auth::hash(&state, &req.password).await?;
-    let user = store::users::create_local(
+    // One transaction: the invite use and the account (a failing INSERT rolls the use back).
+    let user = store::users::create_local_with_invite(
         &state.db,
         store::users::NewLocalUser {
             username: &username,
@@ -201,6 +196,7 @@ pub async fn register(
             is_node_admin: is_admin,
             date_of_birth: Some(&date_of_birth.format("%Y-%m-%d").to_string()),
         },
+        invite,
     )
     .await?;
 

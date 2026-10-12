@@ -167,6 +167,8 @@ jobs:
       runner: ubuntu-latest
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
+      # One manifest list for both; the Dockerfile cross-compiles arm64 on the amd64 runner (no emulated compiles).
+      platforms: linux/amd64,linux/arm64
       build-args: |
         TAVRN_WEB_REF=${{ needs.web-ref.outputs.sha }}
       push: ${{ github.event_name != 'pull_request' }}
