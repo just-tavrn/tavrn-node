@@ -172,7 +172,8 @@ pub async fn update_me(
         },
     )
     .await?;
-    if display_name.is_some() || bio.is_some() || links.is_some() {
+    // The DM setting is part of the public profile too (other nodes mirror it, FEDERATION.md §2.7).
+    if display_name.is_some() || bio.is_some() || links.is_some() || dm_policy.is_some() {
         profile::announce_user(&state, &auth.user.id).await?;
     }
     if req.hide_activity.is_some() {

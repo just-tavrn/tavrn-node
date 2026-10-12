@@ -359,7 +359,8 @@ pub async fn set_room_icon(state: &AppState, room_id: &str, media: Option<&Store
 }
 
 /// Tells the user's rooms, friends and DM contacts on this node that the public profile changed
-/// (`user.update { user }`), so their clients refresh names and avatars.
+/// (`user.update { user }`), so their clients refresh names and avatars, and for a local user the other nodes
+/// that mirror the profile (`profile.changed`, FEDERATION.md §5.2; coalesced in the outbox).
 pub async fn announce_user(state: &AppState, user_id: &str) -> Result<(), ApiError> {
     let Some(user) = store::users::by_id(&state.db, user_id).await? else { return Ok(()) };
     let data = serde_json::json!({ "user": user.to_public() });
@@ -372,6 +373,11 @@ pub async fn announce_user(state: &AppState, user_id: &str) -> Result<(), ApiErr
     users.sort();
     users.dedup();
     state.hub.users(users, "user.update", &data);
+    // The change itself is stored: a failure to queue the notification must not fail it (the other nodes then
+    // refresh with the next federated login or after 24 hours, FEDERATION.md §2.7).
+    if let Err(e) = crate::federation::remote::profile_changed(state, &user).await {
+        tracing::warn!(error = %e, "profile.changed could not be queued");
+    }
     Ok(())
 }
 

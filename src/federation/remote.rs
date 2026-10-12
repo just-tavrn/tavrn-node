@@ -349,7 +349,7 @@ pub async fn refresh_profile(state: &AppState, user: &UserRow, hint: Option<i64>
 
 // ---------------------------------------------------------------- home node: notifications
 
-/// Domains that hear about key changes and revocations of a local user (§5.2): the `federation_targets`
+/// Domains that hear about key changes, revocations and profile changes of a local user (§5.2): the `federation_targets`
 /// of the user (§2.4) plus the home domains of the user's friends and of the co-members of DMs and
 /// group DMs hosted here.
 pub async fn notification_domains(state: &AppState, user: &UserRow) -> Result<Vec<String>, ApiError> {
@@ -384,6 +384,38 @@ pub async fn revoke_sessions(state: &AppState, user: &UserRow, device: Option<&s
 /// `devices.changed` (§5.2): a device was removed or attested.
 pub async fn devices_changed(state: &AppState, user: &UserRow) -> Result<(), ApiError> {
     notify_targets(state, user, "devices.changed", json!({})).await
+}
+
+/// The notification type of a changed public profile (§2.7 (d), §5.2).
+pub const PROFILE_CHANGED: &str = "profile.changed";
+/// A `profile.changed` waits this long before its first attempt, so a burst of edits leaves as one message.
+pub const PROFILE_CHANGED_DELAY_SECS: i64 = 5;
+
+/// `profile.changed { profile_version }` (§5.2) after a change of a local user's public profile, with the version
+/// current now; a queued older one of the same user and target is replaced (at most one per user and target).
+/// Bots are announced with `app.changed` (APPLICATIONS.md §4.5), webhooks never federate.
+pub async fn profile_changed(state: &AppState, user: &UserRow) -> Result<(), ApiError> {
+    if user.domain != state.config.domain || user.kind != "user" {
+        return Ok(());
+    }
+    let targets = notification_domains(state, user).await?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let (version, ..) = store::federation::profile_info(&state.db, &user.id).await?;
+    for target in targets {
+        super::outbox::enqueue_coalesced(
+            state,
+            &target,
+            PROFILE_CHANGED,
+            &user.address(),
+            &target,
+            json!({ "profile_version": version }),
+            PROFILE_CHANGED_DELAY_SECS,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// `identity.changed` (§5.2) after an identity reset.

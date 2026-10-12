@@ -30,6 +30,12 @@ First public release of the node and its container image.
 
 ### Fixed
 
+- A changed avatar, header, display name, bio, linked accounts or DM setting now reaches the other nodes within
+  seconds: the home node sends `profile.changed` (FEDERATION.md §5.2) to the nodes the user signed in on and the home
+  nodes of friends and DM contacts, coalesced to one message per user and node, and those nodes refresh their copy
+  of the profile in the background (rate-limited per sender and user). Before, a DM hosted on another node kept
+  showing the old picture until the user's next federated login there, which could take days. No configuration
+  change is needed; nodes without this version keep refreshing as before.
 - A registration that fails (missing e-mail, captcha, password, username, date of birth, terms) no longer uses up
   the invite: the invite is redeemed in the transaction that creates the account.
 - Call rings are pushed also while the user has an open WebSocket (local calls and ring hints of other nodes): a

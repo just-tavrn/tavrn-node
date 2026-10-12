@@ -353,3 +353,97 @@ async fn the_profile_mirror_copies_images_bio_and_links() {
     assert_eq!(image(&b, &old).await.0, StatusCode::NOT_FOUND);
     let _ = A;
 }
+
+/// The `profile.changed` entries of a node's outbox: (target, payload).
+async fn profile_changes(node: &common::federation::FedNode) -> Vec<(String, Value)> {
+    node.outbox()
+        .await
+        .into_iter()
+        .filter(|e| e.kind == "profile.changed")
+        .map(|e| (e.target, serde_json::from_str::<Value>(&e.body).unwrap()["payload"].clone()))
+        .collect()
+}
+
+/// Waits (up to 10 s) until B's mirror of alice@a.test satisfies `done`.
+async fn mirror_until(b: &common::federation::FedNode, done: impl Fn(&Value) -> bool) -> Value {
+    let mut p = Value::Null;
+    for _ in 0..100 {
+        p = b.req(Method::GET, "/api/v1/users/alice@a.test/profile", None, None).await.1;
+        if done(&p) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(done(&p), "the mirror on B was not refreshed: {p}");
+    p
+}
+
+/// FEDERATION.md §2.7 (d), §5.2: a profile change on A reaches B's mirror through `profile.changed`, without a new
+/// federation token; a burst of edits leaves as one message with the latest version; the private background never
+/// leaves the node.
+#[tokio::test]
+async fn a_profile_change_reaches_the_mirror_without_a_new_token() {
+    let png = need!(still_png());
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    let bob = b.register("bob").await;
+    b.sign_in_from(&a, &alice).await;
+    let (_, p) = b.req(Method::GET, "/api/v1/users/alice@a.test/profile", None, None).await;
+    assert_eq!(p["avatar_sha256"], Value::Null);
+    assert!(profile_changes(&a).await.is_empty());
+
+    // A burst: avatar, name and bio within the coalescing window give one queued message per target.
+    let (st, r) = upload(&a, "/api/v1/users/me/avatar", &alice.token, png.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    a.patch("/api/v1/users/me", &alice.token, json!({ "display_name": "Alice Avatar" })).await;
+    a.patch("/api/v1/users/me", &alice.token, json!({ "bio": "New look" })).await;
+    let (_, home) = a.req(Method::GET, "/api/v1/users/alice/profile", None, None).await;
+    let changes = profile_changes(&a).await;
+    assert_eq!(changes, vec![("b.test".to_string(), json!({ "profile_version": home["profile_version"] }))]);
+    assert_eq!(a.deliver().await.delivered, 0, "held back a few seconds to coalesce the burst");
+
+    let mut rx = b.state.hub.subscribe();
+    assert_eq!(a.deliver_at(6).await.delivered, 1);
+    let p = mirror_until(&b, |p| p["avatar_sha256"] == home["avatar_sha256"]).await;
+    assert_eq!((p["display_name"].as_str(), p["bio"].as_str()), (Some("Alice Avatar"), Some("New look")));
+    assert_eq!(p["profile_version"], home["profile_version"]);
+    assert_ne!(p["avatar_still"], home["avatar_still"], "B serves its own copy");
+    let (st, _, _, bytes) = image(&b, p["avatar_still"].as_str().unwrap()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(tavrn_node::federation::tokens::body_sha256(&bytes), home["avatar_sha256"].as_str().unwrap());
+    let alice_on_b = p["id"].clone();
+    let mut announced = false;
+    for _ in 0..50 {
+        if std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| e.kind == "user.update" && e.data["user"]["id"] == alice_on_b)
+        {
+            announced = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(announced, "clients on B hear about the refreshed mirror");
+    let _ = bob;
+
+    // A second change: the old copy on B goes, the new one is served (still no new token).
+    let old = p["avatar_still"].as_str().unwrap().to_string();
+    a.delete("/api/v1/users/me/avatar", &alice.token).await;
+    assert_eq!(profile_changes(&a).await.len(), 1);
+    a.deliver_at(6).await;
+    mirror_until(&b, |p| p["avatar"].is_null()).await;
+    assert_eq!(image(&b, &old).await.0, StatusCode::NOT_FOUND);
+
+    // The DM setting is public too; the private background and unchanged names are not announced.
+    a.patch("/api/v1/users/me", &alice.token, json!({ "dm_policy": "everyone" })).await;
+    let (_, home) = a.req(Method::GET, "/api/v1/users/alice/profile", None, None).await;
+    assert_eq!(
+        profile_changes(&a).await,
+        vec![("b.test".to_string(), json!({ "profile_version": home["profile_version"] }))]
+    );
+    a.deliver_at(6).await;
+    mirror_until(&b, |p| p["dm_policy"] == "everyone").await;
+    let (st, _) = upload(&a, "/api/v1/users/me/background", &alice.token, png).await;
+    assert_eq!(st, StatusCode::OK);
+    a.patch("/api/v1/users/me", &alice.token, json!({ "hide_activity": true })).await;
+    assert!(profile_changes(&a).await.is_empty(), "no notification for private settings");
+}

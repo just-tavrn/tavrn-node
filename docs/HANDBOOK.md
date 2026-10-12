@@ -1021,6 +1021,15 @@ For operators: `TAVRN_DM_POLICY` is the upper bound of what users may allow (`fr
 `everyone`; default `everyone`). Presence is kept per node: clients push it to every node they use, nodes never
 forward it to each other.
 
+Profiles of users of other nodes are copies (mirrors) kept by this node, images included, so clients never load
+anything from other nodes. When a user changes the public profile (name, avatar, header, bio, linked accounts, DM
+setting; never the private voice background), the home node tells the nodes that mirror it (`profile.changed`,
+FEDERATION.md §5.2): the nodes the user signed in on and the home nodes of friends and DM contacts. The message
+leaves about 5 to 15 seconds after the first change, one per user and node however many edits follow, and the
+other node refreshes its copy in the background (at most 10 refreshes per user and 10 minutes; beyond that it
+answers `429` and the outbox retries). Nodes of older versions ignore the message and refresh on the user's next
+federated login there or after 24 hours. Nothing needs to be configured.
+
 ### Whiteboard
 
 Every conversation has a whiteboard: the 🖍 button in the header of a channel, DM or group DM opens it full screen

@@ -68,6 +68,19 @@ pub struct Envelope<'a> {
     pub payload: Value,
 }
 
+/// A new envelope: `(id, at, body, expires_at)`; `at` is the ULID time, so the receiver's staleness check and
+/// `at` agree.
+fn envelope(kind: &str, from: &str, to: &str, payload: Value) -> Result<(String, String, String, String), ApiError> {
+    let id = util::ulid();
+    let created: DateTime<Utc> =
+        ulid::Ulid::from_string(&id).map(|u| DateTime::<Utc>::from(u.datetime())).unwrap_or_else(|_| Utc::now());
+    let at = util::format_time(created);
+    let body = serde_json::to_string(&Envelope { id: &id, kind, from, to, at: &at, payload })
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let expires_at = util::format_time(created + chrono::Duration::seconds(lifetime_secs(kind)));
+    Ok((id, at, body, expires_at))
+}
+
 /// Queues a notification for `target`. Returns the message id.
 pub async fn enqueue(
     state: &AppState,
@@ -77,14 +90,7 @@ pub async fn enqueue(
     to: &str,
     payload: Value,
 ) -> Result<String, ApiError> {
-    let id = util::ulid();
-    // `at` is the ULID time, so the receiver's staleness check and `at` agree.
-    let created: DateTime<Utc> =
-        ulid::Ulid::from_string(&id).map(|u| DateTime::<Utc>::from(u.datetime())).unwrap_or_else(|_| Utc::now());
-    let at = util::format_time(created);
-    let body = serde_json::to_string(&Envelope { id: &id, kind, from, to, at: &at, payload })
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    let expires_at = util::format_time(created + chrono::Duration::seconds(lifetime_secs(kind)));
+    let (id, at, body, expires_at) = envelope(kind, from, to, payload)?;
     store::federation::enqueue(
         &state.db,
         store::federation::NewOutbox { id: &id, target, kind, body: &body, created_at: &at, expires_at: &expires_at },
@@ -92,6 +98,31 @@ pub async fn enqueue(
     .await?;
     tracing::debug!(target, kind, id, "federation notification queued");
     crate::cache::wake(state, crate::cache::Job::Outbox);
+    Ok(id)
+}
+
+/// Queues a notification that replaces the queued ones of the same `kind` from `from` to `target` (at most one
+/// stays) and leaves at the earliest `delay_secs` from now, so a burst of changes becomes one message carrying
+/// the latest state (`profile.changed`, FEDERATION.md §5.2). A replaced entry's due time is kept.
+pub async fn enqueue_coalesced(
+    state: &AppState,
+    target: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+    payload: Value,
+    delay_secs: i64,
+) -> Result<String, ApiError> {
+    let (id, at, body, expires_at) = envelope(kind, from, to, payload)?;
+    let next_at = util::format_time(Utc::now() + chrono::Duration::seconds(delay_secs));
+    let replaced = store::federation::enqueue_replacing(
+        &state.db,
+        store::federation::NewOutbox { id: &id, target, kind, body: &body, created_at: &at, expires_at: &expires_at },
+        from,
+        &next_at,
+    )
+    .await?;
+    tracing::debug!(target, kind, id, replaced, "federation notification queued (coalesced)");
     Ok(id)
 }
 

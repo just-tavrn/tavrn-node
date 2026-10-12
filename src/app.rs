@@ -160,6 +160,9 @@ pub struct AppState {
     /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
     /// FEDERATION.md §2.7): anonymous reads of a user whose home node fails cannot pile up refresh tasks.
     pub profile_refresh_limiter: Arc<RateLimiter>,
+    /// Mirror refreshes started by received `profile.changed` per sender and user (`<iss>|<user id>`, 10 per 10
+    /// minutes, FEDERATION.md §5.2); beyond it the inbox answers `429` and the sender retries later.
+    pub profile_changed_limiter: Arc<SharedLimiter>,
     /// Received `node.announce` per sending domain (`domain:<domain>`, 1 per 10 minutes, FEDERATION.md §7.2).
     pub directory_announce_limiter: Arc<RateLimiter>,
     /// Public directory reads per client IP (`dir-ip:<ip>`, 120 per minute).
@@ -380,6 +383,11 @@ impl AppState {
             notify_limiter: limiter(1, 60),
             keys_fetch_limiter: limiter(1, 60),
             profile_refresh_limiter: limiter(1, 60),
+            profile_changed_limiter: shared(
+                "fed-profile-changed",
+                crate::federation::profiles::CHANGED_PER_WINDOW,
+                crate::federation::profiles::CHANGED_WINDOW_SECS,
+            ),
             directory_announce_limiter: limiter(directory.0, 600),
             directory_limiter: limiter(directory.1, 60),
             outbox_wakeup: Arc::new(tokio::sync::Notify::new()),
