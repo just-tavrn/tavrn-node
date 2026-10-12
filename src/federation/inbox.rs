@@ -10,7 +10,7 @@
 //!
 //! Handlers run inline before the `202` (short database updates, plus a refetch of the sender's key view
 //! for key changes) and are idempotent through the dedupe. Implemented: `session.revoke`,
-//! `identity.changed`, `devices.changed` (here) and `room.invite`, `conversation.invite`, `friend.*`,
+//! `identity.changed`, `devices.changed`, `profile.changed` (here; the mirror refresh runs in the background) and `room.invite`, `conversation.invite`, `friend.*`,
 //! `notify`, `ban.notify` (`federation::social`) and `node.announce` (`federation::announce`); unknown types
 //! are accepted and ignored (forward compatibility).
 
@@ -95,7 +95,9 @@ pub fn rule(kind: &str) -> Option<(FromRule, ToRule)> {
     Some(match kind {
         "room.invite" | "conversation.invite" => (FromRule::AnyUser, ToRule::User),
         "friend.request" | "friend.accept" | "friend.remove" => (FromRule::UserOfSender, ToRule::User),
-        "identity.changed" | "devices.changed" | "session.revoke" => (FromRule::UserOfSender, ToRule::Node),
+        "identity.changed" | "devices.changed" | "session.revoke" | "profile.changed" => {
+            (FromRule::UserOfSender, ToRule::Node)
+        }
         "node.announce" => (FromRule::Sender, ToRule::Node),
         "ban.notify" | "notify" => (FromRule::Sender, ToRule::User),
         // Applications (APPLICATIONS.md §4.5): the room node tells the bot's home node; the home node tells
@@ -163,9 +165,19 @@ pub fn check_age(id: &str, now: DateTime<Utc>) -> Result<(), ApiError> {
 
 /// What a handled message does, parsed before the message is recorded as seen.
 enum Action {
-    Revoke { device: Option<String> },
-    IdentityChanged { key: String, reset_at: String },
+    Revoke {
+        device: Option<String>,
+    },
+    IdentityChanged {
+        key: String,
+        reset_at: String,
+    },
     DevicesChanged,
+    /// `profile.changed`: the remote user to refresh, `None` when the message changes nothing here.
+    ProfileChanged {
+        version: i64,
+        user: Option<Box<UserRow>>,
+    },
     Social(social::Incoming),
     App(crate::installations::Incoming),
     LegalNotice,
@@ -195,6 +207,14 @@ fn parse_action(kind: &str, iss: &str, payload: &Value) -> Result<Action, ApiErr
             })
         }
         "devices.changed" => Ok(Action::DevicesChanged),
+        super::remote::PROFILE_CHANGED => {
+            let version = payload
+                .get("profile_version")
+                .and_then(Value::as_i64)
+                .filter(|v| *v >= 0)
+                .ok_or_else(|| invalid("invalid payload.profile_version"))?;
+            Ok(Action::ProfileChanged { version, user: None })
+        }
         crate::legal::notices::KIND => Ok(Action::LegalNotice),
         crate::legal::account::KIND => Ok(Action::UserDeleted),
         _ => {
@@ -292,9 +312,13 @@ async fn process(state: &AppState, iss: &str, envelope: &Envelope) -> Result<&'s
     if envelope.kind == super::announce::KIND {
         return super::announce::receive(state, iss, &envelope.id, &envelope.payload).await;
     }
-    let action = parse_action(&envelope.kind, iss, &envelope.payload)?;
+    let mut action = parse_action(&envelope.kind, iss, &envelope.payload)?;
     if let Action::LegalNotice = action {
         crate::legal::notices::admit_inbound(state, iss).await?;
+    }
+    // The rate limit of `profile.changed` answers before the message counts as seen, so the retry is not a duplicate.
+    if let Action::ProfileChanged { version, user } = &mut action {
+        *user = super::profiles::admit_changed(state, iss, &envelope.from, *version).await?.map(Box::new);
     }
     if !store::federation::mark_seen(&state.db, iss, &envelope.id, &envelope.kind).await? {
         return Ok("duplicate");
@@ -330,6 +354,11 @@ async fn handle(
     if let Action::LegalNotice = action {
         return crate::legal::notices::receive(state, iss, &envelope.payload).await;
     }
+    if let Action::ProfileChanged { version, user } = action {
+        let Some(user) = user else { return Ok("ignored") };
+        super::profiles::spawn_changed_refresh(state, *user, version);
+        return Ok("handled");
+    }
     let action = match action {
         Action::App(incoming) => {
             return match &recipient {
@@ -356,7 +385,10 @@ async fn handle(
         None => None,
     };
     match (action, sender_user) {
-        (Action::Ignore | Action::Social(_) | Action::App(_) | Action::LegalNotice, _) => Ok("stored"),
+        (
+            Action::Ignore | Action::Social(_) | Action::App(_) | Action::LegalNotice | Action::ProfileChanged { .. },
+            _,
+        ) => Ok("stored"),
         (_, None) => Ok("no_local_state"),
         (Action::Revoke { device }, Some(user)) => {
             revoke(state, &user, device.as_deref()).await?;
@@ -479,7 +511,7 @@ mod tests {
                 "federation.type_forbidden"
             );
         }
-        for kind in ["identity.changed", "devices.changed", "session.revoke"] {
+        for kind in ["identity.changed", "devices.changed", "session.revoke", "profile.changed"] {
             assert_eq!(ok(kind, "alice@a.example", "b.example"), node);
             assert_eq!(
                 code(check_authority(OWN, ISS, kind, "alice@c.example", "b.example")),
@@ -598,6 +630,18 @@ mod tests {
             .is_err()
         );
         assert!(matches!(parse_action("devices.changed", ISS, &json!({})), Ok(Action::DevicesChanged)));
+        assert!(matches!(
+            parse_action("profile.changed", ISS, &json!({ "profile_version": 7 })),
+            Ok(Action::ProfileChanged { version: 7, user: None })
+        ));
+        for bad in [
+            json!({}),
+            json!({ "profile_version": -1 }),
+            json!({ "profile_version": "7" }),
+            json!({ "profile_version": 1.5 }),
+        ] {
+            assert!(parse_action("profile.changed", ISS, &bad).is_err(), "{bad}");
+        }
         assert!(parse_action("friend.request", ISS, &json!({ "request_id": "x" })).is_err(), "request ids are ULIDs");
         assert!(matches!(
             parse_action("friend.request", ISS, &json!({ "request_id": util::ulid() })),

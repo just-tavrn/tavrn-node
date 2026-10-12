@@ -76,7 +76,14 @@ pub struct RemoteConfig {
     /// Key prefix (`a/b/`), ends with `/` unless empty.
     #[serde(default)]
     pub prefix: String,
+    /// The channel's limit on this store in bytes, set by its managers (`0` = unlimited, FILES.md §5). The node quota
+    /// `files_channels.max_bytes` never applies to external stores.
+    #[serde(default)]
+    pub max_bytes: u64,
 }
+
+/// Largest per-channel limit of an external store (1 PiB, like the entitlement keys).
+pub const MAX_STORE_BYTES: u64 = 1 << 50;
 
 /// Why an external store refused or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +194,9 @@ pub fn validate(kind: Kind, mut c: RemoteConfig, allow_private: bool) -> Result<
     if !valid_prefix(&c.prefix) {
         return Err(RemoteError::Invalid("prefix"));
     }
+    if c.max_bytes > MAX_STORE_BYTES {
+        return Err(RemoteError::Invalid("max_bytes"));
+    }
     let short = |s: &str, max: usize| s.len() <= max && !s.chars().any(char::is_control);
     match kind {
         Kind::Internal => return Err(RemoteError::Invalid("kind")),
@@ -251,6 +261,11 @@ impl RemoteStore {
 
     pub fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// The store's configuration (with the channel's limit).
+    pub fn config(&self) -> &RemoteConfig {
+        &self.config
     }
 
     /// The URL of an object (key without prefix) or, for `""`, of the prefix collection.
@@ -492,6 +507,21 @@ mod tests {
         );
         assert_ne!(location(Kind::S3, &c), location(Kind::S3, &RemoteConfig { bucket: "other".into(), ..c.clone() }));
         assert_eq!(location(Kind::S3, &c), location(Kind::S3, &RemoteConfig { secret_key: "new".into(), ..c.clone() }));
+        assert_eq!(
+            location(Kind::S3, &c),
+            location(Kind::S3, &RemoteConfig { max_bytes: 10, ..c.clone() }),
+            "the limit is no move of the store"
+        );
+        assert_eq!(
+            validate(Kind::S3, RemoteConfig { max_bytes: MAX_STORE_BYTES + 1, ..cfg("https://s3.example") }, false),
+            Err(RemoteError::Invalid("max_bytes"))
+        );
+        assert_eq!(
+            validate(Kind::S3, RemoteConfig { max_bytes: MAX_STORE_BYTES, ..cfg("https://s3.example") }, false)
+                .unwrap()
+                .max_bytes,
+            MAX_STORE_BYTES
+        );
     }
 
     #[tokio::test]

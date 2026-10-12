@@ -1146,6 +1146,67 @@ async fn inbox_policy_and_rate_limit() {
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("federation.peer_blocked")));
 }
 
+/// `profile.changed` (§2.7 (d), §5.2): only for users B knows and only for a newer version; limited per sender and
+/// user with `429` before the message counts as received.
+#[tokio::test]
+async fn profile_changed_is_ignored_for_old_versions_and_unknown_users() {
+    let (a, b) = two_nodes().await;
+    let alice = a.register("alice").await;
+    a.patch("/api/v1/users/me", &alice.token, json!({ "display_name": "Alice" })).await;
+    b.sign_in_from(&a, &alice).await;
+    let name = || sql_text(&b, "SELECT display_name FROM users WHERE username = $1 AND domain = 'a.test'", "alice");
+    let stored = sqlx::query_scalar::<_, i64>(
+        "SELECT r.profile_version FROM remote_users r JOIN users u ON u.id = r.user_id WHERE u.username = 'alice'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let changed = |from: &str, version: Value| {
+        envelope(&util::ulid(), "profile.changed", from, B, json!({ "profile_version": version }))
+    };
+
+    // A user B does not know: accepted, no stub is created.
+    assert_eq!(deliver_signed(&a, &b, &changed("zoe@a.test", json!(5))).await.0, StatusCode::ACCEPTED);
+    assert_eq!(sql_text(&b, "SELECT id FROM users WHERE username = $1", "zoe").await, None);
+
+    // The same or an older version: ignored, the mirror is not fetched again.
+    sql_exec(&a, "UPDATE users SET display_name = 'Sneaky' WHERE id = $1", &[&alice.user_id]).await;
+    for v in [stored, stored - 1] {
+        assert_eq!(deliver_signed(&a, &b, &changed("alice@a.test", json!(v))).await.0, StatusCode::ACCEPTED);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(name().await.as_deref(), Some("Alice"));
+
+    // A newer version refreshes in the background, without a new federation token.
+    assert_eq!(deliver_signed(&a, &b, &changed("alice@a.test", json!(stored + 1))).await.0, StatusCode::ACCEPTED);
+    for _ in 0..100 {
+        if name().await.as_deref() == Some("Sneaky") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(name().await.as_deref(), Some("Sneaky"));
+
+    // Malformed payloads are refused.
+    let (s, j) = deliver_signed(&a, &b, &changed("alice@a.test", json!("7"))).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("federation.envelope_invalid")));
+
+    // Limited per sender and user: the first refresh above counted, nine more pass, then 429 and the message
+    // is not recorded as seen (the sender's retry is not a duplicate).
+    for _ in 0..9 {
+        assert_eq!(deliver_signed(&a, &b, &changed("alice@a.test", json!(1000))).await.0, StatusCode::ACCEPTED);
+    }
+    let id = util::ulid();
+    let limited = envelope(&id, "profile.changed", "alice@a.test", B, json!({ "profile_version": 1000 }));
+    let (s, j) = deliver_signed(&a, &b, &limited).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")), "{j}");
+    assert_eq!(sql_text(&b, "SELECT id FROM federation_inbox_seen WHERE id = $1", &id).await, None);
+
+    // A user of another domain is a spoofing attempt (last: it counts towards blocking A, §9.4).
+    let (s, j) = deliver_signed(&a, &b, &changed("carol@c.test", json!(7))).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("federation.type_forbidden")));
+}
+
 // ---------------------------------------------------------------- outbox
 
 async fn change_password(a: &FedNode, s: &common::Session, new: &str) {

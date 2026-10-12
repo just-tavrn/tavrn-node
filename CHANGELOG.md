@@ -27,9 +27,23 @@ First public release of the node and its container image.
 - **Container image for `linux/amd64` and `linux/arm64`**: one manifest list per tag (`edge` and the releases), so
   the node runs natively on ARM servers; the arm64 image is cross-compiled on the amd64 build host, and a plain
   `docker build` still builds for the host's own architecture.
+- **Files channels on external stores only** (`TAVRN_FILES_INTERNAL=off`, protocol FILES.md §5): the node keeps no
+  files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
+  (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
+  chosen. `GET /node` and the discovery document carry `files_internal`.
+- **The files channel quota covers the node's own storage only** (protocol FILES.md §4, §5):
+  `TAVRN_FILES_CHANNELS_MAX_BYTES` (`files_channels.max_bytes`) no longer limits channels on external WebDAV/S3
+  stores. Their managers can set an optional limit per store in the channel's storage settings (`max_bytes` of
+  `PUT …/files/backend`, `0` = unlimited), enforced with `413 files.quota_exceeded` and shown as the channel's limit.
 
 ### Fixed
 
+- A changed avatar, header, display name, bio, linked accounts or DM setting now reaches the other nodes within
+  seconds: the home node sends `profile.changed` (FEDERATION.md §5.2) to the nodes the user signed in on and the home
+  nodes of friends and DM contacts, coalesced to one message per user and node, and those nodes refresh their copy
+  of the profile in the background (rate-limited per sender and user). Before, a DM hosted on another node kept
+  showing the old picture until the user's next federated login there, which could take days. No configuration
+  change is needed; nodes without this version keep refreshing as before.
 - A registration that fails (missing e-mail, captcha, password, username, date of birth, terms) no longer uses up
   the invite: the invite is redeemed in the transaction that creates the account.
 - Call rings are pushed also while the user has an open WebSocket (local calls and ring hints of other nodes): a

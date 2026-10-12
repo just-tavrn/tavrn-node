@@ -8,8 +8,8 @@ use std::{sync::Arc, time::Duration};
 
 use axum::http::{Method, StatusCode};
 use common::{
-    TestNode, now_secs, password, test_node, totp_code,
-    webauthn::{Authenticator, user_handle},
+    TestNode, now_secs, password, test_node, test_node_with, totp_code,
+    webauthn::{APP_ORIGIN, Authenticator, ORIGIN, user_handle},
 };
 use serde_json::{Value, json};
 use tavrn_node::cache::limiter::SharedLimiter;
@@ -748,4 +748,66 @@ async fn node_admin_resets_a_locked_out_users_second_factor() {
     let entry = log.as_array().unwrap().iter().find(|e| e["action"] == "admin.second_factor_reset").unwrap();
     assert_eq!(entry["meta"]["admin_id"], admin.user_id.as_str(), "{entry}");
     drop(carol);
+}
+
+/// `webauthn.origins` of `GET /node` and of the discovery document.
+async fn published_origins(node: &TestNode) -> (Value, Value) {
+    let (s, info) = node.req(Method::GET, "/api/v1/node", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{info}");
+    let (s, doc) = node.req(Method::GET, "/.well-known/tavrn", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{doc}");
+    (info["webauthn"]["origins"].clone(), doc["webauthn"]["origins"].clone())
+}
+
+#[tokio::test]
+async fn passkeys_of_an_app_origin_count_only_where_the_node_accepts_it() {
+    // Without TAVRN_WEBAUTHN_APP_ORIGINS the node accepts and publishes its web origin only.
+    let node = test_node("t.local").await;
+    assert_eq!(published_origins(&node).await, (json!([ORIGIN]), json!([ORIGIN])));
+    let alice = node.register("alice").await;
+    let mut app = Authenticator::with_origin(APP_ORIGIN);
+    let (s, j) = node.try_add_passkey(&alice.token, &mut app, "Phone", |_| {}).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("webauthn.registration_failed")), "{j}");
+    // A passkey registered in the browser cannot be asserted from the app either.
+    let mut key = Authenticator::new();
+    let cred = node.add_passkey(&alice.token, &mut key, "Laptop").await;
+    key.use_origin(APP_ORIGIN);
+    let pre = preauth(&node.login_preauth("alice", &password("alice")).await);
+    let (s, j) = node.passkey_second_factor(&pre, &mut key).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.second_factor_invalid")), "{j}");
+    let start = discoverable_start(&node).await;
+    let cred_id = cred["credential"]["id"].as_str().unwrap();
+    let a = key.authenticate_discoverable(&start["options"], cred_id, Some(&user_handle(&alice.user_id)), true);
+    let (s, j) = discoverable_finish(&node, start, a).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{j}");
+
+    // With the app's origin configured: published after the web origin, and accepted for every ceremony.
+    let node = test_node_with("t.local", |c| c.webauthn_app_origins = APP_ORIGIN.into()).await;
+    assert_eq!(published_origins(&node).await, (json!([ORIGIN, APP_ORIGIN]), json!([ORIGIN, APP_ORIGIN])));
+    let bob = node.register("bob").await;
+    let mut phone = Authenticator::with_origin(APP_ORIGIN);
+    let cred = node.add_passkey(&bob.token, &mut phone, "Phone").await;
+    let cred_id = cred["credential"]["id"].as_str().unwrap().to_string();
+    // Second factor and passkey-only login in the app.
+    let pre = preauth(&node.login_preauth("bob", &password("bob")).await);
+    let (s, j) = node.passkey_second_factor(&pre, &mut phone).await;
+    assert_eq!((s, j["status"].as_str()), (StatusCode::OK, Some("ok")), "{j}");
+    let start = discoverable_start(&node).await;
+    let a = phone.authenticate_discoverable(&start["options"], &cred_id, Some(&user_handle(&bob.user_id)), true);
+    let (s, j) = discoverable_finish(&node, start, a).await;
+    assert_eq!((s, j["status"].as_str()), (StatusCode::OK, Some("ok")), "{j}");
+    // The relying party id stays the identity domain: the same passkey works in the browser.
+    phone.use_origin(ORIGIN);
+    let pre = preauth(&node.login_preauth("bob", &password("bob")).await);
+    let (s, j) = node.passkey_second_factor(&pre, &mut phone).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    // Another app (another signing key) is still refused.
+    let other = "android:apk-key-hash:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
+    phone.use_origin(other);
+    let pre = preauth(&node.login_preauth("bob", &password("bob")).await);
+    let (s, j) = node.passkey_second_factor(&pre, &mut phone).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.second_factor_invalid")), "{j}");
+    let mut stranger = Authenticator::with_origin(other);
+    let (s, j) = node.try_add_passkey(&bob.token, &mut stranger, "Other app", |_| {}).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("webauthn.registration_failed")), "{j}");
 }

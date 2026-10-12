@@ -5,11 +5,16 @@
 //! `allowCredentials` and returns no user handle. For the discoverable (passkey-only) login the
 //! helper therefore names the credential itself and attaches the user handle afterwards, exactly
 //! what a browser returns for a resident credential (the user handle is not signed).
+//!
+//! The helper calls the authenticator directly with the caller's origin, as a browser or Android's Credential
+//! Manager does after its own relying party checks: so the same key also plays an app whose origin is opaque
+//! (`android:apk-key-hash:…`, PROTOCOL.md §5a.4), which a browser emulation would refuse before the node sees it.
 
 use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
 use webauthn_authenticator_rs::{
-    prelude::{CreationChallengeResponse, RequestChallengeResponse, Url, WebauthnAuthenticator},
+    AuthenticatorBackend,
+    prelude::{CreationChallengeResponse, RequestChallengeResponse, Url},
     softpasskey::SoftPasskey,
 };
 
@@ -18,8 +23,15 @@ use super::TestNode;
 /// Origin of the test node's relying party (`TAVRN_WEBAUTHN_ORIGIN` of the test config).
 pub const ORIGIN: &str = "https://t.local";
 
+/// The origin of an Android app (PROTOCOL.md §5a.4) for the tests: `android:apk-key-hash:` and a (fake) SHA-256 in
+/// base64url, 32 zero bytes.
+pub const APP_ORIGIN: &str = "android:apk-key-hash:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// Timeout the "browser" grants the authenticator (the node asks for more; browsers cap it too).
+const TIMEOUT_MS: u32 = 60_000;
+
 pub struct Authenticator {
-    inner: WebauthnAuthenticator<SoftPasskey>,
+    inner: SoftPasskey,
     origin: Url,
 }
 
@@ -31,19 +43,26 @@ impl Authenticator {
 
     /// The same, but the "browser" runs on another origin (phishing site).
     pub fn with_origin(origin: &str) -> Self {
-        Self { inner: WebauthnAuthenticator::new(SoftPasskey::new(true)), origin: Url::parse(origin).unwrap() }
+        Self { inner: SoftPasskey::new(true), origin: Url::parse(origin).unwrap() }
+    }
+
+    /// The same key, used from now on under `origin` (a passkey made in the app, then used in the browser).
+    pub fn use_origin(&mut self, origin: &str) {
+        self.origin = Url::parse(origin).unwrap();
     }
 
     /// `navigator.credentials.create()` with the node's `options`; returns the credential JSON.
     pub fn register(&mut self, options: &Value) -> Value {
         let options: CreationChallengeResponse = serde_json::from_value(options.clone()).unwrap();
-        serde_json::to_value(self.inner.do_registration(self.origin.clone(), options).unwrap()).unwrap()
+        let credential = self.inner.perform_register(self.origin.clone(), options.public_key, TIMEOUT_MS).unwrap();
+        serde_json::to_value(credential).unwrap()
     }
 
     /// `navigator.credentials.get()` with the node's `options`; returns the assertion JSON.
     pub fn authenticate(&mut self, options: &Value) -> Value {
         let options: RequestChallengeResponse = serde_json::from_value(options.clone()).unwrap();
-        serde_json::to_value(self.inner.do_authentication(self.origin.clone(), options).unwrap()).unwrap()
+        let assertion = self.inner.perform_auth(self.origin.clone(), options.public_key, TIMEOUT_MS).unwrap();
+        serde_json::to_value(assertion).unwrap()
     }
 
     /// Assertion for a discoverable login: the authenticator picks `credential_id` and returns

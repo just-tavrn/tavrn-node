@@ -886,6 +886,51 @@ pub async fn enqueue(db: &Pool, e: NewOutbox<'_>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Queues `e` in place of the entries of the same target and type that `from` sent and that are still queued
+/// (coalescing, FEDERATION.md §5.2 `profile.changed`): at most one such entry stays. The new entry is due at the
+/// earliest `next_at` of the replaced ones (a waiting or backed-off target keeps its schedule), else at `next_at`.
+/// Returns the number of replaced entries. An entry that is being delivered while it is replaced may still
+/// arrive; its successor follows with the newer content.
+pub async fn enqueue_replacing(db: &Pool, e: NewOutbox<'_>, from: &str, next_at: &str) -> Result<u64, ApiError> {
+    let mut tx = db.begin().await?;
+    let queued: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, body, next_at FROM federation_outbox WHERE target = $1 AND type = $2")
+            .bind(e.target)
+            .bind(e.kind)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut due = next_at.to_string();
+    let mut replaced = 0;
+    for (id, body, at) in queued {
+        let sender = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|b| b.get("from").and_then(|f| f.as_str()).map(String::from));
+        if sender.as_deref() != Some(from) {
+            continue;
+        }
+        sqlx::query("DELETE FROM federation_outbox WHERE id = $1").bind(&id).execute(&mut *tx).await?;
+        replaced += 1;
+        if at < due {
+            due = at;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO federation_outbox (id, target, type, body, attempts, next_at, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
+    )
+    .bind(e.id)
+    .bind(e.target)
+    .bind(e.kind)
+    .bind(e.body)
+    .bind(&due)
+    .bind(e.created_at)
+    .bind(e.expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(replaced)
+}
+
 /// Entries due at `now`, oldest first.
 pub async fn due(db: &Pool, now: &str, limit: i64) -> Result<Vec<OutboxRow>, ApiError> {
     Ok(sqlx::query_as(&format!(

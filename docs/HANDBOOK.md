@@ -165,6 +165,7 @@ and sessions work and the minimum age.
 | `TAVRN_CAPTCHA_LOGIN` | `false` | Require the captcha at login (only with a provider). |
 | `TAVRN_WEBAUTHN_ORIGIN` | the public URL | Origin of the web client for passkeys. Override only for development and tests (e.g. `http://localhost:5173`). |
 | `TAVRN_WEBAUTHN_RP_ID` | `TAVRN_DOMAIN` | Relying party id of passkeys; must be the host of the origin or a parent domain of it, otherwise the node refuses to start. Changing it later invalidates every registered passkey ([Passkeys](#passkeys)). |
+| `TAVRN_WEBAUTHN_APP_ORIGINS` | empty | WebAuthn origins of your own apps besides the web origin, comma-separated: `android:apk-key-hash:<base64url SHA-256 of the signing certificate>` per Android signing key. Lets the Android app use passkeys in the app ([Passkeys in the apps](#passkeys-in-the-apps)); published as `webauthn.origins`. Invalid entries stop the start. |
 | `TAVRN_SESSION_ACCESS_MINUTES` | `60` | Access token lifetime (5–1440). A revocation (logout, password change or reset, device removal, an admin disabling the account or resetting its second factor, a node ban, account deletion) ends the access tokens and WebSockets of the affected devices at once (`401 auth.session_revoked`, close code 4001), and their voice and call connections; the node checks the session behind a token at most every 5 seconds per device and instance. |
 | `TAVRN_SESSION_REFRESH_DAYS` | `90` | Sliding refresh token lifetime (1–3650); every refresh extends it. SSO sessions keep `TAVRN_OIDC_SESSION_DAYS` as their hard end, federated sessions their 7 days. |
 | `TAVRN_RATE_USER_PER_MINUTE` | `1200` (`0` in development mode) | API requests per user and minute over every authenticated route and WebSocket connect (`429` with `Retry-After` beyond); `0` switches the general limit off. Route limits (login, uploads, messages, …) apply on top. |
@@ -331,8 +332,9 @@ marked "entitlement" above are the node defaults; node admins extend them per us
 | `TAVRN_SOUNDS_MAX_PERSONAL` | `10` | `sounds.max_personal`, personal soundboard clips (0–100000). |
 | `TAVRN_ATTACHMENT_RETENTION_DAYS` | `0` | `attachments.retention_days`: attachments of channels and DMs are deleted this many days after the upload by the hourly housekeeping; messages keep listing them as "file expired". Pinned messages keep their files. Rooms may only shorten it. 0–36500, `0` = keep forever. |
 | `TAVRN_FILES_CHANNELS` | `on` | `files_channels.enabled`: files channels may be created (`on`/`off`). |
-| `TAVRN_FILES_CHANNELS_MAX_BYTES` | `0` | `files_channels.max_bytes`, storage per files channel. |
+| `TAVRN_FILES_CHANNELS_MAX_BYTES` | `0` | `files_channels.max_bytes`, storage per files channel on the node's own storage (never external stores, which have their own limit in the channel's storage settings). |
 | `TAVRN_FILES_EXTERNAL` | `off` | Files channels on external WebDAV/S3 stores (protocol: FILES.md §5). |
+| `TAVRN_FILES_INTERNAL` | `on` | `off`: files channels on external stores only; the node keeps no files of files channels (needs `TAVRN_FILES_EXTERNAL=on`, see [Files channels on external stores](#files-channels-on-external-stores)). |
 | `TAVRN_FILES_EXTERNAL_PRIVATE` | `off` | `on` also allows external stores on private, loopback or link-local addresses and plain `http` (stores in the LAN); this disables the SSRF protection for them. |
 
 ### Media, previews and search
@@ -709,6 +711,38 @@ relying party id later invalidates all registered passkeys (users sign in with T
 register them again). The node publishes the id as `webauthn.rp_id` (`GET /api/v1/node`, `/.well-known/tavrn`), so
 clients use it for the assertions they build themselves (unlocking the secret storage with a passkey).
 
+#### Passkeys in the apps
+
+A browser puts the page's origin (the public URL) into every passkey ceremony. The Android app (Android 14 and
+newer) runs passkeys through Android's Credential Manager, which puts the **app's** origin there instead:
+`android:apk-key-hash:<hash>`, the base64url (no padding) of the SHA-256 of the certificate the APK is signed with. The node refuses those ceremonies unless the origin is in
+`TAVRN_WEBAUTHN_APP_ORIGINS`; the app then signs in through the browser (as before) and says that the node does not
+accept the app's passkeys yet. With the origin configured, registering a passkey, signing in with it and
+unlocking the encrypted messages with it work inside the app. The relying party id does not change, so a passkey
+made in the app also works in the browser and the other way round.
+
+The node publishes every accepted origin as `webauthn.origins` (`GET /api/v1/node`, `/.well-known/tavrn`), the web
+origin first; the app compares its own origin with that list. `check-config` prints the setting, and the node
+refuses to start with an entry that is not `android:apk-key-hash:` and 43 base64url characters.
+
+Deriving the value from the certificate's SHA-256 fingerprint (hex, with or without colons, as `keytool -list -v`,
+`apksigner verify --print-certs` or the release workflow's `ANDROID_CERT_SHA256` print it):
+
+```sh
+fp='<the SHA-256 fingerprint, 64 hex digits, e.g. AB:CD:…>'
+printf '%s' "$fp" | tr -d ': ' | xxd -r -p | base64 -w0 | tr '+/' '-_' | tr -d '='; echo
+# prints 43 characters → TAVRN_WEBAUTHN_APP_ORIGINS=android:apk-key-hash:<those 43 characters>
+```
+
+Android also requires the relying party's domain to vouch for the app: `https://<relying party id>/.well-known/
+assetlinks.json` must list the app's package with `delegate_permission/common.get_login_creds` and the **same**
+fingerprint (there in the colon-separated hex form). Every signing key is its own origin: list the release key, and
+add a debug or a store's re-signing key only where such builds should use passkeys. Removing an origin later only
+stops new ceremonies from that app; registered passkeys keep working in the browser.
+
+The desktop apps need no entry: they run passkeys through the operating system (Windows) with the node's web
+origin, or through the browser.
+
 Everything else that builds absolute URLs (mail links, invite and application add links, the OIDC redirect URI
 `<public URL>/api/v1/auth/oidc/callback`, the LiveKit signaling URL, `turn.<public host>`) uses the public URL.
 
@@ -887,7 +921,8 @@ Upload size, types, the executable rule, per-room quotas and attachment retentio
 [Rooms, uploads and storage](#rooms-uploads-and-storage) and [Entitlement defaults](#entitlement-defaults). The
 hourly housekeeping deletes expired attachments (messages keep listing them as "file expired"; pinned messages keep
 theirs), orphaned files and cached copies of other nodes' emojis and clips (`TAVRN_MEDIA_CACHE_UNUSED_DAYS`).
-Files channels have their own quota (`TAVRN_FILES_CHANNELS_MAX_BYTES` per channel); they do not count towards the
+Files channels on the node's storage have their own quota (`TAVRN_FILES_CHANNELS_MAX_BYTES` per channel; channels on
+an external store are never limited by it, see below); they do not count towards the
 room's attachment quota and are exempt from attachment and message retention. They can use external WebDAV/S3
 stores only with `TAVRN_FILES_EXTERNAL=on` ([Files channels on external stores](#files-channels-on-external-stores)).
 
@@ -948,6 +983,28 @@ node proxies uploads and downloads as streams and keeps the folder tree in its d
   (below) pauses.
 - A channel can move to another store only while it is empty; credentials and `encrypt_files` can change at any
   time. Backend changes and connection tests are limited to 20 per user and 10 minutes.
+- **Limits**: `TAVRN_FILES_CHANNELS_MAX_BYTES` (and plans and grants of `files_channels.max_bytes`) covers only the
+  node's own storage; it never limits a channel on an external store, since the node does not keep those bytes.
+  Such a channel has its own optional limit, "Limit on the store" in its storage settings (`max_bytes`, empty or 0 =
+  unlimited), set by whoever may configure the store; the node enforces it on the uploads it relays
+  (`413 files.quota_exceeded`) and the clients show it as the channel's limit.
+
+**External stores only.** `TAVRN_FILES_INTERNAL=off` (default `on`; needs `TAVRN_FILES_EXTERNAL=on`, otherwise
+the node does not start and `check-config` names the problem) keeps the files of files channels off the node: large
+shared folders live on the members' own WebDAV or S3 stores, attachments in chats stay on the node as before.
+
+- A new files channel is created without a store. Until its managers choose a WebDAV or S3 store in the channel
+  settings ("Storage"), uploads and new folders answer `403 files.internal_disabled`; the clients show "choose a
+  store first" instead of the upload button. The node's own storage cannot be chosen (`403
+  files.internal_disabled`).
+- Clients see the policy before the first upload: `files_internal: false` in `GET /api/v1/node` and
+  `policies.files_internal` in the discovery document.
+- **The quota**: `TAVRN_FILES_CHANNELS_MAX_BYTES` does not limit the external stores (see "Limits" above), so it
+  can stay as it is for the channels that still keep files on the node.
+- **Switching an existing node**: channels that already keep files on the node keep them (listing, downloads,
+  renames, moves and deletes work), but take no new uploads; once such a channel is empty its managers can move it
+  to an external store. Thumbnails of encrypted channels (at most 1 MiB each) stay on the node, as for every
+  external channel.
 
 Deleting a files channel or a room deletes the files in the node's storage at once. Objects on an external store are
 deleted in the background with the credentials stored for the channel; when the store is unreachable they wait in a
@@ -987,6 +1044,15 @@ message. The "+" in the room list also joins rooms from an invite link or code.
 For operators: `TAVRN_DM_POLICY` is the upper bound of what users may allow (`friends`, `everyone_shared`,
 `everyone`; default `everyone`). Presence is kept per node: clients push it to every node they use, nodes never
 forward it to each other.
+
+Profiles of users of other nodes are copies (mirrors) kept by this node, images included, so clients never load
+anything from other nodes. When a user changes the public profile (name, avatar, header, bio, linked accounts, DM
+setting; never the private voice background), the home node tells the nodes that mirror it (`profile.changed`,
+FEDERATION.md §5.2): the nodes the user signed in on and the home nodes of friends and DM contacts. The message
+leaves about 5 to 15 seconds after the first change, one per user and node however many edits follow, and the
+other node refreshes its copy in the background (at most 10 refreshes per user and 10 minutes; beyond that it
+answers `429` and the outbox retries). Nodes of older versions ignore the message and refresh on the user's next
+federated login there or after 24 hours. Nothing needs to be configured.
 
 ### Whiteboard
 
@@ -2162,6 +2228,7 @@ These are the problems operators run into most often, each with its cause and fi
 | The node refuses to start because of `storage.key` | The file is missing or does not belong to this database. Restore `keys/` from the same backup as the database; never let the node create a new one ([Keys and backups](#keys-and-backups)). |
 | `database migration failed (schema newer than the binary? …)` | An older image against a newer database: start the newer image again, or restore the backup taken before the upgrade ([Upgrade and rollback](#upgrade-and-rollback)). |
 | The node refuses to start because of `TAVRN_WEBAUTHN_RP_ID` | The public URL's host is not covered by the relying party id; see [Passkeys](#passkeys). |
+| The Android app says "This node does not accept the app's passkeys yet" | `TAVRN_WEBAUTHN_APP_ORIGINS` lacks the app's origin (the hash of the key the installed APK is signed with), or `assetlinks.json` of the relying party id does not list that key; see [Passkeys in the apps](#passkeys-in-the-apps). |
 | Rate limits or bans hit everybody at once | The proxy's address is not in `TAVRN_TRUSTED_PROXIES`, so every request seems to come from the proxy. Add it. |
 | Uploads fail with `413` | The proxy's body limit is below `TAVRN_UPLOAD_MAX_BYTES` (nginx `client_max_body_size`, Caddy `request_body max_size`). |
 | The web client loads but never connects or keeps reconnecting | WebSockets are not passed through (`Upgrade`/`Connection` headers, "Websockets Support" in NPM) or the proxy's read timeout is short. |

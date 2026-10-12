@@ -314,6 +314,46 @@ fn external_disabled() -> ApiError {
     }
 }
 
+fn internal_disabled() -> ApiError {
+    ApiError::Forbidden {
+        code: "files.internal_disabled",
+        detail: "This node keeps no files of files channels: choose an external store first (TAVRN_FILES_INTERNAL)"
+            .into(),
+    }
+}
+
+/// The kind of the channel's store as clients see it: `internal`, `webdav`, `s3`, or `none` on a node without
+/// internal storage (`TAVRN_FILES_INTERNAL=off`) while the channel has no external store (FILES.md §5).
+fn backend_kind(state: &AppState, row: Option<&store::files::BackendRow>) -> String {
+    match row.filter(|r| r.kind != "internal") {
+        Some(r) => r.kind.clone(),
+        None if !state.config.files_internal.on() => "none".into(),
+        None => "internal".into(),
+    }
+}
+
+/// New entries (uploads, folders) need a store: on a node without internal storage, an external one.
+async fn require_store(state: &AppState, channel_id: &str) -> Result<(), ApiError> {
+    if state.config.files_internal.on() {
+        return Ok(());
+    }
+    match store::files::backend(&state.db, channel_id).await? {
+        Some(row) if row.kind != "internal" => Ok(()),
+        _ => Err(internal_disabled()),
+    }
+}
+
+/// The channel's limit in bytes (`None` = unlimited, FILES.md §4/§5): an external store's own `max_bytes`, set by the
+/// channel's managers; the node quota `files_channels.max_bytes` (entitlements) only for the node's own storage.
+fn channel_quota(ent: &Entitlements, storage: &Storage) -> Option<i64> {
+    match storage {
+        Storage::Remote { store, .. } => {
+            Some(i64::try_from(store.config().max_bytes).unwrap_or(i64::MAX)).filter(|q| *q > 0)
+        }
+        Storage::Internal => ent.limit(entitlements::FILES_CHANNELS_MAX_BYTES),
+    }
+}
+
 /// The channel's storage (no backend row: internal). External stores need `TAVRN_FILES_EXTERNAL=on`.
 pub async fn storage_of(state: &AppState, channel_id: &str) -> Result<Storage, ApiError> {
     let Some(row) = store::files::backend(&state.db, channel_id).await? else { return Ok(Storage::Internal) };
@@ -670,6 +710,7 @@ pub async fn create_folder(
     if !enabled_for(&state, room_of(&conv)).await? {
         return Err(disabled());
     }
+    require_store(&state, &conv.id).await?;
     let author = auth.user.address();
     let (id, name, record) = if conv.encrypted {
         if req.name.is_some() {
@@ -785,8 +826,10 @@ pub async fn upload(
     if ent.get(entitlements::FILES_CHANNELS_ENABLED) == 0 {
         return Err(disabled());
     }
+    require_store(&state, &conv.id).await?;
     let max = ent.upload_max_bytes(&state.config);
-    let quota = ent.limit(entitlements::FILES_CHANNELS_MAX_BYTES);
+    let storage = storage_of(&state, &conv.id).await?;
+    let quota = channel_quota(&ent, &storage);
 
     let author = auth.user.address();
     // Encrypted channels: client-chosen id, the record instead of a name, the category as declared (FILES.md §8.5).
@@ -849,7 +892,6 @@ pub async fn upload(
         return Err(quota_exceeded(q, used));
     }
     let limit = remaining.map_or(max, |r| r.min(max));
-    let storage = storage_of(&state, &conv.id).await?;
     if matches!(storage, Storage::Remote { .. }) && declared.is_none() {
         return Err(bad("files.length_required", "Uploads to an external store need a Content-Length"));
     }
@@ -1264,13 +1306,15 @@ pub struct FilesInfo {
     /// Files channels are available for this room (`files_channels.enabled`).
     pub enabled: bool,
     pub used_bytes: i64,
-    /// `files_channels.max_bytes` of the room (0 = unlimited).
+    /// The channel's limit (0 = unlimited): on the node's storage `files_channels.max_bytes` of the room, on an
+    /// external store the store's own `max_bytes` (FILES.md §4/§5).
     pub limit_bytes: i64,
     pub files: i64,
     pub folders: i64,
     /// Largest upload for the requester.
     pub max_upload_bytes: u64,
-    /// `internal`, `webdav` or `s3`.
+    /// `internal`, `webdav` or `s3`; `none` on a node without internal storage (`TAVRN_FILES_INTERNAL=off`) while
+    /// the channel has no external store: no uploads or folders until one is set (FILES.md §5).
     pub backend: String,
     /// External store with encryption (files unreadable outside tavrn).
     pub encrypt_files: bool,
@@ -1307,7 +1351,8 @@ pub async fn usage(
     let (used, files_n, folders_n) = store::files::usage(&state.db, &conv.id).await?;
     let backend = store::files::backend(&state.db, &conv.id).await?;
     let allowed = access::upload_categories(&state, &conv, &auth.user.id).await?;
-    let can_upload = enabled && state.config.uploads_enabled && p::has(conv.perms, p::ATTACH_FILES);
+    let kind = backend_kind(&state, backend.as_ref());
+    let can_upload = enabled && state.config.uploads_enabled && p::has(conv.perms, p::ATTACH_FILES) && kind != "none";
     // Where the files are, for those who may delete the channel (never the credentials).
     let location = if p::has(conv.perms, p::MANAGE_CHANNELS) {
         let c = stored_config(&state, &conv.id, backend.as_ref().filter(|b| b.kind != "internal")).unwrap_or_default();
@@ -1319,11 +1364,11 @@ pub async fn usage(
     Ok(Json(FilesInfo {
         enabled,
         used_bytes: used,
-        limit_bytes: ent.get(entitlements::FILES_CHANNELS_MAX_BYTES),
+        limit_bytes: limit_bytes(&state, &ent, &conv.id, backend.as_ref()),
         files: files_n,
         folders: folders_n,
         max_upload_bytes: ent.upload_max_bytes(&state.config),
-        backend: backend.as_ref().map_or("internal".to_string(), |b| b.kind.clone()),
+        backend: kind,
         encrypt_files: backend.as_ref().is_some_and(|b| b.encrypt_files != 0),
         encrypted: conv.encrypted,
         backend_host: location.as_ref().map(|l| l.0.clone()),
@@ -1501,7 +1546,7 @@ pub async fn put_thumbnail(
     }
     let size = bytes.len() as i64;
     let ent = Entitlements::load(&state, Some(&auth.user), Some(room_of(&conv))).await?;
-    if let Some(quota) = ent.limit(entitlements::FILES_CHANNELS_MAX_BYTES) {
+    if let Some(quota) = channel_quota(&ent, &storage_of(&state, &conv.id).await?) {
         let (used, _, _) = store::files::usage(&state.db, &conv.id).await?;
         if used.saturating_sub(entry.thumbnail_size).saturating_add(size) > quota {
             return Err(quota_exceeded(quota, used));
@@ -1552,7 +1597,8 @@ pub async fn get_thumbnail(
 
 #[derive(Serialize, ToSchema)]
 pub struct BackendInfo {
-    /// `internal`, `webdav` or `s3`.
+    /// `internal`, `webdav` or `s3`; `none` while a node without internal storage has no external store for the
+    /// channel.
     pub kind: String,
     pub url: String,
     pub username: String,
@@ -1565,8 +1611,12 @@ pub struct BackendInfo {
     pub bucket: String,
     pub prefix: String,
     pub encrypt_files: bool,
+    /// External stores: the channel's limit on the store in bytes (0 = unlimited); always 0 for the node's storage.
+    pub max_bytes: u64,
     /// External stores are allowed on this node (`TAVRN_FILES_EXTERNAL`).
     pub external_allowed: bool,
+    /// The node's own storage may be chosen (`TAVRN_FILES_INTERNAL`); `false`: only external stores.
+    pub internal_allowed: bool,
     /// Private addresses and plain http are allowed (`TAVRN_FILES_EXTERNAL_PRIVATE`).
     pub private_allowed: bool,
     /// The channel has files (the store can no longer be switched).
@@ -1592,12 +1642,25 @@ pub struct BackendRequest {
     pub prefix: Option<String>,
     /// Wrap files with the storage encryption before they are written (unreadable outside tavrn).
     pub encrypt_files: Option<bool>,
+    /// External stores: the channel's limit on the store in bytes (absent or 0 = unlimited, at most 1 PiB). The node
+    /// quota never applies to external stores; the node's own storage takes none (`400 files.backend_invalid`).
+    pub max_bytes: Option<u64>,
 }
 
 async fn backend_access(state: &AppState, room_id: &str, channel_id: &str, auth: &AuthUser) -> Result<Conv, ApiError> {
     let conv = files_channel(state, room_id, channel_id, auth).await?;
     conv.require(p::MANAGE_CHANNELS | p::MANAGE_FILES, "files.backend_forbidden", "manage channels and files")?;
     Ok(conv)
+}
+
+/// The channel's limit for `GET usage` (0 = unlimited): an external store's `max_bytes`, else the node quota.
+fn limit_bytes(state: &AppState, ent: &Entitlements, channel_id: &str, row: Option<&store::files::BackendRow>) -> i64 {
+    match row.filter(|r| r.kind != "internal") {
+        Some(r) => stored_config(state, channel_id, Some(r))
+            .map(|c| i64::try_from(c.max_bytes).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+        None => ent.get(entitlements::FILES_CHANNELS_MAX_BYTES),
+    }
 }
 
 /// The stored configuration of a channel (empty for internal).
@@ -1626,7 +1689,7 @@ pub async fn get_backend(
     let c = stored_config(&state, &conv.id, row.as_ref())?;
     let (_, files_n, _) = store::files::usage(&state.db, &conv.id).await?;
     Ok(Json(BackendInfo {
-        kind: row.as_ref().map_or("internal".to_string(), |r| r.kind.clone()),
+        kind: backend_kind(&state, row.as_ref()),
         url: c.url,
         username: c.username,
         password_set: !c.password.is_empty(),
@@ -1635,8 +1698,10 @@ pub async fn get_backend(
         region: c.region,
         bucket: c.bucket,
         prefix: c.prefix,
+        max_bytes: c.max_bytes,
         encrypt_files: row.as_ref().is_some_and(|r| r.encrypt_files != 0),
         external_allowed: state.config.files_external.on(),
+        internal_allowed: state.config.files_internal.on(),
         private_allowed: state.config.files_external_private.on(),
         has_files: files_n > 0,
         updated_at: row.map(|r| r.updated_at),
@@ -1652,6 +1717,15 @@ fn requested_config(
 ) -> Result<(Kind, RemoteConfig, bool), ApiError> {
     let kind = Kind::parse(req.kind.trim()).ok_or_else(|| bad("validation.enum", "kind: internal, webdav or s3"))?;
     if kind == Kind::Internal {
+        if !state.config.files_internal.on() {
+            return Err(internal_disabled());
+        }
+        if req.max_bytes.unwrap_or(0) != 0 {
+            return Err(bad(
+                "files.backend_invalid",
+                "max_bytes is for external stores; the node's storage follows files_channels.max_bytes",
+            ));
+        }
         return Ok((kind, RemoteConfig::default(), false));
     }
     if !state.config.files_external.on() {
@@ -1682,6 +1756,7 @@ fn requested_config(
         region: req.region.unwrap_or_default(),
         bucket: req.bucket.unwrap_or_default(),
         prefix: req.prefix.unwrap_or_else(|| format!("tavrn/{}/", conv.id)),
+        max_bytes: req.max_bytes.unwrap_or(0),
     };
     let config = remote::validate(kind, config, state.config.files_external_private.on())
         .map_err(remote::RemoteError::into_api)?;
@@ -1780,6 +1855,9 @@ pub async fn test_backend(
     let row = store::files::backend(&state.db, &conv.id).await?;
     let (kind, config) = if body.iter().all(u8::is_ascii_whitespace) {
         let kind = row.as_ref().and_then(|r| Kind::parse(&r.kind)).unwrap_or(Kind::Internal);
+        if kind == Kind::Internal && !state.config.files_internal.on() {
+            return Err(internal_disabled());
+        }
         if kind != Kind::Internal && !state.config.files_external.on() {
             return Err(external_disabled());
         }

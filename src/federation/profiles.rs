@@ -26,6 +26,9 @@ use crate::{
 
 /// Mirrors older than this are refreshed when the user is displayed or logs in.
 pub const PROFILE_MAX_AGE_SECS: i64 = 24 * 3600;
+/// Refreshes started by `profile.changed` per sender and user and window (§5.2).
+pub const CHANGED_PER_WINDOW: u32 = 10;
+pub const CHANGED_WINDOW_SECS: u64 = 600;
 
 /// One image of a remote profile: where its variants live on the home node and their hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,6 +144,48 @@ pub async fn refresh(state: &AppState, user: &UserRow, hint: Option<i64>) -> Res
             Ok(())
         }
     }
+}
+
+/// A received `profile.changed` (§2.7 (d), §5.2) about `from`, a user of the sender `iss` (checked by the inbox):
+/// the remote user whose mirror is older than `version`, or `None` when the message changes nothing here (a user
+/// this node does not know, no stub is created; a disabled one; a version that is not newer). Limited per sender
+/// and user: beyond it `429` before the message counts as received, so the sender's retry brings the change later.
+pub async fn admit_changed(state: &AppState, iss: &str, from: &str, version: i64) -> Result<Option<UserRow>, ApiError> {
+    let Some((name, domain)) = util::parse_address(from) else { return Ok(None) };
+    if domain != iss || domain == state.config.domain {
+        return Ok(None);
+    }
+    let Some(user) = store::federation::user_by_address(&state.db, name, domain).await? else { return Ok(None) };
+    if user.disabled_at.is_some() {
+        return Ok(None);
+    }
+    let stored = store::federation::remote_meta(&state.db, &user.id).await?.map_or(0, |m| m.profile_version);
+    if version <= stored {
+        return Ok(None);
+    }
+    state.profile_changed_limiter.check_all(&[format!("{iss}|{}", user.id)]).await?;
+    Ok(Some(user))
+}
+
+/// The background refresh after an admitted `profile.changed`: fetches the profile (the old mirror stays on
+/// failure) and, when the mirror changed, sends `user.update` to the user's rooms and contacts here.
+pub fn spawn_changed_refresh(state: &AppState, user: UserRow, version: i64) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let stored = |state: AppState, id: String| async move {
+            store::federation::remote_meta(&state.db, &id).await.ok().flatten().map_or(0, |m| m.profile_version)
+        };
+        let before = stored(state.clone(), user.id.clone()).await;
+        if let Err(e) = refresh(&state, &user, Some(version)).await {
+            tracing::info!(domain = user.domain, result = e.code(), "profile refresh after profile.changed failed");
+            return;
+        }
+        if stored(state.clone(), user.id.clone()).await > before
+            && let Err(e) = profile::announce_user(&state, &user.id).await
+        {
+            tracing::debug!(error = %e, "user.update after a mirror refresh failed");
+        }
+    });
 }
 
 /// Stores a fetched profile in the mirror (names, bio, links, setting, images whose hash changed).

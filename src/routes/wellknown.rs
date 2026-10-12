@@ -37,6 +37,9 @@ pub struct Policies {
     pub camera: ScreensharePolicy,
     /// Largest image (bytes) clients load as a preview without a click (`TAVRN_PREVIEW_AUTO_MAX_BYTES`).
     pub preview_auto_max_bytes: u64,
+    /// Files channels may keep their files on the node (`TAVRN_FILES_INTERNAL`); `false`: a files channel takes
+    /// uploads only once it has an external store (FILES.md §5).
+    pub files_internal: bool,
 }
 
 impl Policies {
@@ -86,17 +89,22 @@ pub struct WellKnown {
     pub age: crate::age::AgeInfo,
 }
 
-/// The WebAuthn relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain). It may be a parent
-/// domain of the web client's host (delegation); clients pass it as `rpId` on assertions they build
-/// themselves (the secret storage PRF, PROTOCOL.md §5a.4).
+/// The WebAuthn relying party of this node (PROTOCOL.md §5a.4).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct WebauthnInfo {
+    /// The relying party id (`TAVRN_WEBAUTHN_RP_ID`, default the identity domain). It may be a parent domain of
+    /// the web client's host (delegation); clients pass it as `rpId` on assertions they build themselves (the
+    /// secret storage PRF).
     pub rp_id: String,
+    /// Every origin the node accepts in `clientDataJSON`: the web origin first, then the origins of the node's own
+    /// apps (`TAVRN_WEBAUTHN_APP_ORIGINS`, e.g. `android:apk-key-hash:<base64url>`). An app offers passkeys in its
+    /// webview only while its own origin is listed, otherwise it signs in through the browser.
+    pub origins: Vec<String>,
 }
 
 impl WebauthnInfo {
     pub fn of(c: &crate::config::Config) -> Self {
-        Self { rp_id: c.webauthn_rp_id() }
+        Self { rp_id: c.webauthn_rp_id(), origins: c.webauthn_origins() }
     }
 }
 
@@ -143,6 +151,7 @@ pub fn build_from(c: &crate::config::Config, keys: &[crate::keys::NodeKey]) -> W
             screenshare: Policies::screenshare(c),
             camera: Policies::camera(c),
             preview_auto_max_bytes: c.preview_auto_max_bytes,
+            files_internal: c.files_internal.on(),
         },
         directory_listing: c.directory_listing,
         age: crate::age::info(c),
@@ -200,6 +209,16 @@ mod tests {
         let web =
             Config { webauthn_origin: Some("https://web.tavrn.org".into()), ..config(Some("https://app.tavrn.org")) };
         assert_eq!(build_from(&web, &keys).web, "https://web.tavrn.org");
+        assert_eq!(build_from(&web, &keys).webauthn.origins, vec!["https://web.tavrn.org".to_string()]);
+        let app = &format!("android:apk-key-hash:{}", "A".repeat(43));
+        let apps = Config { webauthn_app_origins: app.into(), ..config(Some("https://app.tavrn.org")) };
+        let doc = build_from(&apps, &keys);
+        assert_eq!(doc.webauthn.rp_id, "tavrn.org");
+        assert_eq!(
+            doc.webauthn.origins,
+            vec!["https://app.tavrn.org".to_string(), app.to_string()],
+            "web origin first"
+        );
 
         let dev = Config {
             dev: true,
