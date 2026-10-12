@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 //! Test helpers: in-memory nodes. With `TAVRN_TEST_DATABASE_URL` (PostgreSQL) every test node gets its own
 //! fresh database, dropped with the node (`databases`), otherwise SQLite in-memory.
 
@@ -99,6 +99,11 @@ pub async fn within<T>(base: std::time::Duration, what: &str, fut: impl std::fut
         Ok(v) => v,
         Err(_) => panic!("{what}: not within {limit:?} (TAVRN_TEST_TIMEOUT_FACTOR={})", timeout_factor()),
     }
+}
+
+/// `n` rounds of a polling loop (whose limit is rounds × interval) scaled by [`timeout_factor`].
+pub fn rounds(n: u32) -> u32 {
+    (f64::from(n) * timeout_factor()).ceil() as u32
 }
 
 /// Polls `cond` every 20 ms until it holds; fails the test naming `what` after [`timeout`]`(base)`.

@@ -908,7 +908,7 @@ async fn a_revoked_session_closes_its_websocket() {
     .await;
     assert_eq!(a.deliver().await.delivered, 1);
     let closed = loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap() {
+        match tokio::time::timeout(common::timeout(Duration::from_secs(5)), ws.next()).await.unwrap() {
             Some(Ok(Message::Close(frame))) => break frame.map(|f| u16::from(f.code)),
             Some(Ok(_)) => continue,
             other => panic!("unexpected {other:?}"),

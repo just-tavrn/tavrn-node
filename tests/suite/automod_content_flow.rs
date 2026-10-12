@@ -91,7 +91,7 @@ fn rule(name: &str, extra: Value) -> Value {
 }
 
 async fn hub_event(rx: &mut broadcast::Receiver<Arc<Event>>, kind: &str) -> Arc<Event> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     loop {
         let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("event missing").unwrap();
         if ev.kind == kind {

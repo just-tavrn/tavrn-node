@@ -92,7 +92,7 @@ async fn peers(node: &FedNode) -> Vec<String> {
 
 /// Polls `path` on `node` until `ok` holds (the room refresh after an announce runs in the background).
 async fn until(node: &FedNode, path: &str, ok: impl Fn(&Value) -> bool) -> Value {
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         let v = get(node, path).await;
         if ok(&v) {
             return v;

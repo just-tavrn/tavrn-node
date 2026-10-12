@@ -223,7 +223,7 @@ fn receiver(node: &TestNode, bot_user_id: &str, device_id: &str) -> Receiver {
 impl Receiver {
     async fn invocation(&mut self) -> Value {
         let id = self.guard.id;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = common::deadline(Duration::from_secs(5));
         loop {
             let ev = tokio::time::timeout_at(deadline, self.rx.recv()).await.expect("no invocation").unwrap();
             if ev.kind == "command.invoke" && matches!(ev.scope, Scope::Connection(c) if c == id) {
@@ -234,7 +234,7 @@ impl Receiver {
 }
 
 async fn hub_event(rx: &mut broadcast::Receiver<Arc<Event>>, kind: &str) -> Arc<Event> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     loop {
         let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("event missing").unwrap();
         if ev.kind == kind {
@@ -743,7 +743,7 @@ async fn the_ack_times_out_with_an_injected_clock() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!task.is_finished());
     clock.advance(chrono::Duration::milliseconds(3001));
-    let (s, j) = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    let (s, j) = common::within(Duration::from_secs(2), "the invocation times out", task).await.unwrap();
     assert_eq!((s, code(&j)), (StatusCode::GATEWAY_TIMEOUT, "interaction.no_ack"));
     // The interaction is dropped: late callbacks and follow-ups are gone.
     let (s, j) =

@@ -853,7 +853,7 @@ async fn bot_presence_needs_the_presence_scope_and_activities_are_validated() {
     let (s, j) = node.put("/api/v1/users/me/activity", &with.secret, activity).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(j["activity"]["state"], "All quiet");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = common::deadline(std::time::Duration::from_secs(5));
     loop {
         let ev = crossnode::event(&mut alice_ws, "presence.update").await;
         if ev["user_id"] == with.user_id.as_str() && ev["activity"]["name"] == "3 servers" {

@@ -18,8 +18,13 @@ type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 async fn connect(inst: &Instance, token: &str) -> Socket {
     let mut ws = tokio_tungstenite::connect_async(inst.ws_url()).await.unwrap().0;
     ws.send(WsMessage::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
-    assert_eq!(next(&mut ws, 5000).await.unwrap()["op"], "ready");
+    assert_eq!(next(&mut ws, scaled_ms(5000)).await.unwrap()["op"], "ready");
     ws
+}
+
+/// `ms` scaled by `TAVRN_TEST_TIMEOUT_FACTOR` (for the frames a test expects).
+fn scaled_ms(ms: u64) -> u64 {
+    u64::try_from(common::timeout(Duration::from_millis(ms)).as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn next(ws: &mut Socket, ms: u64) -> Option<Value> {
@@ -73,9 +78,9 @@ async fn a_valkey_outage_is_survived_with_a_resync() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    assert_eq!(wait_event(&mut ws, "resync", 10_000).await.unwrap(), json!({ "op": "resync" }));
+    assert_eq!(wait_event(&mut ws, "resync", scaled_ms(10_000)).await.unwrap(), json!({ "op": "resync" }));
     // Commands reconnect by themselves; events flow again.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = common::deadline(Duration::from_secs(10));
     loop {
         b.node.send(&alice.token, &room_id, &channel, "after the outage").await;
         if let Some(ev) = wait_event(&mut ws, "message.create", 1000).await {

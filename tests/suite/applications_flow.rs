@@ -949,7 +949,7 @@ async fn owner_disabled_disables_the_bot_and_closes_its_websocket() {
 
 async fn close_code(ws: &mut crossnode::Ws) -> Option<u16> {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("closed within 5 s") {
+        match tokio::time::timeout(common::timeout(Duration::from_secs(5)), ws.next()).await.expect("closed in time") {
             Some(Ok(Message::Close(frame))) => return frame.map(|f| u16::from(f.code)),
             Some(Ok(_)) => {}
             _ => return None,
