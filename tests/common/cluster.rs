@@ -132,7 +132,10 @@ pub async fn instances_with(
     out
 }
 
-/// Makes instance `leader` the leader (one lease round each, the leader first).
+/// Makes instance `leader` the leader (one lease round each, the leader first) and keeps its lease renewed until the
+/// test ends, as a running node does (`leader::spawn`): a scenario that takes longer than one lease on a loaded
+/// machine must not lose its leader halfway (the leader's announcements would then silently stop). Tests of the
+/// takeover itself run their rounds by hand instead.
 pub async fn elect(instances: &[Instance], leader: usize, lease: Duration) {
     assert!(tavrn_node::cache::leader::round(&instances[leader].node.state.cluster, lease).await);
     for (i, inst) in instances.iter().enumerate() {
@@ -140,13 +143,16 @@ pub async fn elect(instances: &[Instance], leader: usize, lease: Duration) {
             assert!(!tavrn_node::cache::leader::round(&inst.node.state.cluster, lease).await);
         }
     }
+    // Ends with the test's runtime.
+    tavrn_node::cache::leader::spawn(&instances[leader].node.state, lease).expect("instances share a cache");
 }
 
-/// Polls `cond` every 20 ms until it holds; fails the test after `max`.
+/// Polls `cond` every 20 ms until it holds; fails the test after `max` scaled by `TAVRN_TEST_TIMEOUT_FACTOR`.
 pub async fn wait_for(max: Duration, mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + max;
+    let limit = super::timeout(max);
+    let deadline = tokio::time::Instant::now() + limit;
     while !cond() {
-        assert!(tokio::time::Instant::now() < deadline, "condition not reached within {max:?}");
+        assert!(tokio::time::Instant::now() < deadline, "condition not reached within {limit:?}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
