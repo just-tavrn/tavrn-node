@@ -157,7 +157,7 @@ async fn next_event(
     rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<tavrn_node::hub::Event>>,
     kind: &str,
 ) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    common::within(Duration::from_secs(10), &format!("a {kind} event on the hub"), async {
         loop {
             let ev = rx.recv().await.unwrap();
             if ev.kind == kind {
@@ -166,14 +166,23 @@ async fn next_event(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("no {kind} event"))
 }
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// A client WebSocket on `addr` signed in with `token`, once the node answered `ready`: only then is the
+/// connection subscribed to the node's events (`ws.rs`), so nothing published afterwards can pass it by.
+async fn client_socket(addr: std::net::SocketAddr, token: &str) -> Socket {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
+    let ready = common::within(Duration::from_secs(5), "the WebSocket's ready", ws.next()).await.unwrap().unwrap();
+    assert!(ready.to_text().unwrap().contains("\"ready\""), "{ready:?}");
+    ws
+}
+
 /// The next `voice.state` event on a client WebSocket.
-async fn next(ws: &mut Socket) -> Result<Value, tokio::time::error::Elapsed> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+async fn next(ws: &mut Socket) -> Value {
+    common::within(Duration::from_secs(10), "a voice.state event on the WebSocket", async {
         loop {
             if let Message::Text(t) = ws.next().await.unwrap().unwrap() {
                 let v: Value = serde_json::from_str(&t).unwrap();
@@ -229,13 +238,10 @@ async fn livekit_setup_with(tweak: impl FnOnce(&mut Config)) -> (Voice, u16) {
 }
 
 async fn wait_reachable(port: u16) {
-    for _ in 0..100 {
-        if voice::livekit::reachable(port).await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("LiveKit did not come up on port {port}");
+    common::wait_until(Duration::from_secs(10), &format!("LiveKit answers on port {port}"), || {
+        voice::livekit::reachable(port)
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------- join and grants
@@ -537,13 +543,12 @@ async fn livekit_webhooks_become_voice_state_events_over_the_websocket() {
     let addr = listener.local_addr().unwrap();
     let router = v.node.router.clone();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
-    ws.send(Message::Text(json!({ "op": "hello", "token": v.bob.token }).to_string().into())).await.unwrap();
+    let mut ws = client_socket(addr, &v.bob.token).await;
 
     let (s, j) = v.join(&v.alice).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     v.connected(&v.alice).await;
-    let state = next(&mut ws).await.unwrap();
+    let state = next(&mut ws).await;
     assert_eq!(state["channel_id"], v.voice_id.as_str());
     let p0 = &state["participants"][0];
     assert_eq!(p0["user"], "alice@t.local");
@@ -556,11 +561,11 @@ async fn livekit_webhooks_become_voice_state_events_over_the_websocket() {
 
     let track = |event: &str, source: &str| json!({ "event": event, "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.alice) }, "track": { "sid": "TR_1", "source": source } });
     v.webhook(track("track_published", "SCREEN_SHARE")).await;
-    assert_eq!(next(&mut ws).await.unwrap()["participants"][0]["streaming"], true);
+    assert_eq!(next(&mut ws).await["participants"][0]["streaming"], true);
     v.webhook(track("track_published", "CAMERA")).await;
-    assert_eq!(next(&mut ws).await.unwrap()["participants"][0]["camera"], true);
+    assert_eq!(next(&mut ws).await["participants"][0]["camera"], true);
     v.webhook(track("track_unpublished", "SCREEN_SHARE")).await;
-    assert_eq!(next(&mut ws).await.unwrap()["participants"][0]["streaming"], false);
+    assert_eq!(next(&mut ws).await["participants"][0]["streaming"], false);
     let (s, _) = v.webhook(track("track_published", "MICROPHONE")).await;
     assert_eq!(s, StatusCode::OK, "microphone tracks change nothing visible");
 
@@ -568,12 +573,12 @@ async fn livekit_webhooks_become_voice_state_events_over_the_websocket() {
     assert_eq!(p0["connection"], "connected");
     let left = json!({ "event": "participant_left", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.alice), "disconnectReason": "SIGNAL_CLOSE" } });
     v.webhook(left).await;
-    let state = next(&mut ws).await.unwrap();
+    let state = next(&mut ws).await;
     assert_eq!(state["participants"].as_array().unwrap().len(), 1);
     assert_eq!(state["participants"][0]["connection"], "reconnecting");
     assert_eq!(state["participants"][0]["camera"], true, "the state is kept while reconnecting");
     v.connected(&v.alice).await;
-    let state = next(&mut ws).await.unwrap();
+    let state = next(&mut ws).await;
     assert_eq!(state["participants"].as_array().unwrap().len(), 1, "never twice");
     assert_eq!(state["participants"][0]["connection"], "connected");
     // A second connection of the same identity pushes the first out: nothing changes.
@@ -583,7 +588,7 @@ async fn livekit_webhooks_become_voice_state_events_over_the_websocket() {
     // Hanging up removes the participant at once.
     let left = json!({ "event": "participant_left", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.alice), "disconnectReason": "CLIENT_INITIATED" } });
     v.webhook(left).await;
-    assert_eq!(next(&mut ws).await.unwrap()["participants"], json!([]));
+    assert_eq!(next(&mut ws).await["participants"], json!([]));
 
     // Rooms that are no voice channels and unknown events are ignored.
     let (s, _) = v.webhook(json!({ "event": "room_started", "room": { "name": "something-else" } })).await;
@@ -941,7 +946,7 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
     let url =
         format!("ws://127.0.0.1:{port}/rtc?access_token={token}&protocol=16&sdk=rust&version=0.0.1&auto_subscribe=1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("proxied WebSocket");
-    let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+    let first = common::within(Duration::from_secs(10), "LiveKit's JoinResponse", ws.next()).await.unwrap().unwrap();
     assert!(matches!(first, Message::Binary(ref b) if !b.is_empty()), "{first:?}");
     let rooms = v.node.state.voice.rooms().unwrap();
     let present = rooms.list_participants(&v.room_name()).await.unwrap();
@@ -966,12 +971,12 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
     let url =
         format!("ws://127.0.0.1:{port}/rtc?access_token={token}&protocol=16&sdk=rust&version=0.0.1&auto_subscribe=1");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("proxied WebSocket");
-    tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+    common::within(Duration::from_secs(10), "LiveKit's JoinResponse", ws.next()).await.unwrap().unwrap();
     voice::reconcile_once(&v.node.state).await.unwrap();
     assert_eq!(next_event(&mut rx, "voice.state").await["participants"].as_array().unwrap().len(), 1);
     let (s, j) = v.node.post(&v.path("members/bob@t.local/disconnect"), &v.alice.token, json!({})).await;
     assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
-    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+    common::within(Duration::from_secs(10), "the proxied connection ends after the disconnect", async {
         while let Some(Ok(m)) = ws.next().await {
             if m.is_close() {
                 break;
@@ -979,7 +984,6 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
         }
     })
     .await;
-    assert!(closed.is_ok(), "the proxied connection ends after the disconnect");
 
     let (_, j) = v.join(&v.bob).await;
     let token = j["token"].as_str().unwrap().to_string();
@@ -999,7 +1003,8 @@ async fn rtc_signaling_is_proxied_to_livekit_and_webhooks_arrive() {
             .unwrap();
         req.headers_mut().insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("proxied WebSocket with a bearer token");
-        let first = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.unwrap().unwrap().unwrap();
+        let first =
+            common::within(Duration::from_secs(10), "LiveKit's JoinResponse", ws.next()).await.unwrap().unwrap();
         assert!(matches!(first, Message::Binary(ref b) if !b.is_empty()), "{first:?}");
         ws.close(None).await.unwrap();
     }
@@ -1262,15 +1267,10 @@ async fn generated_livekit_configs_are_accepted_by_livekit_in_every_connectivity
     assert!(!yaml.contains("192.168.0.23"), "aliases are handed to the clients, LiveKit takes one address per family");
     // LiveKit listens on the ICE/TCP and the TURN/TLS port (the proxy's plain TCP backend).
     for port in [tcp, turn_tls] {
-        let mut ok = false;
-        for _ in 0..50 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(ok, "LiveKit listens on TCP {port}");
+        common::wait_until(Duration::from_secs(5), &format!("LiveKit listens on TCP {port}"), || async move {
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+        })
+        .await;
     }
     supervisor.stop().await;
 
