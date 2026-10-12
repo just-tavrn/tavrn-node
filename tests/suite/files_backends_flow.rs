@@ -766,17 +766,66 @@ async fn without_internal_storage_files_channels_need_an_external_store() {
     assert_eq!((info["kind"].as_str(), info["internal_allowed"].as_bool()), (Some("internal"), Some(true)));
 }
 
-/// With `TAVRN_FILES_INTERNAL=off` the channel quota (`files_channels.max_bytes`) limits the external stores only
-/// when the operator sets it.
+/// The node quota (`files_channels.max_bytes`) limits only the node's own storage, never an external store
+/// (tavrn-node#58); an external store has its own optional limit in the backend settings (`max_bytes`, FILES.md §5),
+/// enforced on the bytes the node relays and shown as the channel's limit.
 #[tokio::test]
-async fn without_internal_storage_the_quota_applies_only_when_set() {
+async fn the_node_quota_never_limits_external_stores_the_channel_limit_does() {
     let (_m, port) = mock(Flavor::WebDav).await;
     let s = external_only(100_000).await;
-    webdav_for(&s.node, &s.alice.token, &s.room_id, &s.channel, port).await;
+    let info = webdav_for(&s.node, &s.alice.token, &s.room_id, &s.channel, port).await;
+    assert_eq!(info["max_bytes"], 0, "no limit unless set: {info}");
+    let (st, j) = s.up("big.dat", &sample(150_000)).await;
+    assert_eq!(st, StatusCode::CREATED, "the node quota of 100 000 bytes does not apply: {j}");
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!((usage["limit_bytes"].as_i64(), usage["used_bytes"].as_i64()), (Some(0), Some(150_000)), "{usage}");
+
+    // The room's managers limit the store: shown in usage and GET backend, enforced on uploads.
+    let url = format!("http://127.0.0.1:{port}/dav/");
+    let (st, info) = s
+        .backend(json!({ "kind": "webdav", "url": url, "username": DAV_USER, "password": "", "max_bytes": 200_000 }))
+        .await;
+    assert_eq!(
+        (st, info["max_bytes"].as_i64(), info["password_set"].as_bool()),
+        (StatusCode::OK, Some(200_000), Some(true)),
+        "{info}"
+    );
+    let (_, got) = s.node.get_auth(&format!("{}/backend", s.base()), &s.alice.token).await;
+    assert_eq!(got["max_bytes"], 200_000);
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!(usage["limit_bytes"], 200_000, "{usage}");
+    let (st, j) = s.up("more.dat", &sample(100_000)).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("files.quota_exceeded")), "{j}");
+    assert_eq!(
+        (j["meta"]["limit_bytes"].as_i64(), j["meta"]["used_bytes"].as_i64()),
+        (Some(200_000), Some(150_000)),
+        "{j}"
+    );
+    let (st, j) = s.up("fits.dat", &sample(40_000)).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+
+    // Out of range is refused; 0 lifts the limit again.
+    let (st, j) =
+        s.backend(json!({ "kind": "webdav", "url": url, "username": DAV_USER, "max_bytes": 1u64 << 51 })).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("files.backend_invalid")), "{j}");
+    let (st, info) = s.backend(json!({ "kind": "webdav", "url": url, "username": DAV_USER, "max_bytes": 0 })).await;
+    assert_eq!((st, info["max_bytes"].as_i64()), (StatusCode::OK, Some(0)), "{info}");
+    let (st, j) = s.up("again.dat", &sample(100_000)).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+}
+
+/// The node's own storage keeps the node quota; a per-channel limit is only for external stores.
+#[tokio::test]
+async fn the_node_quota_limits_the_node_storage_and_max_bytes_is_for_external_stores_only() {
+    let s = setup_with(|c| c.files_channels_max_bytes = 100_000).await;
     let (st, j) = s.up("big.dat", &sample(150_000)).await;
     assert_eq!((st, j["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("files.quota_exceeded")), "{j}");
-    let (st, j) = s.up("small.dat", &sample(50_000)).await;
-    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.alice.token).await;
+    assert_eq!(usage["limit_bytes"], 100_000, "{usage}");
+    let (st, j) = s.backend(json!({ "kind": "internal", "max_bytes": 5000 })).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("files.backend_invalid")), "{j}");
+    let (st, info) = s.backend(json!({ "kind": "internal" })).await;
+    assert_eq!((st, info["max_bytes"].as_i64()), (StatusCode::OK, Some(0)), "{info}");
 }
 
 /// A node switched to `TAVRN_FILES_INTERNAL=off` keeps the files its channels hold already: they are listed,

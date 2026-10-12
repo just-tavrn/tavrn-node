@@ -30,8 +30,11 @@ First public release of the node and its container image.
 - **Files channels on external stores only** (`TAVRN_FILES_INTERNAL=off`, protocol FILES.md §5): the node keeps no
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
-  chosen. `GET /node` and the discovery document carry `files_internal`. The channel quota then limits the external
-  stores only when it is set, so no small quota is needed to keep files off the node.
+  chosen. `GET /node` and the discovery document carry `files_internal`.
+- **The files channel quota covers the node's own storage only** (protocol FILES.md §4, §5):
+  `TAVRN_FILES_CHANNELS_MAX_BYTES` (`files_channels.max_bytes`) no longer limits channels on external WebDAV/S3
+  stores. Their managers can set an optional limit per store in the channel's storage settings (`max_bytes` of
+  `PUT …/files/backend`, `0` = unlimited), enforced with `413 files.quota_exceeded` and shown as the channel's limit.
 
 ### Fixed
 
