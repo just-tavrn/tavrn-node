@@ -712,9 +712,9 @@ clients use it for the assertions they build themselves (unlocking the secret st
 
 #### Passkeys in the apps
 
-A browser puts the page's origin (the public URL) into every passkey ceremony. The Android app's webview (Android
-14 and newer) puts the **app's** origin there instead: `android:apk-key-hash:<hash>`, the base64url (no padding) of
-the SHA-256 of the certificate the APK is signed with. The node refuses those ceremonies unless the origin is in
+A browser puts the page's origin (the public URL) into every passkey ceremony. The Android app (Android 14 and
+newer) runs passkeys through Android's Credential Manager, which puts the **app's** origin there instead:
+`android:apk-key-hash:<hash>`, the base64url (no padding) of the SHA-256 of the certificate the APK is signed with. The node refuses those ceremonies unless the origin is in
 `TAVRN_WEBAUTHN_APP_ORIGINS`; the app then signs in through the browser (as before) and says that the node does not
 accept the app's passkeys yet. With the origin configured, registering a passkey, signing in with it and
 unlocking the encrypted messages with it work inside the app. The relying party id does not change, so a passkey
