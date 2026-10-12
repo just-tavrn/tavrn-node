@@ -13,7 +13,7 @@ use crate::{
     auth::{self, AuthUser, ClientIp, TokenPair},
     config::{CaptchaAction, EmailMode, Registration},
     error::ApiError,
-    models::UserPrivate,
+    models::{UserPrivate, UserRow},
     second_factor::{self, Stage},
     sessions::Reason,
     store,
@@ -469,8 +469,7 @@ pub async fn resend_verification(
         }
         let token = util::random_token(32);
         store::users::set_email_verification(&state.db, &user.id, &util::sha256_b64(&token), 24 * 3600).await?;
-        let locale = store::users::locale(&state.db, &user.id).await?;
-        state.mailer.send_verification(&user, locale.as_deref(), &token).await;
+        mail_after_answer(&state, user, token, AccountMail::Verification);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -522,10 +521,32 @@ pub async fn forgot_password(
         }
         let token = util::random_token(32);
         store::admin::set_password_reset(&state.db, &user.id, &util::sha256_b64(&token), 3600).await?;
-        let locale = store::users::locale(&state.db, &user.id).await?;
-        state.mailer.send_password_reset(&user, locale.as_deref(), &token).await;
+        mail_after_answer(&state, user, token, AccountMail::PasswordReset);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The mails of the requests that answer `204` for every account.
+enum AccountMail {
+    Verification,
+    PasswordReset,
+}
+
+/// Looks up the user's language and delivers `mail` in a background task, after the token is stored: the answer then
+/// takes as long for an account that gets a mail as for an unknown one, also with a slow SMTP relay (the response
+/// time must not tell which accounts exist).
+fn mail_after_answer(state: &AppState, user: UserRow, token: String, mail: AccountMail) {
+    let (db, mailer) = (state.db.clone(), state.mailer.clone());
+    state.mailer.send_in_background(async move {
+        let locale = store::users::locale(&db, &user.id).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "mail language not read, sending the default");
+            None
+        });
+        match mail {
+            AccountMail::Verification => mailer.send_verification(&user, locale.as_deref(), &token).await,
+            AccountMail::PasswordReset => mailer.send_password_reset(&user, locale.as_deref(), &token).await,
+        }
+    });
 }
 
 #[derive(Deserialize, ToSchema)]

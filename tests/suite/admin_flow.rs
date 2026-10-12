@@ -240,7 +240,7 @@ async fn password_reset_by_email() {
     let (s, _) =
         node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": "alice" }))).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    assert!(node.state.mailer.outbox.lock().unwrap().is_empty());
+    assert!(node.mails().await.is_empty());
 
     // Set the email and mark it confirmed (registration with email + token from the outbox).
     let (s, _) = node
@@ -274,7 +274,8 @@ async fn password_reset_by_email() {
         .req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": "Carol@Example.org" })))
         .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let mail = node.state.mailer.outbox.lock().unwrap().last().unwrap().clone();
+    // Delivered after the answer (no timing difference to unknown accounts).
+    let mail = node.mails().await.last().unwrap().clone();
     assert!(mail.1.contains("password"), "{}", mail.1);
     let reset = mail.2.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
 
@@ -335,17 +336,17 @@ async fn password_reset_requests_keep_the_pending_link_and_are_limited_per_accou
     let user_id: String =
         sqlx::query_scalar("SELECT id FROM users WHERE username = 'dora'").fetch_one(&node.state.db).await.unwrap();
     tavrn_node::store::users::set_email_verified(&node.state.db, &user_id).await.unwrap();
-    let mails = || node.state.mailer.outbox.lock().unwrap().iter().filter(|m| m.1.contains("password")).count();
+    let mails = async || node.mails().await.iter().filter(|m| m.1.contains("password")).count();
     let forgot = || node.req(Method::POST, "/api/v1/auth/forgot-password", None, Some(json!({ "account": "dora" })));
     assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
-    assert_eq!(mails(), 1);
-    let first = node.state.mailer.outbox.lock().unwrap().last().unwrap().2.clone();
+    assert_eq!(mails().await, 1);
+    let first = node.mails().await.last().unwrap().2.clone();
     let link = first.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
     // Further requests send nothing while the link is pending, and the link stays valid.
     for _ in 0..5 {
         assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
     }
-    assert_eq!(mails(), 1, "no new mail, the first link stays the valid one");
+    assert_eq!(mails().await, 1, "no new mail, the first link stays the valid one");
     let (s, j) = node
         .req(
             Method::POST,
@@ -360,7 +361,7 @@ async fn password_reset_requests_keep_the_pending_link_and_are_limited_per_accou
         assert_eq!(forgot().await.0, StatusCode::NO_CONTENT);
         sqlx::query("DELETE FROM password_resets").execute(&node.state.db).await.unwrap();
     }
-    assert_eq!(mails(), 3, "the first mail plus two more in the hour, then none");
+    assert_eq!(mails().await, 3, "the first mail plus two more in the hour, then none");
 }
 
 /// Without SMTP a production node sends no reset link (it could only end up in the log): `503 mail.unavailable`.

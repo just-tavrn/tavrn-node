@@ -172,20 +172,22 @@ async fn verification_mail_can_be_sent_again() {
         )
     };
     assert_eq!(register("alice", "alice@example.org").await.0, StatusCode::CREATED);
-    let mails = || node.state.mailer.outbox.lock().unwrap().clone();
+    // The resent mails are delivered after the answer: `node.mails()` waits for them.
+    let mails = || node.mails();
     let token_of = |body: &str| body.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
     let resend = |account: &str| {
         node.req(Method::POST, "/api/v1/auth/verify-email/resend", None, Some(json!({ "account": account })))
     };
-    let first = token_of(&mails()[0].2);
+    let first = token_of(&mails().await[0].2);
 
     // By username: a new link replaces the first one.
     let (s, j) = resend("alice").await;
     assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
-    assert_eq!(mails().len(), 2);
-    assert_eq!(mails()[1].0, "alice@example.org");
-    assert!(mails()[1].2.contains("/verify-email?token="), "the mail carries the confirmation link");
-    let second = token_of(&mails()[1].2);
+    let sent = mails().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].0, "alice@example.org");
+    assert!(sent[1].2.contains("/verify-email?token="), "the mail carries the confirmation link");
+    let second = token_of(&sent[1].2);
     assert_ne!(first, second);
     let verify =
         |token: String| node.req(Method::POST, "/api/v1/auth/verify-email", None, Some(json!({ "token": token })));
@@ -204,15 +206,15 @@ async fn verification_mail_can_be_sent_again() {
         let (s, j) = resend(account).await;
         assert_eq!(s, StatusCode::NO_CONTENT, "{account}: {j}");
     }
-    assert_eq!(mails().len(), 2);
+    assert_eq!(mails().await.len(), 2);
 
     // By e-mail (case-insensitive) and by address; at most three mails per account and hour, the answer stays 204.
     assert_eq!(register("bob", "bob@example.org").await.0, StatusCode::CREATED);
-    assert_eq!(mails().len(), 3);
+    assert_eq!(mails().await.len(), 3);
     for account in ["Bob@Example.org", "BOB@t.local", "bob", "bob", "bob"] {
         assert_eq!(resend(account).await.0, StatusCode::NO_CONTENT);
     }
-    let to_bob = mails().iter().filter(|m| m.0 == "bob@example.org").count();
+    let to_bob = mails().await.iter().filter(|m| m.0 == "bob@example.org").count();
     assert_eq!(to_bob, 4, "the registration mail plus three resent ones");
 
     // Over-long input is refused before any lookup.
@@ -238,6 +240,56 @@ async fn verification_resend_without_smtp_is_unavailable_in_production() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let j = common::body_json(resp).await;
     assert_eq!(j["code"], "mail.unavailable", "{j}");
+}
+
+/// The answers of `POST /auth/forgot-password` and `POST /auth/verify-email/resend` take as long for an account that
+/// gets a mail as for an unknown one, also with a slow SMTP relay: the delivery runs after the answer, so the response
+/// time does not tell which accounts exist (tavrn-node#52).
+#[tokio::test]
+async fn mail_requests_answer_before_the_delivery() {
+    use std::time::{Duration, Instant};
+    const RELAY_DELAY: Duration = Duration::from_millis(1500);
+    let mut node = test_node("t.local").await;
+    let register = |name: &'static str| {
+        node.req(
+            Method::POST,
+            "/api/v1/auth/register",
+            None,
+            Some(json!({ "username": name, "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": format!("{name}@example.org") })),
+        )
+    };
+    assert_eq!(register("dora").await.0, StatusCode::CREATED);
+    assert_eq!(register("erin").await.0, StatusCode::CREATED);
+    let dora: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'dora'").fetch_one(&node.state.db).await.unwrap();
+    tavrn_node::store::users::set_email_verified(&node.state.db, &dora).await.unwrap();
+
+    // From here on every mail goes through a relay that takes 1.5 s to answer.
+    let relay = common::slow_smtp(RELAY_DELAY).await;
+    let slow = tavrn_node::config::Config { smtp_url: Some(relay), ..(*node.state.config).clone() };
+    node.state.mailer = tavrn_node::mail::Mailer::from_config(&slow);
+    node.router = tavrn_node::app::router(node.state.clone());
+
+    let timed = async |path: &str, account: &str| {
+        let started = Instant::now();
+        let (s, j) = node.req(Method::POST, path, None, Some(json!({ "account": account }))).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{path} {account}: {j}");
+        started.elapsed()
+    };
+    for (path, known, kind) in
+        [("/api/v1/auth/forgot-password", "dora", "password"), ("/api/v1/auth/verify-email/resend", "erin", "Confirm")]
+    {
+        let unknown = timed(path, "nobody").await;
+        let existing = timed(path, known).await;
+        assert!(
+            existing < RELAY_DELAY / 2 && existing < unknown * 5 + Duration::from_millis(200),
+            "{path}: {existing:?} for an account that gets a mail, {unknown:?} for an unknown one"
+        );
+        // The mail is still delivered, after the answer.
+        let to = format!("{known}@example.org");
+        let mails = node.mails().await;
+        assert!(mails.iter().any(|m| m.0 == to && m.1.contains(kind)), "{path}: {mails:?}");
+    }
 }
 
 #[tokio::test]
