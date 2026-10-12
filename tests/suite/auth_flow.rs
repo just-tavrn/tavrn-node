@@ -154,6 +154,92 @@ async fn email_required_mode_needs_verification_before_login() {
     assert_eq!(j["status"], "enrollment_required");
 }
 
+/// `POST /auth/verify-email/resend` (PROTOCOL.md §5a.3): a new confirmation link for an unconfirmed address, by
+/// username, address or e-mail; always `204`, at most three mails per account and hour.
+#[tokio::test]
+async fn verification_mail_can_be_sent_again() {
+    let node = test_node_with("t.local", |c| {
+        c.email = tavrn_node::config::EmailMode::Required;
+        c.smtp_url = Some("smtp://x".into());
+    })
+    .await;
+    let register = |name: &'static str, email: &'static str| {
+        node.req(
+            Method::POST,
+            "/api/v1/auth/register",
+            None,
+            Some(json!({ "username": name, "date_of_birth": "1990-01-01", "password": "password-long-enough", "email": email })),
+        )
+    };
+    assert_eq!(register("alice", "alice@example.org").await.0, StatusCode::CREATED);
+    let mails = || node.state.mailer.outbox.lock().unwrap().clone();
+    let token_of = |body: &str| body.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    let resend = |account: &str| {
+        node.req(Method::POST, "/api/v1/auth/verify-email/resend", None, Some(json!({ "account": account })))
+    };
+    let first = token_of(&mails()[0].2);
+
+    // By username: a new link replaces the first one.
+    let (s, j) = resend("alice").await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    assert_eq!(mails().len(), 2);
+    assert_eq!(mails()[1].0, "alice@example.org");
+    assert!(mails()[1].2.contains("/verify-email?token="), "the mail carries the confirmation link");
+    let second = token_of(&mails()[1].2);
+    assert_ne!(first, second);
+    let verify =
+        |token: String| node.req(Method::POST, "/api/v1/auth/verify-email", None, Some(json!({ "token": token })));
+    let (s, j) = verify(first).await;
+    assert_eq!(
+        (s, j["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("auth.verification_invalid")),
+        "the old link is replaced"
+    );
+    assert_eq!(verify(second).await.0, StatusCode::NO_CONTENT);
+
+    // Confirmed accounts, unknown accounts and other nodes' addresses: 204 and no mail (no account enumeration).
+    for account in
+        ["alice", "alice@t.local", "alice@example.org", "nobody", "nobody@example.org", "alice@other.example", ""]
+    {
+        let (s, j) = resend(account).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{account}: {j}");
+    }
+    assert_eq!(mails().len(), 2);
+
+    // By e-mail (case-insensitive) and by address; at most three mails per account and hour, the answer stays 204.
+    assert_eq!(register("bob", "bob@example.org").await.0, StatusCode::CREATED);
+    assert_eq!(mails().len(), 3);
+    for account in ["Bob@Example.org", "BOB@t.local", "bob", "bob", "bob"] {
+        assert_eq!(resend(account).await.0, StatusCode::NO_CONTENT);
+    }
+    let to_bob = mails().iter().filter(|m| m.0 == "bob@example.org").count();
+    assert_eq!(to_bob, 4, "the registration mail plus three resent ones");
+
+    // Over-long input is refused before any lookup.
+    let (s, j) = resend(&"x".repeat(400)).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("validation.length")), "{j}");
+}
+
+/// Without SMTP a production node cannot send the link again: `503 mail.unavailable`, like the password reset.
+#[tokio::test]
+async fn verification_resend_without_smtp_is_unavailable_in_production() {
+    use tower::ServiceExt;
+    let node = test_node("t.local").await;
+    let mut state = node.state.clone();
+    let production = tavrn_node::config::Config { dev: false, ..(*state.config).clone() };
+    state.mailer = tavrn_node::mail::Mailer::from_config(&production);
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/verify-email/resend")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "account": "x" }).to_string()))
+        .unwrap();
+    let resp = tavrn_node::app::router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let j = common::body_json(resp).await;
+    assert_eq!(j["code"], "mail.unavailable", "{j}");
+}
+
 #[tokio::test]
 async fn login_success_failure_and_rate_limit() {
     let node = test_node("t.local").await;

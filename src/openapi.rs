@@ -44,7 +44,7 @@ impl Modify for BearerAuth {
     paths(
         node::get_node, wellknown::get_well_known, health::healthz, health::readyz,
         auth::device_nonce, mls::pending_removals, mls::own_pending_removals, second_factor::reauth, second_factor::reauth_webauthn_start, keys::put_retired_device,
-        auth::register, auth::login, auth::refresh, auth::logout, auth::verify_email, auth::me, auth::devices, auth::change_password, auth::delete_device, auth::forgot_password, auth::reset_password,
+        auth::register, auth::login, auth::refresh, auth::logout, auth::verify_email, auth::resend_verification, auth::me, auth::devices, auth::change_password, auth::delete_device, auth::forgot_password, auth::reset_password,
         second_factor::verify, second_factor::factors, second_factor::totp_enroll, second_factor::totp_confirm, second_factor::totp_remove, second_factor::regenerate_recovery_codes,
         second_factor::webauthn_register_start, second_factor::webauthn_register_finish, second_factor::webauthn_credentials, second_factor::webauthn_delete_credential,
         second_factor::webauthn_login_start, second_factor::webauthn_login_finish,

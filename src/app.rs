@@ -100,6 +100,8 @@ pub struct AppState {
     pub login_limiter: Arc<SharedLimiter>,
     /// Password reset mails per account (`forgot-user:<id>`, 3 per hour).
     pub forgot_limiter: Arc<SharedLimiter>,
+    /// Confirmation mails sent again per account (`verify-mail-user:<id>`, 3 per hour).
+    pub verify_mail_limiter: Arc<SharedLimiter>,
     pub register_limiter: Arc<SharedLimiter>,
     /// KeyPackage claims per claiming user (`claim:<user id>`).
     pub claim_limiter: Arc<RateLimiter>,
@@ -457,6 +459,7 @@ impl AppState {
             mailer,
             login_limiter: shared("login", login_max, 60),
             forgot_limiter: shared("forgot-user", 3, 3600),
+            verify_mail_limiter: shared("verify-mail-user", 3, 3600),
             register_limiter: shared("register", register_max, 600),
             claim_limiter: limiter(e2ee.0, 60),
             key_package_limiter: limiter(e2ee.1, 60),
@@ -528,6 +531,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/reauth/webauthn/start", post(routes::second_factor::reauth_webauthn_start))
         .route("/auth/logout", post(routes::auth::logout))
         .route("/auth/verify-email", post(routes::auth::verify_email))
+        .route("/auth/verify-email/resend", post(routes::auth::resend_verification))
         .route("/auth/forgot-password", post(routes::auth::forgot_password))
         .route("/auth/reset-password", post(routes::auth::reset_password))
         .route("/auth/second-factor/verify", post(routes::second_factor::verify).layer(small()))
