@@ -226,7 +226,7 @@ fn sample(len: usize) -> Vec<u8> {
 }
 
 async fn eventually(mut check: impl FnMut() -> bool) {
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         if check() {
             return;
         }
@@ -599,7 +599,7 @@ async fn deleting_channels_and_rooms_cleans_the_external_store() {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_pending_deletes").fetch_one(db).await.unwrap();
         n
     };
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         let attempts: Option<i64> =
             sqlx::query_scalar("SELECT MAX(attempts) FROM file_pending_deletes").fetch_one(db).await.unwrap();
         if attempts.unwrap_or(0) >= 1 {

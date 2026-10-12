@@ -77,7 +77,7 @@ type Rx = tokio::sync::broadcast::Receiver<std::sync::Arc<tavrn_node::hub::Event
 
 /// The next hub event of `kind` (data and the users it goes to).
 async fn next(rx: &mut Rx, kind: &str) -> (Value, Vec<String>) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(common::timeout(Duration::from_secs(5)), async {
         loop {
             let ev = rx.recv().await.unwrap();
             if ev.kind == kind {

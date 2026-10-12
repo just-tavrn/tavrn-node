@@ -12,13 +12,13 @@ use common::federation::{FedNode, two_nodes};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-/// Waits (5 s) for a `presence.update` of `user` matching `status` and returns its data.
+/// Waits (5 s, scaled) for a `presence.update` of `user` matching `status` and returns its data.
 async fn presence(ws: &mut Ws, user: &str, status: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
             .await
-            .expect("no matching presence update within 5 s")
+            .expect("no matching presence update in time")
             .unwrap()
             .unwrap();
         let Ok(v) = serde_json::from_str::<Value>(msg.to_text().unwrap_or("")) else { continue };

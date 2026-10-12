@@ -233,7 +233,7 @@ async fn the_websocket_of_an_account_without_a_date_of_birth_closes() {
     ws.send(Message::Text(json!({ "op": "hello", "token": old.token, "capabilities": [] }).to_string().into()))
         .await
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+    let frame = common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap();
     let Message::Close(Some(f)) = frame else { unreachable!("expected a close frame, got {frame:?}") };
     assert_eq!(u16::from(f.code), 4002);
     assert_eq!(f.reason.as_str(), "age.status_required");

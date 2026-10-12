@@ -77,7 +77,7 @@ async fn wait_done(node: &TestNode, started: &Value) -> Value {
         started["id"].as_str().unwrap(),
         started["status_token"].as_str().unwrap()
     );
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         let (s, st) = node.req(Method::GET, &path, None, None).await;
         assert_eq!(s, StatusCode::OK, "{st}");
         if st["state"] == "done" {
@@ -406,7 +406,7 @@ async fn other_nodes_tombstone_the_user_on_user_deleted() {
     a.deliver().await;
 
     let mut content = Value::Null;
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         let (_, msgs) = b.get_auth(&format!("/api/v1/rooms/{room_id}/channels/{channel}/messages"), &carol.token).await;
         let msg = msgs.as_array().unwrap().iter().find(|x| x["id"] == m["id"]).cloned().unwrap();
         assert_eq!(msg["author_deleted"], true, "{msg}");

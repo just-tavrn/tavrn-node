@@ -42,8 +42,14 @@ async fn connect(url: &str, token: &str, last_event_id: Option<&str>) -> Socket 
     let mut ws = tokio_tungstenite::connect_async(url).await.unwrap().0;
     let hello = json!({ "op": "hello", "token": token, "last_event_id": last_event_id });
     ws.send(WsMessage::Text(hello.to_string().into())).await.unwrap();
-    assert_eq!(next(&mut ws, 5000).await.unwrap()["op"], "ready");
+    assert_eq!(next(&mut ws, wait()).await.unwrap()["op"], "ready");
     ws
+}
+
+/// How long a test waits for a frame it expects (milliseconds, scaled by `TAVRN_TEST_TIMEOUT_FACTOR`); the short
+/// windows in which nothing may arrive stay as they are.
+fn wait() -> u64 {
+    u64::try_from(common::timeout(Duration::from_secs(5)).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The next JSON frame within `ms` (pings answered and skipped).
@@ -134,20 +140,20 @@ async fn events_reach_websockets_on_every_instance(cache: Arc<dyn Cache>) {
     // Bob writes through instance B: Alice's WebSocket on A gets it, and Bob's on B.
     let (st, sent) = b.node.send(&bob.token, &room_id, &channel, "hello from B").await;
     assert_eq!(st, StatusCode::CREATED, "{sent}");
-    let ev = wait_event(&mut ws_alice, "message.create", 5000).await.expect("event on A");
+    let ev = wait_event(&mut ws_alice, "message.create", wait()).await.expect("event on A");
     assert_eq!(ev["data"]["id"], sent["id"]);
     assert_eq!(ev["data"]["content"]["body"], "hello from B");
-    let own = wait_event(&mut ws_bob, "message.create", 5000).await.expect("event on B");
+    let own = wait_event(&mut ws_bob, "message.create", wait()).await.expect("event on B");
     assert_eq!(own["id"], ev["id"], "one event, one id on every instance");
     // And the other way round, exactly once each.
     let (st, _) = a.node.send(&alice.token, &room_id, &channel, "hello from A").await;
     assert_eq!(st, StatusCode::CREATED);
     assert_eq!(
-        wait_event(&mut ws_bob, "message.create", 5000).await.unwrap()["data"]["content"]["body"],
+        wait_event(&mut ws_bob, "message.create", wait()).await.unwrap()["data"]["content"]["body"],
         "hello from A"
     );
     assert!(wait_event(&mut ws_bob, "message.create", 400).await.is_none(), "no duplicate");
-    assert!(wait_event(&mut ws_alice, "message.create", 5000).await.is_some());
+    assert!(wait_event(&mut ws_alice, "message.create", wait()).await.is_some());
     assert!(wait_event(&mut ws_alice, "message.create", 400).await.is_none(), "no duplicate");
 }
 both!(events_reach_websockets_on_every_instance, fanout_in_process, fanout_valkey);
@@ -159,11 +165,11 @@ async fn a_reconnect_with_another_instances_event_id_resyncs(cache: Arc<dyn Cach
     let (room_id, channel) = room(a, &alice, &[]).await;
     let mut ws = connect(&a.ws_url(), &alice.token, None).await;
     a.node.send(&alice.token, &room_id, &channel, "x").await;
-    let last = wait_event(&mut ws, "message.create", 5000).await.unwrap()["id"].as_str().unwrap().to_string();
+    let last = wait_event(&mut ws, "message.create", wait()).await.unwrap()["id"].as_str().unwrap().to_string();
     drop(ws);
     // The load balancer sends the reconnect to B: B cannot replay A's events, the client reloads.
     let mut ws = connect(&b.ws_url(), &alice.token, Some(&last)).await;
-    assert_eq!(next(&mut ws, 3000).await.unwrap(), json!({ "op": "resync" }));
+    assert_eq!(next(&mut ws, wait()).await.unwrap(), json!({ "op": "resync" }));
 }
 both!(a_reconnect_with_another_instances_event_id_resyncs, last_event_id_in_process, last_event_id_valkey);
 
@@ -182,7 +188,7 @@ async fn presence_counts_connections_on_every_instance(cache: Arc<dyn Cache>) {
     let ws_alice = connect(&b.ws_url(), &alice.token, None).await;
     let update = loop {
         // Bob's own presence comes first (his connection on A).
-        let ev = wait_event(&mut ws_bob, "presence.update", 5000).await.expect("presence via the bus");
+        let ev = wait_event(&mut ws_bob, "presence.update", wait()).await.expect("presence via the bus");
         if ev["data"]["user_id"] == alice.user_id.as_str() {
             break ev;
         }
@@ -196,7 +202,7 @@ async fn presence_counts_connections_on_every_instance(cache: Arc<dyn Cache>) {
     // Her device goes idle through A (the REST call and the WebSocket on different instances): both agree.
     let (st, j) = a.node.put("/api/v1/users/me/presence", &alice.token, json!({ "status": "idle" })).await;
     assert_eq!(st, StatusCode::OK, "{j}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     while mine(b, &alice.token).await["effective"] != "idle" {
         assert!(tokio::time::Instant::now() < deadline, "idle not replicated to B");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -207,7 +213,7 @@ async fn presence_counts_connections_on_every_instance(cache: Arc<dyn Cache>) {
     drop(ws_alice);
     wait_for(Duration::from_secs(5), || !tavrn_node::presence::is_online(&a.node.state, &alice.user_id)).await;
     let offline = loop {
-        let ev = wait_event(&mut ws_bob, "presence.update", 5000).await.expect("offline update");
+        let ev = wait_event(&mut ws_bob, "presence.update", wait()).await.expect("offline update");
         if ev["data"]["status"] == "offline" {
             break ev;
         }
@@ -315,8 +321,30 @@ async fn exactly_one_instance_leads_and_another_takes_over(cache: Arc<dyn Cache>
 }
 both!(exactly_one_instance_leads_and_another_takes_over, leader_in_process, leader_valkey);
 
-async fn whiteboard_requests_are_relayed_to_the_leader(cache: Arc<dyn Cache>) {
+/// The harness keeps an elected leader leading for the whole test (`cluster::elect`), however long the test takes on a
+/// loaded machine: a lapsed lease silently stopped the leader's announcements halfway (the moved-member scenario
+/// below failed on a busy CI runner).
+async fn an_elected_leader_keeps_leading_past_its_lease(cache: Arc<dyn Cache>) {
     let nodes = instances(&domain(), cache, 2).await;
+    elect(&nodes, 0, LEASE).await;
+    let lapsed = tokio::time::Instant::now() + LEASE * 3;
+    while tokio::time::Instant::now() < lapsed {
+        assert!(nodes[0].node.state.cluster.is_leader(), "the leader lost its lease");
+        tokio::time::sleep(LEASE / 10).await;
+    }
+    assert!(!nodes[1].node.state.cluster.is_leader());
+}
+both!(an_elected_leader_keeps_leading_past_its_lease, elected_in_process, elected_valkey);
+
+async fn whiteboard_requests_are_relayed_to_the_leader(cache: Arc<dyn Cache>) {
+    // The ephemeral limit counted in requests, not in time (the production limit is 30 per second, which a loaded
+    // machine never reaches with sequential requests): five per ten minutes on the leader i0, none on i1, so only a
+    // relayed request can hit it.
+    let nodes = cluster::instances_with(&domain(), cache, 2, |state| {
+        let max = if state.cluster.instance_id == "i0" { 5 } else { u32::MAX };
+        state.ephemeral_limiter = Arc::new(tavrn_node::auth::RateLimiter::new(max, Duration::from_secs(600)));
+    })
+    .await;
     let (a, b) = (&nodes[0], &nodes[1]);
     elect(&nodes, 0, Duration::from_secs(30)).await;
     let alice = a.node.register("alice").await;
@@ -334,11 +362,11 @@ async fn whiteboard_requests_are_relayed_to_the_leader(cache: Arc<dyn Cache>) {
         assert_eq!(s["session"]["owner_id"], alice.user_id.as_str(), "same session through every instance");
     }
     assert!(b.node.state.whiteboards.get(&channel, std::time::Instant::now()).is_none(), "nothing kept on B");
-    assert!(wait_event(&mut ws_bob, "whiteboard.session", 5000).await.is_some());
-    // The ephemeral limiter of the leader counts the relayed events (30 per second and sender).
+    assert!(wait_event(&mut ws_bob, "whiteboard.session", wait()).await.is_some());
+    // The ephemeral limiter of the leader counts the relayed events (one limit per sender for the node).
     let cursor = json!({ "type": "cursor", "content": { "x": 1 } });
     let mut limited = false;
-    for _ in 0..40 {
+    for _ in 0..10 {
         let (st, _) =
             b.node.post(&format!("/api/v1/conversations/{channel}/ephemeral"), &alice.token, cursor.clone()).await;
         limited |= st == StatusCode::TOO_MANY_REQUESTS;
@@ -353,8 +381,9 @@ async fn voice_effects_and_wakeups_reach_the_leader(cache: Arc<dyn Cache>) {
     elect(&nodes, 0, Duration::from_secs(30)).await;
     // A wakeup of a leader-only worker from B reaches A.
     let woken = a.outbox_wakeup.clone();
-    let wait =
-        tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(5), woken.notified()).await.is_ok() });
+    let wait = tokio::spawn(async move {
+        tokio::time::timeout(common::timeout(Duration::from_secs(5)), woken.notified()).await.is_ok()
+    });
     tokio::time::sleep(Duration::from_millis(50)).await;
     tavrn_node::cache::wake(b, tavrn_node::cache::Job::Outbox);
     assert!(wait.await.unwrap(), "the leader's outbox worker was woken");
@@ -410,9 +439,9 @@ async fn a_moved_member_views_the_channel_on_every_instance(cache: Arc<dyn Cache
         .post(&voice(&lobby, &format!("members/bob@{domain}/move")), &alice.token, json!({ "channel_id": stage }))
         .await;
     assert_eq!(st, StatusCode::NO_CONTENT, "{j}");
-    let created = wait_event(&mut ws_bob, "channel.create", 5000).await.expect("channel.create on B");
+    let created = wait_event(&mut ws_bob, "channel.create", wait()).await.expect("channel.create on B");
     assert_eq!(created["data"]["id"], stage.as_str());
-    assert!(wait_event(&mut ws_bob, "voice.move", 5000).await.is_some());
+    assert!(wait_event(&mut ws_bob, "voice.move", wait()).await.is_some());
     let (_, detail) = b.node.get_auth(&format!("/api/v1/rooms/{room_id}"), &bob.token).await;
     assert!(listed(&detail), "B's room detail lists the stage for the moved member");
     let (st, j) = b.node.post(&voice(&stage, "join"), &bob.token, json!({})).await;
@@ -421,7 +450,7 @@ async fn a_moved_member_views_the_channel_on_every_instance(cache: Arc<dyn Cache
     // Leaving through B ends it on B too.
     let (st, _) = b.node.post(&voice(&stage, "leave"), &bob.token, json!({})).await;
     assert_eq!(st, StatusCode::NO_CONTENT);
-    let hidden = wait_event(&mut ws_bob, "channel.delete", 5000).await.expect("channel.delete on B");
+    let hidden = wait_event(&mut ws_bob, "channel.delete", wait()).await.expect("channel.delete on B");
     assert_eq!(hidden["data"]["hidden"], true);
     let (_, detail) = b.node.get_auth(&format!("/api/v1/rooms/{room_id}"), &bob.token).await;
     assert!(!listed(&detail));
@@ -478,7 +507,7 @@ async fn interactions_reach_a_bot_connected_to_another_instance(cache: Arc<dyn C
 
     // The bot is connected to B only; A learns that through the cache.
     let mut ws_bot = connect(&b.ws_url(), secret, None).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     while a.node.state.interactions.remote_receiver(bot_id).await.is_none() {
         assert!(tokio::time::Instant::now() < deadline, "B's receiver not registered");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -488,7 +517,7 @@ async fn interactions_reach_a_bot_connected_to_another_instance(cache: Arc<dyn C
     // Bob invokes through A; B delivers to the bot; the bot answers through B, which relays to A.
     let path = format!("/api/v1/conversations/{channel}/interactions");
     let invocation = spawn_post(a, path.clone(), &bob.token, json!({ "command": command, "args": {} }));
-    let invoke = wait_event(&mut ws_bot, "command.invoke", 5000).await.expect("invocation on B");
+    let invoke = wait_event(&mut ws_bot, "command.invoke", wait()).await.expect("invocation on B");
     let id = invoke["data"]["interaction_id"].as_str().unwrap().to_string();
     assert_eq!(invoke["data"]["user"], format!("bob@{}", a.node.state.config.domain));
     let (st, j) = b
@@ -526,7 +555,7 @@ async fn interactions_reach_a_bot_connected_to_another_instance(cache: Arc<dyn C
 
     // The bot leaves B: A answers `503 interaction.app_offline` once nobody holds a connection.
     drop(ws_bot);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     while a.node.state.interactions.remote_receiver(bot_id).await.is_some() {
         assert!(tokio::time::Instant::now() < deadline, "B's receiver not removed");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -637,8 +666,8 @@ async fn lost_events_make_the_other_instances_clients_resync() {
     flaky.publish_fails.store(false, std::sync::atomic::Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     b.node.send(&alice.token, &room_id, &channel, "after").await;
-    assert_eq!(next(&mut ws, 5000).await.unwrap(), json!({ "op": "resync" }));
-    assert_eq!(wait_event(&mut ws, "message.create", 5000).await.unwrap()["data"]["content"]["body"], "after");
+    assert_eq!(next(&mut ws, wait()).await.unwrap(), json!({ "op": "resync" }));
+    assert_eq!(wait_event(&mut ws, "message.create", wait()).await.unwrap()["data"]["content"]["body"], "after");
 }
 
 #[tokio::test]
@@ -651,11 +680,11 @@ async fn a_broken_subscription_is_renewed_and_clients_resync() {
     let mut ws = connect(&a.ws_url(), &alice.token, None).await;
     // The connection to the cache breaks: every instance subscribes again and its clients reload.
     cache.interrupt();
-    assert_eq!(wait_event(&mut ws, "resync", 5000).await.unwrap(), json!({ "op": "resync" }));
+    assert_eq!(wait_event(&mut ws, "resync", wait()).await.unwrap(), json!({ "op": "resync" }));
     // Afterwards events flow again.
     tokio::time::sleep(Duration::from_millis(300)).await;
     b.node.send(&alice.token, &room_id, &channel, "again").await;
-    assert_eq!(wait_event(&mut ws, "message.create", 5000).await.unwrap()["data"]["content"]["body"], "again");
+    assert_eq!(wait_event(&mut ws, "message.create", wait()).await.unwrap()["data"]["content"]["body"], "again");
     let (_, ready) = a.node.req(Method::GET, "/readyz", None, None).await;
     assert_eq!(ready["cache"], true, "{ready}");
 }

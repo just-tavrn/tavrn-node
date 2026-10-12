@@ -29,7 +29,7 @@ async fn connect(url: &str, token: &str) -> Socket {
     let mut ws = tokio_tungstenite::connect_async(url).await.unwrap().0;
     ws.send(WsMessage::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        let frame = common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap();
         if let WsMessage::Text(t) = frame
             && serde_json::from_str::<Value>(&t).unwrap()["op"] == "ready"
         {

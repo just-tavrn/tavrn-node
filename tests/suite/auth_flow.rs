@@ -457,7 +457,7 @@ async fn review_a_cancelled_login_keeps_its_hashing_slot_until_the_hash_ends() {
             .unwrap();
         router.oneshot(req).await.unwrap().status()
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + common::timeout(std::time::Duration::from_secs(5));
     while node.state.password_hashing.available_permits() == 1 {
         assert!(std::time::Instant::now() < deadline, "the login never started hashing");
         tokio::task::yield_now().await;

@@ -182,7 +182,7 @@ async fn hello(url: &str, token: &str) -> Socket {
 /// The next frame, skipping presence updates.
 async fn next_frame(ws: &mut Socket) -> Value {
     loop {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        let msg = common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap();
         if let Message::Text(t) = msg {
             let v: Value = serde_json::from_str(&t).unwrap();
             if v["type"] != "presence.update" {
@@ -370,7 +370,7 @@ async fn a_timeout_or_a_kick_ends_a_moved_participation() {
     assert_eq!(s, StatusCode::OK, "{j}");
     voice::check_access(&r.node.state, &r.room_id).await;
     let mut gone = false;
-    for _ in 0..50 {
+    for _ in 0..common::rounds(50) {
         if r.participants(&r.alice, &r.stage).await.is_empty() {
             gone = true;
             break;
@@ -463,7 +463,7 @@ async fn a_moved_member_joins_the_voice_channel_s_mls_group_and_is_removed_after
     let mut rx = r.node.state.hub.subscribe();
     let (s, _) = r.node.post(&r.voice(&r.stage, "leave"), bob.token(), json!({})).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let needed = tokio::time::timeout(Duration::from_secs(5), async {
+    let needed = tokio::time::timeout(common::timeout(Duration::from_secs(5)), async {
         loop {
             let ev = rx.recv().await.unwrap();
             if ev.kind == "mls.remove_needed" {

@@ -152,6 +152,11 @@ creation time, and before creating a database the tests drop the `t_*` databases
 `TAVRN_TEST_DB_MAX_AGE_SECS` (default 1200, 20 minutes; at most once a minute per test binary). Nothing else on
 the server is touched. `just test-pg-clean` drops every `t_*` database at once (only while no tests run).
 
+`TAVRN_TEST_TIMEOUT_FACTOR` (default 1; the self-hosted CI runners set 3) scales every limit a test waits for an
+event or a condition (`timeout`, `within`, `wait_until` in `tests/common`), never fixed delays or the windows in which
+nothing may arrive. Tests wait for events, not for time: a WebSocket test acts only after the node's `ready`, a cluster
+test keeps its elected leader's lease renewed.
+
 ### Container image
 
 Releases are published as `ghcr.io/just-tavrn/tavrn-node:<version>` (tags `X.Y.Z`, `X.Y`, `latest`) for

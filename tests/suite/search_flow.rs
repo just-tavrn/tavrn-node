@@ -225,7 +225,7 @@ async fn encrypted_channels_are_never_indexed_and_the_switch_drops_rows() {
     // Back to plaintext: the plaintext messages are indexed again (in the background).
     let (s, _) = r.node.patch(&path, &r.alice.token, json!({ "encrypted": false })).await;
     assert_eq!(s, StatusCode::OK);
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         if r.indexed(&r.channel).await == 1 {
             break;
         }

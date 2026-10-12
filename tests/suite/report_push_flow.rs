@@ -92,7 +92,7 @@ impl Browser {
     }
 
     async fn wait(&self, fake: &Fake, n: usize) {
-        for _ in 0..100 {
+        for _ in 0..common::rounds(100) {
             if self.count(fake) >= n {
                 return;
             }

@@ -285,7 +285,7 @@ async fn log(node: &TestNode, token: &str, welcome: &str, kind: &str) -> Vec<Val
 }
 
 async fn next_event(rx: &mut broadcast::Receiver<Arc<Event>>, kind: &str, matches: impl Fn(&Value) -> bool) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = common::deadline(Duration::from_secs(5));
     loop {
         let ev = tokio::time::timeout_at(deadline, rx.recv()).await.expect("event missing").unwrap();
         if ev.kind == kind && matches(&ev.data) {

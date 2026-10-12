@@ -77,7 +77,7 @@ impl FakePushService {
 
     /// Waits until `path` received `n` pushes (the sender works in the background).
     async fn wait(&self, path: &str, n: usize) -> Vec<Received> {
-        for _ in 0..100 {
+        for _ in 0..common::rounds(100) {
             let got = self.for_path(path);
             if got.len() >= n {
                 return got;
@@ -318,7 +318,7 @@ async fn messages_push_under_the_notification_rules_only_without_a_connection() 
     assert_eq!(r.headers["topic"].len(), 22);
     // The sender records the delivery after the push service answered: wait for it (tavrn-node #21).
     let mut used = None;
-    for _ in 0..100 {
+    for _ in 0..common::rounds(100) {
         used = store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap()[0].last_used_at.clone();
         if used.is_some() {
             break;
@@ -438,7 +438,7 @@ async fn push_service_answers_remove_or_hold_back_subscriptions() {
     s.fake.wait(&busy.path, 1).await;
     let rows = || async { store::push::list(&s.node.state.db, &s.bob.user_id).await.unwrap() };
     let mut left = rows().await;
-    for _ in 0..50 {
+    for _ in 0..common::rounds(50) {
         if left.len() == 1 && left[0].failures == 1 {
             break;
         }

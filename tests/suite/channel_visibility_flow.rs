@@ -36,7 +36,7 @@ async fn hello(url: &str, token: &str) -> Socket {
 /// The next frame, skipping presence updates.
 async fn next_event(ws: &mut Socket) -> Value {
     loop {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        let msg = common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap();
         if let Message::Text(t) = msg {
             let v: Value = serde_json::from_str(&t).unwrap();
             if v["type"] != "presence.update" {

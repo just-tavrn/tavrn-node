@@ -311,7 +311,7 @@ async fn a_missing_rate_limit_only_warns_and_does_not_block() {
 
 /// Waits until `node` has a conformance result for `peer` (a background run).
 async fn wait_for_result(node: &FedNode, peer: &str) -> String {
-    for _ in 0..300 {
+    for _ in 0..common::rounds(300) {
         if let Some(r) =
             store::conformance::peer_state(&node.state.db, peer).await.unwrap().and_then(|p| p.conformance_result)
             && !node.state.conformance.is_running(peer)
