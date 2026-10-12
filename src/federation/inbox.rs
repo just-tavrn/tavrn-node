@@ -11,8 +11,8 @@
 //! Handlers run inline before the `202` (short database updates, plus a refetch of the sender's key view
 //! for key changes) and are idempotent through the dedupe. Implemented: `session.revoke`,
 //! `identity.changed`, `devices.changed`, `profile.changed` (here; the mirror refresh runs in the background) and `room.invite`, `conversation.invite`, `friend.*`,
-//! `notify`, `ban.notify` (`federation::social`) and `node.announce` (`federation::announce`); unknown types
-//! are accepted and ignored (forward compatibility).
+//! `notify`, `ban.notify` (`federation::social`), `node.announce` (`federation::announce`) and `report.forward`
+//! (`reports::forward`); unknown types are accepted and ignored (forward compatibility).
 
 use std::time::Instant;
 
@@ -108,6 +108,8 @@ pub fn rule(kind: &str) -> Option<(FromRule, ToRule)> {
         // an account by its home node.
         "legal.notice" => (FromRule::Sender, ToRule::Node),
         "user.deleted" => (FromRule::UserOfSender, ToRule::Node),
+        // Reports v2 (MODERATION.md §1.6): the node holding a report tells the reported user's home node.
+        "report.forward" => (FromRule::Sender, ToRule::User),
         _ => return None,
     })
 }
@@ -182,6 +184,7 @@ enum Action {
     App(crate::installations::Incoming),
     LegalNotice,
     UserDeleted,
+    ReportForward(crate::reports::forward::Incoming),
     Ignore,
 }
 
@@ -217,6 +220,7 @@ fn parse_action(kind: &str, iss: &str, payload: &Value) -> Result<Action, ApiErr
         }
         crate::legal::notices::KIND => Ok(Action::LegalNotice),
         crate::legal::account::KIND => Ok(Action::UserDeleted),
+        crate::reports::forward::KIND => crate::reports::forward::parse(payload).map(Action::ReportForward),
         _ => {
             if let Some(app) = crate::installations::parse(kind, iss, payload)? {
                 return Ok(Action::App(app));
@@ -320,6 +324,9 @@ async fn process(state: &AppState, iss: &str, envelope: &Envelope) -> Result<&'s
     if let Action::ProfileChanged { version, user } = &mut action {
         *user = super::profiles::admit_changed(state, iss, &envelope.from, *version).await?.map(Box::new);
     }
+    if let Action::ReportForward(_) = action {
+        crate::reports::forward::admit_inbound(state, iss).await?;
+    }
     if !store::federation::mark_seen(&state.db, iss, &envelope.id, &envelope.kind).await? {
         return Ok("duplicate");
     }
@@ -359,6 +366,13 @@ async fn handle(
         super::profiles::spawn_changed_refresh(state, *user, version);
         return Ok("handled");
     }
+    if let Action::ReportForward(incoming) = action {
+        let Some(Recipient::User(username)) = &recipient else { return Ok("ignored") };
+        let user = store::users::by_username(&state.db, username, &state.config.domain)
+            .await?
+            .ok_or_else(recipient_unknown)?;
+        return crate::reports::forward::receive(state, iss, &user, incoming).await;
+    }
     let action = match action {
         Action::App(incoming) => {
             return match &recipient {
@@ -386,7 +400,12 @@ async fn handle(
     };
     match (action, sender_user) {
         (
-            Action::Ignore | Action::Social(_) | Action::App(_) | Action::LegalNotice | Action::ProfileChanged { .. },
+            Action::Ignore
+            | Action::Social(_)
+            | Action::App(_)
+            | Action::LegalNotice
+            | Action::ProfileChanged { .. }
+            | Action::ReportForward(_),
             _,
         ) => Ok("stored"),
         (_, None) => Ok("no_local_state"),
@@ -488,11 +507,19 @@ mod tests {
         // Legal: notices come from the forwarding node, deletions from the user's home node.
         assert_eq!(ok("legal.notice", ISS, OWN), node);
         assert_eq!(ok("user.deleted", "alice@a.example", OWN), node);
+        // Reports v2: from the node holding the report to the reported user of this node.
+        assert_eq!(ok("report.forward", ISS, "bob@b.example"), user);
+        assert_eq!(
+            code(check_authority(OWN, ISS, "report.forward", ISS, "carol@c.example")),
+            "federation.recipient_unknown"
+        );
         for (kind, from, to) in [
             ("legal.notice", "alice@a.example", OWN),
             ("legal.notice", ISS, "bob@b.example"),
             ("user.deleted", "mallory@c.example", OWN),
             ("user.deleted", ISS, OWN),
+            ("report.forward", "alice@a.example", "bob@b.example"),
+            ("report.forward", ISS, OWN),
         ] {
             assert_eq!(
                 code(check_authority(OWN, ISS, kind, from, to)),

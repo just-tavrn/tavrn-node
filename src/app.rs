@@ -61,6 +61,10 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     // Reports and content auto-moderation (MODERATION.md).
     caps.push("reports.v1");
     caps.push("automod.v1");
+    // Forwarding reports about remote users to their home node (MODERATION.md §1.6): a federation feature.
+    if config.federation_enabled {
+        caps.push(crate::reports::forward::CAPABILITY);
+    }
     // History restore after a key reset by request and approval (ENCRYPTION.md §7b).
     caps.push("history.restore");
     // History shares sealed per recipient device (ENCRYPTION.md §7b "Format v2").
@@ -256,6 +260,9 @@ pub struct AppState {
     /// hour) and from all domains together (five times as many).
     pub legal_inbound_limiter: Arc<SharedLimiter>,
     pub legal_inbound_total_limiter: Arc<SharedLimiter>,
+    /// Reports forwarded by other nodes (MODERATION.md §1.6): per sending registrable domain and in total.
+    pub reports_inbound_limiter: Arc<SharedLimiter>,
+    pub reports_inbound_total_limiter: Arc<SharedLimiter>,
     /// Status-link lookups (notices, account deletions) per client IP (`lookup-ip:<ip>`, 60 per hour).
     pub legal_lookup_limiter: Arc<SharedLimiter>,
     /// Access tokens issued before this Unix time are expired. Only development nodes move it
@@ -431,6 +438,8 @@ impl AppState {
             legal_notice_limiter: shared("legal-notice", config.legal_notice_rate_per_hour, 3600),
             legal_inbound_limiter: shared("legal-inbound", config.legal_notice_inbound_per_hour, 3600),
             legal_inbound_total_limiter: shared("legal-inbound-all", config.legal_notice_inbound_per_hour * 5, 3600),
+            reports_inbound_limiter: shared("reports-inbound", config.reports_inbound_per_hour, 3600),
+            reports_inbound_total_limiter: shared("reports-inbound-all", config.reports_inbound_per_hour * 5, 3600),
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),

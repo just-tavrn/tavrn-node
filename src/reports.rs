@@ -7,7 +7,10 @@
 //! node admins, everything else (DMs, users without context, rooms, the room owner) to the node admins only.
 //! Reporters are visible to moderators; the reported user never learns about a report. Action shortcuts run the
 //! existing moderation routes with the caller's own permissions inside [`ACTING_ON`], so the audit entries those
-//! routes write carry the report id.
+//! routes write carry the report id. Reports about users of other nodes can be forwarded to their home node
+//! ([`forward`], MODERATION.md §1.6).
+
+pub mod forward;
 
 use axum::{
     Json,
@@ -125,7 +128,7 @@ pub struct ReportActionRecord {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ModerationReport {
     pub id: String,
-    /// `user` or `automod`.
+    /// `user`, `automod` or `forward` (forwarded by another node).
     pub source: String,
     /// `room` (the room's moderators and node admins) or `node` (node admins).
     pub scope: String,
@@ -144,7 +147,7 @@ pub struct ModerationReport {
     /// The reported user (null for an address this node does not know).
     pub target: Option<User>,
     pub target_address: String,
-    /// Null for automod entries.
+    /// Null for automod entries and forwarded reports.
     pub reporter: Option<User>,
     pub category: String,
     pub detail: String,
@@ -159,9 +162,36 @@ pub struct ModerationReport {
     pub assignee: Option<User>,
     pub note: String,
     pub actions: Vec<ReportActionRecord>,
+    /// Set once a node admin forwarded the report to the reported user's home node.
+    pub forwarded: Option<ReportForward>,
+    /// Set for a report another node forwarded here (`source: forward`).
+    pub origin: Option<ReportOrigin>,
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
+}
+
+/// Where and when a report was forwarded (MODERATION.md §1.6).
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+pub struct ReportForward {
+    /// The reported user's home node.
+    pub node: String,
+    pub at: String,
+    /// The admin who forwarded it (address).
+    pub by: String,
+}
+
+/// The node a forwarded report comes from (`source: forward`, MODERATION.md §1.6).
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+pub struct ReportOrigin {
+    /// The sending node.
+    pub node: String,
+    /// The report's id on the sending node.
+    pub report_id: String,
+    /// The reporter's pseudonym (stable per reporter for this node, never an address).
+    pub reporter: String,
+    /// When the report was made on the sending node.
+    pub reported_at: String,
 }
 
 /// A page of the inbox.
@@ -222,11 +252,17 @@ fn evidence_invalid(detail: impl Into<String>) -> ApiError {
 
 /// Checks reporter-provided evidence (MODERATION.md §1.2); `reported` must be one of the entries.
 pub fn validate_evidence(entries: &[EvidenceEntry], reported: &str) -> Result<String, ApiError> {
+    check_evidence(entries, reported, false)
+}
+
+/// [`validate_evidence`]; `pseudonyms` also allows pseudonyms as authors (forwarded evidence, §1.6).
+pub fn check_evidence(entries: &[EvidenceEntry], reported: &str, pseudonyms: bool) -> Result<String, ApiError> {
     if entries.is_empty() || entries.len() > EVIDENCE_MAX_ENTRIES {
         return Err(evidence_invalid(format!("1 to {EVIDENCE_MAX_ENTRIES} messages")));
     }
     for e in entries {
-        if util::parse_address(&e.author.to_lowercase()).is_none() {
+        if util::parse_address(&e.author.to_lowercase()).is_none() && !(pseudonyms && forward::is_pseudonym(&e.author))
+        {
             return Err(evidence_invalid("author: an address"));
         }
         if e.message_id.as_deref().is_some_and(|id| !util::is_ulid(id))
@@ -562,7 +598,7 @@ pub async fn can_see(state: &AppState, user: &UserRow, row: &ReportRow) -> Resul
     }
 }
 
-fn not_found() -> ApiError {
+pub(crate) fn not_found() -> ApiError {
     access::not_found("Report", "report.not_found")
 }
 
@@ -594,7 +630,7 @@ async fn audience(state: &AppState, row: &ReportRow) -> Result<Vec<String>, ApiE
 }
 
 /// `report.create` (MODERATION.md §1.5): no detail, no evidence.
-async fn announce(state: &AppState, row: &ReportRow) {
+pub(crate) async fn announce(state: &AppState, row: &ReportRow) {
     let room_name = match &row.room_id {
         Some(id) => store::rooms::room_by_id(&state.db, id).await.ok().flatten().map(|r| r.name),
         None => None,
@@ -642,8 +678,8 @@ fn push_report(state: &AppState, row: &ReportRow, room_name: Option<String>, aud
     });
 }
 
-/// `report.update` after a change, an action or a deletion.
-async fn changed(state: &AppState, row: &ReportRow, status: &str) {
+/// `report.update` after a change, an action, a forward or a deletion.
+pub(crate) async fn changed(state: &AppState, row: &ReportRow, status: &str) {
     match audience(state, row).await {
         Ok(ids) => {
             state.hub.users(
@@ -710,6 +746,19 @@ pub async fn to_api(state: &AppState, rows: Vec<ReportRow>, full: bool) -> Resul
                 evidence_source: evidence.as_ref().map(|_| "reporter".to_string()),
                 evidence: if full { evidence } else { None },
                 actions: serde_json::from_str(&r.actions).unwrap_or_default(),
+                forwarded: match (r.forwarded_to, r.forwarded_at) {
+                    (Some(node), Some(at)) => Some(ReportForward { node, at, by: r.forwarded_by.unwrap_or_default() }),
+                    _ => None,
+                },
+                origin: match (r.origin, r.origin_report_id) {
+                    (Some(node), Some(report_id)) => Some(ReportOrigin {
+                        node,
+                        report_id,
+                        reporter: r.origin_reporter.unwrap_or_default(),
+                        reported_at: r.origin_reported_at.unwrap_or_default(),
+                    }),
+                    _ => None,
+                },
                 id: r.id,
                 source: r.source,
                 scope: r.scope,
@@ -835,7 +884,7 @@ fn action_invalid(detail: impl Into<String>) -> ApiError {
     bad("report.action_invalid", detail)
 }
 
-fn require_admin(auth: &AuthUser) -> Result<(), ApiError> {
+pub(crate) fn require_admin(auth: &AuthUser) -> Result<(), ApiError> {
     if auth.user.is_node_admin() {
         Ok(())
     } else {

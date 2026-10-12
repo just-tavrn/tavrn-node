@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Reports and automod inbox entries (protocol MODERATION.md §1, §2.4): table `reports` of migration 0270.
+//! Reports and automod inbox entries (protocol MODERATION.md §1, §2.4): table `reports` of migration 0270, with the
+//! forwarding columns of migration 0380 (§1.6).
 
 use sqlx::{FromRow, Row};
 
@@ -7,7 +8,8 @@ use crate::{db::Pool, error::ApiError};
 
 const COLS: &str = "id, source, scope, kind, reporter_id, room_id, conversation_id, node, message_id, target_user_id, \
                     target_address, category, detail, snapshot, evidence, status, assignee_id, note, actions, \
-                    created_at, updated_at, resolved_at";
+                    created_at, updated_at, resolved_at, forwarded_to, forwarded_at, forwarded_by, origin, \
+                    origin_report_id, origin_reporter, origin_reported_at";
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct ReportRow {
@@ -40,6 +42,23 @@ pub struct ReportRow {
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
+    /// The home node this report was forwarded to (MODERATION.md §1.6), when and by whom (the admin's address).
+    pub forwarded_to: Option<String>,
+    pub forwarded_at: Option<String>,
+    pub forwarded_by: Option<String>,
+    /// `source = 'forward'`: the sending node, the report's id there, the reporter's pseudonym and the original time.
+    pub origin: Option<String>,
+    pub origin_report_id: Option<String>,
+    pub origin_reporter: Option<String>,
+    pub origin_reported_at: Option<String>,
+}
+
+/// Where a forwarded report comes from (MODERATION.md §1.6).
+pub struct NewOrigin<'a> {
+    pub node: &'a str,
+    pub report_id: &'a str,
+    pub reporter: &'a str,
+    pub reported_at: &'a str,
 }
 
 /// A new report (or automod entry).
@@ -63,10 +82,17 @@ pub struct NewReport<'a> {
 }
 
 pub async fn insert(db: &Pool, r: &NewReport<'_>) -> Result<(), ApiError> {
+    insert_with_origin(db, r, None).await
+}
+
+/// Inserts a report; `origin` for one another node forwarded (`source = 'forward'`). A second report of the same
+/// origin and original id violates the unique index `reports_origin`: [`by_origin`] is checked first.
+pub async fn insert_with_origin(db: &Pool, r: &NewReport<'_>, origin: Option<&NewOrigin<'_>>) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO reports (id, source, scope, kind, reporter_id, room_id, conversation_id, node, message_id,
-             target_user_id, target_address, category, detail, snapshot, evidence, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', $16, $16)",
+             target_user_id, target_address, category, detail, snapshot, evidence, status, created_at, updated_at,
+             origin, origin_report_id, origin_reporter, origin_reported_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', $16, $16, $17, $18, $19, $20)",
     )
     .bind(r.id)
     .bind(r.source)
@@ -84,8 +110,47 @@ pub async fn insert(db: &Pool, r: &NewReport<'_>) -> Result<(), ApiError> {
     .bind(r.snapshot)
     .bind(r.evidence)
     .bind(r.created_at)
+    .bind(origin.map(|o| o.node))
+    .bind(origin.map(|o| o.report_id))
+    .bind(origin.map(|o| o.reporter))
+    .bind(origin.map(|o| o.reported_at))
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// The report `origin` forwarded with its id `report_id` there, if it arrived before.
+pub async fn by_origin(db: &Pool, origin: &str, report_id: &str) -> Result<Option<ReportRow>, ApiError> {
+    Ok(sqlx::query_as(&format!("SELECT {COLS} FROM reports WHERE origin = $1 AND origin_report_id = $2"))
+        .bind(origin)
+        .bind(report_id)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// Records that report `id` was forwarded to `node`, unless it was forwarded before; `true` if this call recorded it
+/// (exactly one of several concurrent forwards sends the message).
+pub async fn mark_forwarded(db: &Pool, id: &str, node: &str, by: &str, at: &str) -> Result<bool, ApiError> {
+    Ok(sqlx::query(
+        "UPDATE reports SET forwarded_to = $1, forwarded_by = $2, forwarded_at = $3, updated_at = $3
+         WHERE id = $4 AND forwarded_to IS NULL",
+    )
+    .bind(node)
+    .bind(by)
+    .bind(at)
+    .bind(id)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Takes back a forwarding mark whose message could not be queued.
+pub async fn clear_forwarded(db: &Pool, id: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE reports SET forwarded_to = NULL, forwarded_by = NULL, forwarded_at = NULL WHERE id = $1")
+        .bind(id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -400,6 +465,37 @@ mod tests {
         assert_eq!(prune(&db, "2026-01-01T00:00:00Z").await.unwrap(), 0);
         assert_eq!(prune(&db, "2026-02-01T00:00:00Z").await.unwrap(), 1);
         assert_eq!(ids(list(&db, &ListFilter::default(), 50).await.unwrap()), vec!["01B", "01A"]);
+    }
+
+    #[tokio::test]
+    async fn forwarding_marks_and_origins() {
+        let db = db().await;
+        insert(&db, &report("01A", "2026-01-01T00:00:00Z")).await.unwrap();
+        assert!(mark_forwarded(&db, "01A", "b.example", "u1@d", "2026-01-02T00:00:00Z").await.unwrap());
+        assert!(!mark_forwarded(&db, "01A", "c.example", "u1@d", "2026-01-03T00:00:00Z").await.unwrap(), "once only");
+        let row = by_id(&db, "01A").await.unwrap().unwrap();
+        assert_eq!(
+            (row.forwarded_to.as_deref(), row.forwarded_by.as_deref(), row.forwarded_at.as_deref()),
+            (Some("b.example"), Some("u1@d"), Some("2026-01-02T00:00:00Z"))
+        );
+        clear_forwarded(&db, "01A").await.unwrap();
+        assert_eq!(by_id(&db, "01A").await.unwrap().unwrap().forwarded_to, None);
+
+        let origin =
+            NewOrigin { node: "a.example", report_id: "01X", reporter: "anon-1", reported_at: "2026-01-01T00:00:00Z" };
+        let forwarded = NewReport { source: "forward", reporter_id: None, ..report("01B", "2026-01-02T00:00:00Z") };
+        assert_eq!(by_origin(&db, "a.example", "01X").await.unwrap(), None);
+        insert_with_origin(&db, &forwarded, Some(&origin)).await.unwrap();
+        let row = by_origin(&db, "a.example", "01X").await.unwrap().unwrap();
+        assert_eq!((row.id.as_str(), row.source.as_str()), ("01B", "forward"));
+        assert_eq!(
+            (row.origin_reporter.as_deref(), row.origin_reported_at.as_deref()),
+            (Some("anon-1"), Some("2026-01-01T00:00:00Z"))
+        );
+        assert_eq!(by_origin(&db, "c.example", "01X").await.unwrap(), None, "per origin");
+        let again = NewReport { id: "01C", ..forwarded };
+        assert!(insert_with_origin(&db, &again, Some(&origin)).await.is_err(), "unique per origin and report id");
+        assert_eq!(sent_since(&db, "u1", "2026-01-01T00:00:00Z").await.unwrap().0, 1, "forwarded reports do not count");
     }
 
     #[tokio::test]

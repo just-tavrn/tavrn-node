@@ -21,7 +21,8 @@ use crate::{
     permissions as p,
     reports::{
         self, CreateReportRequest, EvidenceEntry, MessageSnapshot, ModerationReport, ReportActionRecord,
-        ReportActionRequest, ReportActionResult, ReportCreated, ReportList, UpdateReportRequest,
+        ReportActionRequest, ReportActionResult, ReportCreated, ReportForward, ReportList, ReportOrigin,
+        UpdateReportRequest,
     },
     routes::rooms::RoomDetail,
     store::{self, reports::ListFilter},
@@ -41,6 +42,7 @@ pub fn routes() -> Router<AppState> {
             get(get_report).patch(update_report).delete(delete_report).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/reports/{report_id}/actions", post(act_on_report).layer(DefaultBodyLimit::max(16 * 1024)))
+        .route("/reports/{report_id}/forward", post(forward_report).layer(DefaultBodyLimit::max(1024)))
         .route("/rooms/{room_id}/reports", get(room_reports))
         .route("/admin/reports", get(admin_reports))
         .route(
@@ -59,6 +61,7 @@ pub fn routes() -> Router<AppState> {
         update_report,
         delete_report,
         act_on_report,
+        forward_report,
         room_reports,
         admin_reports,
         get_automod,
@@ -77,6 +80,8 @@ pub fn routes() -> Router<AppState> {
         UpdateReportRequest,
         ReportActionRequest,
         ReportActionResult,
+        ReportForward,
+        ReportOrigin,
         AutomodRule,
         AutomodSettings,
         AutomodBurst,
@@ -172,6 +177,24 @@ pub async fn act_on_report(
     ApiJson(req): ApiJson<ReportActionRequest>,
 ) -> Result<Json<ReportActionResult>, ApiError> {
     Ok(Json(reports::act(&state, &auth, &report_id, req).await?))
+}
+
+/// Forward a report to the reported user's home node.
+///
+/// Node admins only, for reports by users about a user of another node whose home node announces `reports.v2`
+/// (MODERATION.md §1.6). The node queues `report.forward` with the report's kind, category, text, snapshot or released
+/// evidence and a pseudonym of the reporter (never the address). Idempotent: a forwarded report answers with its
+/// `forwarded` unchanged. The reporter is told nothing. `400 report.forward_invalid` (automod entries, room reports,
+/// forwarded reports), `409 report.target_local`, `409 report.forward_unsupported`.
+#[utoipa::path(post, path = "/api/v1/reports/{report_id}/forward", security(("bearer" = [])), params(("report_id" = String, Path)),
+    responses((status = 200, body = ModerationReport), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 502, body = ProblemDetails)))]
+pub async fn forward_report(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(report_id): Path<String>,
+) -> Result<Json<ModerationReport>, ApiError> {
+    Ok(Json(reports::forward::forward(&state, &auth, &report_id).await?))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

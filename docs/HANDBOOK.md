@@ -442,7 +442,8 @@ These settings tune the flood detection that works in every channel, encrypted o
 | `TAVRN_AUTOMOD_TIMEOUT_MINUTES` | `10` | Timeout in minutes after a spam burst. |
 
 Reports and content auto-moderation add `TAVRN_REPORTS_RETENTION_DAYS`, `TAVRN_REPORTS_RATE_PER_HOUR`,
-`TAVRN_AUTOMOD_WORDS_FILE` and `TAVRN_AUTOMOD_LINKS`; see [Moderation and auto-moderation](#moderation-and-auto-moderation).
+`TAVRN_REPORTS_INBOUND_PER_HOUR`, `TAVRN_AUTOMOD_WORDS_FILE` and `TAVRN_AUTOMOD_LINKS`; see
+[Moderation and auto-moderation](#moderation-and-auto-moderation).
 
 ### Legal settings
 
@@ -2112,6 +2113,31 @@ deletes resolved and dismissed reports with their evidence; admins can delete a 
 announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
 only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
+#### Forwarding reports to another node
+
+A report about a user of another node (a member from elsewhere in one of your rooms, or the author of a direct
+message hosted elsewhere) lands with you, but only the admins of that user's home node can act on the account. Node
+admins can therefore forward such a report from Admin → Reports ("Forward to the user's home node", after a
+confirmation); the home node must announce `reports.v2` (current tavrn nodes with federation on do). Forwarding is a
+federation message (`report.forward`, retried for three days like every federation message) and happens once per
+report; the report stays in your inbox with "Forwarded to …" and you keep handling it as before.
+
+What is forwarded: the category, the reporter's text, the time, the message id, the snapshot of a plaintext message
+or the plaintext the reporter released for an encrypted one. What is not: the reporter's address (the home node sees
+a pseudonym that stays the same for the same reporter, but cannot be linked across nodes), the addresses and devices
+of other people in the released messages (pseudonyms too), room names and ids, your notes and actions. The reporter
+and the reported user are told nothing. The text itself goes as it is: read it before you forward, since the other
+node's admins, possibly the reported user themselves on a one-person node, will read it.
+
+Forwarded reports from other nodes appear in Admin → Reports marked "Forwarded from …" with the pseudonym of the
+reporter; they are node reports about your user and offer the account actions (node ban, delete the user's content),
+not the message actions (the content lives on the other node). Each original report arrives once; other nodes may
+forward `TAVRN_REPORTS_INBOUND_PER_HOUR` (default 20) reports per hour per sending domain, five times as many from all
+nodes together. Retention is the same as for every report (`TAVRN_REPORTS_RETENTION_DAYS` after closing; open reports
+are kept), on each node independently: deleting a report on one node does not delete the other node's copy, and an
+erased account's forwarded reports lose their target but keep the origin. Both directions are in the audit log
+(`report.forward`, `report.forwarded_in`).
+
 ### Content auto-moderation
 
 Content rules only work where the node can read: unencrypted channels (never ciphertext). Rooms define their own
@@ -2142,7 +2168,7 @@ birth. Some of the actions they record:
 | Audit log | Examples |
 |---|---|
 | Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
-| Node | `user.register`, `user.second_factor_enroll`, `user.recovery_code_used`, `admin.user_disable`, `admin.user_delete`, `admin.second_factor_reset`, `admin.date_of_birth`, `admin.ban`, `admin.federation_block`, `federation.block_auto`, `federation.user_deleted`, `app.create`, `app.token_create`, `webhook.create`, `entitlements.grant_create`, `legal.*`, `retention.messages`, `directory.reports_notice` |
+| Node | `user.register`, `user.second_factor_enroll`, `user.recovery_code_used`, `admin.user_disable`, `admin.user_delete`, `admin.second_factor_reset`, `admin.date_of_birth`, `admin.ban`, `admin.federation_block`, `federation.block_auto`, `federation.user_deleted`, `app.create`, `app.token_create`, `webhook.create`, `entitlements.grant_create`, `legal.*`, `retention.messages`, `directory.reports_notice`, `report.forward`, `report.forwarded_in` |
 
 Moderation shortcuts of the reports inbox add the report they act on (`report_id`). The node keeps audit entries as
 long as the room (room log) or the node (node log) exists; deleted accounts stay in them pseudonymised (LEGAL.md).

@@ -35,6 +35,11 @@ First public release of the node and its container image.
   `TAVRN_FILES_CHANNELS_MAX_BYTES` (`files_channels.max_bytes`) no longer limits channels on external WebDAV/S3
   stores. Their managers can set an optional limit per store in the channel's storage settings (`max_bytes` of
   `PUT …/files/backend`, `0` = unlimited), enforced with `413 files.quota_exceeded` and shown as the channel's limit.
+- **Reports v2: forwarding to the home node** (protocol MODERATION.md §1.6, `reports.v2`): node admins forward a
+  report about a user of another node with `POST /reports/{id}/forward` (once, through the federation outbox, the
+  reporter as a pseudonym); the home node stores `report.forward` in its admins' inbox with the origin, once per
+  original report and at most `TAVRN_REPORTS_INBOUND_PER_HOUR` (default 20) per sending domain and hour. Migration
+  `0380_reports_v2.sql` adds the forwarding and origin columns to `reports`.
 
 ### Fixed
 
