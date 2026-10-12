@@ -27,6 +27,12 @@
 //! as a viewer of the channel ([`VoiceState::moved`], `voice::moved`), and the participant is shown with
 //! `moved: true`.
 //!
+//! A device may add one *screen publisher* (VOICE.md §4b, [`VoiceState::reserve_screen`]): a second participant
+//! `<identity>#screen` that only publishes the device's screen share. It is listed right after its owner with
+//! `screen_of`, takes no seat ([`VoiceState::occupancy`]) and ends with its owner: every removal of the owner removes
+//! it too, and one left behind by an expiry or a reconciliation is collected for the caller to remove from LiveKit
+//! ([`VoiceState::take_orphans`]).
+//!
 //! Everything here is pure and synchronous; callers hold the mutex only for one call.
 
 use std::{
@@ -88,6 +94,11 @@ pub struct VoiceParticipant {
     /// nodes (= `false`).
     #[schema(required = false)]
     pub moved: bool,
+    /// Set only for a device's screen publisher (VOICE.md §4b): the identity of the device it belongs to. Clients
+    /// show it as that participant's stream, not as a participant of its own. Absent for devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(required = false)]
+    pub screen_of: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,12 +134,29 @@ pub struct Who {
     pub user_id: String,
     pub device_id: String,
     pub server_muted: bool,
+    /// The device's screen publisher (VOICE.md §4b), not the device itself.
+    pub screen: bool,
 }
 
 impl Who {
     pub fn identity(&self) -> String {
+        let device = super::identity(&self.user, &self.device_id);
+        if self.screen { super::screen_identity(&device) } else { device }
+    }
+
+    /// The device's own identity (the owner of a screen publisher).
+    pub fn device_identity(&self) -> String {
         super::identity(&self.user, &self.device_id)
     }
+}
+
+/// Why a screen publisher was refused (VOICE.md §4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenRefusal {
+    /// The device has no participant in the channel.
+    NoOwner,
+    /// The device already has a screen publisher (connected, reconnecting or freshly reserved).
+    Active,
 }
 
 /// Changes a client may make to its own state; `None` = unchanged.
@@ -161,6 +189,8 @@ pub struct VoiceState {
     grace: Duration,
     /// Per user id: the user's move (one per user, a new move replaces it).
     moves: HashMap<String, Move>,
+    /// Screen publishers whose owner went away in an expiry or a reconciliation, still to be removed from LiveKit.
+    orphans: Vec<(ChannelKey, String)>,
 }
 
 impl Default for VoiceState {
@@ -172,7 +202,7 @@ impl Default for VoiceState {
 impl VoiceState {
     /// State with a grace period for dropped connections (zero: dropped participants leave at once).
     pub fn with_grace(grace: Duration) -> Self {
-        Self { channels: BTreeMap::new(), grace, moves: HashMap::new() }
+        Self { channels: BTreeMap::new(), grace, moves: HashMap::new(), orphans: Vec::new() }
     }
 
     /// The grace period for dropped connections.
@@ -185,12 +215,19 @@ impl VoiceState {
     /// replaced (one voice session per user).
     pub fn reserve(&mut self, key: &ChannelKey, who: &Who, now: Instant) -> Reserved {
         let identity = who.identity();
-        let mut changed = self.remove_identity_except(&identity, key);
         let mut displaced = Vec::new();
+        // The device's screen publishers elsewhere go with it (the device itself disconnects there by itself).
+        let screen = super::screen_identity(&identity);
+        for (k, entries) in &self.channels {
+            if k != key && entries.iter().any(|e| e.p.identity == screen) {
+                displaced.push((k.clone(), screen.clone()));
+            }
+        }
+        let mut changed = self.remove_identity_except(&identity, key);
         for (k, entries) in self.channels.iter_mut() {
             let mut visible = false;
             entries.retain(|e| {
-                let other_device = e.p.user_id == who.user_id && e.p.identity != identity;
+                let other_device = e.p.user_id == who.user_id && owner_of(&e.p) != identity;
                 if other_device {
                     displaced.push((k.clone(), e.p.identity.clone()));
                     visible |= e.active;
@@ -214,6 +251,38 @@ impl VoiceState {
         Reserved { changed, displaced }
     }
 
+    /// Reserves the screen publisher of `who`'s device in `key` (VOICE.md §4b; `who.screen` is set by the caller):
+    /// the device must have a participant there, and no other screen publisher (connected, reconnecting or reserved
+    /// within [`PENDING_TTL`]). A stale reservation is replaced.
+    pub fn reserve_screen(&mut self, key: &ChannelKey, who: &Who, now: Instant) -> Result<(), ScreenRefusal> {
+        let owner = who.device_identity();
+        let identity = super::screen_identity(&owner);
+        let entries = self.channels.get_mut(key).ok_or(ScreenRefusal::NoOwner)?;
+        if !entries.iter().any(|e| e.p.identity == owner) {
+            return Err(ScreenRefusal::NoOwner);
+        }
+        if let Some(e) = entries.iter().find(|e| e.p.identity == identity) {
+            if e.active || now.duration_since(e.since) < PENDING_TTL {
+                return Err(ScreenRefusal::Active);
+            }
+            entries.retain(|e| e.p.identity != identity);
+        }
+        let screen = Who { screen: true, ..who.clone() };
+        place(entries, Entry { p: participant(&screen, &identity), active: false, since: now, lost: None });
+        Ok(())
+    }
+
+    /// Whether `who` may be a participant of `key`: always for a device, for a screen publisher only while its
+    /// device has a participant there (the caller removes a refused one from LiveKit).
+    pub fn accepts(&self, key: &ChannelKey, who: &Who) -> bool {
+        !who.screen || self.get(key, &who.device_identity()).is_some()
+    }
+
+    /// Screen publishers whose device went away (expiry, reconciliation), for the caller to remove from LiveKit.
+    pub fn take_orphans(&mut self) -> Vec<(ChannelKey, String)> {
+        std::mem::take(&mut self.orphans)
+    }
+
     /// LiveKit reported the participant (`participant_joined` or reconciliation). `who` is needed when no
     /// reservation exists (e.g. a reconnect with a token LiveKit refreshed). Returns `true` if the visible
     /// participants of `key` changed.
@@ -234,9 +303,12 @@ impl VoiceState {
                 true
             }
             None => {
+                if who.screen && !entries.iter().any(|e| e.p.identity == who.device_identity()) {
+                    return false;
+                }
                 let mut p = participant(who, &identity);
                 p.joined_at = crate::util::now();
-                entries.push(Entry { p, active: true, since: now, lost: None });
+                place(entries, Entry { p, active: true, since: now, lost: None });
                 true
             }
         }
@@ -265,6 +337,7 @@ impl VoiceState {
         for (key, entries) in self.channels.iter_mut() {
             let before = entries.len();
             entries.retain(|e| e.lost.is_none_or(|lost| now.duration_since(lost) < grace));
+            drop_orphans(key, entries, &mut self.orphans);
             if entries.len() != before {
                 changed.push(key.clone());
             }
@@ -273,27 +346,36 @@ impl VoiceState {
         changed
     }
 
-    /// Removes `identity` from `key` (left, removed, disconnected). Returns `true` if it was visible.
+    /// Removes `identity` from `key` (left, removed, disconnected), a device with its screen publisher. Returns
+    /// `true` if anything visible went.
     pub fn remove(&mut self, key: &ChannelKey, identity: &str) -> bool {
         let Some(entries) = self.channels.get_mut(key) else { return false };
-        let before = entries.iter().find(|e| e.p.identity == identity).map(|e| e.active);
-        entries.retain(|e| e.p.identity != identity);
+        let gone = |e: &Entry| e.p.identity == identity || e.p.screen_of.as_deref() == Some(identity);
+        let visible = entries.iter().any(|e| gone(e) && e.active);
+        entries.retain(|e| !gone(e));
         if entries.is_empty() {
             self.channels.remove(key);
         }
-        before.unwrap_or(false)
+        visible
     }
 
-    /// A screen share or camera track was published (`true`) or unpublished (`false`).
+    /// A screen share or camera track was published (`true`) or unpublished (`false`). A screen publisher's screen
+    /// share also makes its owner stream.
     pub fn set_track(&mut self, key: &ChannelKey, identity: &str, source: Source, published: bool) -> bool {
         let Some(e) = self.entry_mut(key, identity) else { return false };
         let flag = match source {
             Source::Screen => &mut e.p.streaming,
             Source::Camera => &mut e.p.camera,
         };
-        let changed = *flag != published;
+        let mut changed = *flag != published && e.active;
         *flag = published;
-        changed && e.active
+        if let (Source::Screen, Some(owner)) = (source, e.p.screen_of.clone())
+            && let Some(o) = self.entry_mut(key, &owner)
+        {
+            changed |= o.p.streaming != published && o.active;
+            o.p.streaming = published;
+        }
+        changed
     }
 
     /// Applies a client's own state change. `None` if the device has neither a reservation nor a
@@ -323,7 +405,8 @@ impl VoiceState {
     pub fn set_server_muted(&mut self, room_id: &str, user_id: &str, muted: bool) -> Vec<(ChannelKey, String, bool)> {
         let mut out = Vec::new();
         for (key, entries) in self.channels.iter_mut().filter(|(k, _)| k.0 == room_id) {
-            for e in entries.iter_mut().filter(|e| e.p.user_id == user_id) {
+            // Screen publishers keep their grants (a server mute takes the microphone only, VOICE.md §4b).
+            for e in entries.iter_mut().filter(|e| e.p.user_id == user_id && e.p.screen_of.is_none()) {
                 let changed = e.p.server_muted != muted || (muted && !e.p.muted);
                 e.p.server_muted = muted;
                 if muted {
@@ -357,7 +440,7 @@ impl VoiceState {
             .get(key)
             .map(|v| {
                 v.iter()
-                    .filter(|e| e.p.user_id != except_user_id)
+                    .filter(|e| e.p.user_id != except_user_id && e.p.screen_of.is_none())
                     .filter(|e| e.active || now.duration_since(e.since) < PENDING_TTL)
                     .count()
             })
@@ -508,6 +591,7 @@ impl VoiceState {
                 }
                 keep
             });
+            visible_change |= drop_orphans(key, entries, &mut self.orphans);
             for e in entries.iter_mut() {
                 let here = present.contains(&e.p.identity);
                 if !e.active && here {
@@ -555,13 +639,45 @@ impl VoiceState {
     }
 }
 
+/// The device a participant belongs to: its own identity, or a screen publisher's owner.
+fn owner_of(p: &VoiceParticipant) -> &str {
+    p.screen_of.as_deref().unwrap_or(&p.identity)
+}
+
+/// Adds an entry: a screen publisher right after its owner (and the owner's earlier screen), anything else last.
+fn place(entries: &mut Vec<Entry>, entry: Entry) {
+    let at = entry.p.screen_of.as_deref().and_then(|owner| entries.iter().rposition(|e| owner_of(&e.p) == owner));
+    match at {
+        Some(i) => entries.insert(i + 1, entry),
+        None => entries.push(entry),
+    }
+}
+
+/// Drops the screen publishers of `entries` whose device has no entry any more; collects them in `orphans`.
+/// Returns whether a visible one went.
+fn drop_orphans(key: &ChannelKey, entries: &mut Vec<Entry>, orphans: &mut Vec<(ChannelKey, String)>) -> bool {
+    let owners: HashSet<String> =
+        entries.iter().filter(|e| e.p.screen_of.is_none()).map(|e| e.p.identity.clone()).collect();
+    let mut visible = false;
+    entries.retain(|e| match &e.p.screen_of {
+        Some(owner) if !owners.contains(owner) => {
+            orphans.push((key.clone(), e.p.identity.clone()));
+            visible |= e.active;
+            false
+        }
+        _ => true,
+    });
+    visible
+}
+
 fn participant(who: &Who, identity: &str) -> VoiceParticipant {
     VoiceParticipant {
         user: who.user.clone(),
         user_id: who.user_id.clone(),
         device_id: who.device_id.clone(),
         identity: identity.to_string(),
-        muted: who.server_muted,
+        // A screen publisher has no microphone (VOICE.md §4b).
+        muted: who.server_muted || who.screen,
         deafened: false,
         streaming: false,
         camera: false,
@@ -569,6 +685,7 @@ fn participant(who: &Who, identity: &str) -> VoiceParticipant {
         joined_at: String::new(),
         connection: Connection::Connected,
         moved: false,
+        screen_of: who.screen.then(|| who.device_identity()),
     }
 }
 
@@ -590,7 +707,12 @@ mod tests {
             user_id: format!("id-{user}"),
             device_id: device.into(),
             server_muted: false,
+            screen: false,
         }
+    }
+
+    fn screen(user: &str, device: &str) -> Who {
+        Who { screen: true, ..who(user, device) }
     }
 
     fn id(user: &str, device: &str) -> String {
@@ -835,6 +957,149 @@ mod tests {
         s.activate(&key("c3"), &who("bob", DEV_A), now);
         assert_eq!(s.remove_room("room"), vec![key("c3")]);
         assert!(s.active_channels("room").is_empty());
+    }
+
+    #[test]
+    fn a_screen_publisher_needs_its_device_and_is_one_per_device() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        assert_eq!(s.reserve_screen(&key("c1"), &screen("alice", DEV_A), t0), Err(ScreenRefusal::NoOwner));
+        s.reserve(&key("c1"), &who("bob", DEV_A), t0);
+        assert_eq!(
+            s.reserve_screen(&key("c1"), &screen("alice", DEV_A), t0),
+            Err(ScreenRefusal::NoOwner),
+            "bob's device is not alice's"
+        );
+        s.reserve(&key("c1"), &who("alice", DEV_A), t0);
+        assert_eq!(s.reserve_screen(&key("c1"), &screen("alice", DEV_A), t0), Ok(()));
+        assert_eq!(s.reserve_screen(&key("c1"), &screen("alice", DEV_A), t0), Err(ScreenRefusal::Active), "reserved");
+        // A reservation LiveKit never saw goes stale and may be replaced; a connected one never.
+        let later = t0 + PENDING_TTL;
+        assert_eq!(s.reserve_screen(&key("c1"), &screen("alice", DEV_A), later), Ok(()));
+        assert!(s.activate(&key("c1"), &screen("alice", DEV_A), later));
+        assert_eq!(
+            s.reserve_screen(&key("c1"), &screen("alice", DEV_A), later + PENDING_TTL),
+            Err(ScreenRefusal::Active)
+        );
+        assert_eq!(s.identities_in(&key("c1")).iter().filter(|i| i.ends_with("#screen")).count(), 1, "never twice");
+    }
+
+    #[test]
+    fn a_screen_publisher_is_listed_after_its_owner_and_takes_no_seat() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        s.activate(&key("c1"), &who("alice", DEV_A), t0);
+        s.activate(&key("c1"), &who("bob", DEV_B), t0);
+        s.reserve_screen(&key("c1"), &screen("alice", DEV_A), t0).unwrap();
+        assert_eq!(s.participants(&key("c1")).len(), 2, "reserved: invisible");
+        assert!(s.activate(&key("c1"), &screen("alice", DEV_A), t0));
+        let ps = s.participants(&key("c1"));
+        let ids: Vec<&str> = ps.iter().map(|p| p.identity.as_str()).collect();
+        assert_eq!(ids, [id("alice", DEV_A), format!("{}#screen", id("alice", DEV_A)), id("bob", DEV_B)]);
+        let p = &ps[1];
+        assert_eq!(p.screen_of.as_deref(), Some(id("alice", DEV_A).as_str()));
+        assert_eq!(
+            (p.user.as_str(), p.user_id.as_str(), p.device_id.as_str()),
+            ("alice@node.example", "id-alice", DEV_A)
+        );
+        assert!(p.muted && !p.deafened && !p.camera && !p.streaming);
+        assert_eq!(ps[0].screen_of, None);
+        assert_eq!(s.occupancy(&key("c1"), "x", t0), 2, "two people, not three");
+        // Activated without a reservation (a reconnect with a refreshed token): placed the same way.
+        let mut s2 = VoiceState::default();
+        s2.activate(&key("c1"), &who("alice", DEV_A), t0);
+        s2.activate(&key("c1"), &who("bob", DEV_B), t0);
+        assert!(!s2.activate(&key("c1"), &screen("carol", DEV_A), t0), "no device, no screen publisher");
+        assert!(!s2.accepts(&key("c1"), &screen("carol", DEV_A)));
+        assert!(s2.accepts(&key("c1"), &screen("alice", DEV_A)) && s2.accepts(&key("c1"), &who("carol", DEV_A)));
+        assert!(s2.activate(&key("c1"), &screen("alice", DEV_A), t0));
+        assert_eq!(s2.participants(&key("c1"))[1].identity, format!("{}#screen", id("alice", DEV_A)));
+    }
+
+    #[test]
+    fn the_screen_track_makes_the_owner_stream_and_a_server_mute_leaves_the_screen_alone() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        s.activate(&key("c1"), &who("alice", DEV_A), t0);
+        s.activate(&key("c1"), &screen("alice", DEV_A), t0);
+        let scr = format!("{}#screen", id("alice", DEV_A));
+        assert!(s.set_track(&key("c1"), &scr, Source::Screen, true));
+        let ps = s.participants(&key("c1"));
+        assert!(ps[0].streaming && ps[1].streaming);
+        assert!(!s.set_track(&key("c1"), &scr, Source::Screen, true));
+        assert!(s.set_track(&key("c1"), &scr, Source::Screen, false));
+        assert!(s.participants(&key("c1")).iter().all(|p| !p.streaming));
+        let out = s.set_server_muted("room", "id-alice", true);
+        assert_eq!(out, vec![(key("c1"), id("alice", DEV_A), true)], "only the device's microphone grant changes");
+    }
+
+    #[test]
+    fn a_screen_publisher_ends_with_its_owner() {
+        let mut s = VoiceState::with_grace(Duration::from_secs(5));
+        let t0 = Instant::now();
+        let scr = format!("{}#screen", id("alice", DEV_A));
+        let start = |s: &mut VoiceState| {
+            s.activate(&key("c1"), &who("alice", DEV_A), t0);
+            s.activate(&key("c1"), &screen("alice", DEV_A), t0);
+        };
+        // The owner leaves: both go.
+        start(&mut s);
+        assert!(s.remove(&key("c1"), &id("alice", DEV_A)));
+        assert!(s.participants(&key("c1")).is_empty());
+        // The screen's own leave: the owner stays.
+        start(&mut s);
+        assert!(s.remove(&key("c1"), &scr));
+        assert_eq!(s.identities_in(&key("c1")), vec![id("alice", DEV_A)]);
+        // The owner reconnects: the screen stays; its grace runs out: both go, the screen is collected for LiveKit.
+        start(&mut s);
+        s.lose(&key("c1"), &id("alice", DEV_A), t0);
+        assert!(s.expire(t0 + Duration::from_secs(4)).is_empty());
+        assert_eq!(s.participants(&key("c1")).len(), 2);
+        assert!(s.take_orphans().is_empty());
+        assert_eq!(s.expire(t0 + Duration::from_secs(5)), vec![key("c1")]);
+        assert!(s.participants(&key("c1")).is_empty());
+        assert_eq!(s.take_orphans(), vec![(key("c1"), scr.clone())]);
+        assert!(s.take_orphans().is_empty());
+        // The reconciliation drops an owner LiveKit lost for good the same way.
+        start(&mut s);
+        let only_screen: HashMap<ChannelKey, HashSet<String>> =
+            [(key("c1"), [scr.clone()].into_iter().collect())].into_iter().collect();
+        s.reconcile(&only_screen, t0);
+        let (changed, _) = s.reconcile(&only_screen, t0 + Duration::from_secs(5));
+        assert_eq!(changed, vec![key("c1")]);
+        assert!(s.participants(&key("c1")).is_empty());
+        assert_eq!(s.take_orphans(), vec![(key("c1"), scr.clone())]);
+        // A kick or ban (all of the user's entries).
+        start(&mut s);
+        let removed = s.remove_user("room", "id-alice");
+        assert_eq!(removed, vec![(key("c1"), vec![id("alice", DEV_A), scr.clone()], true)]);
+    }
+
+    #[test]
+    fn the_screen_publisher_follows_its_device_and_leaves_with_a_replaced_device() {
+        let mut s = VoiceState::default();
+        let t0 = Instant::now();
+        let scr = format!("{}#screen", id("alice", DEV_A));
+        s.activate(&key("c1"), &who("alice", DEV_A), t0);
+        s.activate(&key("c1"), &screen("alice", DEV_A), t0);
+        // A rejoin of the device keeps it.
+        let r = s.reserve(&key("c1"), &who("alice", DEV_A), t0);
+        assert_eq!(r, Reserved::default());
+        assert_eq!(s.participants(&key("c1")).len(), 2);
+        // The device joins another channel: its screen publisher there is told to go too.
+        let r = s.reserve(&key("c2"), &who("alice", DEV_A), t0);
+        assert_eq!(r.displaced, vec![(key("c1"), scr.clone())]);
+        assert_eq!(r.changed, vec![key("c1")]);
+        assert!(s.participants(&key("c1")).is_empty());
+        // Another device of the user replaces the device and its screen publisher.
+        s.activate(&key("c2"), &who("alice", DEV_A), t0);
+        s.activate(&key("c2"), &screen("alice", DEV_A), t0);
+        let r = s.reserve(&key("c2"), &who("alice", DEV_B), t0);
+        assert_eq!(
+            r.displaced,
+            vec![(key("c2"), id("alice", DEV_A)), (key("c2"), format!("{}#screen", id("alice", DEV_A)))]
+        );
+        assert_eq!(s.identities_in(&key("c2")), vec![id("alice", DEV_B)]);
     }
 
     #[test]

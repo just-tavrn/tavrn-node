@@ -146,7 +146,7 @@ impl Modify for BearerAuth {
         crate::federation::conformance::Outcome, crate::federation::conformance::HistoryEntry,
         conformance::PeerPublicState, conformance::FederationPeer, conformance::ViolationCount, conformance::BlockPeerRequest,
         health::Health, crate::voice::livekit::LiveKitStatus, node::VoiceInfo, crate::voice::VoiceChannelState, crate::voice::state::VoiceParticipant,
-        voice::VoiceJoin, voice::VoiceLimits, voice::VideoLimits, voice::VoiceStatePatch, voice::RoomVoiceStates, voice::MyVoiceRoom, voice::MyVoiceStates, voice::MuteRequest, voice::MoveRequest,
+        voice::VoiceJoin, voice::VoiceLimits, voice::VideoLimits, voice::VoiceStatePatch, voice::VoiceRole, voice::VoiceRoleRequest, voice::RoomVoiceStates, voice::MyVoiceRoom, voice::MyVoiceStates, voice::MuteRequest, voice::MoveRequest,
         voice::MoveAllRequest, voice::MoveAllResult, voice::MoveSkipped, voice::ConnectionTest, voice::RtcInfo,
         calls::CallJoin, crate::calls::CallState,
         crate::store::voice::Sound,

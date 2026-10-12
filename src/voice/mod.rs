@@ -162,9 +162,23 @@ pub fn identity(user: &str, device_id: &str) -> String {
     format!("{user}/{device_id}")
 }
 
-/// `alice@node.example/<ulid>` → (`alice@node.example`, `<ulid>`).
+/// Suffix of a device's screen publisher (VOICE.md §4b): `<user address>/<device id>#screen`.
+pub const SCREEN_SUFFIX: &str = "#screen";
+
+/// LiveKit identity of the screen publisher of the device with identity `owner`.
+pub fn screen_identity(owner: &str) -> String {
+    format!("{owner}{SCREEN_SUFFIX}")
+}
+
+/// The owner's identity of a screen publisher's identity, `None` for a device's own identity.
+pub fn screen_owner(identity: &str) -> Option<&str> {
+    identity.strip_suffix(SCREEN_SUFFIX)
+}
+
+/// `alice@node.example/<ulid>` → (`alice@node.example`, `<ulid>`); a screen publisher's identity
+/// (`…/<ulid>#screen`) names its device the same way.
 pub fn parse_identity(identity: &str) -> Option<(&str, &str)> {
-    let (user, device) = identity.rsplit_once('/')?;
+    let (user, device) = screen_owner(identity).unwrap_or(identity).rsplit_once('/')?;
     (crate::util::parse_address(user).is_some() && crate::util::is_ulid(device)).then_some((user, device))
 }
 
@@ -269,7 +283,13 @@ pub async fn who(state: &AppState, room_id: &str, identity: &str) -> Option<Who>
     let (username, domain) = crate::util::parse_address(address)?;
     let user = store::users::by_username(&state.db, username, domain).await.ok()??;
     let server_muted = store::voice::server_muted(&state.db, room_id, &user.id).await.unwrap_or(false);
-    Some(Who { user: user.address(), user_id: user.id, device_id: device.to_string(), server_muted })
+    Some(Who {
+        user: user.address(),
+        user_id: user.id,
+        device_id: device.to_string(),
+        server_muted,
+        screen: screen_owner(identity).is_some(),
+    })
 }
 
 /// LiveKit room of a connection test (`POST /voice/test`, VOICE.md §10.4): `test:<random ulid>`.
@@ -318,8 +338,10 @@ pub async fn handle_webhook(state: &AppState, event: proto::WebhookEvent) {
     let identity = event.participant.as_ref().map(|p| p.identity.clone()).unwrap_or_default();
     let changed = match event.event.as_str() {
         "participant_joined" => match who(state, &key.0, &identity).await {
-            Some(who) => state.voice.participants().activate(&key, &who, now),
-            None => {
+            Some(who) if state.voice.participants().accepts(&key, &who) => {
+                state.voice.participants().activate(&key, &who, now)
+            }
+            _ => {
                 tracing::warn!(identity, "unknown participant in LiveKit, removing");
                 remove_from_livekit(state, &key, &identity).await;
                 false
@@ -347,7 +369,9 @@ async fn handle_call_webhook(state: &AppState, conversation_id: &str, event: pro
     let identity = event.participant.as_ref().map(|p| p.identity.clone()).unwrap_or_default();
     let changed = match event.event.as_str() {
         "participant_joined" => match crate::calls::who(state, conversation_id, &identity).await {
-            Some(who) if state.calls.is_active(conversation_id) => state.calls.participants().activate(&key, &who, now),
+            Some(who) if state.calls.is_active(conversation_id) && state.calls.participants().accepts(&key, &who) => {
+                state.calls.participants().activate(&key, &who, now)
+            }
             _ => {
                 tracing::warn!(identity, "unknown participant in the call, removing");
                 remove_from_livekit(state, &key, &identity).await;
@@ -391,22 +415,30 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
         target.insert(key, present);
     }
     let (mut changed, unknown) = state.voice.participants().reconcile(&truth, Instant::now());
+    let orphans = state.voice.participants().take_orphans();
+    for (key, identity) in orphans {
+        remove_from_livekit(state, &key, &identity).await;
+    }
     for (key, identity) in unknown {
         match who(state, &key.0, &identity).await {
-            Some(who) => {
+            Some(who) if state.voice.participants().accepts(&key, &who) => {
                 if state.voice.participants().activate(&key, &who, Instant::now()) && !changed.contains(&key) {
                     changed.push(key);
                 }
             }
-            None => remove_from_livekit(state, &key, &identity).await,
+            _ => remove_from_livekit(state, &key, &identity).await,
         }
     }
     publish(state, &changed).await;
 
     let (mut changed, unknown) = state.calls.participants().reconcile(&calls, Instant::now());
+    let orphans = state.calls.participants().take_orphans();
+    for (key, identity) in orphans {
+        remove_from_livekit(state, &key, &identity).await;
+    }
     for (key, identity) in unknown {
         match crate::calls::who(state, &key.1, &identity).await {
-            Some(who) if state.calls.is_active(&key.1) => {
+            Some(who) if state.calls.is_active(&key.1) && state.calls.participants().accepts(&key, &who) => {
                 if state.calls.participants().activate(&key, &who, Instant::now()) && !changed.contains(&key) {
                     changed.push(key);
                 }
@@ -424,8 +456,16 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
 /// announces moved participations whose grant ran out ([`sync_moved`]).
 pub async fn expire_once(state: &AppState) {
     let changed = state.voice.participants().expire(Instant::now());
+    let orphans = state.voice.participants().take_orphans();
+    for (key, identity) in orphans {
+        remove_from_livekit(state, &key, &identity).await;
+    }
     publish(state, &changed).await;
     let changed = state.calls.participants().expire(Instant::now());
+    let orphans = state.calls.participants().take_orphans();
+    for (key, identity) in orphans {
+        remove_from_livekit(state, &key, &identity).await;
+    }
     for key in changed {
         crate::calls::after_change(state, &key.1).await;
     }
@@ -466,13 +506,18 @@ pub fn spawn_reconciler(state: AppState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Disconnects a participant in LiveKit (best effort: a participant LiveKit does not know is fine).
+/// Disconnects a participant in LiveKit (best effort: a participant LiveKit does not know is fine), a device
+/// together with its screen publisher (VOICE.md §4b), in voice channels and calls (`key` names either).
 /// Tokens are not revoked: a token revocation would also hit a rejoin within the same second (token
 /// timestamps are seconds), and a member who lost access is refused by the `/rtc` proxy anyway.
 pub async fn remove_from_livekit(state: &AppState, key: &ChannelKey, identity: &str) {
     let Some(rooms) = state.voice.rooms() else { return };
-    if let Err(e) = rooms.remove_participant(&room_name(key), identity).await {
-        tracing::debug!(error = %e, identity, "LiveKit participant not removed (not connected?)");
+    let room = room_name(key);
+    let screen = screen_owner(identity).is_none().then(|| screen_identity(identity));
+    for identity in std::iter::once(identity.to_string()).chain(screen) {
+        if let Err(e) = rooms.remove_participant(&room, &identity).await {
+            tracing::debug!(error = %e, identity, "LiveKit participant not removed (not connected?)");
+        }
     }
 }
 
@@ -747,6 +792,15 @@ mod tests {
         let dev = "01J9ZZZZZZZZZZZZZZZZZZZZZZ";
         let id = identity("alice@node.example", dev);
         assert_eq!(parse_identity(&id), Some(("alice@node.example", dev)));
+        // The device's screen publisher names the same device; its owner is the device's identity.
+        let screen = screen_identity(&id);
+        assert_eq!(screen, format!("alice@node.example/{dev}#screen"));
+        assert_eq!(parse_identity(&screen), Some(("alice@node.example", dev)));
+        assert_eq!(screen_owner(&screen), Some(id.as_str()));
+        assert_eq!(screen_owner(&id), None);
+        for bad in [format!("{id}#screen#screen"), format!("{id}#cam"), format!("{id}#")] {
+            assert_eq!(parse_identity(&bad), None, "{bad}");
+        }
         for bad in ["alice@node.example", "alice/01J9ZZZZZZZZZZZZZZZZZZZZZZ", "Alice@node.example/x", "a@b/c/d"] {
             assert_eq!(parse_identity(bad), None, "{bad}");
         }

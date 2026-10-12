@@ -92,6 +92,7 @@ mod suite {
     mod upload_categories_flow;
     mod voice_flow;
     mod voice_move_flow;
+    mod voice_screen_flow;
     mod webhook_logs_flow;
     mod webhooks_flow;
     mod welcome_flow;

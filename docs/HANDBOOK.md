@@ -1283,6 +1283,11 @@ causes and what happens when a connection drops.
 - **Dropped connections:** a participant whose connection breaks stays in the channel as "reconnecting" for
   `TAVRN_VOICE_RECONNECT_GRACE_SECS` (default 45) while the client rejoins by itself; a join from another device of
   the same user replaces the first.
+- **Screen sharing from the Android app** needs nothing to configure: the app publishes the screen as a second
+  LiveKit participant of the same device (`<user>/<device>#screen`, protocol VOICE.md §4b), which the node admits
+  under the screen share settings and the `stream` permission, counts as its device (no seat of a user limit) and
+  removes together with the device. It is end-to-end encrypted like every other track. In LiveKit's own logs and
+  room listings it appears as an extra participant.
 - Several instances: [Voice and video with several instances](#voice-and-video-with-several-instances).
 
 ### Moved members
