@@ -39,7 +39,7 @@ needs a few open ports, and SMTP and Valkey are optional.
 
 | What | Details |
 |---|---|
-| **A Linux host with Docker** | Docker Engine with the Compose plugin. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
+| **A Linux host with Docker** | Docker Engine with the Compose plugin, on x86-64 (`amd64`) or 64-bit ARM (`arm64`, for example Ampere or Graviton servers): the image is published for both and `docker pull` picks the right one. The node is one Rust process; the image adds `livekit-server` (voice and video) and a minimal static `ffmpeg` (media conversion). Hardware needs are modest; voice traffic is the part that grows with use. |
 | **A domain** | `TAVRN_DOMAIN` is the identity of the node and part of every address (`alice@chat.example.org`). Addresses cannot be renamed later, so choose it with care. The node may run on another host than its identity domain ([delegation](#identity-domain-and-node-host-delegation)). |
 | **A reverse proxy with TLS** | Any proxy that terminates TLS and passes WebSockets: examples for Caddy, nginx, Nginx Proxy Manager, Traefik, Apache and HAProxy ship with the repository. The node speaks plain HTTP only and never terminates TLS; nodes federate over HTTPS only. See [Reverse proxy and TLS](#reverse-proxy-and-tls). |
 | **PostgreSQL** | The compose file runs `postgres:17-alpine` next to the node; any existing PostgreSQL server or managed service works too (`TAVRN_DATABASE_URL`). SQLite exists only for development (`--dev`). See [Database](#database). |
@@ -1265,8 +1265,11 @@ users learn about new messages, mentions and calls while no tab of the web clien
 
 How it behaves:
 
-- **When**: a push is only sent when the user has no open connection to the node. Besides
-  `TAVRN_PUSH_MAX_PER_MINUTE` there is at most one push per conversation and user every 30 seconds.
+- **When**: a push is only sent when the user has no open connection to the node, except for incoming calls: call
+  rings are pushed also while a connection is open (a phone keeps the connection of a frozen background tab open),
+  and the web client's service worker shows them only while no page of the client is visible. Besides
+  `TAVRN_PUSH_MAX_PER_MINUTE` there is at most one push per conversation and user every 30 seconds (call rings
+  excepted).
 - **Content**: push payloads are encrypted end-to-end to the browser (RFC 8291); the push services only see
   ciphertext. For **encrypted conversations** a push never contains message content, only the conversation, its
   name and the sender's display name. For **unencrypted conversations** it carries a text preview (at most 120

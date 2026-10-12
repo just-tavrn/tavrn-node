@@ -2,8 +2,9 @@
 #
 # Release of tavrn-node: a tag vX.Y.Z builds the container image with the web client of a tavrn-web release
 # (TAVRN_WEB_REF, repository variable: a tavrn-web tag; a branch fails the release) and pushes it to
-# ghcr.io/just-tavrn/tavrn-node (tags X.Y.Z, X.Y and sha-…, with BuildKit's SLSA provenance and an SBOM, built
-# GitHub-hosted without any cache), records GitHub's build provenance attestation for the image digest, then
+# ghcr.io/just-tavrn/tavrn-node (tags X.Y.Z, X.Y and sha-…, one manifest list for linux/amd64 and linux/arm64,
+# with BuildKit's SLSA provenance and an SBOM, built GitHub-hosted without any cache), records GitHub's build
+# provenance attestation for the manifest list's digest, then
 # creates the GitHub release with the image digest (a tag with a hyphen, vX.Y.Z-rc.N, as a pre-release). The website's download page reads the latest
 # node release through GitHub's API itself. Gated by CI_ENABLED (docs/GITHUB.md); the private repositories are
 # read with TAVRN_READ_PAT.
@@ -65,13 +66,15 @@ jobs:
     if: ${{ vars.CI_ENABLED == 'true' }}
     # Pinned by commit: a later change of the reusable workflow never reaches a release unreviewed (just-tavrn/.github
     # docs/GITHUB.md "Reusable workflows in release paths" has the bump procedure).
-    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@986b804e27987dfac8f5568ae1370cc78e1c2c13 # main of 2026-10-11
+    uses: just-tavrn/.github/.github/workflows/docker-publish.yml@ad56b708acd531e04a72414d0f66ac7e50235ab7 # main of 2026-10-12
     permissions:
       contents: read
       packages: write
     with:
       dockerfile: deploy/Dockerfile
       image-name: tavrn-node
+      # One manifest list for both; the Dockerfile cross-compiles arm64 on the amd64 runner (no emulated compiles).
+      platforms: linux/amd64,linux/arm64
       build-args: |
         TAVRN_WEB_REF=${{ needs.version.outputs.web-sha }}
       push: true
@@ -80,7 +83,8 @@ jobs:
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
 
   # GitHub's build provenance for the pushed image (`gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node:<version>
-  # --repo just-tavrn/tavrn-node`, docs/GITHUB.md "Verifying an image"). Artifact attestations need a public repository
+  # --repo just-tavrn/tavrn-node`, docs/GITHUB.md "Verifying an image"). The subject is the manifest list's digest,
+  # which is what `gh attestation verify` resolves a tag to. Artifact attestations need a public repository
   # on GitHub's Free plan: skipped while the repository is private, and the release goes on without it.
   attest:
     name: Build provenance attestation
@@ -116,7 +120,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           notes="$(mktemp)"
           {
-            echo "Container image: \`ghcr.io/just-tavrn/tavrn-node:${version}\` (\`${DIGEST}\`)"
+            echo "Container image: \`ghcr.io/just-tavrn/tavrn-node:${version}\` (\`${DIGEST}\`, manifest list for linux/amd64 and linux/arm64)"
             echo
             echo "Web client: tavrn-web \`${WEB_REF}\` (\`${WEB_SHA}\`). Upgrade notes: README.md (\"Upgrading\")."
             if [ "$ATTESTED" = success ]; then

@@ -612,6 +612,56 @@ async fn a_call_in_a_local_dm_rings_by_push() {
     assert_eq!((got[0].headers["ttl"].to_str().unwrap(), got[0].headers["urgency"].to_str().unwrap()), ("45", "high"));
 }
 
+/// Call rings push even while the callee has a connection (PROTOCOL.md §6d): a phone keeps the WebSocket of a frozen
+/// background tab open, so "connected" does not mean the ring can be heard. The service worker stays silent while a
+/// page of the client is visible. Messages keep pushing only without a connection (the test above).
+#[tokio::test]
+async fn call_rings_push_even_while_the_callee_is_connected() {
+    let node = test_node_with_limit(10).await;
+    let fake = FakePushService::start().await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    node.befriend(&alice, &bob).await;
+    let dm = node.create_dm(&alice, &bob).await;
+    let browser = Browser::new(&fake, "ok/bob");
+    subscribe(&node, &bob, &browser).await;
+    let _guard = node.state.hub.connect(&bob.user_id);
+    assert!(tavrn_node::presence::is_online(&node.state, &bob.user_id));
+    let caller = store::users::by_id(&node.state.db, &alice.user_id).await.unwrap().unwrap();
+    assert!(tavrn_node::calls::start(&node.state, &dm, &caller, false).await.unwrap());
+    let got = fake.wait(&browser.path, 1).await;
+    let p = browser.open(&got[0]);
+    assert_eq!((p["type"].as_str(), p["conversation_id"].as_str()), (Some("call"), Some(dm.as_str())), "{p}");
+
+    // A ring forwarded by another node (`notify` hint) pushes while connected, too.
+    let bob_row = store::users::by_id(&node.state.db, &bob.user_id).await.unwrap().unwrap();
+    store::federation::touch_target(&node.state.db, &bob_row.id, &bob.device_id, "b.test").await.unwrap();
+    let ring = Incoming::Notify {
+        conversation_id: tavrn_node::util::ulid(),
+        room_id: None,
+        mention: false,
+        everyone: false,
+        call: Some(tavrn_node::federation::social::CallHint::Ring {
+            from: "carol@b.test".into(),
+            started_at: tavrn_node::util::now(),
+            group: false,
+        }),
+    };
+    let r = tavrn_node::federation::social::handle(
+        &node.state,
+        "b.test",
+        "b.test",
+        &bob_row,
+        &tavrn_node::util::now(),
+        ring,
+    )
+    .await
+    .unwrap();
+    assert_eq!(r, "handled");
+    let got = fake.wait(&browser.path, 2).await;
+    assert_eq!(browser.open(&got[1])["type"], "call");
+}
+
 /// Thread messages (PROTOCOL.md §7e) push only to the thread's followers, plus anyone mentioned directly.
 #[tokio::test]
 async fn thread_messages_push_to_followers_and_direct_mentions_only() {
