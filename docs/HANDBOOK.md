@@ -155,7 +155,7 @@ and sessions work and the minimum age.
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_REGISTRATION` | `invite` | `open`, `invite` (account invites from the node administration) or `closed`. `closed` only blocks new accounts, never federation. |
-| `TAVRN_EMAIL` | `optional` | `none`, `optional` or `required` (`required` needs `TAVRN_SMTP_URL`). |
+| `TAVRN_EMAIL` | `optional` | `none`, `optional` or `required` (`required` needs `TAVRN_SMTP_URL`). With `required` an account signs in with its password only after confirming its address through the mailed link (`<public URL>/verify-email?token=…`, valid 24 hours); the device that registered stays signed in, and the login page offers to send the mail again. |
 | `TAVRN_SMTP_URL` | unset | `smtp://host:port` (plain, internal relay), `smtps://host:port` (TLS) or `smtp+starttls://host:port`, optionally `user:pass@`. Test it with `tavrn-node send-test-mail you@example.org`. |
 | `TAVRN_SMTP_FROM` | `noreply@<TAVRN_DOMAIN>` | Sender address. |
 | `TAVRN_MAIL_TEMPLATES_DIR` | `<TAVRN_DATA_DIR>/templates/mail` | Your own texts for the node's mails, per language: `<dir>/<language>/<name>.txt`. See [Mail languages and templates](#mail-languages-and-templates). |
@@ -210,7 +210,7 @@ body. `{name}`-style variables are filled in; every template knows `{node}` (`TA
 
 | Template | Sent when | Own variables |
 |---|---|---|
-| `verify_email` | an account registers with an e-mail address | `{name}`, `{link}` |
+| `verify_email` | an account registers with an e-mail address, or asks for the confirmation mail again ("Send the confirmation mail again" on the login page: a new link, at most three per account and hour) | `{name}`, `{link}` |
 | `password_reset` | a user asks for a password reset | `{name}`, `{link}` |
 | `account_deleted`, `account_deleted_by_admin` | the user or a node admin deleted the account | `{address}`, `{purge_after}` |
 | `account_restored` | a node admin restored a deleted account | `{address}` |
@@ -1634,7 +1634,7 @@ Limits that protect against guessing and abuse are shared across the instances; 
 
 | Limiter | Decision | Reason |
 |---|---|---|
-| `login_limiter` (login per address and failed logins per account, re-auth and identity reset per account with keys of their own, password change, connect exchange, federated login, device nonces), `register_limiter` (registration, forgot password per address), `forgot_limiter` (reset mails per account, 3 per hour) | **shared** | Password guessing and account creation must not scale with the number of instances. Only failed logins count against an account, and the right password with a valid device proof passes even then, so nobody can lock an owner out by guessing. |
+| `login_limiter` (login per address and failed logins per account, re-auth and identity reset per account with keys of their own, password change, connect exchange, federated login, device nonces), `register_limiter` (registration, forgot password and confirmation mails sent again per address), `forgot_limiter` (reset mails per account, 3 per hour), `verify_mail_limiter` (confirmation mails sent again per account, 3 per hour) | **shared** | Password guessing and account creation must not scale with the number of instances. Only failed logins count against an account, and the right password with a valid device proof passes even then, so nobody can lock an owner out by guessing. |
 | `second_factor_user_limiter`, `second_factor_ip_limiter` | **shared** | TOTP / recovery code guessing. |
 | `federation_inbox_limiter`, `federation_login_limiter`, `federation_token_limiter` | **shared** | Per remote domain / device; a peer or token must not get N× its quota. |
 | `claim_pair_limiter` | **shared** | Protects KeyPackages from being drained by one requester. |

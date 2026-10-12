@@ -429,6 +429,20 @@ pub async fn set_email_verification(db: &Pool, user_id: &str, token_hash: &str, 
     Ok(())
 }
 
+/// Active local accounts of `domain` whose address `email` (lower case) is not confirmed yet, oldest first, at most
+/// `limit` (addresses are not unique: confirmation mails sent again, `POST /auth/verify-email/resend`).
+pub async fn unverified_by_email(db: &Pool, domain: &str, email: &str, limit: i64) -> Result<Vec<UserRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {USER_COLS} FROM users WHERE domain = $1 AND email = $2 AND email_verified_at IS NULL AND kind = 'user'
+           AND disabled_at IS NULL AND deleted_at IS NULL ORDER BY created_at, id LIMIT $3"
+    ))
+    .bind(domain)
+    .bind(email)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
 /// Redeems a verification token and returns the user ID if valid.
 pub async fn consume_email_verification(db: &Pool, token_hash: &str) -> Result<Option<String>, ApiError> {
     let row = sqlx::query("SELECT user_id, expires_at FROM email_verifications WHERE token_hash = $1")
@@ -694,5 +708,34 @@ mod tests {
         assert_eq!(invite_uses(&db, code).await, 1);
         // Without an invite the account is simply created.
         create_local_with_invite(&db, new_user("dave"), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unverified_by_email_finds_only_unconfirmed_active_accounts() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let with_email = |name: &'static str| NewLocalUser { email: Some("same@example.org"), ..new_user(name) };
+        let a = create_local(&db, with_email("anna")).await.unwrap();
+        let b = create_local(&db, with_email("bert")).await.unwrap();
+        let c = create_local(&db, with_email("cleo")).await.unwrap();
+        let d = create_local(&db, with_email("dave")).await.unwrap();
+        create_local(&db, new_user("emil")).await.unwrap();
+        set_email_verified(&db, &b.id).await.unwrap();
+        sqlx::query("UPDATE users SET disabled_at = $1 WHERE id = $2")
+            .bind(now())
+            .bind(&c.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        let ids = |v: Vec<UserRow>| {
+            let mut ids = v.into_iter().map(|u| u.id).collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let mut expected = vec![a.id, d.id];
+        expected.sort();
+        assert_eq!(ids(unverified_by_email(&db, "d", "same@example.org", 5).await.unwrap()), expected);
+        assert_eq!(unverified_by_email(&db, "d", "same@example.org", 1).await.unwrap().len(), 1);
+        assert!(unverified_by_email(&db, "other", "same@example.org", 5).await.unwrap().is_empty());
+        assert!(unverified_by_email(&db, "d", "nobody@example.org", 5).await.unwrap().is_empty());
     }
 }

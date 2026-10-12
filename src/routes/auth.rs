@@ -418,6 +418,64 @@ pub async fn verify_email(
 }
 
 #[derive(Deserialize, ToSchema)]
+pub struct ResendVerificationRequest {
+    /// Username, address (`name@domain`) or email address of the account (at most 320 characters)
+    pub account: String,
+}
+
+/// Send the confirmation mail of an unconfirmed email address again.
+///
+/// The new link replaces the previous one. Always answers 204, so no accounts can be guessed: confirmed, unknown and
+/// disabled accounts get no mail. At most three mails per account and hour. A node without SMTP answers
+/// `503 mail.unavailable`.
+#[utoipa::path(post, path = "/api/v1/auth/verify-email/resend", request_body = ResendVerificationRequest,
+    responses((status = 204), (status = 400, body = crate::error::ProblemDetails), (status = 429, body = crate::error::ProblemDetails),
+        (status = 503, body = crate::error::ProblemDetails)))]
+pub async fn resend_verification(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<ResendVerificationRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !state.mailer.can_deliver() {
+        return Err(ApiError::Unavailable { code: "mail.unavailable", detail: "This node sends no e-mail".into() });
+    }
+    let account = crate::validate::text("account", &req.account, 0, 320)?.to_lowercase();
+    state.register_limiter.check_all(&[format!("verify-resend:{ip}")]).await?;
+    if account.is_empty() || state.config.email == EmailMode::None {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let account = account
+        .strip_suffix(&format!("@{}", state.config.domain))
+        .filter(|a| !a.contains('@'))
+        .unwrap_or(&account)
+        .to_string();
+    let users = if account.contains('@') {
+        store::users::unverified_by_email(&state.db, &state.config.domain, &account, 3).await?
+    } else {
+        store::users::by_username(&state.db, &account, &state.config.domain).await?.into_iter().collect()
+    };
+    for user in users {
+        if user.kind != "user"
+            || user.disabled_at.is_some()
+            || user.deleted_at.is_some()
+            || user.email.is_none()
+            || user.email_verified_at.is_some()
+        {
+            continue;
+        }
+        // Per account, after the lookup (the answer stays 204): no mail bombing.
+        if state.verify_mail_limiter.check_all(&[format!("verify-mail-user:{}", user.id)]).await.is_err() {
+            continue;
+        }
+        let token = util::random_token(32);
+        store::users::set_email_verification(&state.db, &user.id, &util::sha256_b64(&token), 24 * 3600).await?;
+        let locale = store::users::locale(&state.db, &user.id).await?;
+        state.mailer.send_verification(&user, locale.as_deref(), &token).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct ForgotPasswordRequest {
     /// Username or email address
     pub account: String,
