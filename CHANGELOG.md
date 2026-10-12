@@ -31,6 +31,13 @@ First public release of the node and its container image.
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
   chosen. `GET /node` and the discovery document carry `files_internal`.
+- **Screen publishers for the Android app** (protocol VOICE.md §4b): `voice/join` and `call/join` take an optional
+  `{ "role": "screen" }` and issue a device's second LiveKit participant `<user>/<device>#screen` that may only
+  publish the screen share and its audio and never subscribes; it needs the device in the channel or call and the
+  `stream` permission (`409 voice.not_connected`, `403 voice.stream_forbidden`), one per device
+  (`409 voice.screen_active`), takes no seat, is listed right after its device with `screen_of` and leaves with it
+  (leave, disconnect, end of the grace period, kick, another device). `voice/leave` and `call/leave` with the same
+  body end it alone. Nothing to configure.
 - **The files channel quota covers the node's own storage only** (protocol FILES.md §4, §5):
   `TAVRN_FILES_CHANNELS_MAX_BYTES` (`files_channels.max_bytes`) no longer limits channels on external WebDAV/S3
   stores. Their managers can set an optional limit per store in the channel's storage settings (`max_bytes` of

@@ -585,6 +585,7 @@ pub async fn who(state: &AppState, conversation_id: &str, identity: &str) -> Opt
         user_id: user.id,
         device_id: device.to_string(),
         server_muted: false,
+        screen: voice::screen_owner(identity).is_some(),
     })
 }
 

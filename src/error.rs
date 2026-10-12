@@ -213,6 +213,56 @@ where
     }
 }
 
+/// An optional JSON body: no body at all (or only whitespace) is `T::default()`, anything else must be JSON with a
+/// JSON content type, rejected like [`ApiJson`]. For routes that took no body and gained optional fields (the
+/// `role` of `voice/join`, VOICE.md §4b), so existing clients keep sending nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApiJsonOrEmpty<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for ApiJsonOrEmpty<T>
+where
+    T: serde::de::DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let json_type = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| v == "application/json" || (v.starts_with("application/") && v.ends_with("+json")));
+        let bytes = match <axum::body::Bytes as axum::extract::FromRequest<S>>::from_request(req, state).await {
+            Ok(b) => b,
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return Err(ApiError::PayloadTooLarge {
+                    code: "request.too_large",
+                    detail: "Request too large".into(),
+                    meta: Value::Null,
+                });
+            }
+            Err(rejection) => {
+                return Err(ApiError::BadRequest { code: "request.invalid_json", detail: rejection.body_text() });
+            }
+        };
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self(T::default()));
+        }
+        if !json_type {
+            return Err(ApiError::BadRequest {
+                code: "request.invalid_json",
+                detail: "Expected request with `Content-Type: application/json`".into(),
+            });
+        }
+        serde_json::from_slice(&bytes).map(Self).map_err(|e| ApiError::BadRequest {
+            code: "request.invalid_json",
+            detail: format!("Invalid JSON body: {e}"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

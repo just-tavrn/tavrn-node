@@ -17,8 +17,8 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     calls::{self, CallState},
-    error::{ApiError, ApiJson, ProblemDetails},
-    routes::voice::{VideoLimits, VoiceLimits, VoiceStatePatch, ice_aliases},
+    error::{ApiError, ApiJson, ApiJsonOrEmpty, ProblemDetails},
+    routes::voice::{VideoLimits, VoiceLimits, VoiceRole, VoiceRoleRequest, VoiceStatePatch, ice_aliases},
     store,
     voice::{
         self,
@@ -88,17 +88,27 @@ pub struct CallJoin {
     pub call: CallState,
 }
 
-async fn join_inner(state: &AppState, auth: &AuthUser, conversation_id: &str) -> Result<CallJoin, ApiError> {
+async fn join_inner(
+    state: &AppState,
+    auth: &AuthUser,
+    conversation_id: &str,
+    role: VoiceRole,
+) -> Result<CallJoin, ApiError> {
     let who = Who {
         user: auth.user.address(),
         user_id: auth.user.id.clone(),
         device_id: auth.public_device_id().to_string(),
         server_muted: false,
+        screen: role == VoiceRole::Screen,
     };
     let identity = who.identity();
     let key = calls::key(conversation_id);
     let config = &state.config;
-    let reserved = {
+    // A screen publisher (VOICE.md §4b) counts as its device: no seat, no displacement, no answer.
+    let reserved = if who.screen {
+        crate::routes::voice::reserve_screen(&mut state.calls.participants(), &key, &who, sources(state).screen)?;
+        voice::state::Reserved::default()
+    } else {
         let mut participants = state.calls.participants();
         if participants.occupancy(&key, &auth.user.id, Instant::now()) >= config.voice_max_participants as usize {
             return Err(ApiError::Conflict {
@@ -113,11 +123,14 @@ async fn join_inner(state: &AppState, auth: &AuthUser, conversation_id: &str) ->
     for (old_key, old_identity) in &reserved.displaced {
         voice::remove_from_livekit(state, old_key, old_identity).await;
     }
-    calls::answer(state, conversation_id, &auth.user).await;
+    if !who.screen {
+        calls::answer(state, conversation_id, &auth.user).await;
+    }
     let api_key = state.voice.api_key().ok_or_else(disabled)?;
     let room = calls::room_name(conversation_id);
-    let jwt =
-        token::issue(&api_key.key, &api_key.secret, &identity, token::grants(&room, sources(state)), token::TOKEN_TTL)?;
+    let grants =
+        if who.screen { crate::routes::voice::screen_grants(&room) } else { token::grants(&room, sources(state)) };
+    let jwt = token::issue(&api_key.key, &api_key.secret, &identity, grants, token::TOKEN_TTL)?;
     let epoch = store::e2ee::group_epoch(&state.db, conversation_id).await?;
     let call = state.calls.snapshot(conversation_id);
     let s = sources(state);
@@ -177,18 +190,21 @@ pub async fn start(
     if calls::start(&state, &conv.id, &auth.user, group).await? {
         tracing::info!(conversation = %conv.id, group, "call started");
     }
-    Ok(Json(join_inner(&state, &auth, &conv.id).await?))
+    Ok(Json(join_inner(&state, &auth, &conv.id, VoiceRole::Device).await?))
 }
 
-/// Join (answer) a running call.
+/// Join (answer) a running call. With `role: "screen"` the token is the device's screen publisher's (VOICE.md §4b):
+/// it needs the device in the call, answers nothing and takes no seat.
 #[utoipa::path(post, path = "/api/v1/conversations/{conversation_id}/call/join", security(("bearer" = [])),
     params(("conversation_id" = String, Path)),
-    responses((status = 200, body = CallJoin), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails),
+    request_body(content = Option<VoiceRoleRequest>, description = "Optional: `{ \"role\": \"screen\" }` for the device's screen publisher"),
+    responses((status = 200, body = CallJoin), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails),
         (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
 pub async fn join(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(conversation_id): Path<String>,
+    ApiJsonOrEmpty(req): ApiJsonOrEmpty<VoiceRoleRequest>,
 ) -> Result<Json<CallJoin>, ApiError> {
     let (conv, _) = call_conversation(&state, &conversation_id, &auth).await?;
     // Blocks always win (PROTOCOL.md §8a): a blocked person cannot join (or rejoin) the DM's call either.
@@ -197,20 +213,25 @@ pub async fn join(
     if !state.calls.is_active(&conv.id) {
         return Err(calls::not_active());
     }
-    Ok(Json(join_inner(&state, &auth, &conv.id).await?))
+    Ok(Json(join_inner(&state, &auth, &conv.id, req.role).await?))
 }
 
-/// Leave the call (this device). The last one to leave ends it.
+/// Leave the call (this device, with its screen publisher). The last one to leave ends it. With `role: "screen"`
+/// only the device's screen publisher leaves (VOICE.md §4b).
 #[utoipa::path(post, path = "/api/v1/conversations/{conversation_id}/call/leave", security(("bearer" = [])),
-    params(("conversation_id" = String, Path)), responses((status = 204), (status = 404, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
+    params(("conversation_id" = String, Path)),
+    request_body(content = Option<VoiceRoleRequest>, description = "Optional: `{ \"role\": \"screen\" }` ends only the screen publisher"),
+    responses((status = 204), (status = 400, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
 pub async fn leave(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(conversation_id): Path<String>,
+    ApiJsonOrEmpty(req): ApiJsonOrEmpty<VoiceRoleRequest>,
 ) -> Result<StatusCode, ApiError> {
     let (conv, _) = call_conversation(&state, &conversation_id, &auth).await?;
     let key = calls::key(&conv.id);
-    let identity = voice::identity(&auth.user.address(), auth.public_device_id());
+    let device = voice::identity(&auth.user.address(), auth.public_device_id());
+    let identity = if req.role == VoiceRole::Screen { voice::screen_identity(&device) } else { device };
     let was_there = !state.calls.participants().identities_of(&key, &auth.user.id).is_empty();
     state.calls.participants().remove(&key, &identity);
     voice::remove_from_livekit(&state, &key, &identity).await;
@@ -262,10 +283,7 @@ pub async fn update_state(
     state.voice_limiter.check_all(&[format!("voice:{}", auth.user.id)])?;
     let allowed = sources(&state);
     if req.streaming == Some(true) && !allowed.screen {
-        return Err(ApiError::Forbidden {
-            code: "voice.stream_forbidden",
-            detail: "Screen sharing is not allowed here".into(),
-        });
+        return Err(crate::routes::voice::stream_forbidden());
     }
     if req.camera == Some(true) && !allowed.camera {
         return Err(ApiError::Forbidden {

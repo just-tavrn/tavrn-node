@@ -18,14 +18,14 @@ use crate::{
     access::{self, RoomAccess},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiJsonOrEmpty, ProblemDetails},
     models::{ChannelRow, UserRow},
     permissions::{self as p, Perms},
     store,
     validate::{self, bad},
     voice::{
         self, VoiceChannelState,
-        state::{ChannelKey, SelfPatch, VoiceParticipant, Who},
+        state::{ChannelKey, ScreenRefusal, SelfPatch, VoiceParticipant, Who},
         token::{self, Sources},
     },
 };
@@ -151,16 +151,68 @@ pub struct VoiceJoin {
     pub ice_aliases: Vec<String>,
 }
 
+/// Who joins or leaves: the device itself, or its screen publisher (VOICE.md §4b).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceRole {
+    /// The device (the default).
+    #[default]
+    Device,
+    /// The device's screen publisher: a second participant `<identity>#screen` that only publishes the screen share.
+    Screen,
+}
+
+/// Optional body of `voice/join`, `voice/leave`, `call/join` and `call/leave` (no body = the device).
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceRoleRequest {
+    #[serde(default)]
+    pub role: VoiceRole,
+}
+
+/// The checks of a screen publisher's join (VOICE.md §4b), after the device's own checks: screen sharing allowed
+/// (`allowed`), the device in the channel or call, no screen publisher yet. Reserves it in `participants`.
+pub(crate) fn reserve_screen(
+    participants: &mut voice::state::VoiceState,
+    key: &ChannelKey,
+    who: &Who,
+    allowed: bool,
+) -> Result<(), ApiError> {
+    if !allowed {
+        return Err(stream_forbidden());
+    }
+    participants.reserve_screen(key, who, Instant::now()).map_err(|refusal| match refusal {
+        ScreenRefusal::NoOwner => not_connected(),
+        ScreenRefusal::Active => {
+            ApiError::conflict("voice.screen_active", "This device already shares its screen here")
+        }
+    })
+}
+
+pub(crate) fn stream_forbidden() -> ApiError {
+    ApiError::Forbidden { code: "voice.stream_forbidden", detail: "Screen sharing is not allowed here".into() }
+}
+
+/// The grants of a screen publisher: its screen share and the share's audio, nothing to receive (VOICE.md §4b).
+pub(crate) fn screen_grants(room: &str) -> livekit_api::access_token::VideoGrants {
+    let mut grants = token::grants(room, Sources { screen: true, ..Default::default() });
+    grants.can_subscribe = Some(false);
+    grants
+}
+
 /// Join a voice channel: checks `connect` (or a moderator's move into this channel), the user limit and the node
-/// policies and returns a LiveKit token.
+/// policies and returns a LiveKit token. With `role: "screen"` the token is the device's screen publisher's
+/// (VOICE.md §4b): it publishes the screen share only, takes no seat and needs the device in the channel and `stream`.
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/join", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)),
+    request_body(content = Option<VoiceRoleRequest>, description = "Optional: `{ \"role\": \"screen\" }` for the device's screen publisher"),
     responses((status = 200, body = VoiceJoin), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
         (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 429, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
 pub async fn join(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
+    ApiJsonOrEmpty(req): ApiJsonOrEmpty<VoiceRoleRequest>,
 ) -> Result<Json<VoiceJoin>, ApiError> {
     let vc = voice_channel(&state, &room_id, &channel_id, &auth.user).await?;
     state.voice_limiter.check_all(&[format!("voice:{}", auth.user.id)])?;
@@ -184,6 +236,7 @@ pub async fn join(
         user_id: auth.user.id.clone(),
         device_id: auth.public_device_id().to_string(),
         server_muted,
+        screen: req.role == VoiceRole::Screen,
     };
     let identity = who.identity();
     let config = &state.config;
@@ -193,7 +246,12 @@ pub async fn join(
     // stream/camera caps the client applies.
     let ent = crate::entitlements::Entitlements::load(&state, Some(&auth.user), Some(&vc.access.room)).await?;
     let plan_limit = ent.limit(crate::entitlements::VOICE_MAX_PARTICIPANTS).map(|n| usize::try_from(n).unwrap_or(0));
-    let reserved = {
+    // A screen publisher counts as its device: no seat, no displacement, no move grant (reserved above).
+    let reserved = if who.screen {
+        let allowed = sources(&state, &vc, server_muted).screen;
+        reserve_screen(&mut state.voice.participants(), &key, &who, allowed)?;
+        voice::state::Reserved::default()
+    } else {
         let mut participants = state.voice.participants();
         let occupancy = participants.occupancy(&key, &auth.user.id, Instant::now());
         if let Some(limit) = plan_limit.filter(|l| occupancy >= *l && *l < node_limit) {
@@ -225,7 +283,8 @@ pub async fn join(
     let sources = sources(&state, &vc, server_muted);
     let api_key = state.voice.api_key().ok_or_else(disabled)?;
     let room = voice::room_name(&key);
-    let jwt = token::issue(&api_key.key, &api_key.secret, &identity, token::grants(&room, sources), token::TOKEN_TTL)?;
+    let grants = if who.screen { screen_grants(&room) } else { token::grants(&room, sources) };
+    let jwt = token::issue(&api_key.key, &api_key.secret, &identity, grants, token::TOKEN_TTL)?;
     let current = voice::channel_state(&state, &key).await;
     let max_bitrate = i64::from(config.voice_max_bitrate_kbps);
     Ok(Json(VoiceJoin {
@@ -260,20 +319,24 @@ pub async fn join(
     }))
 }
 
-/// Leave a voice channel (this device). Always allowed; disconnects the device in LiveKit as well.
+/// Leave a voice channel (this device, with its screen publisher). Always allowed; disconnects the device in
+/// LiveKit as well. With `role: "screen"` only the device's screen publisher leaves (VOICE.md §4b).
 #[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/leave", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path)),
-    responses((status = 204), (status = 503, body = ProblemDetails)))]
+    request_body(content = Option<VoiceRoleRequest>, description = "Optional: `{ \"role\": \"screen\" }` ends only the screen publisher"),
+    responses((status = 204), (status = 400, body = ProblemDetails), (status = 503, body = ProblemDetails)))]
 pub async fn leave(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
+    ApiJsonOrEmpty(req): ApiJsonOrEmpty<VoiceRoleRequest>,
 ) -> Result<StatusCode, ApiError> {
     require_enabled(&state)?;
     validate::ulid("room_id", &room_id)?;
     validate::ulid("channel_id", &channel_id)?;
     let key = (room_id, channel_id);
-    let identity = voice::identity(&auth.user.address(), auth.public_device_id());
+    let device = voice::identity(&auth.user.address(), auth.public_device_id());
+    let identity = if req.role == VoiceRole::Screen { voice::screen_identity(&device) } else { device };
     let visible = state.voice.participants().remove(&key, &identity);
     voice::remove_from_livekit(&state, &key, &identity).await;
     if visible {
@@ -318,10 +381,7 @@ pub async fn update_state(
     }
     let allowed = sources(&state, &vc, current.server_muted);
     if req.streaming == Some(true) && !allowed.screen {
-        return Err(ApiError::Forbidden {
-            code: "voice.stream_forbidden",
-            detail: "Screen sharing is not allowed here".into(),
-        });
+        return Err(stream_forbidden());
     }
     if req.camera == Some(true) && !allowed.camera {
         return Err(ApiError::Forbidden {
