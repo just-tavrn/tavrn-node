@@ -367,3 +367,75 @@ async fn members_listing_and_nicknames() {
     assert_eq!(s, StatusCode::OK, "{j}");
     assert!(j["nickname"].is_null());
 }
+
+/// A role editor's "save" sends every field at once: one write, one audit row, every field applied; `null` clears
+/// the color and the upload categories, an empty request changes nothing.
+#[tokio::test]
+async fn a_full_role_save_applies_every_field_with_one_audit_row() {
+    let (node, alice, _, room_id, _) = setup().await;
+    let (s, role) = node
+        .post(&format!("/api/v1/rooms/{room_id}/roles"), &alice.token, json!({ "name": "Mod", "position": 3 }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{role}");
+    let role_id = role["id"].as_str().unwrap().to_string();
+    let path = format!("/api/v1/rooms/{room_id}/roles/{role_id}");
+    let audit_rows = || async {
+        let (s, log) = node.get_auth(&format!("/api/v1/rooms/{room_id}/audit-log"), &alice.token).await;
+        assert_eq!(s, StatusCode::OK, "{log}");
+        log.as_array().unwrap().iter().filter(|e| e["action"] == "role.update").cloned().collect::<Vec<Value>>()
+    };
+
+    let permissions = perms(&[p::MANAGE_MESSAGES, p::KICK_MEMBERS]);
+    let (s, saved) = node
+        .patch(
+            &path,
+            &alice.token,
+            json!({
+                "name": "Moderators", "color": "#00AA55", "position": 7, "permissions": permissions,
+                "hoist": true, "mentionable": true, "allowed_upload_categories": ["images", "audio"]
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{saved}");
+    assert_eq!(saved["name"], "Moderators");
+    assert_eq!(saved["color"], "#00aa55");
+    assert_eq!(saved["position"], 7);
+    assert_eq!(saved["permissions"], permissions);
+    assert_eq!(saved["hoist"], true);
+    assert_eq!(saved["mentionable"], true);
+    assert_eq!(saved["allowed_upload_categories"], json!(["images", "audio"]));
+    let (_, room) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &alice.token).await;
+    let stored = room["roles"].as_array().unwrap().iter().find(|r| r["id"] == role_id.as_str()).unwrap().clone();
+    assert_eq!(stored, saved, "the answer is what was stored");
+    let rows = audit_rows().await;
+    assert_eq!(rows.len(), 1, "one audit row per save: {rows:?}");
+    assert_eq!(rows[0]["target"], role_id.as_str());
+    assert_eq!(rows[0]["actor_id"], alice.user_id.as_str());
+    assert_eq!(
+        rows[0]["meta"],
+        json!({ "permissions": permissions, "hoist": true, "upload_categories": ["images", "audio"] })
+    );
+
+    // Clearing: the other fields stay.
+    let (s, cleared) =
+        node.patch(&path, &alice.token, json!({ "color": null, "allowed_upload_categories": null })).await;
+    assert_eq!(s, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["color"], Value::Null);
+    assert_eq!(cleared["allowed_upload_categories"], Value::Null);
+    assert_eq!((cleared["name"].clone(), cleared["position"].clone()), (json!("Moderators"), json!(7)));
+    assert_eq!((cleared["hoist"].clone(), cleared["permissions"].clone()), (json!(true), json!(permissions)));
+
+    // An empty save changes nothing (and is still recorded like before).
+    let (s, same) = node.patch(&path, &alice.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{same}");
+    assert_eq!(same, cleared);
+    assert_eq!(audit_rows().await.len(), 3);
+
+    // A role of another room is not found, nothing is written.
+    let other = node.plaintext_room(&alice.token, "Other").await;
+    let other_id = other["id"].as_str().unwrap();
+    let (s, j) =
+        node.patch(&format!("/api/v1/rooms/{other_id}/roles/{role_id}"), &alice.token, json!({ "hoist": false })).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
+    assert_eq!(audit_rows().await.len(), 3);
+}
