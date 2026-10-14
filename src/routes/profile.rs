@@ -189,8 +189,9 @@ pub async fn update_me(
         .await?
         .ok_or(ApiError::Unauthorized { code: "auth.token_invalid" })?;
     let mut me = user.to_private();
-    me.auto_preview = Some(store::users::auto_preview(&state.db, &auth.user.id).await?);
-    me.locale = store::users::locale(&state.db, &auth.user.id).await?;
+    let settings = store::users::account_settings(&state.db, &auth.user.id).await?;
+    me.auto_preview = Some(settings.auto_preview);
+    me.locale = settings.locale;
     Ok(Json(me))
 }
 

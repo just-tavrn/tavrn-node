@@ -590,9 +590,10 @@ pub async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Us
 pub(crate) async fn own_account(state: &AppState, auth: &AuthUser) -> Result<UserPrivate, ApiError> {
     let mut me = auth.user.to_private();
     if !auth.is_remote() && auth.user.domain == state.config.domain {
-        me.notification_settings = Some(crate::notifications::load(&state.db, &auth.user.id).await?);
-        me.auto_preview = Some(store::users::auto_preview(&state.db, &auth.user.id).await?);
-        me.locale = store::users::locale(&state.db, &auth.user.id).await?;
+        let settings = store::users::account_settings(&state.db, &auth.user.id).await?;
+        me.notification_settings = Some(crate::notifications::parse(settings.notification_settings.as_deref()));
+        me.auto_preview = Some(settings.auto_preview);
+        me.locale = settings.locale;
         if auth.user.kind == "user" {
             me.date_of_birth = Some(auth.user.date_of_birth.clone());
             me.age_status = Some(crate::age::status(&auth.user));
