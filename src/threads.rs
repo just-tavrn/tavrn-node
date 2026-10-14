@@ -631,6 +631,7 @@ mod tests {
             kind: "forum".into(),
             name: "f".into(),
             topic: String::new(),
+            status: String::new(),
             position: 0,
             slowmode_secs: 0,
             bitrate_kbps: 64,

@@ -11,7 +11,7 @@ use crate::{
 
 const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate, history_restore";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
-const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.position, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
+const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.status, c.position, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
 const OVERRIDE_COLS: &str =
     "id, room_id, target_type, target_id, subject_type, subject_id, allow, deny, upload_allow, upload_deny";
 const MEMBER_COLS: &str = "room_id, user_id, nickname, joined_at, rules_accepted_at, timeout_until, avatar_media_id, avatar_animated, bio, key_reset_at, history_restored_at";
@@ -685,6 +685,12 @@ pub async fn update_channel(db: &Pool, channel_id: &str, u: ChannelUpdate<'_>) -
             .await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+/// Sets the status line of a voice channel (VOICE.md §2a); the caller validated and authorized it.
+pub async fn set_channel_status(db: &Pool, channel_id: &str, status: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE channels SET status = $1 WHERE id = $2").bind(status).bind(channel_id).execute(db).await?;
     Ok(())
 }
 

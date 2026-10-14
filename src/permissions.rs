@@ -54,6 +54,7 @@ perms! {
     MANAGE_APPLICATIONS = 35, "manage_applications";
     MANAGE_THREADS = 36, "manage_threads";
     RESTORE_HISTORY = 37, "restore_history";
+    VOICE_STATUS = 38, "voice_status";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -139,7 +140,8 @@ pub const CHANNEL_SCOPED: Perms = VIEW_CHANNEL
     | USE_EXTERNAL_SOUNDS
     | MANAGE_FILES
     | READ_HISTORY
-    | MANAGE_THREADS;
+    | MANAGE_THREADS
+    | VOICE_STATUS;
 
 /// Permissions a member keeps while timed out.
 pub const TIMEOUT_KEEPS: Perms = VIEW_CHANNEL | READ_HISTORY;
@@ -199,7 +201,8 @@ pub const SCOPES: &[(&str, Perms)] = &[
             | CREATE_INVITES
             | MANAGE_EMOJIS
             | MANAGE_FILES
-            | MANAGE_APPLICATIONS,
+            | MANAGE_APPLICATIONS
+            | VOICE_STATUS,
     ),
     ("voice", CONNECT | SPEAK | STREAM | USE_CAMERA | USE_SOUNDBOARD | USE_EXTERNAL_SOUNDS | PRIORITY_SPEAKER),
     ("whiteboard", USE_WHITEBOARD | MANAGE_WHITEBOARD),
@@ -603,7 +606,7 @@ mod tests {
     #[test]
     fn channel_scoped_matches_the_protocol_table() {
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(CHANNEL_SCOPED, 103_049_789_951);
+        assert_eq!(CHANNEL_SCOPED, 377_927_696_895);
         let doc = include_str!("../protocol/permissions.md");
         let section = doc.split("## Channel-scoped bits").nth(1).unwrap().split("\n## ").next().unwrap();
         let from_doc = section
@@ -619,7 +622,22 @@ mod tests {
         for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
             assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
         }
-        assert_eq!(names(CHANNEL_SCOPED).len(), 26);
+        assert_eq!(names(CHANNEL_SCOPED).len(), 27);
+    }
+
+    #[test]
+    fn voice_status_is_a_channel_scoped_bit_of_its_own() {
+        assert_eq!(VOICE_STATUS, 1 << 38);
+        assert!(!has(EVERYONE_RESTRICTED, VOICE_STATUS), "a room may let everybody set the status");
+        assert!(!has(DEFAULT_EVERYONE, VOICE_STATUS), "but not by default");
+        assert!(has(CHANNEL_SCOPED, VOICE_STATUS), "an override can grant it alone");
+        assert!(has(scope_mask(&["rooms:manage".to_string()]), VOICE_STATUS));
+        assert!(
+            !has(scope_mask(&["voice".to_string()]), VOICE_STATUS),
+            "the voice scope joins and speaks, it does not edit"
+        );
+        assert_eq!(names(VOICE_STATUS), vec!["voice_status"]);
+        assert_eq!(parse(&VOICE_STATUS.to_string()), Some(VOICE_STATUS));
     }
 
     #[test]
