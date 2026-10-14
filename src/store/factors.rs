@@ -437,12 +437,13 @@ pub async fn put_secret_storage(
     let mut tx = db.begin().await?;
     lock_user(&mut tx, user_id).await?;
     if let Some(id) = credential {
-        let marked = sqlx::query("UPDATE webauthn_credentials SET prf_supported = 1 WHERE credential_id = $1 AND user_id = $2")
-            .bind(id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let marked =
+            sqlx::query("UPDATE webauthn_credentials SET prf_supported = 1 WHERE credential_id = $1 AND user_id = $2")
+                .bind(id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         if marked == 0 {
             return Ok(false);
         }

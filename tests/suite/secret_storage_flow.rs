@@ -166,7 +166,9 @@ async fn passkey_entries_belong_to_a_prf_credential_and_go_with_it() {
         json!({ "wrapped": b64(&wrap_master_secret(&master, &key, ALICE, &passkey_method(id).unwrap()).unwrap()), "params": { "prf": "v1" } })
     };
     let (_, factors) = node.get_auth("/api/v1/auth/factors", &alice.token).await;
-    let flag = |f: &serde_json::Value| f["webauthn"].as_array().unwrap().iter().find(|c| c["id"] == plain_id).unwrap()["prf_supported"].clone();
+    let flag = |f: &serde_json::Value| {
+        f["webauthn"].as_array().unwrap().iter().find(|c| c["id"] == plain_id).unwrap()["prf_supported"].clone()
+    };
     assert_eq!(flag(&factors), false, "{factors}");
     let (s, j) =
         node.put(&format!("/api/v1/users/me/secret-storage/passkey/{plain_id}"), &alice.token, entry(&plain_id)).await;
