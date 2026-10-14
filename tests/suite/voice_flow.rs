@@ -617,6 +617,62 @@ async fn dropped_participants_leave_after_the_grace_period() {
     assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("voice.not_connected")), "{j}");
 }
 
+/// VOICE.md §5 "Session start": `session_started_at` is set with the first connected participant, kept while
+/// anybody is connected or reconnecting (whoever that is), cleared with the last one, and carried by every voice
+/// state (the room's list, `/users/me/voice`, the join answer, the `voice.state` event).
+#[tokio::test]
+async fn the_voice_state_carries_the_session_start() {
+    let v = setup_with(|c| c.voice_reconnect_grace_secs = 1).await;
+    let states = v.voice_states(&v.alice).await;
+    assert_eq!(states["items"].as_array().unwrap().len(), 0, "nothing before anybody joins");
+    let mut rx = v.node.state.hub.subscribe();
+    let (s, j) = v.join(&v.alice).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(j["session_started_at"].is_null(), "reserved, not connected: {j}");
+    v.connected(&v.alice).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    let started = ev["session_started_at"].as_str().expect("set with the first participant").to_string();
+    assert!(started.ends_with('Z'), "RFC 3339: {started}");
+    let item = &v.voice_states(&v.bob).await["items"][0];
+    assert_eq!(item["session_started_at"], started.as_str());
+    let (s, mine) = v.node.get_auth("/api/v1/users/me/voice", &v.bob.token).await;
+    assert_eq!(s, StatusCode::OK, "{mine}");
+    assert_eq!(mine["rooms"][0]["channels"][0]["session_started_at"], started.as_str());
+
+    // Bob joins later: the join answer tells him when the session began; Alice leaving changes nothing.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let (s, j) = v.join(&v.bob).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(j["session_started_at"], started.as_str(), "the late joiner sees the channel's start");
+    v.connected(&v.bob).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    assert_eq!((ev["participants"].as_array().unwrap().len(), ev["session_started_at"].as_str()), (2, Some(started.as_str())));
+    let left = json!({ "event": "participant_left", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.alice), "disconnectReason": "CLIENT_INITIATED" } });
+    v.webhook(left).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    assert_eq!(ev["participants"].as_array().unwrap().len(), 1);
+    assert_eq!(ev["session_started_at"], started.as_str(), "the session is the channel's, not the first joiner's");
+    assert_eq!(v.voice_states(&v.alice).await["items"][0]["session_started_at"], started.as_str());
+
+    // A dropped connection keeps it through the grace period; the expiry of the last participant clears it.
+    let aborted = json!({ "event": "participant_connection_aborted", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.bob) } });
+    v.webhook(aborted).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    assert_eq!((ev["participants"][0]["connection"].as_str(), ev["session_started_at"].as_str()), (Some("reconnecting"), Some(started.as_str())));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    voice::expire_once(&v.node.state).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    assert_eq!((ev["participants"].as_array().unwrap().len(), ev["session_started_at"].is_null()), (0, true), "{ev}");
+    assert!(v.voice_states(&v.alice).await["items"].as_array().unwrap().is_empty());
+
+    // The next session starts anew.
+    v.join(&v.alice).await;
+    v.connected(&v.alice).await;
+    let ev = next_event(&mut rx, "voice.state").await;
+    let again = ev["session_started_at"].as_str().unwrap();
+    assert!(again > started.as_str(), "a new session: {again} after {started}");
+}
+
 #[tokio::test]
 async fn a_second_device_of_the_same_user_replaces_the_first() {
     let v = setup().await;

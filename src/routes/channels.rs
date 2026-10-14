@@ -494,6 +494,11 @@ pub async fn create_channel(
 pub struct UpdateChannelRequest {
     pub name: Option<String>,
     pub topic: Option<String>,
+    /// Voice channels: the status line (plain text, at most 128 characters after trimming, `""` clears it;
+    /// VOICE.md §2a). Needs `voice_status` in the channel instead of `manage_channels` when it is the only field
+    /// (`403 channel.status_forbidden`); refused on other kinds (`400 channel.status_not_voice`). Audited as
+    /// `channel.voice_status`.
+    pub status: Option<String>,
     #[serde(default, with = "crate::serde_with_double_option")]
     pub category_id: Option<Option<String>>,
     pub position: Option<i64>,
@@ -523,9 +528,35 @@ pub struct UpdateChannelRequest {
     pub age_gate: Option<String>,
 }
 
+/// The length limit of a voice channel's status line (VOICE.md §2a).
+pub const STATUS_MAX_CHARS: usize = 128;
+
+impl UpdateChannelRequest {
+    /// `status` is the only field: the request is a status change (`voice_status`), not a channel edit.
+    fn status_only(&self) -> bool {
+        self.status.is_some()
+            && self.name.is_none()
+            && self.topic.is_none()
+            && self.category_id.is_none()
+            && self.position.is_none()
+            && self.sync_with_category.is_none()
+            && self.slowmode_secs.is_none()
+            && self.bitrate_kbps.is_none()
+            && self.user_limit.is_none()
+            && self.encrypted.is_none()
+            && self.no_bots.is_none()
+            && self.bots_allowed.is_none()
+            && self.history_for_new_members.is_none()
+            && self.auto_archive_minutes.is_none()
+            && self.tags.is_none()
+            && self.age_gate.is_none()
+    }
+}
+
 /// Update a channel (`manage_channels`). Moving it out of its category copies the category's overrides into the
 /// channel; moving it into a category that grants more needs `manage_roles` there (protocol permissions.md "Moving
-/// channels").
+/// channels"). A request that carries only `status` sets a voice channel's status line and needs `voice_status`
+/// in the channel instead (VOICE.md §2a).
 #[utoipa::path(patch, path = "/api/v1/rooms/{room_id}/channels/{channel_id}", security(("bearer" = [])), params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = UpdateChannelRequest, responses((status = 200, body = Channel), (status = 403, body = ProblemDetails)))]
 pub async fn update_channel(
     State(state): State<AppState>,
@@ -534,11 +565,31 @@ pub async fn update_channel(
     Json(req): Json<UpdateChannelRequest>,
 ) -> Result<Json<Channel>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    let status_only = req.status_only();
+    if !status_only {
+        access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    }
     let current = access::channel_in_room(&state, &room_id, &channel_id).await?;
     // In the channel itself (permissions.md step 4; bots get nothing in "no bots" channels, APPLICATIONS.md §3.5).
     let perms = access::channel_perms(&state, &access, &current, &auth.user.id).await?;
-    access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    if !status_only {
+        access::require(perms, p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
+    }
+    // The status line of a voice channel (VOICE.md §2a): its own bit, also next to other fields.
+    let status = match req.status.as_deref() {
+        Some(_) if current.kind != "voice" => {
+            return Err(bad("channel.status_not_voice", "Only voice channels carry a status"));
+        }
+        Some(text) => {
+            access::require(perms, p::VOICE_STATUS, "channel.status_forbidden", "Set the voice channel status")?;
+            let text = validate::text("status", text, 0, STATUS_MAX_CHARS)?;
+            if text.contains('\n') {
+                return Err(bad("validation.multiline", "status: a single line only"));
+            }
+            Some(text)
+        }
+        None => None,
+    };
     let before = store::rooms::channels(&state.db, &room_id).await?;
     if current.kind == "system"
         && (req.name.is_some()
@@ -697,6 +748,19 @@ pub async fn update_channel(
             )
             .await?;
         }
+    }
+    if let Some(status) = status.filter(|s| *s != current.status) {
+        store::rooms::set_channel_status(&state.db, &channel_id, &status).await?;
+        store::rooms::audit(
+            &state.db,
+            Some(&room_id),
+            Some(&auth.user.id),
+            "channel.voice_status",
+            &channel_id,
+            "",
+            serde_json::json!({ "status": status }),
+        )
+        .await?;
     }
     let channel = store::rooms::channel_by_id(&state.db, &channel_id)
         .await?

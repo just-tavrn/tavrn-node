@@ -140,6 +140,9 @@ pub struct VoiceJoin {
     pub channel_id: String,
     /// Current MLS epoch of the channel's group (null before the group exists): derive the frame key from it.
     pub epoch: Option<i64>,
+    /// When the channel's current session began (VOICE.md §5; `null` while nobody is connected yet, this device
+    /// included: its own connection starts the session).
+    pub session_started_at: Option<String>,
     pub limits: VoiceLimits,
     /// Participants already connected.
     pub participants: Vec<VoiceParticipant>,
@@ -296,6 +299,7 @@ pub async fn join(
         room_id,
         channel_id,
         epoch: current.epoch,
+        session_started_at: current.session_started_at,
         limits: VoiceLimits {
             audio_bitrate_kbps: vc.channel.bitrate_kbps.min(max_bitrate),
             audio_fec: AUDIO_FEC,

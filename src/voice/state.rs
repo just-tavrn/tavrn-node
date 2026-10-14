@@ -33,6 +33,11 @@
 //! it too, and one left behind by an expiry or a reconciliation is collected for the caller to remove from LiveKit
 //! ([`VoiceState::take_orphans`]).
 //!
+//! The **session start** of a channel ([`VoiceState::session_started_at`], VOICE.md §5) is the time the first
+//! participant connected to it while it was empty; it stays while anybody is connected or reconnecting, whoever
+//! that is, and goes with the last participant. It lives here with the participants: a node restart restarts
+//! LiveKit and drops every participant, so there is nothing to persist.
+//!
 //! Everything here is pure and synchronous; callers hold the mutex only for one call.
 
 use std::{
@@ -191,6 +196,10 @@ pub struct VoiceState {
     moves: HashMap<String, Move>,
     /// Screen publishers whose owner went away in an expiry or a reconciliation, still to be removed from LiveKit.
     orphans: Vec<(ChannelKey, String)>,
+    /// Per channel: when the current session began (RFC 3339), set with the first visible participant. Read through
+    /// [`Self::session_started_at`], which ignores entries of channels that are empty again; those are dropped in
+    /// [`Self::expire`].
+    sessions: BTreeMap<ChannelKey, String>,
 }
 
 impl Default for VoiceState {
@@ -202,7 +211,7 @@ impl Default for VoiceState {
 impl VoiceState {
     /// State with a grace period for dropped connections (zero: dropped participants leave at once).
     pub fn with_grace(grace: Duration) -> Self {
-        Self { channels: BTreeMap::new(), grace, moves: HashMap::new(), orphans: Vec::new() }
+        Self { channels: BTreeMap::new(), grace, moves: HashMap::new(), orphans: Vec::new(), sessions: BTreeMap::new() }
     }
 
     /// The grace period for dropped connections.
@@ -289,6 +298,10 @@ impl VoiceState {
     pub fn activate(&mut self, key: &ChannelKey, who: &Who, now: Instant) -> bool {
         let identity = who.identity();
         let entries = self.channels.entry(key.clone()).or_default();
+        if !entries.iter().any(|e| e.active) {
+            // The first participant of an empty channel starts its session (VOICE.md §5).
+            self.sessions.insert(key.clone(), crate::util::now());
+        }
         match entries.iter_mut().find(|e| e.p.identity == identity) {
             // Back within the grace period: the same entry continues (joined_at and flags kept).
             Some(e) if e.active => {
@@ -343,7 +356,16 @@ impl VoiceState {
             }
         }
         self.channels.retain(|_, v| !v.is_empty());
+        let channels = &self.channels;
+        self.sessions.retain(|key, _| channels.get(key).is_some_and(|v| v.iter().any(|e| e.active)));
         changed
+    }
+
+    /// When the current session of `key` began (VOICE.md §5): the time the first participant connected to the
+    /// empty channel, as long as anybody is connected or reconnecting there; `None` for an empty channel.
+    pub fn session_started_at(&self, key: &ChannelKey) -> Option<String> {
+        let busy = self.channels.get(key).is_some_and(|v| v.iter().any(|e| e.active));
+        if busy { self.sessions.get(key).cloned() } else { None }
     }
 
     /// Removes `identity` from `key` (left, removed, disconnected), a device with its screen publisher. Returns
@@ -579,6 +601,7 @@ impl VoiceState {
         let empty = HashSet::new();
         let grace = self.grace;
         let mut changed = Vec::new();
+        let mut started = Vec::new();
         for (key, entries) in self.channels.iter_mut() {
             let present = truth.get(key).unwrap_or(&empty);
             let mut visible_change = false;
@@ -592,9 +615,13 @@ impl VoiceState {
                 keep
             });
             visible_change |= drop_orphans(key, entries, &mut self.orphans);
+            let was_empty = !entries.iter().any(|e| e.active);
             for e in entries.iter_mut() {
                 let here = present.contains(&e.p.identity);
                 if !e.active && here {
+                    if was_empty {
+                        started.push(key.clone());
+                    }
                     e.active = true;
                     e.p.joined_at = crate::util::now();
                     visible_change = true;
@@ -611,6 +638,11 @@ impl VoiceState {
             }
         }
         self.channels.retain(|_, v| !v.is_empty());
+        for key in started {
+            // A reservation LiveKit knows connected an empty channel: its session begins now (a channel that was
+            // connected before keeps its start; `session_started_at` hides entries of channels that emptied).
+            self.sessions.insert(key, crate::util::now());
+        }
         let mut unknown = Vec::new();
         for (key, identities) in truth {
             for identity in identities {
@@ -735,6 +767,47 @@ mod tests {
         assert!(s.remove(&key("c1"), &id("alice", DEV_A)));
         assert!(s.participants(&key("c1")).is_empty());
         assert!(!s.remove(&key("c1"), &id("alice", DEV_A)), "removing twice is a no-op");
+    }
+
+    #[test]
+    fn the_session_start_is_set_by_the_first_participant_and_cleared_with_the_last() {
+        let mut s = VoiceState::with_grace(Duration::from_secs(1));
+        let now = Instant::now();
+        assert_eq!(s.session_started_at(&key("c1")), None, "an empty channel has no session");
+        s.reserve(&key("c1"), &who("alice", DEV_A), now);
+        assert_eq!(s.session_started_at(&key("c1")), None, "a reservation alone starts nothing");
+        s.activate(&key("c1"), &who("alice", DEV_A), now);
+        let started = s.session_started_at(&key("c1")).expect("the first connected participant starts the session");
+        assert!(!started.is_empty());
+        // Bob joins later, Alice leaves: the session keeps its start (it is the channel's, not the first joiner's).
+        s.activate(&key("c1"), &who("bob", DEV_B), now);
+        assert_eq!(s.session_started_at(&key("c1")).as_deref(), Some(started.as_str()));
+        assert!(s.remove(&key("c1"), &id("alice", DEV_A)));
+        assert_eq!(s.session_started_at(&key("c1")).as_deref(), Some(started.as_str()), "kept while anybody is in");
+        // A dropped connection keeps the session during the grace period and ends it with the expiry.
+        assert!(s.lose(&key("c1"), &id("bob", DEV_B), now));
+        assert_eq!(s.session_started_at(&key("c1")).as_deref(), Some(started.as_str()), "reconnecting counts");
+        assert_eq!(s.expire(now + Duration::from_secs(2)), vec![key("c1")]);
+        assert_eq!(s.session_started_at(&key("c1")), None, "cleared with the last participant");
+        assert!(s.sessions.is_empty(), "the expiry drops the entry of an empty channel");
+        // The next session gets a start of its own; another channel is independent.
+        s.activate(&key("c1"), &who("bob", DEV_B), now);
+        assert!(s.session_started_at(&key("c1")).is_some());
+        assert_eq!(s.session_started_at(&key("c2")), None);
+    }
+
+    #[test]
+    fn the_reconciliation_starts_a_session_for_a_reservation_livekit_knows() {
+        let mut s = VoiceState::default();
+        let now = Instant::now();
+        s.reserve(&key("c1"), &who("alice", DEV_A), now);
+        let truth = HashMap::from([(key("c1"), HashSet::from([id("alice", DEV_A)]))]);
+        let (changed, unknown) = s.reconcile(&truth, now);
+        assert_eq!((changed, unknown.len()), (vec![key("c1")], 0));
+        assert!(s.session_started_at(&key("c1")).is_some(), "connected through the reconciliation");
+        // A channel that empties and comes back through the reconciliation again starts anew.
+        assert!(s.remove(&key("c1"), &id("alice", DEV_A)));
+        assert_eq!(s.session_started_at(&key("c1")), None);
     }
 
     #[test]

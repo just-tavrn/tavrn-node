@@ -1302,6 +1302,22 @@ end of the reconnect grace period or a join elsewhere ends it: the channel disap
 permissions show it, and they cannot come back by themselves. The API marks such participants with `moved: true`.
 There is nothing to configure; with several instances the leader announces the moved members to every instance.
 
+### Session timer and channel status
+
+Every voice state (`GET /rooms/{id}/voice`, `GET /users/me/voice`, the join answer and `voice.state`) carries
+`session_started_at`: when the channel's current session began, that is when somebody connected to the empty
+channel; it stays while anybody is connected or reconnecting (whoever that is) and goes with the last participant.
+Clients show a timer from it that is right for late joiners and for people outside the call. The node keeps it in
+memory with the participants: a restart restarts LiveKit and drops everybody anyway, so there is nothing to persist
+(protocol: VOICE.md §5).
+
+Voice channels also carry a **status** line (at most 128 characters, protocol VOICE.md §2a): members with the
+permission *Set voice channel status* (`voice_status`, bit 38) change it at any time through the channel update
+route without *Manage channels* (audited as `channel.voice_status`, announced with `channel.update`). At the first
+start with this release the bit is granted once to every role that holds *Manage channels* (fixup marker
+`fixup.voice_status` in `node_settings`); rooms hand it to other roles or to `@everyone` as they like. Nothing to
+configure.
+
 ### Voice activity in the room list
 
 Clients show who is in voice where (also friends in voice, and a badge on rooms with voice activity) without opening

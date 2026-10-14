@@ -200,18 +200,24 @@ pub struct VoiceChannelState {
     /// Current MLS epoch of the channel's group (null before the group exists). Clients derive the frame
     /// key of this epoch (`ENCRYPTION.md` §5a).
     pub epoch: Option<i64>,
+    /// When the current session began (RFC 3339; VOICE.md §5): set with the first connected participant, kept
+    /// while anybody is connected or reconnecting, `null` while the channel is empty. Clients show a timer from it.
+    pub session_started_at: Option<String>,
     /// Connected participants in join order.
     pub participants: Vec<VoiceParticipant>,
 }
 
 /// Current state of one channel, with the MLS epoch from the database.
 pub async fn channel_state(state: &AppState, key: &ChannelKey) -> VoiceChannelState {
-    let participants = state.voice.participants().participants(key);
+    let (participants, session_started_at) = {
+        let voice = state.voice.participants();
+        (voice.participants(key), voice.session_started_at(key))
+    };
     let epoch = store::e2ee::group_epoch(&state.db, &key.1).await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "cannot read MLS epoch for voice.state");
         None
     });
-    VoiceChannelState { room_id: key.0.clone(), channel_id: key.1.clone(), epoch, participants }
+    VoiceChannelState { room_id: key.0.clone(), channel_id: key.1.clone(), epoch, session_started_at, participants }
 }
 
 /// Publishes `voice.state` of each channel to the room's members (and announces moved participations that ended

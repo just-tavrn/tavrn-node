@@ -380,6 +380,9 @@ pub struct ChannelRow {
     pub kind: String,
     pub name: String,
     pub topic: String,
+    /// Voice channels: the status line (VOICE.md §2a); `""` elsewhere.
+    #[sqlx(default)]
+    pub status: String,
     pub position: i64,
     pub slowmode_secs: i64,
     pub bitrate_kbps: i64,
@@ -441,6 +444,7 @@ impl ChannelRow {
             kind: self.kind.clone(),
             name: self.name.clone(),
             topic: self.topic.clone(),
+            status: self.status.clone(),
             position: self.position,
             encrypted: b(self.encrypted),
             slowmode_secs: self.slowmode_secs,
@@ -488,6 +492,10 @@ pub struct Channel {
     pub kind: String,
     pub name: String,
     pub topic: String,
+    /// Voice channels: one line of plain text about what is going on (at most 128 characters, `""` = none;
+    /// VOICE.md §2a), set by members with `voice_status`. Always `""` on other kinds.
+    #[serde(default)]
+    pub status: String,
     pub position: i64,
     pub encrypted: bool,
     pub slowmode_secs: i64,

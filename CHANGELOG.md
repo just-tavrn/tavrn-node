@@ -31,6 +31,14 @@ First public release of the node and its container image.
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
   chosen. `GET /node` and the discovery document carry `files_internal`.
+- **Voice session timer and channel status** (protocol VOICE.md §5, §2a; fixes #65, #66): every voice state carries
+  `session_started_at` (set with the first connected participant of an empty channel, kept while anybody is
+  connected or reconnecting, cleared with the last one; in memory with the participants), and voice channels carry
+  a `status` line (at most 128 characters) that members with the new channel-scoped permission `voice_status`
+  (bit 38) change through `PATCH …/channels/{id}` `{ status }` without `manage_channels` (`403
+  channel.status_forbidden`, `400 channel.status_not_voice` on other kinds; audit `channel.voice_status`, event
+  `channel.update`). Migration 0390 adds the column; a startup fixup grants the bit once to every role that holds
+  `manage_channels` (`fixup.voice_status`).
 - **Screen publishers for the Android app** (protocol VOICE.md §4b): `voice/join` and `call/join` take an optional
   `{ "role": "screen" }` and issue a device's second LiveKit participant `<user>/<device>#screen` that may only
   publish the screen share and its audio and never subscribes; it needs the device in the channel or call and the

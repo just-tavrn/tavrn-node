@@ -25,6 +25,9 @@
 //! - `manage_threads` (bit 36) is added once to every role that holds `manage_messages` (marker
 //!   [`MANAGE_THREADS_MARKER`]), so moderators keep moderating threads; rooms narrow it later. `create_threads`
 //!   (bit 6) has been part of `@everyone`'s defaults since the first release and needs no fixup.
+//! - `voice_status` (bit 38) is added once to every role that holds `manage_channels` (marker
+//!   [`VOICE_STATUS_MARKER`]), so the people who manage channels can set a voice channel's status from the start;
+//!   rooms hand it to other roles afterwards (VOICE.md §2a).
 //! - Overrides carry channel-scoped bits only (`permissions::CHANNEL_SCOPED`, layered overrides of 2026-10-09):
 //!   other bits are removed from the `allow` and `deny` masks of every override, an override left with nothing at
 //!   all is deleted, and each change is audited in the room as `role.override_restricted`.
@@ -50,6 +53,8 @@ pub struct FixupReport {
     pub manage_threads_roles: u64,
     /// Overrides whose bits outside `CHANNEL_SCOPED` were removed (or that were deleted for it).
     pub override_restricted: u64,
+    /// Roles holding `manage_channels` that got `voice_status`.
+    pub voice_status_roles: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -63,6 +68,9 @@ pub const MANAGE_APPLICATIONS_MARKER: &str = "fixup.manage_applications";
 
 /// `node_settings` key: the one-time grant of `manage_threads` to roles holding `manage_messages` has run.
 pub const MANAGE_THREADS_MARKER: &str = "fixup.manage_threads";
+
+/// `node_settings` key: the one-time grant of `voice_status` to roles holding `manage_channels` has run.
+pub const VOICE_STATUS_MARKER: &str = "fixup.voice_status";
 
 /// `node_settings` key: the `allowed` default of existing rooms for `bots_in_encrypted_channels` was recorded.
 pub const BOTS_IN_ENCRYPTED_MARKER: &str = "fixup.bots_in_encrypted_channels";
@@ -135,6 +143,7 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.bots_encrypted_rooms = record_bots_in_encrypted(db).await?;
     report.manage_threads_roles = grant_manage_threads(db).await?;
     report.override_restricted = strip_unscoped_overrides(db).await?;
+    report.voice_status_roles = grant_voice_status(db).await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }
@@ -287,6 +296,10 @@ async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
 /// Adds `manage_threads` to every role holding `manage_messages`, once per node (see the module docs).
 async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
     grant_to_holders(db, MANAGE_THREADS_MARKER, permissions::MANAGE_MESSAGES, permissions::MANAGE_THREADS).await
+}
+
+async fn grant_voice_status(db: &Pool) -> anyhow::Result<u64> {
+    grant_to_holders(db, VOICE_STATUS_MARKER, permissions::MANAGE_CHANNELS, permissions::VOICE_STATUS).await
 }
 
 /// Adds `add` to every role (not `@everyone`) holding `have`, once per node (`marker` in `node_settings`).
