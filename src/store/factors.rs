@@ -423,9 +423,9 @@ pub async fn secret_storage(db: &Pool, user_id: &str) -> Result<Vec<SecretStorag
     .await?)
 }
 
-/// Stores or replaces an entry. With `credential`, the entry is only stored while that
-/// PRF-capable credential of the user exists (checked under the user lock, so it cannot race
-/// with the credential's removal); `false` otherwise.
+/// Stores or replaces an entry. With `credential`, the entry is only stored while that credential
+/// of the user exists (checked under the user lock, so it cannot race with the credential's
+/// removal), and the credential is marked PRF-capable in the same transaction; `false` otherwise.
 pub async fn put_secret_storage(
     db: &Pool,
     user_id: &str,
@@ -437,15 +437,13 @@ pub async fn put_secret_storage(
     let mut tx = db.begin().await?;
     lock_user(&mut tx, user_id).await?;
     if let Some(id) = credential {
-        let ok = sqlx::query(
-            "SELECT 1 AS x FROM webauthn_credentials WHERE credential_id = $1 AND user_id = $2 AND prf_supported = 1",
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !ok {
+        let marked = sqlx::query("UPDATE webauthn_credentials SET prf_supported = 1 WHERE credential_id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if marked == 0 {
             return Ok(false);
         }
     }
