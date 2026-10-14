@@ -1552,30 +1552,37 @@ async fn ended_sessions_leave_voice() {
     }
 }
 
-/// A leave answers without waiting for LiveKit's room service; a rejoin of the same device waits until that removal is
-/// done, so the late removal can never disconnect the new connection.
-#[tokio::test]
-async fn a_leave_answers_at_once_and_a_rejoin_waits_for_the_livekit_removal() {
+/// A LiveKit room service stand-in on a local port: it refuses every request (`404`), but holds the requests that
+/// arrive while `hold` is `true` until it turns `false`.
+async fn holding_livekit() -> (u16, tokio::sync::watch::Sender<bool>) {
     use tokio::io::AsyncWriteExt;
-    // A LiveKit room service that holds every request until released, then refuses it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (release, released) = tokio::sync::watch::channel(false);
+    let (hold, held) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
-            let mut released = released.clone();
+            let mut held = held.clone();
             tokio::spawn(async move {
-                let _ = released.wait_for(|r| *r).await;
+                let _ = held.wait_for(|h| !*h).await;
                 let _ =
                     socket.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
             });
         }
     });
+    (port, hold)
+}
+
+/// A leave answers without waiting for LiveKit's room service; a rejoin of the same device waits until that removal is
+/// done, so the late removal can never disconnect the new connection.
+#[tokio::test]
+async fn a_leave_answers_at_once_and_a_rejoin_waits_for_the_livekit_removal() {
+    let (port, hold) = holding_livekit().await;
     let v = setup_with(|c| c.livekit_port = port).await;
     let key = (v.room_id.clone(), v.voice_id.clone());
     let identity = v.identity(&v.bob);
     assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
 
+    hold.send(true).unwrap();
     let (s, _) =
         common::within(Duration::from_secs(2), "the leave", v.node.post(&v.path("leave"), &v.bob.token, json!({})))
             .await;
@@ -1589,8 +1596,52 @@ async fn a_leave_answers_at_once_and_a_rejoin_waits_for_the_livekit_removal() {
         tokio::time::timeout(Duration::from_millis(300), &mut rejoin).await.is_err(),
         "the rejoin waits for the pending removal"
     );
-    release.send(true).unwrap();
+    hold.send(false).unwrap();
     let (s, j) = common::within(Duration::from_secs(5), "the rejoin", rejoin).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert!(!voice::removal_pending(&v.node.state, &key, &identity));
+}
+
+/// A move never waits for a pending removal: the moved member's client leaves the old channel (its removal still
+/// held by LiveKit) and joins the target at once, and the moderator's move itself answers at once.
+#[tokio::test]
+async fn a_move_and_the_moved_members_join_do_not_wait_for_pending_removals() {
+    let (port, hold) = holding_livekit().await;
+    let v = setup_with(|c| c.livekit_port = port).await;
+    let path = format!("/api/v1/rooms/{}/channels", v.room_id);
+    let (s, stage) = v.node.post(&path, &v.alice.token, json!({ "kind": "voice", "name": "Stage" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{stage}");
+    let stage = stage["id"].as_str().unwrap().to_string();
+    let stage_path = |rest: &str| format!("/api/v1/rooms/{}/channels/{stage}/voice/{rest}", v.room_id);
+    let identity = v.identity(&v.bob);
+    let lobby = (v.room_id.clone(), v.voice_id.clone());
+
+    // A pending removal of Bob's device in the lobby (an earlier leave), then he is back in the lobby.
+    assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
+    hold.send(true).unwrap();
+    assert_eq!(v.node.post(&v.path("leave"), &v.bob.token, json!({})).await.0, StatusCode::NO_CONTENT);
+    assert!(voice::removal_pending(&v.node.state, &lobby, &identity));
+    hold.send(false).unwrap();
+    common::within(Duration::from_secs(5), "the lobby rejoin", v.join(&v.bob)).await;
+
+    // Alice moves him to the stage; his client leaves the lobby (held by LiveKit) and joins the stage.
+    let (s, j) = common::within(
+        Duration::from_secs(5),
+        "the move",
+        v.node.post(&v.path("members/bob@t.local/move"), &v.alice.token, json!({ "channel_id": stage })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    hold.send(true).unwrap();
+    assert_eq!(v.node.post(&v.path("leave"), &v.bob.token, json!({})).await.0, StatusCode::NO_CONTENT);
+    assert!(voice::removal_pending(&v.node.state, &lobby, &identity), "the lobby removal is still held");
+    let (s, j) = common::within(
+        Duration::from_millis(1500),
+        "the moved member's join (no wait for the lobby's removal)",
+        v.node.post(&stage_path("join"), &v.bob.token, json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(voice::removal_pending(&v.node.state, &lobby, &identity), "it did not wait for the removal");
+    hold.send(false).unwrap();
 }
