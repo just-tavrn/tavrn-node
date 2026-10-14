@@ -29,7 +29,7 @@ repository, which is the `protocol/` submodule of this repository.
 16. [Threads and forum channels](#threads-and-forum-channels)
 17. [Polls](#polls)
 18. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
-19. [Logs and troubleshooting](#logs-and-troubleshooting)
+19. [Logs and troubleshooting](#logs-and-troubleshooting) ([Performance](#performance))
 20. [Upgrade and rollback](#upgrade-and-rollback)
 21. [Security hardening checklist](#security-hardening-checklist)
 
@@ -852,8 +852,9 @@ PostgreSQL holds everything except the uploaded files and the keys; SQLite is on
 - **PostgreSQL** is the production database: the compose service `db` (`postgres:17-alpine`, data in
   `./pgdata`) or an external server or managed service via `TAVRN_DATABASE_URL`
   (`postgres://user:password@host:port/db`; remove the `db` service then). SQLite is refused outside `--dev`.
-- **Connections**: every instance opens a pool of up to 16 connections. With several instances set
-  `max_connections` to at least `16 × instances + 10`, or put PgBouncer in session mode in between.
+- **Connections**: every instance opens a pool of up to 16 connections and keeps at least 2 of them open while
+  idle (see [Performance](#performance)). With several instances set `max_connections` to at least
+  `16 × instances + 10`, or put PgBouncer in session mode in between.
 - **Migrations** are built into the binary and run automatically at every start (with several instances under a
   startup lease, one instance after the other). They only go forward: the node refuses to start against a
   database whose schema is newer than the binary (`database migration failed (schema newer than the binary? …)`),
@@ -2293,6 +2294,17 @@ personal data and rotate them (Docker's `json-file` driver with `max-size`/`max-
 The output of the supervised LiveKit process is forwarded into the node's log. Useful lines: `LiveKit starting
 media=…` (announced addresses and ports), `new node signing key generated` (first start), the background storage
 encryption progress, `Auto-moderation: message flood`.
+
+### Performance
+
+A node answers most API requests in a few milliseconds; these settings and behaviours keep it that way and help to
+find the exceptions.
+
+- **Database connections stay warm.** Each instance keeps at least 2 PostgreSQL connections open while idle and
+  closes further idle ones only after 30 minutes (every connection is replaced after 2 hours). A connection is
+  checked with a ping only when it was idle for more than 30 seconds, not on every request. So the first clicks
+  after a quiet period do not pay a new connection (TCP, TLS, authentication) and the re-preparation of the
+  statements.
 
 ### Common problems
 
