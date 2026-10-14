@@ -4,13 +4,12 @@
 # Pre-publication check (docs/GITHUB.md). Run it before every push and in the CI:
 #   scripts/publish-check.sh [directory]          (default: the current directory)
 # It fails when the tree contains anything private: planning notes, agent or memory files, local data, test
-# output, environment or key files, secrets, or private domains and addresses outside the two deploy examples.
+# output, environment or key files, secrets, or private domains and addresses.
 #
 # Private domains and addresses are not written into this script (it is public itself). They come from
 #   - PUBLISH_CHECK_PRIVATE (comma-separated literal strings; in the CI the secret of the same name),
 #   - the file .publish-check.private in the checked directory, in its parent directory or next to this
-#     script's repository (one string per line, gitignored, never committed),
-#   - the example reference node in deploy/.env.example (TAVRN_REFERENCE_NODES) and its parent domain.
+#     script's repository (one string per line, gitignored, never committed).
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,7 +41,8 @@ for f in "${files[@]}"; do
   esac
 done
 
-# 2. Private domains and addresses (only the example reference node is allowed, and only in the two deploy files).
+# 2. Private domains and addresses: the configured private patterns are refused everywhere, the deploy examples included
+#    (the default reference node tavrn.org is the project's public domain, not a private name).
 patterns=()
 IFS=',' read -r -a env_patterns <<< "${PUBLISH_CHECK_PRIVATE:-}"
 for p in "${env_patterns[@]}"; do [ -n "${p// /}" ] && patterns+=("${p// /}"); done
@@ -50,20 +50,7 @@ for list in ./.publish-check.private ../.publish-check.private "$here/.publish-c
   [ -f "$list" ] || continue
   while IFS= read -r p; do [ -n "$p" ] && [[ "$p" != \#* ]] && patterns+=("$p"); done < "$list"
 done
-# The example reference node (and its parent domain) is the one private name the two deploy examples may carry.
-reference=()
-for example in deploy/.env.example "$here/deploy/.env.example"; do
-  [ -f "$example" ] || continue
-  ref=$(sed -n 's/^TAVRN_REFERENCE_NODES=\([^ #]*\).*/\1/p' "$example" | head -n 1)
-  for d in ${ref//,/ }; do
-    reference+=("$d")
-    parent="${d#*.}"
-    [[ "$parent" == *.* ]] && reference+=("$parent")
-  done
-done
-patterns+=("${reference[@]}")
 [ "${#patterns[@]}" -gt 0 ] && mapfile -t patterns < <(printf '%s\n' "${patterns[@]}" | sort -u)
-is_reference() { local r; for r in "${reference[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
 if [ "${#patterns[@]}" -eq 0 ]; then
   report "no private domains or addresses configured (PUBLISH_CHECK_PRIVATE or .publish-check.private)"
 else
@@ -73,8 +60,6 @@ else
     esac
     [ -f "$f" ] || continue
     for p in "${patterns[@]}"; do
-      # Only the reference node is allowed in the deploy examples; every other private string is refused there too.
-      case "$f" in deploy/docker-compose.yml | deploy/.env.example) is_reference "$p" && continue ;; esac
       if grep -qIF -- "$p" "$f"; then
         # File and line only: the CI log of a public repository must not repeat the private string.
         report "private domain/address in $f:$(grep -nIF -- "$p" "$f" | head -n 1 | cut -d: -f1)"

@@ -16,7 +16,7 @@ First public release of the node and its container image.
   stale epochs refused, history shares sealed per device, history restore after a key reset, encrypted files
   channels.
 - **Federation** between nodes, direct messages and friends across nodes, a signed "over 18" claim instead of dates
-  of birth.
+  of birth. `deploy/.env.example` lists new nodes at the official reference node `tavrn.org` by default (clear `TAVRN_REFERENCE_NODES` to stay out of every directory).
 - **Voice, video and screen sharing** through a supervised `livekit-server`, moves into voice channels, the voice
   state of all rooms (`/users/me/voice`).
 - **Accounts**: mandatory second factor, passkeys, single sign-on, sessions and devices, age assurance (date of

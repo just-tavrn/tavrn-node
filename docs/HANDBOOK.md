@@ -93,8 +93,8 @@ What the compose file does:
 - **`valkey`** (commented out): only for several instances ([Scaling with Valkey](#scaling-with-valkey)).
 - **`networks`** (commented out): an IPv6 subnet for the default network, for voice over IPv6
   ([Voice and video](#voice-and-video)).
-- `TAVRN_REFERENCE_NODES` is empty by default (the node is in no directory); `tavrn.org` in `.env` lists it in
-  the official directory ([Getting listed in the directory](#getting-listed-in-the-directory)).
+- `TAVRN_REFERENCE_NODES=tavrn.org` in `.env.example` lists the node in the official directory and pulls its node
+  list; leave it empty to be in no directory ([Getting listed in the directory](#getting-listed-in-the-directory)).
 
 Many published UDP ports make Docker's userland proxy slow; with large ranges consider `network_mode: host`.
 
@@ -391,7 +391,7 @@ These settings decide whether and with whom the node federates and how it takes 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_FEDERATION_ENABLED` | `true` | `false`: no federation tokens, federated logins, inbox or outbox. |
-| `TAVRN_REFERENCE_NODES` | empty (compose and `.env.example`: an example node) | Comma-separated domains of the reference nodes this node announces itself to and pulls the node list from ([directory](#getting-listed-in-the-directory)). Lowercase, at least one dot, no port. |
+| `TAVRN_REFERENCE_NODES` | empty (`.env.example`: `tavrn.org`, the official node) | Comma-separated domains of the reference nodes this node announces itself to and pulls the node list from ([directory](#getting-listed-in-the-directory)). Lowercase, at least one dot, no port. |
 | `TAVRN_DIRECTORY_LISTING` | `true` | `false`: never announce; other nodes refuse to list this node. |
 | `TAVRN_DIRECTORY_MAX_ROOMS` | `5000` | Cached rooms of other nodes for Discover in total (at most 200 per node; > 0). |
 | `TAVRN_FEDERATION_BLOCKLIST` | empty | Domains never federated with (also blocks their subdomains). |
@@ -1113,8 +1113,8 @@ sends [web push](#web-push) where needed.
 ### Getting listed in the directory
 
 Nodes find each other through **reference nodes** (`TAVRN_REFERENCE_NODES`, several comma-separated are fine).
-The setting is empty by default; `tavrn.org` is the official node and reference directory, which you may use,
-replace or leave out. Without a reference node a node neither announces
+The binary's default is empty; `.env.example` sets `tavrn.org`, the official node and reference directory, which
+you may keep, replace or clear. Without a reference node a node neither announces
 itself nor pulls a node list; its Discover page then shows only the nodes that announce themselves to it. With
 `TAVRN_DIRECTORY_LISTING=true` (the default) a node announces itself to each of them at startup, every 6 hours and
 whenever a room is listed or unlisted. The reference node verifies the announce against the node's own
