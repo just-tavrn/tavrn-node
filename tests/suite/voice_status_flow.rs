@@ -112,10 +112,8 @@ async fn the_status_needs_voice_status_alone_and_is_validated_audited_and_announ
     assert_eq!(t.audit("channel.voice_status").await.len(), 1);
 
     // The bit does not open the other fields.
-    let (s, j) = t
-        .node
-        .patch(&t.channel(&t.voice_id), &t.bob.token, json!({ "status": "Planning", "user_limit": 5 }))
-        .await;
+    let (s, j) =
+        t.node.patch(&t.channel(&t.voice_id), &t.bob.token, json!({ "status": "Planning", "user_limit": 5 })).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("channel.manage_forbidden")), "{j}");
     let (s, j) = t.node.patch(&t.channel(&t.voice_id), &t.bob.token, json!({ "name": "loud" })).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("channel.manage_forbidden")), "{j}");
@@ -228,8 +226,11 @@ async fn the_startup_fixup_grants_voice_status_to_roles_that_manage_channels_onc
         let id = id.to_string();
         let db = t.node.state.db.clone();
         async move {
-            let perms: i64 =
-                sqlx::query_scalar("SELECT permissions FROM roles WHERE id = $1").bind(id).fetch_one(&db).await.unwrap();
+            let perms: i64 = sqlx::query_scalar("SELECT permissions FROM roles WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
             perms as u64
         }
     };

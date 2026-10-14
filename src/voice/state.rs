@@ -777,7 +777,7 @@ mod tests {
         s.reserve(&key("c1"), &who("alice", DEV_A), now);
         assert_eq!(s.session_started_at(&key("c1")), None, "a reservation alone starts nothing");
         s.activate(&key("c1"), &who("alice", DEV_A), now);
-        let started = s.session_started_at(&key("c1")).expect("the first connected participant starts the session");
+        let started = s.session_started_at(&key("c1")).unwrap();
         assert!(!started.is_empty());
         // Bob joins later, Alice leaves: the session keeps its start (it is the channel's, not the first joiner's).
         s.activate(&key("c1"), &who("bob", DEV_B), now);

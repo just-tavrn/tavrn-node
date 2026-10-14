@@ -646,7 +646,10 @@ async fn the_voice_state_carries_the_session_start() {
     assert_eq!(j["session_started_at"], started.as_str(), "the late joiner sees the channel's start");
     v.connected(&v.bob).await;
     let ev = next_event(&mut rx, "voice.state").await;
-    assert_eq!((ev["participants"].as_array().unwrap().len(), ev["session_started_at"].as_str()), (2, Some(started.as_str())));
+    assert_eq!(
+        (ev["participants"].as_array().unwrap().len(), ev["session_started_at"].as_str()),
+        (2, Some(started.as_str()))
+    );
     let left = json!({ "event": "participant_left", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.alice), "disconnectReason": "CLIENT_INITIATED" } });
     v.webhook(left).await;
     let ev = next_event(&mut rx, "voice.state").await;
@@ -658,7 +661,10 @@ async fn the_voice_state_carries_the_session_start() {
     let aborted = json!({ "event": "participant_connection_aborted", "room": { "name": v.room_name() }, "participant": { "identity": v.identity(&v.bob) } });
     v.webhook(aborted).await;
     let ev = next_event(&mut rx, "voice.state").await;
-    assert_eq!((ev["participants"][0]["connection"].as_str(), ev["session_started_at"].as_str()), (Some("reconnecting"), Some(started.as_str())));
+    assert_eq!(
+        (ev["participants"][0]["connection"].as_str(), ev["session_started_at"].as_str()),
+        (Some("reconnecting"), Some(started.as_str()))
+    );
     tokio::time::sleep(Duration::from_millis(1100)).await;
     voice::expire_once(&v.node.state).await;
     let ev = next_event(&mut rx, "voice.state").await;

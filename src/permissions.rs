@@ -632,7 +632,10 @@ mod tests {
         assert!(!has(DEFAULT_EVERYONE, VOICE_STATUS), "but not by default");
         assert!(has(CHANNEL_SCOPED, VOICE_STATUS), "an override can grant it alone");
         assert!(has(scope_mask(&["rooms:manage".to_string()]), VOICE_STATUS));
-        assert!(!has(scope_mask(&["voice".to_string()]), VOICE_STATUS), "the voice scope joins and speaks, it does not edit");
+        assert!(
+            !has(scope_mask(&["voice".to_string()]), VOICE_STATUS),
+            "the voice scope joins and speaks, it does not edit"
+        );
         assert_eq!(names(VOICE_STATUS), vec!["voice_status"]);
         assert_eq!(parse(&VOICE_STATUS.to_string()), Some(VOICE_STATUS));
     }
