@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use crate::{db::Pool, error::ApiError, models::MessageRow, util::now};
 
-const COLS: &str = "m.id, m.conversation_id, m.author_id, u.username AS author_username, u.domain AS author_domain, u.kind AS author_kind, m.device_id, m.encrypted, m.format, m.epoch, m.content, m.content_size, m.reply_to_id, m.thread_id, m.mentions, m.mentions_everyone, m.created_at, m.edited_at, m.signature, m.webhook_id, m.webhook_name, m.interaction, u.deleted_at AS author_deleted_at";
+const COLS: &str = "m.id, m.conversation_id, m.author_id, u.username AS author_username, u.domain AS author_domain, u.kind AS author_kind, m.device_id, m.encrypted, m.format, m.epoch, m.content, m.content_size, m.reply_to_id, m.thread_id, m.mentions, m.mentions_everyone, m.created_at, m.edited_at, m.signature, m.webhook_id, m.webhook_name, m.interaction, m.poll_closes_at, u.deleted_at AS author_deleted_at";
 
 pub struct NewMessage<'a> {
     pub id: &'a str,

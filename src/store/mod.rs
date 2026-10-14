@@ -23,6 +23,7 @@ pub mod media;
 pub mod messages;
 pub mod oidc;
 pub mod pending_removals;
+pub mod polls;
 pub mod push;
 pub mod reports;
 pub mod room_admin;

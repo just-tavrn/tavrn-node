@@ -225,6 +225,9 @@ pub struct CreateMessageRequest {
     /// Write into this thread of the channel (PROTOCOL.md §7e): needs `create_threads` in text and announcement
     /// channels, `manage_threads` in a locked thread; an archived thread reopens.
     pub thread_id: Option<String>,
+    /// Close time of a poll (PROTOCOL.md §7g): RFC 3339 with an offset, 1 minute to 1 year ahead, any content. Needs
+    /// `create_polls`; the node refuses votes after it.
+    pub poll_closes_at: Option<String>,
 }
 
 pub(crate) struct Validated {
@@ -286,8 +289,10 @@ pub(crate) fn validate_content(
                         return Err(bad("message.gif_invalid", "GIF URL is not from the configured provider"));
                     }
                 }
-            } else if kind.starts_with("system.") {
-                return Err(bad("message.type_reserved", "System messages cannot be sent"));
+            } else if kind == crate::polls::POLL_TYPE {
+                crate::polls::validate_poll(obj)?;
+            } else if kind.starts_with("system.") || kind == crate::polls::VOTE_TYPE {
+                return Err(bad("message.type_reserved", "System messages and poll votes cannot be sent as messages"));
             }
             serde_json::to_string(content).map_err(|e| ApiError::Internal(e.into()))?
         }
@@ -644,6 +649,12 @@ pub(crate) async fn create_in(
     if !encrypted {
         check_body_emojis(state, conv, &req.content).await?;
     }
+    // Polls (PROTOCOL.md §7g): `create_polls` where the node sees a poll (plaintext) or a close time.
+    if (!encrypted && is_poll(&req.content)) || req.poll_closes_at.is_some() {
+        conv.require(p::CREATE_POLLS, "message.poll_forbidden", "Create polls")?;
+    }
+    let closes_at =
+        req.poll_closes_at.as_deref().map(|c| crate::polls::closes_at_for_create(c, chrono::Utc::now())).transpose()?;
     if req.spoilers.iter().any(|s| !req.attachments.contains(s)) {
         return Err(bad("message.spoiler_invalid", "spoilers must name attachments of this message"));
     }
@@ -700,6 +711,9 @@ pub(crate) async fn create_in(
         if !req.spoilers.is_empty() {
             store::blobs::mark_spoilers(&state.db, &id, &req.spoilers).await?;
         }
+    }
+    if let Some(closes_at) = &closes_at {
+        store::polls::set_closes_at(&state.db, &id, closes_at).await?;
     }
     let message = enrich_one(state, &auth.user.id, &id).await?;
     // `delete` and `timeout` rules: accepted, but never shown to anyone else.
@@ -776,8 +790,10 @@ async fn automod_check(
 
 #[derive(Deserialize, ToSchema)]
 pub struct EditMessageRequest {
-    #[schema(value_type = Value)]
-    pub content: Value,
+    /// The new content; absent when the request only closes a poll early (`poll_closes_at`).
+    #[serde(default)]
+    #[schema(value_type = Option<Value>)]
+    pub content: Option<Value>,
     #[serde(default)]
     pub mentions: Vec<String>,
     #[serde(default)]
@@ -788,6 +804,10 @@ pub struct EditMessageRequest {
     /// §10.3). Rejected in encrypted conversations; mentions must then be sent normalized (lowercase,
     /// without duplicates) because the node stores them as signed.
     pub signature: Option<String>,
+    /// Close a poll early (PROTOCOL.md §7g): a time earlier than the current close time and not more than a minute
+    /// in the past (the node stores the later of it and its clock). Without `content` the author or a member with
+    /// `manage_messages` may send it; it never moves later and a message without a close time gets none.
+    pub poll_closes_at: Option<String>,
 }
 
 /// Edit an own message.
@@ -814,6 +834,45 @@ pub async fn edit_conversation_message(
     edit_in(&state, &auth, &conv, &message_id, req).await
 }
 
+/// Is this plaintext content object a poll (PROTOCOL.md §7g)?
+fn is_poll(content: &Value) -> bool {
+    content.get("type").and_then(Value::as_str) == Some(crate::polls::POLL_TYPE)
+}
+
+/// `PATCH …/messages/{id} { poll_closes_at }` without content: closes a poll early (PROTOCOL.md §7g).
+async fn close_poll(
+    state: &AppState,
+    auth: &AuthUser,
+    conv: &Conv,
+    existing: &MessageRow,
+    closes_at: &str,
+) -> Result<Json<Message>, ApiError> {
+    let own = existing.author_id == auth.user.id;
+    if !own && !p::has(conv.perms, p::MANAGE_MESSAGES) {
+        return Err(ApiError::Forbidden {
+            code: "message.not_author",
+            detail: "Only the author or a member with manage_messages closes a poll".into(),
+        });
+    }
+    let stored = crate::polls::closes_at_for_close(closes_at, existing.poll_closes_at.as_deref(), chrono::Utc::now())?;
+    store::polls::set_closes_at(&state.db, &existing.id, &stored).await?;
+    if !own && let Some(room_id) = conv.room_id() {
+        store::rooms::audit(
+            &state.db,
+            Some(room_id),
+            Some(&auth.user.id),
+            "message.poll_close",
+            &existing.id,
+            "",
+            serde_json::json!({ "channel_id": conv.id, "author_id": existing.author_id, "poll_closes_at": stored }),
+        )
+        .await?;
+    }
+    let message = enrich_one(state, &auth.user.id, &existing.id).await?;
+    conv.publish_recorded(state, "message.update", &message).await;
+    Ok(Json(message))
+}
+
 async fn edit_in(
     state: &AppState,
     auth: &AuthUser,
@@ -821,6 +880,17 @@ async fn edit_in(
     message_id: &str,
     req: EditMessageRequest,
 ) -> Result<Json<Message>, ApiError> {
+    let Some(content) = req.content.as_ref() else {
+        let Some(closes_at) = req.poll_closes_at.as_deref() else {
+            return Err(bad("message.content_missing", "content is missing (or poll_closes_at to close a poll)"));
+        };
+        conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
+        let existing = store::messages::by_id(&state.db, message_id)
+            .await?
+            .filter(|m| m.conversation_id == conv.id)
+            .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+        return close_poll(state, auth, conv, &existing, closes_at).await;
+    };
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
     let existing = store::messages::by_id(&state.db, message_id)
         .await?
@@ -839,18 +909,28 @@ async fn edit_in(
         conv.require(p::MENTION_EVERYONE, "message.mention_everyone_forbidden", "Mention @everyone")?;
     }
     check_not_blocked(state, auth, conv).await?;
-    let v = validate_content(gif_hosts(state), conv.encrypted, &req.content, &req.mentions)?;
+    let v = validate_content(gif_hosts(state), conv.encrypted, content, &req.mentions)?;
     check_role_mentions(state, conv, &v.mentions).await?;
     if !conv.encrypted {
-        check_body_emojis(state, conv, &req.content).await?;
+        check_body_emojis(state, conv, content).await?;
+        // Polls cannot be edited, and no message becomes one by an edit (PROTOCOL.md §7g).
+        let was_poll =
+            existing.encrypted == 0 && serde_json::from_str::<Value>(&existing.content).is_ok_and(|c| is_poll(&c));
+        if was_poll || is_poll(content) {
+            return Err(bad("message.poll_immutable", "Polls cannot be edited"));
+        }
     }
+    let closes_at = match req.poll_closes_at.as_deref() {
+        Some(c) => Some(crate::polls::closes_at_for_close(c, existing.poll_closes_at.as_deref(), chrono::Utc::now())?),
+        None => None,
+    };
     let signature = validate_signature(conv.encrypted, req.signature.as_deref(), &req.mentions, &v.mentions)?;
     let hit = if conv.encrypted {
         None
     } else {
         let names: Vec<String> =
             store::blobs::by_message(&state.db, message_id).await?.into_iter().map(|b| b.name).collect();
-        crate::automod::evaluate(state, conv, &req.content, &names).await?
+        crate::automod::evaluate(state, conv, content, &names).await?
     };
     if let Some(h) = hit.as_ref().filter(|h| h.blocks()) {
         return Err(crate::automod::blocked(state, conv, &auth.user, h).await);
@@ -870,6 +950,9 @@ async fn edit_in(
         },
     )
     .await?;
+    if let Some(closes_at) = &closes_at {
+        store::polls::set_closes_at(&state.db, message_id, closes_at).await?;
+    }
     let message = enrich_one(state, &auth.user.id, message_id).await?;
     if let Some(h) = &hit {
         crate::automod::remove(state, conv, &auth.user, h, message_id).await?;

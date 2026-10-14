@@ -1140,6 +1140,10 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
     };
     let v = msgs::validate_content(msgs::gif_hosts(state), conv.encrypted, &content, mentions)
         .map_err(as_interaction_error)?;
+    // A plaintext poll as an answer needs `create_polls` like any poll the node can see (PROTOCOL.md §7g).
+    if !conv.encrypted && content.get("type").and_then(Value::as_str) == Some(crate::polls::POLL_TYPE) {
+        conv.require(p::CREATE_POLLS, "message.poll_forbidden", "Create polls")?;
+    }
     if conv.encrypted && auth.device_id.is_empty() {
         return Err(ApiError::BadRequest {
             code: "interaction.device_invalid",
