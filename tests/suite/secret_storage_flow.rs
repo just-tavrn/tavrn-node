@@ -154,7 +154,8 @@ async fn passkey_entries_belong_to_a_prf_credential_and_go_with_it() {
     let bob = node.register("bob").await;
     let master = MasterSecret::generate().unwrap();
 
-    // A credential without PRF cannot hold an entry.
+    // A credential whose registration announced no PRF accepts an entry (the entry proves the PRF works, for
+    // example a platform authenticator that reports the extension only at assertion time) and gains the flag.
     let mut plain = Authenticator::new();
     let plain_id = node.add_passkey(&alice.token, &mut plain, "Old security key").await["credential"]["id"]
         .as_str()
@@ -164,9 +165,18 @@ async fn passkey_entries_belong_to_a_prf_credential_and_go_with_it() {
         let key = passkey_wrapping_key(&[7u8; 32]).unwrap();
         json!({ "wrapped": b64(&wrap_master_secret(&master, &key, ALICE, &passkey_method(id).unwrap()).unwrap()), "params": { "prf": "v1" } })
     };
+    let (_, factors) = node.get_auth("/api/v1/auth/factors", &alice.token).await;
+    let flag = |f: &serde_json::Value| {
+        f["webauthn"].as_array().unwrap().iter().find(|c| c["id"] == plain_id).unwrap()["prf_supported"].clone()
+    };
+    assert_eq!(flag(&factors), false, "{factors}");
     let (s, j) =
         node.put(&format!("/api/v1/users/me/secret-storage/passkey/{plain_id}"), &alice.token, entry(&plain_id)).await;
-    assert_eq!((s, j["code"].as_str()), (StatusCode::CONFLICT, Some("secret_storage.prf_unsupported")), "{j}");
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    let (_, factors) = node.get_auth("/api/v1/auth/factors", &alice.token).await;
+    assert_eq!(flag(&factors), true, "the stored entry marks the credential as PRF-capable: {factors}");
+    let (s, _) = node.delete(&format!("/api/v1/users/me/secret-storage/passkey/{plain_id}"), &alice.token).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
 
     // Two PRF credentials, one entry each.
     let mut prf_ids = Vec::new();

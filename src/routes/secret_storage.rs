@@ -125,9 +125,11 @@ fn credential_not_found() -> ApiError {
     ApiError::NotFound { code: "webauthn.not_found", what: "Security key".into() }
 }
 
-/// Stores or replaces the entry of a PRF-capable WebAuthn credential of the user (needs a reauth token).
+/// Stores or replaces the entry of a WebAuthn credential of the user and marks the credential as PRF-capable: the
+/// entry (a wrap under the credential's PRF output) proves the extension works even when the registration did not
+/// announce it (needs a reauth token).
 #[utoipa::path(put, path = "/api/v1/users/me/secret-storage/passkey/{credential_id}", security(("bearer" = [])), params(("credential_id" = String, Path)), request_body = PutSecretStorage,
-    responses((status = 204), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
+    responses((status = 204), (status = 400, body = ProblemDetails), (status = 401, body = ProblemDetails), (status = 404, body = ProblemDetails), (status = 413, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
 pub async fn put_passkey(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -138,13 +140,7 @@ pub async fn put_passkey(
     credential_id(&id)?;
     crate::reauth::require(&state, &auth, &headers).await?;
     let (wrapped, params) = validate(&state, &auth, &req)?;
-    let cred = store::factors::credential(&state.db, &auth.user.id, &id).await?.ok_or_else(credential_not_found)?;
-    if cred.prf_supported == 0 {
-        return Err(ApiError::conflict(
-            "secret_storage.prf_unsupported",
-            "This security key does not support the PRF extension",
-        ));
-    }
+    store::factors::credential(&state.db, &auth.user.id, &id).await?.ok_or_else(credential_not_found)?;
     let method = format!("passkey:{id}");
     if !store::factors::put_secret_storage(&state.db, &auth.user.id, &method, &wrapped, &params, Some(&id)).await? {
         return Err(credential_not_found());
