@@ -39,6 +39,19 @@ First public release of the node and its container image.
   channel.status_forbidden`, `400 channel.status_not_voice` on other kinds; audit `channel.voice_status`, event
   `channel.update`). Migration 0390 adds the column; a startup fixup grants the bit once to every role that holds
   `manage_channels` (`fixup.voice_status`).
+- **Polls and date polls** (protocol PROTOCOL.md §7g, capability `polls.v1`; fixes just-tavrn/tavrn-protocol#35):
+  messages carry the plaintext close time `poll_closes_at` (migration 0400; set on create 1 minute to 1 year ahead,
+  moved earlier only by the author or `manage_messages` through `PATCH …/messages/{id} { poll_closes_at }`, audit
+  `message.poll_close`), plaintext polls are checked (`400 message.poll_invalid`) and cannot be edited
+  (`400 message.poll_immutable`). Vote records, one per user and poll (the last device wins), live in the new table
+  `poll_votes` and go with their message: `PUT`/`DELETE /conversations/{id}/messages/{message_id}/poll/vote`, `GET
+  …/poll/votes`; encrypted votes pass the §5.3 checks, plaintext votes are checked against the poll; `409
+  poll.closed`, `413 poll.vote_too_large` (4 KiB), 10 changes per user and minute. Events `poll.vote` and
+  `poll.vote.delete` to the conversation audience; votes never count as unread or notify. Bots vote with
+  `messages:write`, read votes and `poll.*` events with `messages:read`. New permission `create_polls` (bit 39,
+  channel-scoped, default of `@everyone`, in DMs, denied in the welcome channel, covered by `messages:write`) for
+  plaintext polls and every message with a close time; a startup fixup grants it once to every role and override
+  that allows `send_messages` (`fixup.create_polls`).
 - **Screen publishers for the Android app** (protocol VOICE.md §4b): `voice/join` and `call/join` take an optional
   `{ "role": "screen" }` and issue a device's second LiveKit participant `<user>/<device>#screen` that may only
   publish the screen share and its audio and never subscribes; it needs the device in the channel or call and the
