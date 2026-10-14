@@ -185,6 +185,10 @@ async fn plaintext_polls_are_checked_and_votes_are_records_not_messages() {
     assert_eq!((ev["conversation_id"].as_str(), ev["user"].as_str()), (Some(t.channel.as_str()), v["user"].as_str()));
     assert_eq!(t.unread(&t.alice.token).await, unread, "votes never count as unread");
     assert_eq!(t.node.get_auth(&t.messages(), &t.alice.token).await.1.as_array().unwrap().len(), count);
+    // The account's data summary names the votes (LEGAL.md §3.1).
+    let (_, data) = t.node.get_auth("/api/v1/users/me/data", &t.bob.token).await;
+    let votes = data["categories"].as_array().unwrap().iter().find(|c| c["key"] == "poll_votes").cloned();
+    assert_eq!(votes.map(|c| c["count"].clone()), Some(json!(1)), "{data}");
 
     // Changing the vote replaces the record (created_at stays), with an optional plaintext signature.
     let sig = tavrn_crypto::PlaintextSignature { nonce: [1; 16], signature: [2; 64] }.to_base64url();
@@ -301,6 +305,7 @@ async fn create_polls_moderators_closing_timeouts_members_and_the_rate_limit() {
     let t = setup().await;
     let m = t.send_poll(&t.alice.token, Some(in_secs(3600))).await;
     let mid = m["id"].as_str().unwrap().to_string();
+    let bobs = t.send_poll(&t.bob.token, Some(in_secs(3600))).await;
 
     // Without create_polls (a channel override): no plaintext polls, no close times; voting stays possible.
     let (s, j) = t
@@ -354,6 +359,15 @@ async fn create_polls_moderators_closing_timeouts_members_and_the_rate_limit() {
     assert!(s.is_success(), "{j}");
     let (s, j) = t.node.put(&t.vote_url(&mid), &t.bob.token, json!({ "content": vote(&mid, &poll(), &["b"]) })).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.timed_out"), "{j}");
+    let (s, j) = t
+        .node
+        .patch(
+            &format!("{}/{}", t.messages(), bobs["id"].as_str().unwrap()),
+            &t.bob.token,
+            json!({ "poll_closes_at": in_secs(60) }),
+        )
+        .await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.timed_out"), "closing is writing: {j}");
     let dave = t.node.register("dave").await;
     let (s, j) = t.node.put(&t.vote_url(&mid), &dave.token, json!({ "content": vote(&mid, &poll(), &["b"]) })).await;
     assert!(s == StatusCode::FORBIDDEN || s == StatusCode::NOT_FOUND, "{s} {j}");

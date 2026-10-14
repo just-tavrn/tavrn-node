@@ -854,6 +854,17 @@ async fn close_poll(
             detail: "Only the author or a member with manage_messages closes a poll".into(),
         });
     }
+    // A timeout limits writing (permissions.md step 5), closing a poll too.
+    if let ConvKind::Channel { access, .. } = &conv.kind
+        && !access.is_owner
+        && !access.is_node_admin
+        && access.member.as_ref().is_some_and(crate::models::MemberRow::is_timed_out)
+    {
+        return Err(ApiError::Forbidden {
+            code: "member.timed_out",
+            detail: "Members in timeout cannot close polls".into(),
+        });
+    }
     let stored = crate::polls::closes_at_for_close(closes_at, existing.poll_closes_at.as_deref(), chrono::Utc::now())?;
     store::polls::set_closes_at(&state.db, &existing.id, &stored).await?;
     if !own && let Some(room_id) = conv.room_id() {

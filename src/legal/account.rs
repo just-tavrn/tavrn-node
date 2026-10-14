@@ -310,6 +310,7 @@ async fn erase_personal(state: &AppState, user: &UserRow) -> Result<(), ApiError
         "user_emojis",
         "user_sounds",
         "reactions",
+        "poll_votes",
         "totp_secrets",
         "recovery_codes",
         "webauthn_credentials",
