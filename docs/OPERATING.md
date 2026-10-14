@@ -16,4 +16,5 @@ in the [README](../README.md) in one document. The former sections of this page 
 - SSO with Authentik/Keycloak: [Single sign-on (OpenID Connect)](HANDBOOK.md#single-sign-on-openid-connect)
 - Legal setup: [Legal pages and GDPR](HANDBOOK.md#legal-pages-and-gdpr)
 - Threads, forum and announcement channels: [Threads and forum channels](HANDBOOK.md#threads-and-forum-channels)
+- Polls, the *Create polls* permission and its upgrade fixup: [Polls](HANDBOOK.md#polls)
 - Moderation, reports and auto-moderation: [Moderation and auto-moderation](HANDBOOK.md#moderation-and-auto-moderation)

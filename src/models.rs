@@ -787,6 +787,9 @@ pub struct MessageRow {
     /// Answer to a command (APPLICATIONS.md §5.7): the JSON of the envelope field `interaction`.
     #[sqlx(default)]
     pub interaction: Option<String>,
+    /// Plaintext close time of a poll (PROTOCOL.md §7g), UTC.
+    #[sqlx(default)]
+    pub poll_closes_at: Option<String>,
 }
 
 impl MessageRow {
@@ -829,6 +832,7 @@ impl MessageRow {
                 .map(|id| WebhookRef { id, name: self.webhook_name.clone().unwrap_or_default() }),
             interaction: self.interaction.as_deref().and_then(|j| serde_json::from_str(j).ok()),
             thread: None,
+            poll_closes_at: self.poll_closes_at.clone(),
         }
     }
 }
@@ -889,6 +893,9 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     #[serde(default)]
     pub pinned: bool,
+    /// Plaintext close time of a poll (PROTOCOL.md §7g), null otherwise: the node refuses votes after it.
+    #[serde(default)]
+    pub poll_closes_at: Option<String>,
     /// Room channels: the author's per-room profile (nickname, room avatar), null without one.
     #[serde(default)]
     pub author_room_profile: Option<RoomProfile>,

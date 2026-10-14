@@ -55,6 +55,7 @@ perms! {
     MANAGE_THREADS = 36, "manage_threads";
     RESTORE_HISTORY = 37, "restore_history";
     VOICE_STATUS = 38, "voice_status";
+    CREATE_POLLS = 39, "create_polls";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -85,7 +86,8 @@ pub const DEFAULT_EVERYONE: Perms = VIEW_CHANNEL
     | USE_WHITEBOARD
     | USE_EXTERNAL_EMOJIS
     | USE_EXTERNAL_SOUNDS
-    | READ_HISTORY;
+    | READ_HISTORY
+    | CREATE_POLLS;
 
 /// Management-class permissions that can never be granted to `@everyone`, neither on the role nor by
 /// an `allow` in a channel or category override (`role.everyone_restricted`, protocol/permissions.md).
@@ -141,7 +143,8 @@ pub const CHANNEL_SCOPED: Perms = VIEW_CHANNEL
     | MANAGE_FILES
     | READ_HISTORY
     | MANAGE_THREADS
-    | VOICE_STATUS;
+    | VOICE_STATUS
+    | CREATE_POLLS;
 
 /// Permissions a member keeps while timed out.
 pub const TIMEOUT_KEEPS: Perms = VIEW_CHANNEL | READ_HISTORY;
@@ -153,7 +156,7 @@ pub const SYSTEM_CHANNEL_FORCED: Perms = VIEW_CHANNEL | READ_HISTORY;
 /// Never granted in a system channel: only the node writes there. Reading, reactions and moderation (deleting
 /// entries) stay possible.
 pub const SYSTEM_CHANNEL_DENIED: Perms =
-    SEND_MESSAGES | ATTACH_FILES | CREATE_THREADS | MENTION_EVERYONE | USE_WHITEBOARD | PIN_MESSAGES;
+    SEND_MESSAGES | ATTACH_FILES | CREATE_THREADS | MENTION_EVERYONE | USE_WHITEBOARD | PIN_MESSAGES | CREATE_POLLS;
 
 /// Granted in a voice channel while the member has a moved participation there (a moderator with `move_members`
 /// moved them in, `VOICE.md` §7): seeing the channel, reading it and staying connected. Speaking, sending and the
@@ -177,7 +180,8 @@ pub const SCOPES: &[(&str, Perms)] = &[
             | MENTION_EVERYONE
             | CREATE_THREADS
             | PIN_MESSAGES
-            | USE_EXTERNAL_EMOJIS,
+            | USE_EXTERNAL_EMOJIS
+            | CREATE_POLLS,
     ),
     ("members:read", 0),
     (
@@ -606,7 +610,7 @@ mod tests {
     #[test]
     fn channel_scoped_matches_the_protocol_table() {
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(CHANNEL_SCOPED, 377_927_696_895);
+        assert_eq!(CHANNEL_SCOPED, 927_683_510_783);
         let doc = include_str!("../protocol/permissions.md");
         let section = doc.split("## Channel-scoped bits").nth(1).unwrap().split("\n## ").next().unwrap();
         let from_doc = section
@@ -622,7 +626,20 @@ mod tests {
         for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
             assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
         }
-        assert_eq!(names(CHANNEL_SCOPED).len(), 27);
+        assert_eq!(names(CHANNEL_SCOPED).len(), 28);
+    }
+
+    #[test]
+    fn create_polls_is_a_channel_scoped_default_bit() {
+        assert_eq!(CREATE_POLLS, 1 << 39);
+        assert!(has(DEFAULT_EVERYONE, CREATE_POLLS), "everybody may send polls in new rooms");
+        assert!(!has(EVERYONE_RESTRICTED, CREATE_POLLS));
+        assert!(has(CHANNEL_SCOPED, CREATE_POLLS), "an override can take it away per channel");
+        assert!(has(SYSTEM_CHANNEL_DENIED, CREATE_POLLS), "the welcome channel holds no polls");
+        assert!(has(scope_mask(&["messages:write".to_string()]), CREATE_POLLS));
+        assert!(!has(scope_mask(&["messages:read".to_string(), "rooms:manage".to_string()]), CREATE_POLLS));
+        assert!(has(crate::access::DIRECT_PERMS, CREATE_POLLS), "every member of a DM may send polls");
+        assert_eq!(names(CREATE_POLLS), vec!["create_polls"]);
     }
 
     #[test]

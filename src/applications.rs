@@ -128,6 +128,7 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/rooms/{room_id}/search", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/pins", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/pins", Scope("messages:read")),
+    ("GET", "/api/v1/conversations/{conversation_id}/messages/{message_id}/poll/votes", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/history-keys", Scope("messages:read")),
     ("DELETE", "/api/v1/conversations/{conversation_id}/history-keys/{share_id}", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/history-pending", Scope("messages:read")),
@@ -170,6 +171,9 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
         "/api/v1/conversations/{conversation_id}/messages/{message_id}/reactions/{emoji}",
         Scope("messages:write"),
     ),
+    // polls (PROTOCOL.md §7g): voting under messages:write, reading votes under messages:read
+    ("PUT", "/api/v1/conversations/{conversation_id}/messages/{message_id}/poll/vote", Scope("messages:write")),
+    ("DELETE", "/api/v1/conversations/{conversation_id}/messages/{message_id}/poll/vote", Scope("messages:write")),
     ("PUT", "/api/v1/rooms/{room_id}/channels/{channel_id}/pins/{message_id}", Scope("messages:write")),
     ("DELETE", "/api/v1/rooms/{room_id}/channels/{channel_id}/pins/{message_id}", Scope("messages:write")),
     ("PUT", "/api/v1/conversations/{conversation_id}/pins/{message_id}", Scope("messages:write")),
@@ -300,9 +304,8 @@ pub fn event_allowed(kind: &str, data: &Value, scopes: &[String]) -> bool {
         ("room" | "channel" | "category" | "role" | "mls" | "application", _)
         | (_, "override.update" | "identity.changed" | "identity.rotated" | "devices.changed")
         | (_, crate::federation::inbox::SESSION_REVOKED_EVENT) => !matches!(kind, "room.invite"),
-        ("message" | "reaction" | "pin" | "emoji" | "conversation" | "thread", _) | (_, "typing" | "read.update") => {
-            kind != "conversation.invite" && has("messages:read")
-        }
+        ("message" | "reaction" | "pin" | "poll" | "emoji" | "conversation" | "thread", _)
+        | (_, "typing" | "read.update") => kind != "conversation.invite" && has("messages:read"),
         ("member" | "presence", _) | (_, "user.update") => has("members:read"),
         ("voice" | "call" | "soundboard", _) => has("voice"),
         ("whiteboard", _) => has("whiteboard"),
