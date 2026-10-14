@@ -71,6 +71,8 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.push("history.shares2");
     // End-to-end encrypted files channels (FILES.md §8).
     caps.push("files.e2ee");
+    // Polls with vote records and the plaintext close time (PROTOCOL.md §7g).
+    caps.push("polls.v1");
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
@@ -230,6 +232,8 @@ pub struct AppState {
     pub app_create_limiter: Arc<SharedLimiter>,
     /// Messages per bot and conversation (`bot-msg:<bot id>:<conversation id>`, 5 per 5 seconds).
     pub bot_message_limiter: Arc<RateLimiter>,
+    /// Vote changes per user and minute (PROTOCOL.md §7g; part of the protocol, also in development).
+    pub poll_vote_limiter: Arc<SharedLimiter>,
     /// New DMs per bot (`bot-dm:<bot id>`, 10 per 10 minutes).
     pub bot_dm_limiter: Arc<RateLimiter>,
     /// Open WebSockets per app token (at most 2, APPLICATIONS.md §2.6).
@@ -426,6 +430,7 @@ impl AppState {
             app_rotate_limiter: shared("app-rotate", 1, 24 * 3600),
             app_create_limiter: shared("app-create", 5, 24 * 3600),
             bot_message_limiter: limiter(5, 5),
+            poll_vote_limiter: shared("poll-vote", crate::polls::VOTES_PER_MINUTE, 60),
             bot_dm_limiter: limiter(10, 600),
             interactions: Arc::new(crate::interactions::Interactions::new(&cluster)),
             interaction_limiter: limiter(5, 5),
@@ -777,6 +782,12 @@ pub fn router(state: AppState) -> Router {
             put(routes::attachments::add_conversation_reaction)
                 .delete(routes::attachments::remove_conversation_reaction),
         )
+        // Poll vote records (PROTOCOL.md §7g): one per member and poll.
+        .route(
+            "/conversations/{conversation_id}/messages/{message_id}/poll/vote",
+            put(routes::polls::put_poll_vote).delete(routes::polls::delete_poll_vote).layer(small()),
+        )
+        .route("/conversations/{conversation_id}/messages/{message_id}/poll/votes", get(routes::polls::list_poll_votes))
         .route("/conversations/{conversation_id}/pins", get(routes::attachments::list_conversation_pins))
         .route(
             "/conversations/{conversation_id}/pins/{message_id}",

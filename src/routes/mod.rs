@@ -33,6 +33,7 @@ pub mod node;
 pub mod notifications;
 pub mod oidc;
 pub mod peer_resolve;
+pub mod polls;
 pub mod presence;
 pub mod profile;
 pub mod push;

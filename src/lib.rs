@@ -46,6 +46,7 @@ pub mod notifications;
 pub mod oidc;
 pub mod openapi;
 pub mod permissions;
+pub mod polls;
 pub mod presence;
 pub mod profile;
 pub mod push;

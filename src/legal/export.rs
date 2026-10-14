@@ -193,6 +193,19 @@ pub async fn head(state: &AppState, user: &UserRow) -> Result<Map<String, Value>
             .await?
         ),
     );
+    // Poll votes (PROTOCOL.md §7g): the vote object of plaintext conversations, metadata only for encrypted ones.
+    m.insert(
+        "poll_votes".into(),
+        json!(
+            table(
+                state,
+                "SELECT message_id, conversation_id, CASE WHEN epoch IS NULL THEN content ELSE NULL END, created_at, updated_at FROM poll_votes WHERE user_id = $1 ORDER BY created_at",
+                id,
+                &["message_id", "conversation_id", "content", "created_at", "updated_at"]
+            )
+            .await?
+        ),
+    );
     m.insert(
         "personal_emojis".into(),
         json!(
@@ -394,7 +407,7 @@ pub async fn stream(state: AppState, user: UserRow) -> Result<Body, ApiError> {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DataCategory {
     /// account, profile, devices, sessions, rooms, conversations, friends, blocks, messages, encrypted_messages,
-    /// attachments, reactions, personal_emojis, personal_sounds, whiteboards, applications, audit_log,
+    /// attachments, reactions, poll_votes, personal_emojis, personal_sounds, whiteboards, applications, audit_log,
     /// legal_notices, terms_acceptances
     pub key: String,
     pub count: i64,
@@ -449,6 +462,7 @@ pub async fn summary(state: &AppState, user: &UserRow) -> Result<DataSummary, Ap
         ),
         ("attachments", "SELECT COUNT(*), MIN(created_at) FROM blobs WHERE uploader_id = $1"),
         ("reactions", "SELECT COUNT(*), MIN(created_at) FROM reactions WHERE user_id = $1"),
+        ("poll_votes", "SELECT COUNT(*), MIN(created_at) FROM poll_votes WHERE user_id = $1"),
         ("personal_emojis", "SELECT COUNT(*), MIN(created_at) FROM user_emojis WHERE user_id = $1"),
         ("personal_sounds", "SELECT COUNT(*), MIN(created_at) FROM user_sounds WHERE user_id = $1"),
         ("whiteboards", "SELECT COUNT(*), MIN(created_at) FROM whiteboard_scenes WHERE user_id = $1"),

@@ -12,6 +12,7 @@ use crate::routes::history;
 use crate::routes::history_requests;
 use crate::routes::identity;
 use crate::routes::peer_resolve;
+use crate::routes::polls;
 use crate::routes::whiteboard;
 use crate::routes::{
     admin, attachments, auth, backups, channels, conformance, connect, conversations, conversations_index, directory,
@@ -71,6 +72,7 @@ impl Modify for BearerAuth {
         conversations::create, conversations::list, conversations::get, conversations::update, conversations::add_member, conversations::remove_member, read::mark_read,
         conversations::requests, conversations::accept, conversations::decline,
         messages::list_conversation_messages, messages::create_conversation_message, messages::edit_conversation_message, messages::delete_conversation_message,
+        polls::put_poll_vote, polls::delete_poll_vote, polls::list_poll_votes,
         attachments::upload_to_conversation, attachments::add_conversation_reaction, attachments::remove_conversation_reaction, attachments::pin_in_conversation, attachments::unpin_in_conversation, attachments::list_conversation_pins,
         federation::issue_token, federation::federated_login, federation::inbox, federation::claim, federation::avatar,
         connect::connect_code, connect::connect_token, connect::create_session, connect::poll_session, connect::peer_document, peer_resolve::resolve_peer, conversations_index::get_index, conversations_index::put_index,
@@ -125,6 +127,7 @@ impl Modify for BearerAuth {
         channels::CreateCategoryRequest, channels::UpdateCategoryRequest, channels::CreateChannelRequest, channels::UpdateChannelRequest, channels::SetOverrideRequest,
         roles::CreateRoleRequest, roles::UpdateRoleRequest,
         messages::CreateMessageRequest, messages::EditMessageRequest,
+        polls::PollVote, polls::PollVoteList, polls::PollVoteRequest,
         keys::IdentityKeyRequest, keys::DeviceKey, keys::UserKeys, keys::DeviceKeyRequest, keys::ShareKeyRequest, keys::KeyPackagesRequest, keys::KeyPackageCount, keys::ClaimedKeyPackage, keys::ClaimedKeyPackages, keys::IdentityResetRequest,
         history::CreateHistoryShareRequest, history::HistoryShareCreated, history::HistoryShare, history::HistoryShareList, history::HistoryPendingMember, history::HistoryPendingList,
         history_requests::HistoryRequest, history_requests::HistoryRequestChannel, history_requests::HistoryRequestList, history_requests::MyHistoryState, history_requests::CreateHistoryRequest, history_requests::ApproveHistoryRequest, history_requests::DenyHistoryRequest,

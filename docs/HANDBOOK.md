@@ -27,10 +27,11 @@ repository, which is the `protocol/` submodule of this repository.
 14. [Legal pages and GDPR](#legal-pages-and-gdpr) ([Age gates](#age-gates))
 15. [Moderation and auto-moderation](#moderation-and-auto-moderation)
 16. [Threads and forum channels](#threads-and-forum-channels)
-17. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
-18. [Logs and troubleshooting](#logs-and-troubleshooting)
-19. [Upgrade and rollback](#upgrade-and-rollback)
-20. [Security hardening checklist](#security-hardening-checklist)
+17. [Polls](#polls)
+18. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
+19. [Logs and troubleshooting](#logs-and-troubleshooting)
+20. [Upgrade and rollback](#upgrade-and-rollback)
+21. [Security hardening checklist](#security-hardening-checklist)
 
 ## Requirements
 
@@ -2221,6 +2222,35 @@ channel's "Auto-archive" time (default 7 days) in its hourly housekeeping; a new
 moderator locked them. Permission bits: *Create threads* (everyone by default) and *Manage threads* (rename,
 archive, lock, delete others' threads; granted once at the upgrade to every role that could manage messages).
 Nothing needs configuring ([PROTOCOL.md §7e](https://github.com/just-tavrn/tavrn-protocol/blob/main/PROTOCOL.md)).
+
+## Polls
+
+Members create polls ("Where do we meet?", single or multiple choice) and date polls (time slots answered
+yes/maybe/no) in text, announcement and forum channels, threads, DMs and group DMs; bots too. A poll is an ordinary
+message, encrypted like every message of an encrypted conversation; votes are separate records the node keeps next
+to it, one per member (the last device to vote wins), encrypted and signed by the voter's device. Votes never count
+as unread messages, never notify and go with their message (deletion, purges, message retention). What the node
+sees in encrypted conversations: who voted on which message and when, the size of each vote, and the poll's close
+time, which is plaintext so that the node can refuse late votes. Questions, options and choices stay end-to-end
+encrypted. In unencrypted channels the node checks polls and votes against each other.
+
+- **Permission** *Create polls* (`create_polls`, bit 39, channel-scoped, everyone by default): needed for polls the
+  node can see (unencrypted channels) and for every message with a close time; in encrypted channels the clients
+  enforce it, since the node cannot tell a poll from a message there. Voting needs nothing beyond *View channel*. At
+  the first start with this release the node grants the bit once to every role that holds *Send messages*
+  (`@everyone` included) and adds it to every channel or category override that allows *Send messages* (fixup marker
+  `fixup.create_polls` in `node_settings`), so nobody who could write loses polls; rooms narrow it afterwards. The
+  welcome channel never holds polls.
+- **Closing**: a poll's author or a member with *Manage messages* closes it early, also a poll created without an
+  end (audited as `message.poll_close` when it is someone else's poll); a close time only ever moves earlier, and a
+  poll without one never gets a future one. Retracting and changing votes is possible until the close.
+- **Limits** (part of the protocol, not configurable): 2–20 options, 1–60 slots, a question of at most 300 and labels
+  of at most 100 characters, a close time 1 minute to 1 year ahead, votes of at most 4 KiB, 10 vote changes per user
+  and minute.
+
+"Hidden until close" and "results after voting" are honoured by the clients; every member can technically read every
+vote, and the clients say so. Nothing needs configuring
+([PROTOCOL.md §7g](https://github.com/just-tavrn/tavrn-protocol/blob/main/PROTOCOL.md)).
 
 ## The `doctor` and other CLI commands
 

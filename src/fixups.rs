@@ -28,6 +28,10 @@
 //! - `voice_status` (bit 38) is added once to every role that holds `manage_channels` (marker
 //!   [`VOICE_STATUS_MARKER`]), so the people who manage channels can set a voice channel's status from the start;
 //!   rooms hand it to other roles afterwards (VOICE.md §2a).
+//! - `create_polls` (bit 39) is added once to every role that holds `send_messages`, `@everyone` included, and to the
+//!   `allow` mask of every override that allows `send_messages` (marker [`CREATE_POLLS_MARKER`]), so whoever could
+//!   write a message can still send a poll (PROTOCOL.md §7g); rooms narrow it afterwards. New rooms get it from
+//!   `DEFAULT_EVERYONE`.
 //! - Overrides carry channel-scoped bits only (`permissions::CHANNEL_SCOPED`, layered overrides of 2026-10-09):
 //!   other bits are removed from the `allow` and `deny` masks of every override, an override left with nothing at
 //!   all is deleted, and each change is audited in the room as `role.override_restricted`.
@@ -55,6 +59,8 @@ pub struct FixupReport {
     pub override_restricted: u64,
     /// Roles holding `manage_channels` that got `voice_status`.
     pub voice_status_roles: u64,
+    /// Roles and overrides allowing `send_messages` that got `create_polls`.
+    pub create_polls_grants: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -68,6 +74,9 @@ pub const MANAGE_APPLICATIONS_MARKER: &str = "fixup.manage_applications";
 
 /// `node_settings` key: the one-time grant of `manage_threads` to roles holding `manage_messages` has run.
 pub const MANAGE_THREADS_MARKER: &str = "fixup.manage_threads";
+
+/// `node_settings` key: the one-time grant of `create_polls` to roles and overrides with `send_messages` has run.
+pub const CREATE_POLLS_MARKER: &str = "fixup.create_polls";
 
 /// `node_settings` key: the one-time grant of `voice_status` to roles holding `manage_channels` has run.
 pub const VOICE_STATUS_MARKER: &str = "fixup.voice_status";
@@ -144,6 +153,7 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.manage_threads_roles = grant_manage_threads(db).await?;
     report.override_restricted = strip_unscoped_overrides(db).await?;
     report.voice_status_roles = grant_voice_status(db).await?;
+    report.create_polls_grants = grant_create_polls(db).await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }
@@ -300,6 +310,44 @@ async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
 
 async fn grant_voice_status(db: &Pool) -> anyhow::Result<u64> {
     grant_to_holders(db, VOICE_STATUS_MARKER, permissions::MANAGE_CHANNELS, permissions::VOICE_STATUS).await
+}
+
+/// Adds `create_polls` to every role holding `send_messages` (`@everyone` included) and to every override allowing it,
+/// once per node (see the module docs).
+async fn grant_create_polls(db: &Pool) -> anyhow::Result<u64> {
+    if marker_set(db, CREATE_POLLS_MARKER).await? {
+        return Ok(0);
+    }
+    let (have, add) = (permissions::SEND_MESSAGES, permissions::CREATE_POLLS);
+    let mut tx = db.begin().await?;
+    let mut changed = 0;
+    for (select, update) in [
+        (
+            "SELECT id, permissions AS bits FROM roles WHERE (permissions & $1) <> 0",
+            "UPDATE roles SET permissions = $1 WHERE id = $2",
+        ),
+        (
+            "SELECT id, allow AS bits FROM permission_overrides WHERE (allow & $1) <> 0",
+            "UPDATE permission_overrides SET allow = $1 WHERE id = $2",
+        ),
+    ] {
+        for row in sqlx::query(select).bind(have as i64).fetch_all(&mut *tx).await? {
+            let (id, bits): (String, i64) = (row.try_get("id")?, row.try_get("bits")?);
+            if bits as u64 & add == add {
+                continue;
+            }
+            sqlx::query(update).bind((bits as u64 | add) as i64).bind(&id).execute(&mut *tx).await?;
+            changed += 1;
+        }
+    }
+    sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
+        .bind(CREATE_POLLS_MARKER)
+        .bind("done")
+        .bind(util::now())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// Adds `add` to every role (not `@everyone`) holding `have`, once per node (`marker` in `node_settings`).
