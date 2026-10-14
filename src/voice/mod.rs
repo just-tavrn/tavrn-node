@@ -53,8 +53,11 @@ pub struct VoiceRuntime {
     announced: Mutex<Announced>,
     /// LiveKit removals of answered leaves that still run, by LiveKit room and identity
     /// ([`remove_from_livekit_later`]); a gate is held until its removal is done.
-    pending_removals: Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    pending_removals: Mutex<PendingRemovals>,
 }
+
+/// LiveKit room and identity → the gate of its running removal.
+type PendingRemovals = HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
 
 /// What [`sync_moved`] announced last.
 struct Announced {
@@ -150,7 +153,7 @@ impl VoiceRuntime {
         self.participants.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn pending_removals(&self) -> MutexGuard<'_, HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>> {
+    fn pending_removals(&self) -> MutexGuard<'_, PendingRemovals> {
         self.pending_removals.lock().unwrap_or_else(|e| e.into_inner())
     }
 

@@ -151,8 +151,9 @@ async fn slow_requests_are_logged_when_enabled() {
     let text = capture.text();
     let line = text
         .lines()
-        .find(|l| l.contains("slow request") && l.contains("route=/api/v1/auth/register") && l.contains("method=POST"))
-        .unwrap_or_else(|| panic!("no slow request line:\n{text}"));
+        .find(|l| l.contains("slow request") && l.contains("route=/api/v1/auth/register") && l.contains("method=POST"));
+    assert!(line.is_some(), "no slow request line for the registration:\n{text}");
+    let line = line.unwrap();
     assert!(line.contains("duration_ms="), "{line}");
     assert!(line.contains("status=201") || line.contains("status=200"), "{line}");
 }
