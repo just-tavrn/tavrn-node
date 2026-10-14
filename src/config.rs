@@ -564,6 +564,13 @@ pub struct Config {
     pub admin_users: String,
     pub log_level: String,
     pub log_format: LogFormat,
+    /// `TAVRN_LOG_SLOW_REQUEST_MS`: one `slow request` line (level info) for every HTTP request that took at least this
+    /// many milliseconds, with its route template, status, duration and the number of database statements it ran;
+    /// 0 (default) = off. Up to one hour.
+    pub log_slow_request_ms: u64,
+    /// `TAVRN_DB_SLOW_STATEMENT_MS`: a database statement that takes at least this many milliseconds is logged as a
+    /// warning (`slow statement`, with the statement); 0 = off; default 1000. Up to one hour.
+    pub db_slow_statement_ms: u64,
     /// Minimum age for registration (13–99, default 16; PROTOCOL.md §5e): every registration path refuses younger
     /// people with `age.below_minimum`.
     pub minimum_age: u32,
@@ -738,6 +745,8 @@ impl Default for Config {
             admin_users: String::new(),
             log_level: "info".into(),
             log_format: LogFormat::Text,
+            log_slow_request_ms: 0,
+            db_slow_statement_ms: 1000,
             minimum_age: 16,
         }
     }
@@ -779,6 +788,9 @@ impl std::error::Error for ConfigError {}
 
 /// Flags of `TAVRN_DEV_MISBEHAVE` (development nodes that break the protocol on purpose, FEDERATION.md §13.1).
 pub const MISBEHAVIORS: &[&str] = &["accept_bad_signatures", "replay_ok", "plaintext_ok", "no_rate_limit"];
+
+/// Upper bound of `TAVRN_LOG_SLOW_REQUEST_MS` and `TAVRN_DB_SLOW_STATEMENT_MS` (one hour).
+const MAX_LOG_THRESHOLD_MS: u64 = 3_600_000;
 
 /// Bitrate of a new voice channel without an explicit `bitrate_kbps` (kbps, lowered to the node's cap): the
 /// "High" preset of the clients (VOICE.md §4a).
@@ -1012,6 +1024,12 @@ impl Config {
         }
         self.validate_legal(&mut problems);
         self.validate_push_metrics(&mut problems);
+        if self.log_slow_request_ms > MAX_LOG_THRESHOLD_MS {
+            problems.push("TAVRN_LOG_SLOW_REQUEST_MS must be between 0 and 3600000 (0 = off)".into());
+        }
+        if self.db_slow_statement_ms > MAX_LOG_THRESHOLD_MS {
+            problems.push("TAVRN_DB_SLOW_STATEMENT_MS must be between 0 and 3600000 (0 = off)".into());
+        }
         if !(1..=crate::webhooks::MAX_PER_ROOM as u32).contains(&self.webhooks_per_channel) {
             problems.push("TAVRN_WEBHOOKS_PER_CHANNEL must be between 1 and 50".into());
         }
@@ -1110,6 +1128,17 @@ impl Config {
             .filter(|c| !c.is_empty())
             .map(String::from)
             .unwrap_or_else(|| self.public_url())
+    }
+
+    /// The duration from which a request is logged as slow (`TAVRN_LOG_SLOW_REQUEST_MS`), `None` when off.
+    pub fn slow_request_threshold(&self) -> Option<std::time::Duration> {
+        (self.log_slow_request_ms > 0).then(|| std::time::Duration::from_millis(self.log_slow_request_ms))
+    }
+
+    /// The duration from which a database statement is logged as slow (`TAVRN_DB_SLOW_STATEMENT_MS`), `None` when
+    /// off.
+    pub fn slow_statement_threshold(&self) -> Option<std::time::Duration> {
+        (self.db_slow_statement_ms > 0).then(|| std::time::Duration::from_millis(self.db_slow_statement_ms))
     }
 
     /// The bearer token of `/metrics`, `None` when empty.
@@ -1798,6 +1827,31 @@ mod tests {
     #[test]
     fn valid_production_config_passes() {
         prod().validate().unwrap();
+    }
+
+    #[test]
+    fn slow_request_and_statement_thresholds_load_and_validate() {
+        let c = prod();
+        assert_eq!(c.slow_request_threshold(), None, "the slow request log is off by default");
+        assert_eq!(c.slow_statement_threshold(), Some(std::time::Duration::from_secs(1)), "sqlx's default");
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TAVRN_DOMAIN", "env.example");
+            jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
+            jail.set_env("TAVRN_LOG_SLOW_REQUEST_MS", "250");
+            jail.set_env("TAVRN_DB_SLOW_STATEMENT_MS", "0");
+            let c = Config::load(false).unwrap();
+            assert_eq!(c.slow_request_threshold(), Some(std::time::Duration::from_millis(250)));
+            assert_eq!(c.slow_statement_threshold(), None, "0 = off");
+            Ok(())
+        });
+        for (field, bad) in [
+            ("TAVRN_LOG_SLOW_REQUEST_MS", Config { log_slow_request_ms: 3_600_001, ..prod() }),
+            ("TAVRN_DB_SLOW_STATEMENT_MS", Config { db_slow_statement_ms: 3_600_001, ..prod() }),
+        ] {
+            let err = bad.validate().unwrap_err();
+            assert!(err.problems.iter().any(|p| p.starts_with(field)), "{field}: {err}");
+        }
+        assert!(Config { log_slow_request_ms: 3_600_000, db_slow_statement_ms: 1, ..prod() }.validate().is_ok());
     }
 
     #[test]

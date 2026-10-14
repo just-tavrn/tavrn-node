@@ -4937,6 +4937,7 @@ dependencies = [
  "lettre",
  "livekit-api",
  "livekit-protocol",
+ "log",
  "mime_guess",
  "nix",
  "openssl",

@@ -11,7 +11,10 @@
 //! bounded: HTTP routes are route templates (`/api/v1/rooms/{room_id}`), never ids; unmatched paths count as
 //! `unmatched`.
 
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -24,6 +27,7 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use subtle::ConstantTimeEq;
+use tracing::Instrument;
 
 use crate::app::AppState;
 
@@ -164,18 +168,49 @@ impl Metrics {
     }
 }
 
-/// Middleware: counts every request by method, route template and status.
+/// Middleware: counts every request by method, route template and status, and logs the slow ones
+/// (`TAVRN_LOG_SLOW_REQUEST_MS`).
 pub async fn track(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if !state.config.metrics.on() {
+    let slow = state.config.slow_request_threshold();
+    if !state.config.metrics.on() && slow.is_none() {
         return next.run(request).await;
     }
     let started = Instant::now();
     let method = request.method().as_str().to_string();
     let route = request.extensions().get::<MatchedPath>().map_or("unmatched", |p| p.as_str()).to_string();
-    let response = next.run(request).await;
-    state.metrics.observe_request(&method, &route, response.status().as_u16(), started.elapsed().as_secs_f64());
+    let (response, statements) = if slow.is_some() {
+        // The request runs in a span that counts its database statements (`telemetry.rs`).
+        let span = tracing::trace_span!(target: crate::telemetry::REQUEST_SPAN, "request");
+        let response = next.run(request).instrument(span.clone()).await;
+        (response, crate::telemetry::statements(&span))
+    } else {
+        (next.run(request).await, None)
+    };
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    if state.config.metrics.on() {
+        state.metrics.observe_request(&method, &route, status, elapsed.as_secs_f64());
+    }
+    if slow.is_some_and(|threshold| elapsed >= threshold) {
+        log_slow_request(&method, &route, status, elapsed, statements);
+    }
     response
 }
+
+/// The `slow request` line: method, route template (never ids), status, duration in milliseconds (microsecond
+/// precision) and, when counted, the database statements the request ran.
+pub fn log_slow_request(method: &str, route: &str, status: u16, elapsed: Duration, statements: Option<u64>) {
+    let duration_ms = elapsed.as_micros() as f64 / 1000.0;
+    match statements {
+        Some(queries) => {
+            tracing::info!(target: SLOW_REQUEST, %method, %route, status, duration_ms, queries, "slow request");
+        }
+        None => tracing::info!(target: SLOW_REQUEST, %method, %route, status, duration_ms, "slow request"),
+    }
+}
+
+/// Log target of the `slow request` lines (`TAVRN_LOG_LEVEL` can address it, e.g. `warn,tavrn_node::slow_request=info`).
+pub const SLOW_REQUEST: &str = "tavrn_node::slow_request";
 
 /// `GET /metrics` (not part of the API specification: an operator endpoint).
 pub async fn endpoint(State(state): State<AppState>, request: Request) -> Response {
@@ -218,6 +253,52 @@ pub async fn endpoint(State(state): State<AppState>, request: Request) -> Respon
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Collects what a test subscriber writes.
+    #[derive(Clone, Default)]
+    struct Written(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Written {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn slow_requests_are_logged_with_route_status_duration_and_statements() {
+        let written = Written::default();
+        let writer = written.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_slow_request("GET", "/api/v1/rooms/{room_id}", 200, Duration::from_micros(12_345), Some(7));
+            log_slow_request("POST", "unmatched", 404, Duration::from_millis(3), None);
+        });
+        let text = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for part in [
+            "INFO",
+            "tavrn_node::slow_request",
+            "slow request",
+            "method=GET",
+            "route=/api/v1/rooms/{room_id}",
+            "status=200",
+            "duration_ms=12.345",
+            "queries=7",
+        ] {
+            assert!(lines[0].contains(part), "{part} in {}", lines[0]);
+        }
+        assert!(lines[1].contains("status=404") && lines[1].contains("duration_ms=3"), "{}", lines[1]);
+        assert!(!lines[1].contains("queries="), "no count without the counting layer: {}", lines[1]);
+    }
 
     #[test]
     fn registry_renders_counters_and_build_info() {

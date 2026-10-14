@@ -3,8 +3,12 @@
 //! share the same code. Migrations live in `migrations/` and run at startup.
 
 use anyhow::Context;
-use sqlx::{AnyPool, Connection, any::AnyPoolOptions};
-use std::time::Duration;
+use log::LevelFilter;
+use sqlx::{
+    AnyPool, ConnectOptions, Connection,
+    any::{AnyConnectOptions, AnyPoolOptions},
+};
+use std::{str::FromStr, time::Duration};
 
 pub type Pool = AnyPool;
 
@@ -50,15 +54,30 @@ fn needs_ping(idle_for: Duration) -> bool {
     idle_for > PING_AFTER_IDLE
 }
 
+/// The default of `TAVRN_DB_SLOW_STATEMENT_MS` (sqlx's own).
+pub const SLOW_STATEMENT: Duration = Duration::from_secs(1);
+
+/// Connects with the default slow statement threshold (tests and tools).
 pub async fn connect(database_url: &str) -> anyhow::Result<Pool> {
+    connect_with(database_url, Some(SLOW_STATEMENT)).await
+}
+
+/// Connects, migrates and prepares the search schema. A statement that takes `slow_statement` or longer is logged as
+/// a warning (`sqlx::query`: `slow statement`); `None` turns that off.
+pub async fn connect_with(database_url: &str, slow_statement: Option<Duration>) -> anyhow::Result<Pool> {
     sqlx::any::install_default_drivers();
     if let Some(dir) = sqlite_parent_dir(database_url) {
         std::fs::create_dir_all(&dir).with_context(|| format!("cannot create SQLite directory {dir}"))?;
     }
-    let pool = pool_options(database_url)
-        .connect(database_url)
-        .await
-        .with_context(|| format!("database connection failed ({})", redact(database_url)))?;
+    let failed = || format!("database connection failed ({})", redact(database_url));
+    let options = AnyConnectOptions::from_str(database_url).with_context(failed)?;
+    // Off: never "slow", so every statement keeps its normal (debug) level, which the per-request statement count of
+    // `TAVRN_LOG_SLOW_REQUEST_MS` relies on.
+    let options = match slow_statement {
+        Some(threshold) => options.log_slow_statements(LevelFilter::Warn, threshold),
+        None => options.log_slow_statements(LevelFilter::Off, Duration::MAX),
+    };
+    let pool = pool_options(database_url).connect_with(options).await.with_context(failed)?;
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
