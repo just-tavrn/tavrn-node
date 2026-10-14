@@ -174,6 +174,20 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    /// Migration 0410: a room's categories and permission overrides are read through an index, not a table scan.
+    #[tokio::test]
+    async fn room_snapshot_reads_use_the_room_indexes() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        for (sql, index) in [
+            ("SELECT id FROM categories WHERE room_id = 'r' ORDER BY position, id", "categories_room"),
+            ("SELECT id FROM permission_overrides WHERE room_id = 'r' ORDER BY id", "permission_overrides_room"),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&pool).await.unwrap();
+            assert!(plan.iter().any(|(.., detail)| detail.contains(index)), "{sql}: {plan:?}");
+        }
+    }
+
     /// Binary columns (BYTEA) round-trip through the `Any` driver on SQLite (and PostgreSQL in test-pg).
     #[tokio::test]
     async fn binary_columns_roundtrip() {
