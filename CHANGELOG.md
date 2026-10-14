@@ -71,6 +71,11 @@ First public release of the node and its container image.
 
 ### Fixed
 
+- A passkey whose registration did not announce the PRF extension can unlock messages after all (protocol
+  ENCRYPTION.md §2.4, fixes #69): `PUT /users/me/secret-storage/passkey/{credential_id}` accepts the entry for any
+  passkey of the user and marks the credential `prf_supported` in the same transaction, instead of refusing it with
+  `409 secret_storage.prf_unsupported`. Some authenticators report the extension only when used or gain it with a
+  system update (Windows Hello); the client's "Enable message unlock" stores the entry for them.
 - A changed avatar, header, display name, bio, linked accounts or DM setting now reaches the other nodes within
   seconds: the home node sends `profile.changed` (FEDERATION.md §5.2) to the nodes the user signed in on and the home
   nodes of friends and DM contacts, coalesced to one message per user and node, and those nodes refresh their copy
