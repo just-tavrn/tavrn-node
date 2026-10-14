@@ -129,3 +129,31 @@ async fn counters_move() {
     // The scrape itself is not secret-bearing: no tokens or addresses.
     assert!(!after.contains(&alice.token));
 }
+
+/// `TAVRN_LOG_SLOW_REQUEST_MS`: a request at or above the threshold leaves a `slow request` line with the method, the
+/// route template, the status and the duration; off (the default) nothing is logged.
+#[tokio::test]
+async fn slow_requests_are_logged_when_enabled() {
+    let _capture = common::logs::CAPTURE.lock().await;
+    let off = test_node("t.local").await;
+    let quiet = off.register("quiet").await;
+    let on = test_node_with("t.local", |c| c.log_slow_request_ms = 1).await;
+
+    let (capture, guard) = common::logs::start();
+    assert_eq!(off.get_auth("/api/v1/users/me", &quiet.token).await.0, StatusCode::OK);
+    drop(guard);
+    assert!(!capture.text().contains("slow request"), "off by default:\n{}", capture.text());
+
+    // A registration hashes a password (Argon2, 64 MiB): above 1 ms on any machine.
+    let (capture, guard) = common::logs::start();
+    on.register("alice").await;
+    drop(guard);
+    let text = capture.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("slow request") && l.contains("route=/api/v1/auth/register") && l.contains("method=POST"));
+    assert!(line.is_some(), "no slow request line for the registration:\n{text}");
+    let line = line.unwrap();
+    assert!(line.contains("duration_ms="), "{line}");
+    assert!(line.contains("status=201") || line.contains("status=200"), "{line}");
+}

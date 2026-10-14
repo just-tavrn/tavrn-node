@@ -109,7 +109,7 @@ async fn main() {
             telemetry::init(&config);
             let key_dir = std::path::Path::new(&config.data_dir).join("keys");
             let result = async {
-                let db = tavrn_node::db::connect(&config.database_url).await?;
+                let db = tavrn_node::db::connect_with(&config.database_url, config.slow_statement_threshold()).await?;
                 tavrn_node::storage::rotate_storage_key(&key_dir, &db).await
             }
             .await;

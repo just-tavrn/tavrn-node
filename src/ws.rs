@@ -133,6 +133,10 @@ async fn run(state: AppState, mut socket: WebSocket) {
         }
     };
     tokio::pin!(expired);
+    // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`). Before
+    // `ready`: a client acts (and reads the room) only after it, so every change it causes or sees comes after this
+    // snapshot and is told as a change, instead of disappearing into a snapshot taken later.
+    visible.know(&state, &rooms, &auth.user.id).await;
     let session_id = crate::util::ulid();
     let mut ready = json!({ "op": "ready", "session_id": session_id, "user": auth.user.to_public(), "capabilities": crate::app::capabilities(&state.config), "client_capabilities": capabilities });
     if let Some(app) = &auth.app {
@@ -149,8 +153,6 @@ async fn run(state: AppState, mut socket: WebSocket) {
         return;
     }
 
-    // What the user knows of each room, so that later changes can be told (`visibility::Filter::deliver`).
-    visible.know(&state, &rooms, &auth.user.id).await;
     let (mut sink, mut stream) = socket.split();
     let mut ping = tokio::time::interval(state.ws_ping);
     ping.tick().await;

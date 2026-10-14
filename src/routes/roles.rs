@@ -185,7 +185,7 @@ pub async fn update_role(
         Some(None) => Some(None),
         Some(Some(list)) => Some(Some(upload_categories(list)?)),
     };
-    store::rooms::update_role(
+    let role = store::rooms::update_role(
         &state.db,
         &room_id,
         &role_id,
@@ -198,22 +198,15 @@ pub async fn update_role(
             mentionable: req.mentionable,
             upload_categories: upload,
         },
+        &auth.user.id,
+        |row| {
+            let role = row.to_api();
+            serde_json::json!({ "permissions": role.permissions, "hoist": role.hoist, "upload_categories": role.allowed_upload_categories })
+        },
     )
-    .await?;
-    let role = store::rooms::role_by_id(&state.db, &room_id, &role_id)
-        .await?
-        .ok_or_else(|| access::not_found("Role", "role.not_found"))?
-        .to_api();
-    store::rooms::audit(
-        &state.db,
-        Some(&room_id),
-        Some(&auth.user.id),
-        "role.update",
-        &role_id,
-        "",
-        serde_json::json!({ "permissions": role.permissions, "hoist": role.hoist, "upload_categories": role.allowed_upload_categories }),
-    )
-    .await?;
+    .await?
+    .ok_or_else(|| access::not_found("Role", "role.not_found"))?
+    .to_api();
     state.hub.room(&room_id, "role.update", &role);
     Ok(Json(role))
 }

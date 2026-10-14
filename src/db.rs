@@ -3,22 +3,81 @@
 //! share the same code. Migrations live in `migrations/` and run at startup.
 
 use anyhow::Context;
-use sqlx::{AnyPool, any::AnyPoolOptions};
-use std::time::Duration;
+use log::LevelFilter;
+use sqlx::{
+    AnyPool, ConnectOptions, Connection,
+    any::{AnyConnectOptions, AnyPoolOptions},
+};
+use std::{str::FromStr, time::Duration};
 
 pub type Pool = AnyPool;
 
+/// Connections of a PostgreSQL pool (per instance; docs/HANDBOOK.md "Database" sizes `max_connections` by it).
+const MAX_CONNECTIONS: u32 = 16;
+/// Connections a PostgreSQL pool keeps open even when the node is idle. Without them an idle node dropped all its
+/// connections after the idle timeout, and the first clicks after a quiet period paid a new connection (TCP, TLS,
+/// SCRAM authentication) plus the re-preparation of every statement on it.
+const MIN_CONNECTIONS: u32 = 2;
+/// An idle connection is closed after this long (above the minimum). sqlx's default (10 minutes) is short for a
+/// chat node with quiet hours; the minimum connections stay regardless.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Every connection is replaced after this long, so server-side memory (prepared statements, caches) and a
+/// failover behind a DNS name are picked up eventually.
+const MAX_LIFETIME: Duration = Duration::from_secs(2 * 3600);
+/// A connection idle for longer than this is pinged before it is handed out (a firewall or the server may have
+/// dropped it); a connection in recent use is handed out directly. sqlx's default pings on every acquire, a
+/// round trip per request (and per transaction) that a busy node does not need.
+const PING_AFTER_IDLE: Duration = Duration::from_secs(30);
+
+/// The pool settings of a database URL: SQLite (development and tests) is one connection, kept open.
+fn pool_options(database_url: &str) -> AnyPoolOptions {
+    let sqlite = database_url.starts_with("sqlite:");
+    AnyPoolOptions::new()
+        .max_connections(if sqlite { 1 } else { MAX_CONNECTIONS })
+        .min_connections(if sqlite { 1 } else { MIN_CONNECTIONS })
+        .acquire_timeout(Duration::from_secs(10))
+        .idle_timeout(IDLE_TIMEOUT)
+        .max_lifetime(MAX_LIFETIME)
+        .test_before_acquire(false)
+        .before_acquire(|conn, meta| {
+            Box::pin(async move {
+                if needs_ping(meta.idle_for) {
+                    conn.ping().await?;
+                }
+                Ok(true)
+            })
+        })
+}
+
+/// Whether a connection that was idle for `idle_for` is pinged before use ([`PING_AFTER_IDLE`]).
+fn needs_ping(idle_for: Duration) -> bool {
+    idle_for > PING_AFTER_IDLE
+}
+
+/// The default of `TAVRN_DB_SLOW_STATEMENT_MS` (sqlx's own).
+pub const SLOW_STATEMENT: Duration = Duration::from_secs(1);
+
+/// Connects with the default slow statement threshold (tests and tools).
 pub async fn connect(database_url: &str) -> anyhow::Result<Pool> {
+    connect_with(database_url, Some(SLOW_STATEMENT)).await
+}
+
+/// Connects, migrates and prepares the search schema. A statement that takes `slow_statement` or longer is logged as
+/// a warning (`sqlx::query`: `slow statement`); `None` turns that off.
+pub async fn connect_with(database_url: &str, slow_statement: Option<Duration>) -> anyhow::Result<Pool> {
     sqlx::any::install_default_drivers();
     if let Some(dir) = sqlite_parent_dir(database_url) {
         std::fs::create_dir_all(&dir).with_context(|| format!("cannot create SQLite directory {dir}"))?;
     }
-    let pool = AnyPoolOptions::new()
-        .max_connections(if database_url.starts_with("sqlite:") { 1 } else { 16 })
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(database_url)
-        .await
-        .with_context(|| format!("database connection failed ({})", redact(database_url)))?;
+    let failed = || format!("database connection failed ({})", redact(database_url));
+    let options = AnyConnectOptions::from_str(database_url).with_context(failed)?;
+    // Off: never "slow", so every statement keeps its normal (debug) level, which the per-request statement count of
+    // `TAVRN_LOG_SLOW_REQUEST_MS` relies on.
+    let options = match slow_statement {
+        Some(threshold) => options.log_slow_statements(LevelFilter::Warn, threshold),
+        None => options.log_slow_statements(LevelFilter::Off, Duration::MAX),
+    };
+    let pool = pool_options(database_url).connect_with(options).await.with_context(failed)?;
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -78,12 +137,55 @@ mod tests {
         assert_eq!(sqlite_parent_dir("postgres://x"), None);
     }
 
+    #[test]
+    fn pool_keeps_connections_and_pings_only_after_idle() {
+        let pg = pool_options("postgres://u@db/x");
+        assert_eq!((pg.get_min_connections(), pg.get_max_connections()), (MIN_CONNECTIONS, MAX_CONNECTIONS));
+        assert!(!pg.get_test_before_acquire(), "no ping round trip on every acquire");
+        assert_eq!(pg.get_idle_timeout(), Some(IDLE_TIMEOUT));
+        assert_eq!(pg.get_max_lifetime(), Some(MAX_LIFETIME));
+        assert!(IDLE_TIMEOUT < MAX_LIFETIME);
+        let sqlite = pool_options("sqlite://data-dev/tavrn.db?mode=rwc");
+        assert_eq!((sqlite.get_min_connections(), sqlite.get_max_connections()), (1, 1));
+        assert!(!needs_ping(Duration::ZERO));
+        assert!(!needs_ping(PING_AFTER_IDLE));
+        assert!(needs_ping(PING_AFTER_IDLE + Duration::from_millis(1)));
+    }
+
+    /// The pool hands out its connection again and again (`before_acquire` keeps it).
+    #[tokio::test]
+    async fn the_pool_reuses_its_connection() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE t (x INTEGER)").execute(&pool).await.unwrap();
+        for i in 0..5_i64 {
+            sqlx::query("INSERT INTO t (x) VALUES ($1)").bind(i).execute(&pool).await.unwrap();
+        }
+        // An in-memory database lives in its one connection: the rows prove it was never replaced.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(pool.size(), 1);
+    }
+
     #[tokio::test]
     async fn in_memory_sqlite_connects_and_migrates() {
         let pool = connect("sqlite::memory:").await.unwrap();
         assert!(ping(&pool).await);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_settings").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Migration 0410: a room's categories and permission overrides are read through an index, not a table scan.
+    #[tokio::test]
+    async fn room_snapshot_reads_use_the_room_indexes() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        for (sql, index) in [
+            ("SELECT id FROM categories WHERE room_id = 'r' ORDER BY position, id", "categories_room"),
+            ("SELECT id FROM permission_overrides WHERE room_id = 'r' ORDER BY id", "permission_overrides_room"),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&pool).await.unwrap();
+            assert!(plan.iter().any(|(.., detail)| detail.contains(index)), "{sql}: {plan:?}");
+        }
     }
 
     /// Binary columns (BYTEA) round-trip through the `Any` driver on SQLite (and PostgreSQL in test-pg).

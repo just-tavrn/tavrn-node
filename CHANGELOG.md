@@ -9,6 +9,14 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 First public release of the node and its container image.
 
+- **Performance and observability**: the database pool keeps 2 PostgreSQL connections open while idle, closes
+  further idle ones after 30 minutes and pings a connection only after 30 seconds of idleness (the first requests
+  after a quiet period no longer pay a new connection, and no request pays a ping); a role save is one statement
+  with its audit row in the same transaction; a voice leave answers before LiveKit confirmed the removal (a rejoin
+  of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
+  threshold with route template, status, duration and statement count; `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000,
+  0 = off) sets the threshold of the slow statement warning (docs/HANDBOOK.md "Performance").
+
 - **Rooms and channels**: text, voice, announcement, forum and files channels, threads and forum posts, roles with
   layered permissions (room, channel and single-member overrides), visibility that withholds events, hints and pushes
   of channels a member cannot view.

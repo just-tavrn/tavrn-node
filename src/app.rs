@@ -317,7 +317,7 @@ impl AppState {
         // Several instances starting together: one at a time through migrations, fixups and key setup.
         crate::cache::leader::startup_lock(&cluster).await?;
         let prepared = async {
-            let db = db::connect(&config.database_url).await?;
+            let db = db::connect_with(&config.database_url, config.slow_statement_threshold()).await?;
             crate::fixups::run(&db).await?;
             let storage = BlobStorage::open(&config, db.clone()).await?;
             anyhow::Ok((db, storage))

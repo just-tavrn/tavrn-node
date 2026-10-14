@@ -244,7 +244,12 @@ pub async fn load(db: &Pool, user_id: &str) -> Result<NotificationSettings, ApiE
         .bind(user_id)
         .fetch_optional(db)
         .await?;
-    Ok(row.and_then(|(s,)| serde_json::from_str(&s).ok()).unwrap_or_default())
+    Ok(parse(row.as_ref().map(|(s,)| s.as_str())))
+}
+
+/// Stored settings (JSON) or the defaults when there are none or they do not parse.
+pub fn parse(stored: Option<&str>) -> NotificationSettings {
+    stored.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
 }
 
 pub async fn save(db: &Pool, user_id: &str, settings: &NotificationSettings) -> Result<(), ApiError> {

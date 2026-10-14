@@ -459,66 +459,76 @@ pub struct RoleUpdate<'a> {
     pub upload_categories: Option<Option<u64>>,
 }
 
-pub async fn update_role(db: &Pool, room_id: &str, role_id: &str, u: RoleUpdate<'_>) -> Result<(), ApiError> {
+/// Applies a role update with one `UPDATE` of the given fields and records it in the audit log (`role.update`, meta
+/// from `audit_meta`) in the same transaction. Returns the updated role; `None` when the room has no such role
+/// (nothing is written then).
+pub async fn update_role(
+    db: &Pool,
+    room_id: &str,
+    role_id: &str,
+    u: RoleUpdate<'_>,
+    actor_id: &str,
+    audit_meta: impl FnOnce(&RoleRow) -> serde_json::Value,
+) -> Result<Option<RoleRow>, ApiError> {
+    let columns = [
+        ("name", u.name.is_some()),
+        ("color", u.color.is_some()),
+        ("position", u.position.is_some()),
+        ("permissions", u.permissions.is_some()),
+        ("hoist", u.hoist.is_some()),
+        ("mentionable", u.mentionable.is_some()),
+        ("upload_categories", u.upload_categories.is_some()),
+    ];
+    let set: Vec<String> = columns
+        .iter()
+        .filter(|(_, given)| *given)
+        .enumerate()
+        .map(|(i, (column, _))| format!("{column} = ${}", i + 1))
+        .collect();
     let mut tx = db.begin().await?;
-    if let Some(v) = u.name {
-        sqlx::query("UPDATE roles SET name = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v)
+    let row: Option<RoleRow> = if set.is_empty() {
+        sqlx::query_as(&format!("SELECT {ROLE_COLS} FROM roles WHERE room_id = $1 AND id = $2"))
             .bind(room_id)
             .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.color {
-        sqlx::query("UPDATE roles SET color = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v)
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.position {
-        sqlx::query("UPDATE roles SET position = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v)
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.permissions {
-        sqlx::query("UPDATE roles SET permissions = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v as i64)
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.hoist {
-        sqlx::query("UPDATE roles SET hoist = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v as i64)
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.mentionable {
-        sqlx::query("UPDATE roles SET mentionable = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v as i64)
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(v) = u.upload_categories {
-        sqlx::query("UPDATE roles SET upload_categories = $1 WHERE room_id = $2 AND id = $3")
-            .bind(v.map(|c| c as i64))
-            .bind(room_id)
-            .bind(role_id)
-            .execute(&mut *tx)
-            .await?;
-    }
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        let n = set.len();
+        let sql = format!(
+            "UPDATE roles SET {} WHERE room_id = ${} AND id = ${} RETURNING {ROLE_COLS}",
+            set.join(", "),
+            n + 1,
+            n + 2
+        );
+        // The values in the order of `columns`.
+        let mut q = sqlx::query_as::<_, RoleRow>(&sql);
+        if let Some(v) = u.name {
+            q = q.bind(v);
+        }
+        if let Some(v) = u.color {
+            q = q.bind(v);
+        }
+        if let Some(v) = u.position {
+            q = q.bind(v);
+        }
+        if let Some(v) = u.permissions {
+            q = q.bind(v as i64);
+        }
+        if let Some(v) = u.hoist {
+            q = q.bind(v as i64);
+        }
+        if let Some(v) = u.mentionable {
+            q = q.bind(v as i64);
+        }
+        if let Some(v) = u.upload_categories {
+            q = q.bind(v.map(|c| c as i64));
+        }
+        q.bind(room_id).bind(role_id).fetch_optional(&mut *tx).await?
+    };
+    let Some(row) = row else { return Ok(None) };
+    audit(&mut *tx, Some(room_id), Some(actor_id), "role.update", role_id, "", audit_meta(&row)).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(Some(row))
 }
 
 pub async fn delete_role(db: &Pool, room_id: &str, role_id: &str) -> Result<bool, ApiError> {
@@ -1039,15 +1049,19 @@ pub async fn message_retention_rooms(db: &Pool) -> Result<Vec<(String, i64)>, Ap
         .await?)
 }
 
-pub async fn audit(
-    db: &Pool,
+/// Records an audit log entry, on the pool or inside a caller's transaction (`&mut *tx`).
+pub async fn audit<'e, E>(
+    db: E,
     room_id: Option<&str>,
     actor_id: Option<&str>,
     action: &str,
     target: &str,
     reason: &str,
     mut meta: serde_json::Value,
-) -> Result<(), ApiError> {
+) -> Result<(), ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     // Action shortcuts of the moderation inbox record the report they act on (MODERATION.md §1.4).
     if let (Some(report_id), Some(obj)) = (crate::reports::acting_on(), meta.as_object_mut()) {
         obj.insert("report_id".into(), report_id.into());
@@ -1094,4 +1108,98 @@ pub async fn moderator_ids(db: &Pool, room_id: &str) -> Result<Vec<String>, ApiE
     .fetch_all(db)
     .await?;
     rows.iter().map(|r| r.try_get::<String, _>("user_id").map_err(Into::into)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Every combination of fields lands in the right columns (the `UPDATE` is built from the given fields), the
+    /// others stay, and each update writes exactly one audit row in its transaction.
+    #[tokio::test]
+    async fn update_role_writes_any_subset_of_fields_with_one_audit_row() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ('a', 'a', 'd', 'a', 'x')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO rooms (id, name, owner_id, created_at) VALUES ('r', 'R', 'a', 'x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let base = NewRole {
+            name: "base",
+            color: Some("#000000"),
+            position: 1,
+            permissions: 1,
+            hoist: false,
+            mentionable: false,
+            upload_categories: Some(1),
+        };
+        for mask in 0..128_u32 {
+            let id = create_role(&db, "r", NewRole { ..base }).await.unwrap();
+            let given = |bit: u32| mask & (1 << bit) != 0;
+            let update = RoleUpdate {
+                name: given(0).then_some("renamed"),
+                color: given(1).then_some(None),
+                position: given(2).then_some(9),
+                permissions: given(3).then_some(6),
+                hoist: given(4).then_some(true),
+                mentionable: given(5).then_some(true),
+                upload_categories: given(6).then_some(Some(3)),
+            };
+            let row = update_role(&db, "r", &id, update, "a", |r| serde_json::json!({ "position": r.position }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.name, if given(0) { "renamed" } else { "base" }, "mask {mask}");
+            assert_eq!(row.color.as_deref(), if given(1) { None } else { Some("#000000") }, "mask {mask}");
+            assert_eq!(row.position, if given(2) { 9 } else { 1 }, "mask {mask}");
+            assert_eq!(row.permissions, if given(3) { 6 } else { 1 }, "mask {mask}");
+            assert_eq!(row.hoist, i64::from(given(4)), "mask {mask}");
+            assert_eq!(row.mentionable, i64::from(given(5)), "mask {mask}");
+            assert_eq!(row.upload_categories, Some(if given(6) { 3 } else { 1 }), "mask {mask}");
+            let stored = role_by_id(&db, "r", &id).await.unwrap().unwrap();
+            assert_eq!((stored.name, stored.position, stored.permissions), (row.name, row.position, row.permissions));
+            let audits: Vec<(String,)> =
+                sqlx::query_as("SELECT meta FROM audit_log WHERE action = 'role.update' AND target = $1")
+                    .bind(&id)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap();
+            assert_eq!(audits.len(), 1, "mask {mask}");
+            assert_eq!(audits[0].0, serde_json::json!({ "position": row.position }).to_string());
+        }
+        // Another room's role: nothing, and no audit row.
+        let id = create_role(&db, "r", NewRole { ..base }).await.unwrap();
+        let none = update_role(
+            &db,
+            "elsewhere",
+            &id,
+            RoleUpdate {
+                name: Some("x"),
+                color: None,
+                position: None,
+                permissions: None,
+                hoist: None,
+                mentionable: None,
+                upload_categories: None,
+            },
+            "a",
+            |_| serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
+        assert_eq!(role_by_id(&db, "r", &id).await.unwrap().unwrap().name, "base");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE target = $1")
+            .bind(&id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
 }

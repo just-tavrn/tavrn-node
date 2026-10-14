@@ -29,7 +29,7 @@ repository, which is the `protocol/` submodule of this repository.
 16. [Threads and forum channels](#threads-and-forum-channels)
 17. [Polls](#polls)
 18. [The `doctor` and other CLI commands](#the-doctor-and-other-cli-commands)
-19. [Logs and troubleshooting](#logs-and-troubleshooting)
+19. [Logs and troubleshooting](#logs-and-troubleshooting) ([Performance](#performance))
 20. [Upgrade and rollback](#upgrade-and-rollback)
 21. [Security hardening checklist](#security-hardening-checklist)
 
@@ -485,12 +485,14 @@ Details: [Scaling with Valkey](#scaling-with-valkey).
 
 ### Logging
 
-Two settings control how much the node logs and in which format.
+These settings control how much the node logs, in which format, and which slow requests and statements it reports.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TAVRN_LOG_LEVEL` | `info` (`--dev`: `debug,sqlx=info`) | A log filter: a level (`error`, `warn`, `info`, `debug`, `trace`) or per-module directives such as `info,sqlx=warn`. An invalid filter falls back to `info`. |
 | `TAVRN_LOG_FORMAT` | `text` | `text` or `json` (one JSON object per line, for log collectors). |
+| `TAVRN_LOG_SLOW_REQUEST_MS` | `0` (off) | Logs one `slow request` line (level info, target `tavrn_node::slow_request`) for every HTTP request that took at least this many milliseconds (up to 3600000): method, route template (never ids), status, `duration_ms` and `queries` (the database statements it ran). See [Performance](#performance). |
+| `TAVRN_DB_SLOW_STATEMENT_MS` | `1000` | A database statement that takes at least this many milliseconds is logged as a warning (`slow statement`, target `sqlx::query`, with the statement text but no values); `0` turns it off (up to 3600000). |
 
 ### Variables outside the node
 
@@ -852,8 +854,9 @@ PostgreSQL holds everything except the uploaded files and the keys; SQLite is on
 - **PostgreSQL** is the production database: the compose service `db` (`postgres:17-alpine`, data in
   `./pgdata`) or an external server or managed service via `TAVRN_DATABASE_URL`
   (`postgres://user:password@host:port/db`; remove the `db` service then). SQLite is refused outside `--dev`.
-- **Connections**: every instance opens a pool of up to 16 connections. With several instances set
-  `max_connections` to at least `16 × instances + 10`, or put PgBouncer in session mode in between.
+- **Connections**: every instance opens a pool of up to 16 connections and keeps at least 2 of them open while
+  idle (see [Performance](#performance)). With several instances set `max_connections` to at least
+  `16 × instances + 10`, or put PgBouncer in session mode in between.
 - **Migrations** are built into the binary and run automatically at every start (with several instances under a
   startup lease, one instance after the other). They only go forward: the node refuses to start against a
   database whose schema is newer than the binary (`database migration failed (schema newer than the binary? …)`),
@@ -2293,6 +2296,26 @@ personal data and rotate them (Docker's `json-file` driver with `max-size`/`max-
 The output of the supervised LiveKit process is forwarded into the node's log. Useful lines: `LiveKit starting
 media=…` (announced addresses and ports), `new node signing key generated` (first start), the background storage
 encryption progress, `Auto-moderation: message flood`.
+
+### Performance
+
+A node answers most API requests in a few milliseconds; these settings and behaviours keep it that way and help to
+find the exceptions.
+
+- **Database connections stay warm.** Each instance keeps at least 2 PostgreSQL connections open while idle and
+  closes further idle ones only after 30 minutes (every connection is replaced after 2 hours). A connection is
+  checked with a ping only when it was idle for more than 30 seconds, not on every request. So the first clicks
+  after a quiet period do not pay a new connection (TCP, TLS, authentication) and the re-preparation of the
+  statements.
+- **Slow requests.** `TAVRN_LOG_SLOW_REQUEST_MS=250` logs every request that took 250 ms or more:
+  `slow request method=GET route=/api/v1/rooms/{room_id} status=200 duration_ms=312.4 queries=9`. The route is the
+  template, so the lines group well and carry no ids; `queries` counts the database statements of the request (a
+  high count points at a missing batch, a long duration with few statements at the database or a slow external
+  call). The line is at level info, so a `TAVRN_LOG_LEVEL` of `warn` hides it unless it names the target
+  (`warn,tavrn_node::slow_request=info`). Counting costs a little per statement, so leave it off when you are not
+  looking.
+- **Slow statements.** `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000) logs a warning with the statement text for
+  every statement at or above the threshold; lower it (e.g. `100`) to find the statements behind slow requests.
 
 ### Common problems
 

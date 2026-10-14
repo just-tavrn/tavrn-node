@@ -86,6 +86,7 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `lettre` | 0.11.23 | MIT | runtime |
 | `livekit-api` | 0.8.2 | Apache-2.0 | runtime |
 | `livekit-protocol` | 0.8.0 | Apache-2.0 | runtime |
+| `log` | 0.4.34 | MIT OR Apache-2.0 | runtime |
 | `mime_guess` | 2.0.5 | MIT | runtime |
 | `nix` | 0.31.3 | MIT | runtime (unix) |
 | `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | runtime |

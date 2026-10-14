@@ -225,6 +225,30 @@ pub async fn auto_preview(db: &Pool, user_id: &str) -> Result<String, ApiError> 
     Ok(v.unwrap_or_else(|| "friends_and_shared".into()))
 }
 
+/// The own-account settings `GET /users/me` adds to the account row, read in one statement.
+pub struct AccountSettings {
+    /// `auto_preview` (default `friends_and_shared`).
+    pub auto_preview: String,
+    /// The mail language, `None` = the node's default.
+    pub locale: Option<String>,
+    /// The stored notification settings (JSON), `None` = defaults.
+    pub notification_settings: Option<String>,
+}
+
+/// [`auto_preview`], [`locale`] and the notification settings of a user in one query (defaults for a missing user).
+pub async fn account_settings(db: &Pool, user_id: &str) -> Result<AccountSettings, ApiError> {
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT u.auto_preview, u.locale, n.settings FROM users u
+         LEFT JOIN notification_settings n ON n.user_id = u.id WHERE u.id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+    let (auto_preview, locale, notification_settings) =
+        row.unwrap_or_else(|| ("friends_and_shared".into(), None, None));
+    Ok(AccountSettings { auto_preview, locale, notification_settings })
+}
+
 pub async fn set_auto_preview(db: &Pool, user_id: &str, value: &str) -> Result<(), ApiError> {
     sqlx::query("UPDATE users SET auto_preview = $1 WHERE id = $2").bind(value).bind(user_id).execute(db).await?;
     Ok(())
@@ -630,6 +654,48 @@ pub async fn device_id_in_use(db: &Pool, device_id: &str) -> Result<bool, ApiErr
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn account_settings_read_the_preview_locale_and_notifications_at_once() {
+        let db = crate::db::connect("sqlite::memory:").await.unwrap();
+        let none = account_settings(&db, "missing").await.unwrap();
+        assert_eq!(
+            (none.auto_preview.as_str(), none.locale, none.notification_settings),
+            ("friends_and_shared", None, None)
+        );
+        for id in ["u1", "u2"] {
+            sqlx::query(
+                "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $1, 'd', $1, 'x')",
+            )
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let fresh = account_settings(&db, "u1").await.unwrap();
+        assert_eq!(
+            (fresh.auto_preview.as_str(), fresh.locale, fresh.notification_settings),
+            ("friends_and_shared", None, None)
+        );
+        set_auto_preview(&db, "u1", "never").await.unwrap();
+        set_locale(&db, "u1", Some("de")).await.unwrap();
+        let mut settings = crate::notifications::NotificationSettings::default();
+        settings.rooms.insert(
+            "r".into(),
+            crate::notifications::RoomSettings { muted_until: Some("forever".into()), ..Default::default() },
+        );
+        crate::notifications::save(&db, "u1", &settings).await.unwrap();
+        let set = account_settings(&db, "u1").await.unwrap();
+        assert_eq!((set.auto_preview.as_str(), set.locale.as_deref()), ("never", Some("de")));
+        assert_eq!(crate::notifications::parse(set.notification_settings.as_deref()), settings);
+        assert_eq!(set.auto_preview, auto_preview(&db, "u1").await.unwrap());
+        assert_eq!(set.locale, locale(&db, "u1").await.unwrap());
+        let other = account_settings(&db, "u2").await.unwrap();
+        assert_eq!(
+            (other.auto_preview.as_str(), other.locale, other.notification_settings),
+            ("friends_and_shared", None, None)
+        );
+    }
 
     #[tokio::test]
     async fn members_of_room_returns_the_members_only() {
