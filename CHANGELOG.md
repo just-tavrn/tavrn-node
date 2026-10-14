@@ -40,9 +40,9 @@ First public release of the node and its container image.
   `channel.update`). Migration 0390 adds the column; a startup fixup grants the bit once to every role that holds
   `manage_channels` (`fixup.voice_status`).
 - **Polls and date polls** (protocol PROTOCOL.md §7g, capability `polls.v1`; fixes just-tavrn/tavrn-protocol#35):
-  messages carry the plaintext close time `poll_closes_at` (migration 0400; set on create 1 minute to 1 year ahead,
-  moved earlier only by the author or `manage_messages` through `PATCH …/messages/{id} { poll_closes_at }`, audit
-  `message.poll_close`), plaintext polls are checked (`400 message.poll_invalid`) and cannot be edited
+  messages carry the plaintext close time `poll_closes_at` (migration 0400; set on create 1 minute to 1 year ahead;
+  through `PATCH …/messages/{id} { poll_closes_at }` the author or `manage_messages` closes a poll now, also one
+  without a close time, or moves its close time earlier, never later; audit `message.poll_close`), plaintext polls are checked (`400 message.poll_invalid`) and cannot be edited
   (`400 message.poll_immutable`). Vote records, one per user and poll (the last device wins), live in the new table
   `poll_votes` and go with their message: `PUT`/`DELETE /conversations/{id}/messages/{message_id}/poll/vote`, `GET
   …/poll/votes`; encrypted votes pass the §5.3 checks, plaintext votes are checked against the poll; `409

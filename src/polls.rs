@@ -26,8 +26,6 @@ pub const VOTES_PER_MINUTE: u32 = 10;
 pub const MIN_CLOSE_SECS: i64 = 60;
 /// … and at most this far.
 pub const MAX_CLOSE_SECS: i64 = 366 * 24 * 3600;
-/// Closing early may name a time this far in the past (clock skew); the node stores its own clock then.
-pub const CLOSE_SKEW_SECS: i64 = 60;
 
 fn poll_invalid(detail: impl Into<String>) -> ApiError {
     bad("message.poll_invalid", detail.into())
@@ -251,23 +249,24 @@ pub fn closes_at_for_create(s: &str, now: DateTime<Utc>) -> Result<String, ApiEr
     Ok(crate::util::format_time(t))
 }
 
-/// The new close time when a poll closes early: earlier than the current one (which has not passed) and not more than
-/// a minute before the node's clock; the node stores the later of the given time and its clock.
+/// The new close time when a poll closes early (PROTOCOL.md §7g): a time not after the node's clock closes it now
+/// (also a poll without a close time); a later time only moves an existing close time earlier. A poll without a close
+/// time never gets a future one, and a passed close time is final (`409 poll.closed`).
 pub fn closes_at_for_close(s: &str, current: Option<&str>, now: DateTime<Utc>) -> Result<String, ApiError> {
     let t = parse_time(s).ok_or_else(|| closes_invalid("poll_closes_at: RFC 3339 with an offset"))?;
-    let Some(current) = current.and_then(crate::util::parse_time) else {
-        return Err(closes_invalid("This message has no close time; a poll without one cannot be closed"));
-    };
-    if current <= now {
+    let current = current.and_then(crate::util::parse_time);
+    if current.is_some_and(|c| c <= now) {
         return Err(closed());
     }
-    if t >= current {
-        return Err(closes_invalid("A close time only moves earlier"));
+    if t <= now {
+        // Closing now; an earlier time would turn votes the node accepted into late ones.
+        return Ok(crate::util::format_time(now));
     }
-    if t < now - chrono::Duration::seconds(CLOSE_SKEW_SECS) {
-        return Err(closes_invalid("poll_closes_at lies in the past"));
+    match current {
+        Some(c) if t < c => Ok(crate::util::format_time(t)),
+        Some(_) => Err(closes_invalid("A close time only moves earlier")),
+        None => Err(closes_invalid("A poll without a close time can only be closed now")),
     }
-    Ok(crate::util::format_time(t.max(now)))
 }
 
 fn closes_invalid(detail: &str) -> ApiError {
@@ -438,12 +437,21 @@ mod tests {
         assert_eq!(ok("tomorrow"), Err("message.poll_closes_invalid".into()));
         let close = |s: &str, cur: Option<&str>| closes_at_for_close(s, cur, now).map_err(|e| e.code().to_string());
         let cur = Some("2026-11-02T00:00:00.000Z");
-        assert_eq!(close("2026-11-01T18:00:00Z", cur), Ok("2026-11-01T18:00:00.000Z".into()));
-        assert_eq!(close("2026-11-01T11:59:30Z", cur), Ok("2026-11-01T12:00:00.000Z".into()), "now, not the past");
-        assert_eq!(close("2026-11-01T11:58:00Z", cur), Err("message.poll_closes_invalid".into()));
+        let now_s = "2026-11-01T12:00:00.000Z".to_string();
+        assert_eq!(close("2026-11-01T18:00:00Z", cur), Ok("2026-11-01T18:00:00.000Z".into()), "earlier");
+        assert_eq!(close("2026-11-01T11:59:30Z", cur), Ok(now_s.clone()), "now, not the past");
+        assert_eq!(close("2020-01-01T00:00:00Z", cur), Ok(now_s.clone()), "any past time closes now");
         assert_eq!(close("2026-11-03T00:00:00Z", cur), Err("message.poll_closes_invalid".into()), "never later");
-        assert_eq!(close("2026-11-01T18:00:00Z", None), Err("message.poll_closes_invalid".into()), "never from null");
+        assert_eq!(close("2026-11-02T00:00:00Z", cur), Err("message.poll_closes_invalid".into()), "never equal");
+        assert_eq!(close("2026-11-01T12:00:00Z", None), Ok(now_s.clone()), "a poll without an end closes now");
+        assert_eq!(close("2026-11-01T11:00:00+01:00", None), Ok(now_s), "a past time too");
+        assert_eq!(
+            close("2026-11-01T18:00:00Z", None),
+            Err("message.poll_closes_invalid".into()),
+            "never a future end from none"
+        );
         assert_eq!(close("2026-11-01T18:00:00Z", Some("2026-11-01T11:00:00.000Z")), Err("poll.closed".into()));
+        assert_eq!(close("2026-11-01T10:00:00Z", Some("2026-11-01T12:00:00.000Z")), Err("poll.closed".into()));
         assert!(is_closed(Some("2026-11-01T12:00:00.000Z"), now));
         assert!(!is_closed(Some("2026-11-01T12:00:01.000Z"), now));
         assert!(!is_closed(None, now));

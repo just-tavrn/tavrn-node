@@ -2241,9 +2241,9 @@ encrypted. In unencrypted channels the node checks polls and votes against each 
   (`@everyone` included) and adds it to every channel or category override that allows *Send messages* (fixup marker
   `fixup.create_polls` in `node_settings`), so nobody who could write loses polls; rooms narrow it afterwards. The
   welcome channel never holds polls.
-- **Closing**: a poll's author or a member with *Manage messages* closes it early (audited as `message.poll_close`
-  when it is someone else's poll); a close time never moves later. Retracting and changing votes is possible until
-  then.
+- **Closing**: a poll's author or a member with *Manage messages* closes it early, also a poll created without an
+  end (audited as `message.poll_close` when it is someone else's poll); a close time only ever moves earlier, and a
+  poll without one never gets a future one. Retracting and changing votes is possible until the close.
 - **Limits** (part of the protocol, not configurable): 2–20 options, 1–60 slots, a question of at most 300 and labels
   of at most 100 characters, a close time 1 minute to 1 year ahead, votes of at most 4 KiB, 10 vote changes per user
   and minute.

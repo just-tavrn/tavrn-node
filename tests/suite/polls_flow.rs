@@ -260,19 +260,30 @@ async fn plaintext_polls_are_checked_and_votes_are_records_not_messages() {
     let (s, j) = t.node.delete(&t.vote_url(&mid), &t.alice.token).await;
     assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "poll.vote_not_found"));
 
-    // Closing early: only earlier, only by the author (or manage_messages), never from null.
+    // Closing early: only earlier, only by the author (or manage_messages); a poll without an end closes only now.
     let close = |at: String| json!({ "poll_closes_at": at });
     let url = format!("{}/{mid}", t.messages());
     let (s, j) = t.node.patch(&url, &t.alice.token, close(in_secs(5 * 3600))).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.poll_closes_invalid"), "later: {j}");
-    let (s, j) = t.node.patch(&url, &t.alice.token, close(in_secs(-600))).await;
-    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.poll_closes_invalid"), "past: {j}");
     let (s, j) = t.node.patch(&url, &t.bob.token, close(in_secs(0))).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "message.not_author"), "{j}");
-    let (s, j) = t.node.patch(&format!("{}/{text_id}", t.messages()), &t.alice.token, close(in_secs(0))).await;
-    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.poll_closes_invalid"), "no close time: {j}");
+    let earlier = in_secs(3600);
+    let (s, j) = t.node.patch(&url, &t.alice.token, close(earlier.clone())).await;
+    assert_eq!(s, StatusCode::OK, "earlier: {j}");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(j["poll_closes_at"].as_str().unwrap()).unwrap(),
+        chrono::DateTime::parse_from_rfc3339(&earlier).unwrap()
+    );
+    let open = t.send_poll(&t.alice.token, None).await;
+    let open_url = format!("{}/{}", t.messages(), open["id"].as_str().unwrap());
+    let (s, j) = t.node.patch(&open_url, &t.alice.token, close(in_secs(600))).await;
+    assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.poll_closes_invalid"), "no future end from none: {j}");
+    let (s, j) = t.node.patch(&open_url, &t.alice.token, close(in_secs(-600))).await;
+    assert_eq!(s, StatusCode::OK, "a poll without an end closes now: {j}");
+    let at = chrono::DateTime::parse_from_rfc3339(j["poll_closes_at"].as_str().unwrap()).unwrap();
+    assert!((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds().abs() < 5, "now, not the past");
     let mut rx = t.node.state.hub.subscribe();
-    let (s, closed) = t.node.patch(&url, &t.alice.token, close(in_secs(-5))).await;
+    let (s, closed) = t.node.patch(&url, &t.alice.token, close(in_secs(-600))).await;
     assert_eq!(s, StatusCode::OK, "{closed}");
     assert_eq!(closed["edited_at"], Value::Null, "closing is no edit");
     let at = chrono::DateTime::parse_from_rfc3339(closed["poll_closes_at"].as_str().unwrap()).unwrap();

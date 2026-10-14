@@ -804,9 +804,10 @@ pub struct EditMessageRequest {
     /// §10.3). Rejected in encrypted conversations; mentions must then be sent normalized (lowercase,
     /// without duplicates) because the node stores them as signed.
     pub signature: Option<String>,
-    /// Close a poll early (PROTOCOL.md §7g): a time earlier than the current close time and not more than a minute
-    /// in the past (the node stores the later of it and its clock). Without `content` the author or a member with
-    /// `manage_messages` may send it; it never moves later and a message without a close time gets none.
+    /// Close a poll early (PROTOCOL.md §7g): a time not after the node's clock closes it now (also a poll without a
+    /// close time); a later time only moves an existing close time earlier. Without `content` the author or a member
+    /// with `manage_messages` may send it; a close time never moves later and a poll without one never gets a future
+    /// one.
     pub poll_closes_at: Option<String>,
 }
 
