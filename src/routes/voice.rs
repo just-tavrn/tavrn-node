@@ -282,6 +282,8 @@ pub async fn join(
     for (old_key, old_identity) in &reserved.displaced {
         voice::remove_from_livekit(&state, old_key, old_identity).await;
     }
+    // A leave of this device just before: its LiveKit removal must not hit the connection this token opens.
+    voice::removal_settled(&state, &key, &identity).await;
     voice::publish(&state, &reserved.changed).await;
     let sources = sources(&state, &vc, server_muted);
     let api_key = state.voice.api_key().ok_or_else(disabled)?;
@@ -342,7 +344,8 @@ pub async fn leave(
     let device = voice::identity(&auth.user.address(), auth.public_device_id());
     let identity = if req.role == VoiceRole::Screen { voice::screen_identity(&device) } else { device };
     let visible = state.voice.participants().remove(&key, &identity);
-    voice::remove_from_livekit(&state, &key, &identity).await;
+    // LiveKit's removal runs after the answer; a rejoin of this device waits for it (`voice::removal_settled`).
+    voice::remove_from_livekit_later(&state, &key, &identity);
     if visible {
         voice::publish(&state, &[key]).await;
     } else {

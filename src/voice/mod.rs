@@ -51,6 +51,9 @@ pub struct VoiceRuntime {
     restart: tokio::sync::Notify,
     /// The moved participations last announced per room ([`sync_moved`]).
     announced: Mutex<Announced>,
+    /// LiveKit removals of answered leaves that still run, by LiveKit room and identity
+    /// ([`remove_from_livekit_later`]); a gate is held until its removal is done.
+    pending_removals: Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// What [`sync_moved`] announced last.
@@ -84,6 +87,7 @@ impl VoiceRuntime {
             problem: Mutex::new(None),
             restart: tokio::sync::Notify::new(),
             announced: Mutex::default(),
+            pending_removals: Mutex::default(),
         })
     }
 
@@ -97,6 +101,7 @@ impl VoiceRuntime {
             problem: Mutex::new(None),
             restart: tokio::sync::Notify::new(),
             announced: Mutex::default(),
+            pending_removals: Mutex::default(),
         }
     }
 
@@ -143,6 +148,10 @@ impl VoiceRuntime {
     /// The participant state; hold the guard only for synchronous work.
     pub fn participants(&self) -> MutexGuard<'_, VoiceState> {
         self.participants.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pending_removals(&self) -> MutexGuard<'_, HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>> {
+        self.pending_removals.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// LiveKit's room service (only with voice enabled).
@@ -525,6 +534,55 @@ pub async fn remove_from_livekit(state: &AppState, key: &ChannelKey, identity: &
             tracing::debug!(error = %e, identity, "LiveKit participant not removed (not connected?)");
         }
     }
+}
+
+/// How long a join waits for a pending LiveKit removal of the same device ([`removal_settled`]): the room service's
+/// request timeout.
+const REMOVAL_WAIT: Duration = Duration::from_secs(5);
+
+/// [`remove_from_livekit`] after the response: a leave answers without waiting for LiveKit (two room service calls).
+/// A join of the same device or its screen publisher into the same channel waits for it first ([`removal_settled`]),
+/// so a late removal never disconnects the new connection. Voice requests run on the leader instance
+/// (`cache::relay`), so the pending removals of one instance are all there are.
+pub fn remove_from_livekit_later(state: &AppState, key: &ChannelKey, identity: &str) {
+    if state.voice.rooms().is_none() {
+        return;
+    }
+    let slot = (room_name(key), identity.to_string());
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    // A new mutex is free: the guard is held until the removal is done.
+    let held = gate.clone().try_lock_owned();
+    state.voice.pending_removals().insert(slot.clone(), gate.clone());
+    let (state, key, identity) = (state.clone(), key.clone(), identity.to_string());
+    tokio::spawn(async move {
+        remove_from_livekit(&state, &key, &identity).await;
+        drop(held);
+        let mut pending = state.voice.pending_removals();
+        if pending.get(&slot).is_some_and(|g| Arc::ptr_eq(g, &gate)) {
+            pending.remove(&slot);
+        }
+    });
+}
+
+/// Waits (at most [`REMOVAL_WAIT`]) for a pending LiveKit removal ([`remove_from_livekit_later`]) of `identity` in
+/// this channel, or of the device a screen identity belongs to (its removal takes the screen publisher along).
+pub async fn removal_settled(state: &AppState, key: &ChannelKey, identity: &str) {
+    let room = room_name(key);
+    let gates: Vec<_> = {
+        let pending = state.voice.pending_removals();
+        std::iter::once(identity)
+            .chain(screen_owner(identity))
+            .filter_map(|id| pending.get(&(room.clone(), id.to_string())).cloned())
+            .collect()
+    };
+    for gate in gates {
+        let _ = tokio::time::timeout(REMOVAL_WAIT, gate.lock()).await;
+    }
+}
+
+/// Whether a LiveKit removal of `identity` in this channel is still pending (tests).
+pub fn removal_pending(state: &AppState, key: &ChannelKey, identity: &str) -> bool {
+    state.voice.pending_removals().contains_key(&(room_name(key), identity.to_string()))
 }
 
 /// Grants or revokes the microphone of a connected participant (moderator mute) without a reconnect; data

@@ -1551,3 +1551,46 @@ async fn ended_sessions_leave_voice() {
         assert!(v.participants(&v.alice).await.is_empty(), "{how}");
     }
 }
+
+/// A leave answers without waiting for LiveKit's room service; a rejoin of the same device waits until that removal is
+/// done, so the late removal can never disconnect the new connection.
+#[tokio::test]
+async fn a_leave_answers_at_once_and_a_rejoin_waits_for_the_livekit_removal() {
+    use tokio::io::AsyncWriteExt;
+    // A LiveKit room service that holds every request until released, then refuses it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release, released) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut released = released.clone();
+            tokio::spawn(async move {
+                let _ = released.wait_for(|r| *r).await;
+                let _ =
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            });
+        }
+    });
+    let v = setup_with(|c| c.livekit_port = port).await;
+    let key = (v.room_id.clone(), v.voice_id.clone());
+    let identity = v.identity(&v.bob);
+    assert_eq!(v.join(&v.bob).await.0, StatusCode::OK);
+
+    let (s, _) =
+        common::within(Duration::from_secs(2), "the leave", v.node.post(&v.path("leave"), &v.bob.token, json!({})))
+            .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(v.participants(&v.alice).await.is_empty(), "gone for the others at once");
+    assert!(voice::removal_pending(&v.node.state, &key, &identity), "LiveKit still holds the removal");
+
+    let rejoin = v.join(&v.bob);
+    tokio::pin!(rejoin);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut rejoin).await.is_err(),
+        "the rejoin waits for the pending removal"
+    );
+    release.send(true).unwrap();
+    let (s, j) = common::within(Duration::from_secs(5), "the rejoin", rejoin).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(!voice::removal_pending(&v.node.state, &key, &identity));
+}
