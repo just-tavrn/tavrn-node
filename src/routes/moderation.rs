@@ -263,6 +263,7 @@ pub async fn room_reports(
         status: q.status,
         exclude_target: (!auth.user.is_node_admin() || auth.user.is_bot()).then(|| auth.user.id.clone()),
         before: q.before,
+        exclude_owner: None,
     };
     let limit = validate::limit(q.limit, 50, 100);
     if auth.user.is_bot() {
@@ -280,7 +281,7 @@ pub async fn admin_reports(
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<ReportList>, ApiError> {
     let scope = q.scope.as_deref().map(|s| validate::one_of("scope", s, &["room", "node"])).transpose()?;
-    let filter = ListFilter { room_id: None, scope, status: q.status, exclude_target: None, before: q.before };
+    let filter = ListFilter { room_id: None, scope, status: q.status, before: q.before, ..ListFilter::default() };
     Ok(Json(reports::page(&state, filter, validate::limit(q.limit, 50, 100)).await?))
 }
 

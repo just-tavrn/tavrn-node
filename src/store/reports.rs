@@ -240,6 +240,9 @@ pub struct ListFilter {
     pub status: Option<String>,
     /// Leaves out reports about this user (moderators never see reports about themselves).
     pub exclude_target: Option<String>,
+    /// A bot's view: leaves out reports about its owner (this lowercase address, and the account `owner_id` when
+    /// local) and about the owner's other bots.
+    pub exclude_owner: Option<(String, Option<String>)>,
     /// Reports with a smaller id (paging).
     pub before: Option<String>,
 }
@@ -265,6 +268,18 @@ fn list_where(f: &ListFilter, with_status: bool, with_before: bool) -> (String, 
     }
     if with_before && let Some(v) = &f.before {
         push("id < ?", v, &mut binds);
+    }
+    if let Some((address, owner_id)) = &f.exclude_owner {
+        binds.push(address.clone());
+        clauses.push(format!("LOWER(target_address) <> ${}", binds.len()));
+        binds.push(address.clone());
+        let a = binds.len();
+        binds.push(owner_id.clone().unwrap_or_default());
+        let o = binds.len();
+        clauses.push(format!(
+            "NOT EXISTS (SELECT 1 FROM users u WHERE u.id = reports.target_user_id AND u.kind <> 'user'
+               AND (LOWER(COALESCE(u.owner_address, '')) = ${a} OR (${o} <> '' AND u.owner_id = ${o})))"
+        ));
     }
     (clauses.join(" AND "), binds)
 }

@@ -24,6 +24,7 @@ mod suite {
     mod backups_flow;
     mod blob_deletion_flow;
     mod bot_files_flow;
+    mod bot_owner_flow;
     mod bots_encrypted_flow;
     mod calls_flow;
     mod channel_visibility_flow;
