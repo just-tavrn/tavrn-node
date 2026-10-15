@@ -518,3 +518,90 @@ async fn command_approval_state_is_for_local_node_admins_only() {
     let (s, j) = b.get_auth(path, &remote.token).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "federation.local_only"));
 }
+
+/// Sends a commit and drops the request once the node stored it (the client went away: a tab closed or navigated right
+/// after committing, as the e2e test does after switching bots off). "Stored" is seen as the commit's `mls.commit`
+/// event: the request future is polled by hand, and between polls the hub is read (the database stays untouched, the
+/// paused request may hold the test pool's connection). Returns false when the request had finished first.
+async fn post_commit_and_disconnect(
+    node: &TestNode,
+    token: &str,
+    channel: &str,
+    out: &tavrn_crypto::CommitOutput,
+) -> bool {
+    use axum::body::Body;
+    use axum::http::{Method, Request, header};
+    use std::{future::Future, task::Poll};
+    use tower::ServiceExt;
+    let mut rx = node.state.hub.subscribe();
+    let body = json!({ "epoch": out.epoch, "commit": common::e2ee::b64(&out.commit), "group_info": common::e2ee::b64(&out.group_info) });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/conversations/{channel}/mls/commits"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let mut call = Box::pin(node.router.clone().oneshot(request));
+    for _ in 0..1_000_000 {
+        let done = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx).is_ready())).await;
+        if done {
+            return false;
+        }
+        while let Ok(ev) = rx.try_recv() {
+            if ev.kind == "mls.commit" && ev.data["conversation_id"] == channel {
+                drop(call);
+                return true;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    unreachable!("the commit was never stored")
+}
+
+#[tokio::test]
+async fn the_security_log_entry_follows_a_stored_commit_even_when_the_client_went_away() {
+    let node = test_node(D).await;
+    let alice = node.register("alice").await;
+    let mut carol = node.crypto_user("carol").await;
+    let b = bot(&node, &alice, "Reader").await;
+    let room = node.create_room(carol.token(), "Secret room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = TestNode::text_channel(&room);
+    let welcome = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "system").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, j) =
+        install(&node, carol.token(), &room_id, json!({ "application": b.reference(), "permissions": "0" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let master = MasterSecret::generate().unwrap();
+    node.put_identity(&b.session(), &master).await;
+    let mut bot_dev = node.attest(b.session(), master, 3).await;
+    let bot_identity = bot_dev.identity();
+    node.create_group(&mut carol, &channel).await;
+    patch_channel(&node, carol.token(), &room_id, &channel, json!({ "bots_allowed": true })).await;
+    external_join(&node, &mut bot_dev, &channel).await.unwrap();
+
+    // Off again; carol's removal commit is stored, and her client is gone before the answer.
+    patch_channel(&node, carol.token(), &room_id, &channel, json!({ "bots_allowed": false })).await;
+    node.catch_up(&mut carol, &channel).await;
+    let out = carol.client.remove_members(&qualified(&channel), std::slice::from_ref(&bot_identity)).unwrap();
+    assert!(
+        post_commit_and_disconnect(&node, carol.token(), &channel, &out).await,
+        "the request was cut after the store"
+    );
+    // What follows the stored commit still happens: the security log entry and the cleared pending removal.
+    let mut removed = Vec::new();
+    for _ in 0..50 {
+        removed = log(&node, carol.token(), &welcome, "system.bot_removed").await;
+        if !removed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!((removed.len(), &removed[0]["reason"]), (1, &json!("bots_not_allowed")));
+    let (s, pending) =
+        node.get_auth(&format!("/api/v1/conversations/{channel}/mls/pending-removals"), carol.token()).await;
+    assert_eq!((s, &pending["items"]), (StatusCode::OK, &json!([])));
+}
