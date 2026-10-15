@@ -436,7 +436,8 @@ async fn frames_up_to_the_limit_arrive_through_the_small_read_buffer() {
     let mut ws = connect(&url).await;
     ws.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
     assert_eq!(next_json(&mut ws).await["op"], "ready");
-    assert!(tavrn_node::ws::READ_BUFFER * 8 <= tavrn_node::ws::MAX_FRAME, "the test reads a frame in several parts");
+    // The frames below take several reads.
+    const { assert!(tavrn_node::ws::READ_BUFFER * 8 <= tavrn_node::ws::MAX_FRAME) };
     // A pong padded to just under the limit (the node ignores the unknown field), twice in one write.
     let pad = "x".repeat(tavrn_node::ws::MAX_FRAME - 64);
     let big = json!({ "op": "pong", "pad": pad }).to_string();
