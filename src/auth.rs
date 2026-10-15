@@ -330,8 +330,10 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
         }
         Err(_) => return Err(invalid("auth.token_invalid")),
     };
-    // Development nodes only: `POST /dev/expire-access-tokens` ends every access token issued before it (e2e tests).
-    if claims.iat < state.access_not_before.load(std::sync::atomic::Ordering::Relaxed) {
+    // Development nodes only: `POST /dev/expire-access-tokens` ends the account's access tokens issued before it.
+    if state.config.dev
+        && state.access_not_before.lock().is_ok_and(|m| m.get(&claims.sub).is_some_and(|nb| claims.iat < *nb))
+    {
         return Err(invalid("auth.token_expired"));
     }
     let mut user = store::users::by_id(&state.db, &claims.sub).await?.ok_or_else(|| invalid("auth.token_invalid"))?;

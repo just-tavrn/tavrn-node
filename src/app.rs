@@ -271,9 +271,10 @@ pub struct AppState {
     pub reports_inbound_total_limiter: Arc<SharedLimiter>,
     /// Status-link lookups (notices, account deletions) per client IP (`lookup-ip:<ip>`, 60 per hour).
     pub legal_lookup_limiter: Arc<SharedLimiter>,
-    /// Access tokens issued before this Unix time are expired. Only development nodes move it
-    /// (`POST /dev/expire-access-tokens`, e2e tests of the refresh paths); 0 otherwise.
-    pub access_not_before: Arc<std::sync::atomic::AtomicI64>,
+    /// Per account (user id): access tokens issued before this Unix time are expired. Only development nodes fill it
+    /// (`POST /dev/expire-access-tokens`, e2e tests of the refresh paths); empty otherwise. Per account, so a test
+    /// never ends the sessions of the tests running in parallel on the same node.
+    pub access_not_before: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// Web push (`push.rs`): VAPID key, subscriptions' sender, limits.
     pub push: Arc<crate::push::Push>,
     /// Counters and gauges of `GET /metrics` (`metrics.rs`).
@@ -450,7 +451,7 @@ impl AppState {
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
-            access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            access_not_before: Arc::default(),
             live_sessions: Arc::default(),
             ws_ping: crate::ws::PING_INTERVAL,
             password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
