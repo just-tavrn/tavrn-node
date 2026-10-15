@@ -145,6 +145,7 @@ First public release of the node and its container image.
 
 ### Security
 
+- A `Tavrn-Relayed` value with an extreme time is refused instead of overflowing the age check.
 - `check-config` prints the passwords of `TAVRN_DATABASE_URL` and `TAVRN_SMTP_URL`, secret query parameters, the
   Turnstile secret and the GIF key as `***`. The image's health check is the new `tavrn-node health` (one request to
   `/healthz`, nothing printed), so the container state no longer holds the configuration and the identity provider
