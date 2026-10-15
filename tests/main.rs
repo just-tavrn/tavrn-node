@@ -15,6 +15,7 @@ mod suite {
     mod app_install_flow;
     mod app_install_index_flow;
     mod applications_flow;
+    mod attachment_quota_flow;
     mod attachment_retention_flow;
     mod attachments_flow;
     mod auth_flow;

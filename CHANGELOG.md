@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- Attachment uploads that stream at the same time reserve their share of the room's (or DM's) storage quota before
+  their body arrives, and the usage is checked again once a file is stored, so parallel uploads can no longer overrun
+  the quota.
 - Web push: a user's subscriptions are sent to at once within one 10-second deadline, a push for a user whose previous
   one is still under way is skipped, and registering an endpoint again keeps its failure count, so endpoints that
   never answer can no longer hold the node's push senders.
