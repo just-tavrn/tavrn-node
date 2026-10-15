@@ -60,6 +60,7 @@ pub mod sessions;
 pub mod storage;
 pub mod store;
 pub mod subscriptions;
+pub mod supervise;
 pub mod telemetry;
 pub mod threads;
 pub mod unfurl;
@@ -105,15 +106,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Hostnames among the announced media addresses are resolved before LiveKit starts (and kept current).
     let advertiser = voice::advertise::start(&state).await;
     let livekit = if config.voice_enabled { Some(voice::livekit::Supervisor::start(&state)?) } else { None };
-    let reconciler = config.voice_enabled.then(|| voice::spawn_reconciler(state.clone()));
-    let grace_sweeper = config.voice_enabled.then(|| voice::spawn_grace_sweeper(state.clone()));
-    let housekeeping = housekeeping::spawn(state.clone());
-    let search_backfill = search::spawn_backfill(state.clone());
-    let outbox = federation::outbox::spawn(state.clone());
-    let subscriptions = subscriptions::spawn(state.clone());
-    let directory = federation::announce::spawn(state.clone());
-    let conformance = federation::conformance::spawn(state.clone());
-    let whiteboards = whiteboard::spawn_sweeper(state.clone());
+    // The background workers start again after a panic (logged), instead of staying dead until a restart.
+    supervise::log_panics();
+    let worker = |name: &'static str, start: fn(app::AppState) -> tokio::task::JoinHandle<()>| {
+        let state = state.clone();
+        supervise::supervised(name, move || start(state.clone()))
+    };
+    let reconciler = config.voice_enabled.then(|| worker("voice reconciler", voice::spawn_reconciler));
+    let grace_sweeper = config.voice_enabled.then(|| worker("voice grace sweeper", voice::spawn_grace_sweeper));
+    let housekeeping = worker("housekeeping", housekeeping::spawn);
+    let search_backfill = worker("search backfill", search::spawn_backfill);
+    let outbox = worker("federation outbox", federation::outbox::spawn);
+    let subscriptions = worker("event subscriptions", subscriptions::spawn);
+    let directory = worker("directory announcements", federation::announce::spawn);
+    let conformance = worker("conformance", federation::conformance::spawn);
+    let whiteboards = worker("whiteboard sweeper", whiteboard::spawn_sweeper);
     let reloads = spawn_reload_on_hangup(state.clone());
     if config.federation_allow_private {
         tracing::warn!(
