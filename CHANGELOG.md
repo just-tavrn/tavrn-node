@@ -145,6 +145,8 @@ First public release of the node and its container image.
 
 ### Security
 
+- One node may hold at most 500 entries of a bot's install index (of 10 000), so it can no longer fill the index and
+  make the bot miss other nodes' installations.
 - A bot's interaction replies and follow-ups pass the checks of an ordinary message: role mentions, the room's and the
   node's content rules, slowmode, blocks and the channel kind; they are indexed for search like the bot's own
   messages.

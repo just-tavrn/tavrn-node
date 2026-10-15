@@ -38,6 +38,8 @@ pub const DOCUMENT_MAX_AGE_SECS: u32 = 300;
 const NAME_MAX: usize = 100;
 /// Install index entries per application (§4.5); further `app.install` messages are ignored.
 pub const MAX_INDEX_ENTRIES: i64 = 10_000;
+/// Entries one node may hold in an application's index: no node can fill it for the others.
+pub const MAX_INDEX_ENTRIES_PER_NODE: i64 = 500;
 /// Reasons of an uninstall (`app.uninstall` audit entry and events).
 pub const REASONS: &[&str] = &["removed", "kicked", "banned", "left", "no_bots", "owner_banned", "blocked", "deleted"];
 
@@ -772,8 +774,14 @@ pub async fn handle_for_bot(
             if apps::disabled_reason(state, &app, bot).await?.is_some() {
                 return Err(unknown());
             }
-            // Other nodes cannot grow the index without bound (DoS).
-            if store::installations::index_count(&state.db, &app.id).await? >= MAX_INDEX_ENTRIES {
+            // Other nodes cannot grow the index without bound (DoS), and one node cannot fill it for the others: each
+            // gets its share. An entry it already has is refreshed.
+            let known = store::installations::index_has(&state.db, &app.id, iss, &room_id).await?;
+            if !known
+                && (store::installations::index_count_of_node(&state.db, &app.id, iss).await?
+                    >= MAX_INDEX_ENTRIES_PER_NODE
+                    || store::installations::index_count(&state.db, &app.id).await? >= MAX_INDEX_ENTRIES)
+            {
                 tracing::warn!(sender = iss, application = app.id, "install index full, app.install ignored");
                 return Ok("ignored");
             }

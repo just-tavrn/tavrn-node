@@ -13,6 +13,7 @@ mod suite {
     mod age_flow;
     mod api_basics;
     mod app_install_flow;
+    mod app_install_index_flow;
     mod applications_flow;
     mod attachment_retention_flow;
     mod attachments_flow;
