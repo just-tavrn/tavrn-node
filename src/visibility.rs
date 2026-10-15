@@ -323,7 +323,7 @@ impl RoomView {
     /// `None` when `user` is no member of the snapshot or the channel is not in it (the caller asks the database).
     pub fn conversation(&self, channel_id: &str, user: &UserRow) -> Option<Result<access::Conv, ApiError>> {
         let channel = self.channels.get(channel_id)?.clone();
-        let m = self.members.get(&user.id)?;
+        let m = self.member(&user.id)?;
         let access = match access::member_access(
             self.room.clone(),
             &self.roles,

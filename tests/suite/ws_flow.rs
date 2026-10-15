@@ -587,6 +587,8 @@ async fn the_heartbeat_checks_every_connected_device_in_one_statement() {
     assert_eq!(alive.iter().filter(|a| !**a).count(), 2, "{alive:?}");
     assert!(!alive[3] && !alive[5]);
     drop(guards);
+}
+
 /// Leaving a room tells the user's other devices too (as kick and ban do): their room list must not keep the room.
 #[tokio::test]
 async fn leaving_a_room_reaches_the_users_other_devices() {
