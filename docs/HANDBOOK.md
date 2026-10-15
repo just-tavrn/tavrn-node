@@ -2203,8 +2203,8 @@ members" in the room (give it a role with that permission) lists the room's repo
 for example to post a summary in a moderators' channel or to escalate after several reports about one user. Bots
 see metadata only: kind, category, the reported user, status, counts, times and the id of the reported message, never
 the reporter's text, the snapshot, released plaintext, your notes or actions, and the reporter only as a pseudonym
-(the same for the same reporter in that room, never the address). Bots never see reports about themselves or about
-the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
+(the same for the same reporter in that room, never the address). Bots never see reports about themselves, their
+owner, their owner's other bots or the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
 (MODERATION.md §1.4a). Take the permission away to close the inbox for the bot.
 
 #### Forwarding reports to another node
@@ -2236,7 +2236,10 @@ erased account's forwarded reports lose their target but keep the origin. Both d
 
 Content rules only work where the node can read: unencrypted channels (never ciphertext). Rooms define their own
 rules (room settings → Auto-moderation: word lists with `*` wildcards, link allow and block lists, exempt roles and
-channels; actions block, delete or timeout), checked on send and edit, including attachment file names. As operator
+channels; actions block, delete or timeout), checked on send and edit, including attachment file names and bots'
+interaction replies. Delete and timeout rules act only on members ranked below whoever last saved the rules (as that
+member's own moderation would), and a timeout is shown to the room like a moderator's. Matching runs off the request
+threads with a fixed amount of work per message; a message that would need more is refused. As operator
 you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
 (one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
 line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;
