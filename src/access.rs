@@ -402,7 +402,42 @@ impl Conv {
     }
 }
 
-fn conversation_not_found() -> ApiError {
+/// Does [`message`] apply the requester's history window?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// Reading the message (or acting on it in a way that serves it): an encrypted message older than the
+    /// requester's history window (ENCRYPTION.md §7b) is not found, as on a page of messages.
+    Apply,
+    /// Writes addressed to the message by id that serve no older content (edit, delete, the read marker).
+    Ignore,
+}
+
+/// The message `message_id` (any case) of `conv`: `404 message.not_found` when there is no such message in this
+/// conversation or, with [`Window::Apply`], when it lies before the requester's history window. The one lookup of
+/// a conversation's message by id; the caller has checked the permissions it needs.
+pub async fn message(
+    state: &AppState,
+    user: &UserRow,
+    conv: &Conv,
+    message_id: &str,
+    window: Window,
+) -> Result<crate::models::MessageRow, ApiError> {
+    let missing = || not_found("Message", "message.not_found");
+    let message = store::messages::by_id(&state.db, &message_id.to_ascii_uppercase())
+        .await?
+        .filter(|m| m.conversation_id == conv.id)
+        .ok_or_else(missing)?;
+    if window == Window::Apply
+        && message.encrypted != 0
+        && let Some(cut) = crate::history::list_cutoff(state, conv, user).await?
+        && message.id.as_str() < cut.as_str()
+    {
+        return Err(missing());
+    }
+    Ok(message)
+}
+
+pub(crate) fn conversation_not_found() -> ApiError {
     not_found("Conversation", "conversation.not_found")
 }
 

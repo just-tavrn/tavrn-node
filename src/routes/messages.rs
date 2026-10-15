@@ -107,17 +107,7 @@ pub async fn readable(
     message_id: &str,
 ) -> Result<MessageRow, ApiError> {
     conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
-    let message = store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
-    if message.encrypted != 0
-        && let Some(cut) = crate::history::list_cutoff(state, conv, &auth.user).await?
-        && message.id.as_str() < cut.as_str()
-    {
-        return Err(access::not_found("Message", "message.not_found"));
-    }
-    Ok(message)
+    access::message(state, &auth.user, conv, message_id, access::Window::Apply).await
 }
 
 pub async fn enrich_one(state: &AppState, user_id: &str, message_id: &str) -> Result<Message, ApiError> {
@@ -935,17 +925,13 @@ pub(crate) async fn edit_in(
             return Err(bad("message.content_missing", "content is missing (or poll_closes_at to close a poll)"));
         };
         conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
-        let existing = store::messages::by_id(&state.db, message_id)
-            .await?
-            .filter(|m| m.conversation_id == conv.id)
-            .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+        let existing = access::message(state, &auth.user, conv, message_id, access::Window::Ignore).await?;
         return close_poll(state, auth, conv, &existing, closes_at).await;
     };
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
-    let existing = store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+    let existing = access::message(state, &auth.user, conv, message_id, access::Window::Ignore).await?;
+    let canonical = existing.id.clone();
+    let message_id = canonical.as_str();
     if existing.author_id != auth.user.id {
         return Err(ApiError::Forbidden {
             code: "message.not_author",
@@ -1040,10 +1026,8 @@ pub async fn delete_conversation_message(
 
 async fn delete_in(state: &AppState, auth: &AuthUser, conv: &Conv, message_id: &str) -> Result<StatusCode, ApiError> {
     conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
-    let existing = store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+    let existing = access::message(state, &auth.user, conv, message_id, access::Window::Ignore).await?;
+    let message_id = existing.id.as_str();
     // The welcome channel is the room's security log: nobody deletes its entries (MODERATION.md §3).
     if let ConvKind::Channel { channel, .. } = &conv.kind
         && channel.kind == "system"
