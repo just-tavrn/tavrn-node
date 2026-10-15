@@ -221,16 +221,22 @@ pub async fn device_keys(
 
 /// Devices of a user attested under the current identity key.
 pub async fn attested_devices(db: &Pool, user_id: &str) -> Result<Vec<DeviceKeyRow>, ApiError> {
-    let rows: Vec<DeviceKeyRow> = sqlx::query_as(&format!(
+    // At most the newest `MAX_ATTESTED` (clients refuse a keys document with more; accounts that had more devices
+    // before the node capped them still get a document clients accept), oldest first.
+    let mut rows: Vec<DeviceKeyRow> = sqlx::query_as(&format!(
         "SELECT {DEVICE_KEY_COLS} FROM devices d JOIN users u ON u.id = d.user_id
          WHERE d.user_id = $1 AND d.identity_signature IS NOT NULL AND d.attested_identity_key = u.identity_pubkey
-         ORDER BY d.created_at, d.id"
+         ORDER BY d.created_at DESC, d.id DESC LIMIT {MAX_ATTESTED}"
     ))
     .bind(user_id)
     .fetch_all(db)
     .await?;
+    rows.reverse();
     Ok(rows)
 }
+
+/// Devices in a keys document (`federation::keys::MAX_DEVICES`, the clients' limit).
+const MAX_ATTESTED: usize = crate::federation::keys::MAX_DEVICES;
 
 /// Stores the device key and attestation. Allowed when the device has no key yet, or (after an
 /// identity reset) has the same key without a valid attestation. The identity key the signature

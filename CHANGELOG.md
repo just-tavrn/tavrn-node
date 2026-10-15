@@ -145,6 +145,10 @@ First public release of the node and its container image.
 
 ### Security
 
+- An account has at most 100 devices, the limit clients apply to a keys document: a login that would create the 101st
+  is refused with `403 auth.device_limit`, the keys document lists at most the newest 100 devices, and an identity key
+  is not rotated beyond 100 continuity statements (`409 e2ee.rotation_limit`), so a keys document always stays within
+  what clients accept.
 - Attachment uploads that stream at the same time reserve their share of the room's (or DM's) storage quota before
   their body arrives, and the usage is checked again once a file is stored, so parallel uploads can no longer overrun
   the quota.

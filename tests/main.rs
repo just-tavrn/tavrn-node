@@ -37,6 +37,7 @@ mod suite {
     mod connect_flow;
     mod conversation_index_flow;
     mod delegation_flow;
+    mod device_limit_flow;
     mod directory_flow;
     mod dm_flow;
     mod dm_requests_flow;
