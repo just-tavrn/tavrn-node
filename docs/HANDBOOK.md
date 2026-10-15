@@ -1856,6 +1856,13 @@ What the operator decides:
   buttons. In encrypted channels the values people send are end-to-end encrypted to the bot; the node sees which
   component of which message was used. Forms an application opens are kept with their interaction (15 minutes) and
   never stored.
+- **Files channels**: bots browse and download with the scope `messages:read` and create folders, upload and delete
+  their own entries with `messages:write` (the channel's *Attach files*, upload categories and the bot account's
+  upload size apply as for people; others' entries need *Manage files*, which only the scope `rooms:manage`
+  unlocks). The storage settings of a files channel (store URL and credentials) stay closed to bots whatever their
+  scopes and roles. In encrypted files channels a bot that may read the channel is a member of its encryption group
+  and encrypts names and contents itself, so the node learns no more than from people's uploads; "no bots" and the
+  channel setting *Bots allowed* decide as for text channels.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and
   `TAVRN_FEDERATION_REMOTE_BOTS` (other nodes' bots may act here), both on by default.
 - **Outbound requests**: the node calls applications' interactions URLs and event subscription endpoints. They must

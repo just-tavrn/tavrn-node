@@ -6,7 +6,9 @@
 //!
 //! Permissions (channel level): `view_channel` browses and downloads; `attach_files` uploads, creates folders
 //! and renames, moves or deletes the member's own entries; `manage_files` does that for everybody's entries;
-//! the backend needs `manage_channels` and `manage_files`. Bots have no access (not in `APP_ROUTES`).
+//! the backend needs `manage_channels` and `manage_files`. Bots (FILES.md §3 "Bots") browse with `messages:read` and
+//! write with `messages:write` under the same rights (`applications::APP_ROUTES`); the backend routes are closed to
+//! them and `usage` never names the store to a bot.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1332,15 +1334,16 @@ pub struct FilesInfo {
     /// The channel is end-to-end encrypted (FILES.md §8).
     pub encrypted: bool,
     /// Members with `manage_channels`: the external store's host (`""` for the node's storage), for the deletion
-    /// dialog (FILES.md §9); `null` for everybody else.
+    /// dialog (FILES.md §9); `null` for everybody else and always for bots.
     pub backend_host: Option<String>,
-    /// Members with `manage_channels`: the object prefix on the external store (`""` for the node's storage).
+    /// Members with `manage_channels`: the object prefix on the external store (`""` for the node's storage); `null`
+    /// for everybody else and always for bots.
     pub backend_prefix: Option<String>,
     /// The requester may upload and create folders.
     pub can_upload: bool,
     /// The requester may manage everybody's entries (`manage_files`).
     pub can_manage: bool,
-    /// The requester may configure the storage backend.
+    /// The requester may configure the storage backend (never a bot: the backend routes are closed to app tokens).
     pub can_configure: bool,
     /// Upload categories of the requester here.
     pub allowed_categories: Vec<String>,
@@ -1365,8 +1368,10 @@ pub async fn usage(
     let internal = internal_allowed(&ent);
     let kind = backend_kind(internal, backend.as_ref());
     let can_upload = enabled && state.config.uploads_enabled && p::has(conv.perms, p::ATTACH_FILES) && kind != "none";
-    // Where the files are, for those who may delete the channel (never the credentials).
-    let location = if p::has(conv.perms, p::MANAGE_CHANNELS) {
+    // Where the files are, for those who may delete the channel (never the credentials); bots never configure a store
+    // (the backend routes are closed to them, FILES.md §3 "Bots"), so they learn nothing about it either.
+    let bot = auth.user.is_bot();
+    let location = if p::has(conv.perms, p::MANAGE_CHANNELS) && !bot {
         let c = stored_config(&state, &conv.id, backend.as_ref().filter(|b| b.kind != "internal")).unwrap_or_default();
         let host = reqwest::Url::parse(&c.url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
         Some((host, c.prefix))
@@ -1388,7 +1393,7 @@ pub async fn usage(
         backend_prefix: location.map(|l| l.1),
         can_upload,
         can_manage: p::has(conv.perms, p::MANAGE_FILES),
-        can_configure: p::has(conv.perms, p::MANAGE_CHANNELS | p::MANAGE_FILES),
+        can_configure: p::has(conv.perms, p::MANAGE_CHANNELS | p::MANAGE_FILES) && !bot,
         allowed_categories: crate::uploads::names(allowed),
         executables_allowed: state.config.upload_allow_executables && allowed & crate::uploads::OTHER != 0,
     }))
