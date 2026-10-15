@@ -348,7 +348,7 @@ plaintext channels.
 | `TAVRN_MEDIA_FFMPEG` | `auto` | Media pipeline for avatars, profile headers, room icons and video backgrounds: `auto` (ffmpeg from `PATH`; the image ships one), `off` (only static PNG/JPEG/WebP, no animations or video input) or an absolute path to ffmpeg. |
 | `TAVRN_MEDIA_WORKERS` | `1` | Concurrent conversions (1–8); a few more uploads wait, the rest get `503 media.busy`. |
 | `TAVRN_WHITEBOARD_MAX_SCENES` | `50` | Whiteboard scenes per user in the encrypted library (1–1000, at most 5 MB each). |
-| `TAVRN_GIF_PROVIDER` | `none` | GIF search: `none`, `giphy` or `tenor`. The API key stays on the node; clients only ask the node. |
+| `TAVRN_GIF_PROVIDER` | `none` | GIF search: `none`, `giphy` or `tenor`. The API key stays on the node; clients only ask the node. Answers are cached (trending 5 minutes, searches 10 minutes) and each user may search 30 times a minute, so a few users cannot use up the key's quota; a provider error answers `503 gif.unavailable`. |
 | `TAVRN_GIF_API_KEY` | unset | Required with a GIF provider. |
 | `TAVRN_UNFURL` | `on` | Link previews: the sender's client asks this node to load a linked page (public addresses only, 5 s, 1 MiB of HTML, image downscaled to a 40 KiB WebP) and puts the preview into the message. The node sees the URLs its users preview; readers never fetch anything. `off`: no previews from this node (`404 unfurl.disabled`). |
 | `TAVRN_SEARCH_ENABLED` | `true` | Node-side message search over **unencrypted** channels (protocol: SEARCH.md); `false` removes the route (`404 search.disabled`) and stops indexing. Encrypted conversations are only searched in the clients' local encrypted index. |
@@ -537,6 +537,11 @@ clients depend on it: web clients of other nodes that act on this node for their
 pages have their own origin, so every request it sends is cross-origin, including the uploads with their `Tavrn-*`
 headers. A proxy that answers preflights itself with a fixed header list breaks those clients ("network error")
 while the node's own web client, which is same-origin, keeps working.
+
+Compression is not needed in the proxy: the node sends the web client's files compressed itself (gzip, or a
+`.br`/`.gz` copy shipped with the build, whichever the browser accepts) with an `ETag`, and API answers are better
+left uncompressed (they can carry secrets next to attacker-chosen text, the BREACH pattern). If you enable it
+anyway, limit it to the static files.
 
 Also recommended: redirect HTTP to HTTPS, send HSTS, and block `/metrics` for the public
 ([Metrics and health](#metrics-and-health)). Route `/rtc` only to tavrn, never to LiveKit's port 7880 (which is
@@ -1398,6 +1403,11 @@ How it behaves:
   and room only, at most one per room every 30 seconds); each of them can turn it off ("Reports" in the notification
   settings).
 - **Several instances**: any instance sends; the rate counters live in Valkey.
+- **Load**: pushes are queued and sent in the background, never on the request path. Ordinary channel messages
+  have a queue of their own, so a busy channel never delays or drops the pushes of DMs, mentions, calls and
+  reports. A message's recipients are loaded together (a few statements per message, whatever the room's size),
+  members who were pushed for the conversation within the last 30 seconds are skipped first, and the deliveries to
+  different users run in parallel.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
 - **Monitoring**: `tavrn_push_sent_total` and `tavrn_push_failed_total` ([Metrics and health](#metrics-and-health)).
@@ -2349,6 +2359,15 @@ find the exceptions.
   looking.
 - **Slow statements.** `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000) logs a warning with the statement text for
   every statement at or above the threshold; lower it (e.g. `100`) to find the statements behind slow requests.
+- **The web client** is served from memory without a copy per request, compressed (about 70 % smaller for scripts
+  and WebAssembly) and with an `ETag`, so a revalidation of `index.html` answers `304`.
+- **Stalled clients.** A WebSocket client that stops reading (a frozen tab, a broken mobile link) is disconnected
+  once a send has waited 15 seconds; the user then counts as offline (and gets web pushes again) instead of staying
+  "online" until the kernel gives up on the connection. The heartbeat re-checks the sessions of all connected
+  devices of an instance together, a few statements per 30 seconds instead of two per connection.
+- **Background workers** (federation outbox, housekeeping, event subscriptions, voice sweeps, directory, whiteboard
+  sweeper) start again after a panic; the log shows `background worker panicked, starting it again` with the
+  worker's name, and the panic itself as a `panic` line with its location.
 
 ### Common problems
 

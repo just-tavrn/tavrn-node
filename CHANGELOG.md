@@ -22,6 +22,17 @@ First public release of the node and its container image.
   of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
   threshold with route template, status, duration and statement count; `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000,
   0 = off) sets the threshold of the slow statement warning (docs/HANDBOOK.md "Performance").
+- **Fan-out and services under load**: a message's web pushes load their recipients in batches (one statement per
+  500 users instead of four per member; 108 statements for a channel with 20 offline subscribers became 13), skip
+  coalesced members first, deliver to several users at once, and DMs, mentions, rings and notices have a queue of
+  their own; attachments stream into storage (memory per upload is a chunk, not the file) and are cut off at the
+  limit; the embedded web client is served without a copy per request, compressed and with an `ETag`; room
+  auto-moderation rules are compiled once per room and matched in one pass over the message; the search index is
+  written from the message after its delivery; `notify` hints to many remote members are queued in one statement,
+  limited per node; the channel visibility snapshot evaluates each member once, keeps viewers as bit sets and
+  survives cosmetic updates (nicknames, topics, descriptions); WebSocket sends time out after 15 seconds; the
+  heartbeat checks all connected devices together; GIF searches are cached and limited per user, and provider
+  errors (GIF, captcha) answer `503`/`502` instead of `500`; background workers start again after a panic.
 
 - **Rooms and channels**: text, voice, announcement, forum and files channels, threads and forum posts, roles with
   layered permissions (room, channel and single-member overrides), visibility that withholds events, hints and pushes
