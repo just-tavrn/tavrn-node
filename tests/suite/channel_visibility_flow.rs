@@ -470,3 +470,76 @@ async fn private_channel_and_category_metadata_reach_only_their_audience() {
         carol_saw.iter().find(|e| e["type"] == "channel.delete" && e["data"]["id"] == r.secret.as_str()).unwrap();
     assert!(deleted["data"].get("hidden").is_none(), "a real deletion: {deleted}");
 }
+
+/// What a lagging connection makes of the room's events: the frames it sends and, for the event itself, its type and
+/// id when it is delivered.
+async fn lagging_delivery(
+    r: &Room,
+    filter: &mut tavrn_node::visibility::Filter,
+    events: &[(&str, &Value)],
+) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let frame = |f: &str| {
+        let v: Value = serde_json::from_str(f).unwrap();
+        (v["type"].as_str().unwrap().to_string(), v["data"]["id"].clone())
+    };
+    for (kind, data) in events {
+        let d = filter.deliver(&r.node.state, &r.room_id, kind, data, &r.bob.user_id).await;
+        out.extend(d.before.iter().map(|f| frame(f)));
+        if d.event {
+            out.push((kind.to_string(), data["id"].clone()));
+        }
+        out.extend(d.after.iter().map(|f| frame(f)));
+    }
+    out
+}
+
+/// tavrn-node#61: a connection checks each event against the room's state at delivery time, so one that lags behind
+/// already sees later changes. A category and its first channel, both committed before the connection delivers the
+/// `category.create`, still reach the member once each and in order: `category.create`, then `channel.create`
+/// (not a `channel.create` before its category and the hub's copy again after it). The same for a channel the
+/// connection already told as gained (or that its starting snapshot knew): its own `channel.create` is not sent twice.
+#[tokio::test]
+async fn a_lagging_connection_tells_a_new_category_and_its_channel_once_and_in_order() {
+    let r = Room::new().await;
+    let room = format!("/api/v1/rooms/{}", r.room_id);
+    let mut filter = tavrn_node::visibility::Filter::default();
+    filter.know(&r.node.state, [&r.room_id], &r.bob.user_id).await;
+
+    // Both are committed (and published) before the connection gets to the first of them.
+    let (s, cat) = r.node.post(&format!("{room}/categories"), &r.alice.token, json!({ "name": "staff" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{cat}");
+    let (s, ch) = r
+        .node
+        .post(
+            &format!("{room}/channels"),
+            &r.alice.token,
+            json!({ "kind": "text", "name": "notes", "encrypted": false, "category_id": cat["id"] }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{ch}");
+    let seen = lagging_delivery(&r, &mut filter, &[("category.create", &cat), ("channel.create", &ch)]).await;
+    assert_eq!(
+        seen,
+        vec![("category.create".to_string(), cat["id"].clone()), ("channel.create".to_string(), ch["id"].clone())]
+    );
+
+    // A connection whose starting snapshot already holds a channel does not get its creation again.
+    let (s, open2) = r
+        .node
+        .post(
+            &format!("{room}/channels"),
+            &r.alice.token,
+            json!({ "kind": "text", "name": "more", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{open2}");
+    let mut late = tavrn_node::visibility::Filter::default();
+    late.know(&r.node.state, [&r.room_id], &r.bob.user_id).await;
+    assert_eq!(lagging_delivery(&r, &mut late, &[("channel.create", &open2)]).await, Vec::<(String, Value)>::new());
+    // The connection that knew the room before gets it once.
+    assert_eq!(
+        lagging_delivery(&r, &mut filter, &[("channel.create", &open2)]).await,
+        vec![("channel.create".to_string(), open2["id"].clone())]
+    );
+}
