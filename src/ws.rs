@@ -90,14 +90,13 @@ async fn run(state: AppState, mut socket: WebSocket) {
     let Ok(ClientOp::Hello { token, capabilities, last_event_id }) = serde_json::from_str::<ClientOp>(&text) else {
         return close(socket, CLOSE_PROTOCOL, "hello expected").await;
     };
-    // The close reason carries the error code (`auth.token_expired`, …): clients refresh and reconnect. Only a refused
-    // token or session is `4001` (clients end the session when it repeats); a failing database is not.
+    // The close reason carries the error code (`auth.token_expired`, `app.disabled`, …): clients refresh and reconnect.
+    // Only a refused token or session is `4001` (clients end the session when it repeats); a failing database (a 5xx
+    // error) is not.
     let auth = match auth::authenticate(&state, &token).await {
         Ok(a) => a,
-        Err(ApiError::Unauthorized { code } | ApiError::Forbidden { code, .. }) => {
-            return close(socket, CLOSE_AUTH, code).await;
-        }
-        Err(e) => return close_unavailable(socket, &e).await,
+        Err(e) if e.status().is_server_error() => return close_unavailable(socket, &e).await,
+        Err(e) => return close(socket, CLOSE_AUTH, e.code()).await,
     };
     // The general per-user limit applies to connecting as to every other request (`TAVRN_RATE_USER_PER_MINUTE`).
     if let Some(limiter) = &state.user_api_limiter
