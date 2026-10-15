@@ -2,10 +2,9 @@
 //! Housekeeping of devices and MLS leaves (ENCRYPTION.md §4.7): stale devices
 //! (`TAVRN_DEVICE_STALE_DAYS`), leaves of devices that no longer exist, old pending removals and device tombstones.
 
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 use chrono::{DateTime, Utc};
-use tavrn_crypto::ds::DsGroup;
 
 use crate::{app::AppState, error::ApiError, store, util};
 
@@ -77,23 +76,36 @@ pub async fn detect_ghost_leaves(state: &AppState) -> Result<u64, ApiError> {
     }
     let own = format!("@{}", state.config.domain);
     let mut found = 0;
-    for (conversation_id, ds_state) in groups {
-        let Ok(roster) = DsGroup::import_state(&ds_state).and_then(|g| g.roster()) else { continue };
+    // A user is looked up once per round, however many groups and leaves name them.
+    let mut users: HashMap<String, Option<crate::models::UserRow>> = HashMap::new();
+    for (conversation_id, roster) in crate::e2ee::rosters(groups).await {
         let mut deleted = Vec::new();
         let mut unattested = Vec::new();
+        // The local leaves' device keys of the group in one statement per 500.
+        let local: Vec<String> = roster
+            .iter()
+            .filter_map(|e| tavrn_crypto::util::parse_device_identity(&e.identity))
+            .filter(|(address, _)| address.ends_with(&own))
+            .map(|(_, device)| device.to_string())
+            .collect();
+        let keys = store::e2ee::device_keys(&state.db, &local).await?;
         for entry in roster {
             let Some((address, device_id)) = tavrn_crypto::util::parse_device_identity(&entry.identity) else {
                 continue;
             };
             let Some(username) = address.strip_suffix(&own) else { continue };
-            let Some(user) = store::users::by_username(&state.db, username, &state.config.domain).await? else {
+            if !users.contains_key(username) {
+                let user = store::users::by_username(&state.db, username, &state.config.domain).await?;
+                users.insert(username.to_string(), user);
+            }
+            let Some(Some(user)) = users.get(username) else {
                 deleted.push(entry.identity.clone());
                 continue;
             };
-            let row = store::e2ee::device_key(&state.db, device_id).await?;
-            if row.as_ref().is_none_or(|r| r.user_id != user.id) {
+            let row = keys.get(device_id);
+            if row.is_none_or(|r| r.user_id != user.id) {
                 deleted.push(entry.identity.clone());
-            } else if crate::e2ee::attested_key_of(row.as_ref(), &user.id).is_none_or(|k| k != entry.signature_key) {
+            } else if crate::e2ee::attested_key_of(row, &user.id).is_none_or(|k| k != entry.signature_key) {
                 unattested.push(entry.identity.clone());
             }
         }
