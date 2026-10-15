@@ -13,6 +13,7 @@
 
 pub mod forward;
 
+use crate::error::ApiJson;
 use axum::{
     Json,
     extract::{Path, State},
