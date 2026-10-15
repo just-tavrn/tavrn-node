@@ -251,6 +251,26 @@ pub async fn member_count(db: &Pool, room_id: &str) -> Result<i64, ApiError> {
     Ok(row.try_get::<i64, _>("n")?)
 }
 
+/// Member counts of several rooms (room id → count; rooms without members are absent), one grouped query per
+/// [`super::IN_CHUNK`] rooms.
+pub async fn member_counts(db: &Pool, room_ids: &[String]) -> Result<std::collections::HashMap<String, i64>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in room_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT room_id, CAST(COUNT(*) AS BIGINT) AS n FROM room_members WHERE room_id IN ({}) GROUP BY room_id",
+            super::placeholders(1, chunk.len())
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.insert(r.try_get::<String, _>("room_id")?, r.try_get::<i64, _>("n")?);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- Members
 
 pub async fn member(db: &Pool, room_id: &str, user_id: &str) -> Result<Option<MemberRow>, ApiError> {

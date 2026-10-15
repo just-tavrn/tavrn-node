@@ -233,19 +233,44 @@ impl PublicRoom {
 }
 
 /// Public rooms of this node ("Discover"). Rooms with an age gate are listed only when the request carries the
-/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e).
-#[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>)))]
+/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e). Anonymous requests are
+/// rate-limited per client address.
+#[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>), (status = 429, body = ProblemDetails)))]
 pub async fn discover_rooms(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<PublicRoom>>, ApiError> {
-    let adult = crate::age::requester_is_adult(&state, &headers).await;
-    let mut out = Vec::new();
-    for r in store::rooms::public_rooms(&state.db, 100, adult).await? {
-        let member_count = store::rooms::member_count(&state.db, &r.id).await?;
-        out.push(PublicRoom::of(r, member_count));
-    }
-    Ok(Json(out))
+    let requester = match crate::auth::bearer(&headers) {
+        Some(token) => crate::auth::authenticate(&state, token).await.ok(),
+        None => None,
+    };
+    // Anonymous callers are limited per address like the other public directory reads, signed-in users by the
+    // general per-user request limit.
+    let adult = match &requester {
+        Some(auth) => {
+            if let Some(limiter) = &state.user_api_limiter {
+                limiter.check_all(&[format!("user:{}", auth.user.id)])?;
+            }
+            crate::age::is_adult(&state, &auth.user).await.unwrap_or(false)
+        }
+        None => {
+            state.directory_limiter.check_all(&[format!("discover-ip:{ip}")])?;
+            false
+        }
+    };
+    let rooms = store::rooms::public_rooms(&state.db, 100, adult).await?;
+    let ids: Vec<String> = rooms.iter().map(|r| r.id.clone()).collect();
+    let counts = store::rooms::member_counts(&state.db, &ids).await?;
+    Ok(Json(
+        rooms
+            .into_iter()
+            .map(|r| {
+                let n = counts.get(&r.id).copied().unwrap_or(0);
+                PublicRoom::of(r, n)
+            })
+            .collect(),
+    ))
 }
 
 /// Room with categories, channels, roles and own permissions.
