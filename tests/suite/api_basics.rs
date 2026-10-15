@@ -143,3 +143,55 @@ async fn security_headers_and_the_web_client_csp() {
         assert!(csp.to_str().unwrap().contains("https://challenges.cloudflare.com"));
     }
 }
+
+/// Malformed bodies and query strings answer Problem Details with a stable code like every other error
+/// (PROTOCOL.md §4), and every Problem Details body names the request id the response carries in `x-request-id`.
+#[tokio::test]
+async fn malformed_input_answers_problem_details_with_the_request_id() {
+    use axum::http::Method;
+    let node = test_node("test.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let channel = common::TestNode::text_channel(&room);
+    let messages = format!("/api/v1/conversations/{channel}/messages");
+    let json = [("content-type", "application/json")];
+    for (method, path, headers, body, code) in [
+        (Method::POST, messages.clone(), &json[..], b"{".to_vec(), "request.invalid_json"),
+        (Method::POST, messages.clone(), &json[..], br#"[1]"#.to_vec(), "request.invalid_json"),
+        (Method::POST, messages.clone(), &[][..], br#"{"content": "x"}"#.to_vec(), "request.invalid_json"),
+        (Method::GET, format!("{messages}?limit=abc"), &[][..], Vec::new(), "request.invalid_query"),
+    ] {
+        let (status, headers, body) = node.raw(method.clone(), &path, &alice.token, headers, body).await;
+        let what = format!("{method} {path}");
+        assert!(status.is_client_error(), "{what}: {status}");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json", "{what}");
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((status, problem["code"].as_str()), (StatusCode::BAD_REQUEST, Some(code)), "{what}: {problem}");
+        let id = headers["x-request-id"].to_str().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(problem["request_id"], id, "{what}: {problem}");
+    }
+    // Errors of the handlers carry it as well.
+    let (status, headers, body) =
+        node.raw(Method::GET, "/api/v1/rooms/01J9AAAAAAAAAAAAAAAAAAAAAA", &alice.token, &[], Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["request_id"], headers["x-request-id"].to_str().unwrap(), "{problem}");
+}
+
+/// `tavrn-node health` (the image's health check) probes the running server on its listen port: healthy while it
+/// answers, unhealthy when nothing answers.
+#[tokio::test]
+async fn the_health_probe_checks_the_running_server() {
+    let node = test_node_with("test.local", |c| c.voice_enabled = false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let router = node.router.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let listen = format!("0.0.0.0:{port}");
+    tavrn_node::routes::health::probe(&listen, false).await.unwrap();
+    tavrn_node::routes::health::probe(&listen, true).await.unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let err = tavrn_node::routes::health::probe(&format!("0.0.0.0:{closed}"), false).await.unwrap_err();
+    assert!(err.contains(&format!("127.0.0.1:{closed}/healthz")), "{err}");
+}

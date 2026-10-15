@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Entry point of the tavrn node.
 //!
-//! Subcommands: `serve` (default), `openapi` (print the specification), `check-config`, `send-test-mail`,
+//! Subcommands: `serve` (default), `openapi` (print the specification), `check-config`, `health` (probe the running
+//! server, the image's health check), `send-test-mail`,
 //! `doctor --peer <domain>` (conformance check of another node, FEDERATION.md §9), `rotate-storage-key`,
 //! `well-known` (the discovery document for a static copy on the identity domain).
 
@@ -25,8 +26,15 @@ enum Command {
     Serve,
     /// Write the OpenAPI specification as JSON to stdout.
     Openapi,
-    /// Load, validate and print the configuration as JSON without starting.
+    /// Load, validate and print the configuration as JSON without starting (passwords, keys and tokens as `***`).
     CheckConfig,
+    /// Probe the server running on this machine: `GET /healthz` on the listen port, exit code 0 when it answers within
+    /// 3 seconds, 1 otherwise (the image's Docker `HEALTHCHECK`). Prints nothing when healthy.
+    Health {
+        /// Probe `/readyz` instead (database and, with voice, LiveKit).
+        #[arg(long)]
+        ready: bool,
+    },
     /// Send a test mail via the configured SMTP relay.
     SendTestMail {
         /// Recipient address
@@ -52,6 +60,18 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if let Some(&Command::Health { ready }) = cli.command.as_ref() {
+        // Exit codes of a Docker health check: 0 healthy, 1 unhealthy (a broken configuration included).
+        let result = match Config::load(cli.dev) {
+            Ok(config) => tavrn_node::routes::health::probe(&config.listen, ready).await,
+            Err(e) => Err(format!("configuration error: {e}")),
+        };
+        if let Err(e) = result {
+            eprintln!("unhealthy: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let config = match Config::load(cli.dev) {
         Ok(c) => c,
         Err(e) => {
@@ -62,6 +82,7 @@ async fn main() {
     };
 
     match cli.command.unwrap_or(Command::Serve) {
+        Command::Health { .. } => {}
         Command::Openapi => {
             let spec = tavrn_node::openapi::spec();
             println!("{}", spec.to_pretty_json().unwrap_or_default());

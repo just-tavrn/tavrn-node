@@ -1418,9 +1418,11 @@ Two endpoints tell whether the node is alive and whether it is ready to serve.
 | `GET /healthz` | Always `200` while the process serves requests: `{"status":"ok","voice":"running"}`. `voice` is the state of the supervised LiveKit process (`disabled`, `stopped`, `starting`, `running`, `restarting`); `voice_problem` appears when the operator has to fix something in the voice setup (e.g. none of the announced hostnames resolves). | Liveness. |
 | `GET /readyz` | `200` or `503` with `{"ready":…,"database":…,"livekit":…,"cache":…}`. `ready` requires the database and, with voice on, LiveKit answering on its local port (`livekit` is `null` with voice off). `cache` reports Valkey and the cache bus (`null` without `TAVRN_CACHE_URL`) but is **not** part of `ready`. | Readiness, load balancer health checks, external monitoring. |
 
-The image's Docker `HEALTHCHECK` runs `tavrn-node check-config` every 30 seconds: the container turns unhealthy
-when the configuration, the LiveKit binary or (with SSO) the provider check fails. It does not replace a
-`/readyz` check.
+The image's Docker `HEALTHCHECK` runs `tavrn-node health` every 30 seconds: one request to `/healthz` on the listen
+port inside the container with a 3-second timeout, nothing printed while healthy. The container turns unhealthy when
+the server stops answering (hung, crashed, the listener gone); a database or LiveKit outage does not restart it
+(`tavrn-node health --ready` probes `/readyz` instead, for a setup that wants that). It does not replace a `/readyz`
+check from outside, and it never contacts the identity provider (`check-config` does, run it by hand).
 
 ### Prometheus metrics
 
