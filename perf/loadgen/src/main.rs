@@ -6,10 +6,12 @@
 //! WebSockets and runs the scenarios: idle node, idle connections, 20 msg/s plaintext and
 //! encrypted (real MLS clients, a self-update commit every 100 messages) with message lists
 //! alongside, login, and a ramp to 1000 connections. The node's CPU time and RSS are sampled from
-//! `/proc`. Results go to a JSON file that `perf/report.ts` classifies against `perf/budgets.json`.
+//! `/proc`; the CPU under load is also given on the reference machine (`machine.rs`). Results go to a
+//! JSON file that `perf/report.ts` classifies against `perf/budgets.json`.
 
 mod api;
 mod guard;
+mod machine;
 mod mls;
 mod node;
 mod procstat;
@@ -250,6 +252,8 @@ struct Ctx {
     observer: Arc<Observer>,
     connections: usize,
     sampler: Option<Sampler>,
+    /// Speed of this machine relative to the reference (`machine::speed_factor`).
+    speed: Option<f64>,
 }
 
 /// Runs `f` for every item with at most `n` in flight, failing on the first error.
@@ -293,6 +297,17 @@ async fn bench(args: &Args, url: &str, pid: Option<u32>) -> Result<(Report, Vec<
     eprintln!("[3/7] room, channels, MLS group of {} devices", users.len());
     let (ctx_base, setup_info) = setup_room(&api, users).await?;
     report.info.extend(setup_info);
+    let speed = machine::speed_factor(ctx_base.catch_up_cpu_secs, args.clients);
+    report.add(
+        "node.machine_catch_up_cpu_secs",
+        "Machine: CPU time of the load generator's MLS catch-up (fixed work, lower is faster)",
+        ctx_base.catch_up_cpu_secs.map(round1),
+        "s",
+        json!({ "reference_secs": machine::REFERENCE_CATCH_UP_CPU_SECS, "speed": speed.map(machine::round3) }),
+    );
+    if let Some(m) = report.metrics.last_mut() {
+        m.baseline = true;
+    }
     let (stop_tx, stop_rx) = watch::channel(false);
     let ws = Arc::new(WsStats::default());
     let observer = Arc::new(Observer::default());
@@ -320,6 +335,7 @@ async fn bench(args: &Args, url: &str, pid: Option<u32>) -> Result<(Report, Vec<
         observer,
         connections: args.clients,
         sampler,
+        speed,
     };
 
     eprintln!("[4/7] {} idle connections ({} s)", ctx.connections, args.idle_secs);
@@ -407,6 +423,8 @@ struct RoomSetup {
     log: Arc<CommitLog>,
     plain_id: String,
     enc_id: String,
+    /// CPU seconds of the catch-up threads together (the machine's speed, `machine.rs`).
+    catch_up_cpu_secs: Option<f64>,
 }
 
 /// A public room with a plaintext and an encrypted channel; all users join, attest a device and
@@ -480,11 +498,12 @@ async fn setup_room(api: &Api, users: Vec<User>) -> Result<(RoomSetup, serde_jso
     info.insert("mls_join_secs".into(), json!(round1(started.elapsed().as_secs_f64())));
     info.insert("mls_join_commit_ms".into(), joins.summary());
 
-    // Every member processes the joins after its own, spread over all cores.
+    // Every member processes the joins after its own, spread over all cores. The threads' CPU time is the
+    // calibration of the machine's speed (`machine.rs`).
     let started = Instant::now();
     let shared = members.clone();
     let shared_log = log.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let catch_up_cpu_secs = tokio::task::spawn_blocking(move || -> Result<Option<f64>> {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = shared.len().div_ceil(threads).max(1);
         std::thread::scope(|scope| {
@@ -492,21 +511,28 @@ async fn setup_room(api: &Api, users: Vec<User>) -> Result<(RoomSetup, serde_jso
                 .chunks(chunk)
                 .map(|part| {
                     let log = &shared_log;
-                    scope.spawn(move || -> Result<()> {
+                    scope.spawn(move || -> Result<Option<f64>> {
+                        let cpu = machine::thread_cpu_secs();
                         for m in part {
                             lock(m).catch_up(log)?;
                         }
-                        Ok(())
+                        Ok(cpu.zip(machine::thread_cpu_secs()).map(|(from, to)| to - from))
                     })
                 })
                 .collect();
-            handles.into_iter().try_for_each(|h| h.join().map_err(|_| anyhow!("catch-up thread panicked"))?)
+            let mut total = Some(0.0);
+            for h in handles {
+                let cpu = h.join().map_err(|_| anyhow!("catch-up thread panicked"))??;
+                total = total.zip(cpu).map(|(t, c)| t + c);
+            }
+            Ok(total)
         })
     })
     .await??;
     info.insert("mls_catch_up_secs".into(), json!(round1(started.elapsed().as_secs_f64())));
+    info.insert("mls_catch_up_cpu_secs".into(), json!(catch_up_cpu_secs.map(round1)));
     info.insert("mls_group_size".into(), json!(members.len()));
-    Ok((RoomSetup { users, members, log, plain_id, enc_id }, info))
+    Ok((RoomSetup { users, members, log, plain_id, enc_id, catch_up_cpu_secs }, info))
 }
 
 /// `rate` messages per second for `load_secs` (open loop, round-robin over the users), message
@@ -665,6 +691,13 @@ async fn load(args: &Args, ctx: &Ctx, encrypted: bool, report: &mut Report) -> R
     }
     report.latency(&format!("node.{name}_delivery_p95_ms"), &format!("{label}: send → WebSocket p95"), &delivery);
     report.usage(&format!("node.{name}"), &format!("{label} load"), usage, false);
+    report.add(
+        &format!("node.{name}_cpu_ref_pct"),
+        &format!("{label} load: CPU on the reference machine"),
+        usage.zip(ctx.speed).map(|(u, speed)| machine::on_reference(u.cpu_pct, speed)),
+        "%",
+        json!({ "measured_pct": usage.map(|u| u.cpu_pct), "speed": ctx.speed.map(machine::round3) }),
+    );
     let errors_total = send.errors + list.errors + commit.errors;
     report.add(
         &format!("node.{name}_errors"),

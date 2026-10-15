@@ -39,6 +39,12 @@ pub const CLOSE_TRY_AGAIN: u16 = 1013;
 /// Largest client frame and message: the client's operations are small JSON objects; a larger frame is refused
 /// before it is buffered (also before the hello).
 pub const MAX_FRAME: usize = 64 * 1024;
+/// Read buffer of a connection (tungstenite's default is 128 KiB). Before every read tungstenite zeroes the free part
+/// of the buffer, also for the reads that find nothing, and every wake-up of a connection (each event it is sent)
+/// polls its socket: with 128 KiB that zeroing was about 40 % of the node's user CPU under the benchmark's fan-out
+/// (perf/README.md "Machine speed") and up to 128 KiB of resident memory per open connection. The client's
+/// operations are small; a frame up to `MAX_FRAME` still arrives, in several reads.
+pub const READ_BUFFER: usize = 4 * 1024;
 /// Typing operations of one connection closer together than this are dropped (clients send every 3 s).
 pub const TYPING_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -69,7 +75,10 @@ enum ClientOp {
 }
 
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| run(state, socket))
+    ws.max_message_size(MAX_FRAME)
+        .max_frame_size(MAX_FRAME)
+        .read_buffer_size(READ_BUFFER)
+        .on_upgrade(move |socket| run(state, socket))
 }
 
 async fn close(mut socket: WebSocket, code: u16, reason: &str) {

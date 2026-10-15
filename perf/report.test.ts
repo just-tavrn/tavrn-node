@@ -56,6 +56,10 @@ test("the budget file carries the decided budgets", async () => {
   assert.equal(max("client.desktop.ingest_enc_render_p95_ms"), 150);
   assert.equal(max("node.enc_commit_p95_ms"), 150);
   assert.equal(max("node.ramp_rss_mb"), 400);
+  // The node's CPU under load on the reference machine (perf/README.md "Machine speed"); the measured share is info.
+  assert.equal(max("node.plain_cpu_ref_pct"), 20);
+  assert.equal(max("node.enc_cpu_ref_pct"), 20);
+  assert.equal(max("node.plain_cpu_pct"), undefined);
   // Phase 4 voice: connected idle <= 5 %, talking <= 15 % of one core.
   assert.equal(max("client.desktop.voice_idle_cpu_pct"), 5);
   assert.equal(max("client.desktop.voice_talk_cpu_pct"), 15);

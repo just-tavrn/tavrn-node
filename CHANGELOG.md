@@ -19,7 +19,11 @@ First public release of the node and its container image.
   further idle ones after 30 minutes and pings a connection only after 30 seconds of idleness (the first requests
   after a quiet period no longer pay a new connection, and no request pays a ping); a role save is one statement
   with its audit row in the same transaction; a voice leave answers before LiveKit confirmed the removal (a rejoin
-  of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
+  of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. A WebSocket
+  connection reads through a 4 KiB buffer instead of 128 KiB: zeroing the large buffer before every read was about
+  40 % of the node's user CPU while it fans messages out (the 20 msg/s benchmark to 200 connections needs a third
+  to almost half less CPU), and an open connection holds 70 to 100 KiB less memory.
+  `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
   threshold with route template, status, duration and statement count; `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000,
   0 = off) sets the threshold of the slow statement warning (docs/HANDBOOK.md "Performance").
 - **Fan-out and services under load**: a message's web pushes load their recipients in batches (one statement per
