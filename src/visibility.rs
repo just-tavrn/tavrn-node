@@ -231,6 +231,36 @@ impl RoomView {
         self.member_perms_with(self.channels.get(channel_id)?, &self.overrides, user_id, false)
     }
 
+    /// The channel `channel_id` as a conversation of the member `user` (the requester's own row: its kind, scopes and
+    /// node admin flag count), evaluated on the snapshot with the REST routes' rules (`access::conversation`):
+    /// `None` when `user` is no member of the snapshot or the channel is not in it (the caller asks the database).
+    pub fn conversation(&self, channel_id: &str, user: &UserRow) -> Option<Result<access::Conv, ApiError>> {
+        let channel = self.channels.get(channel_id)?.clone();
+        let m = self.members.get(&user.id)?;
+        let access = match access::member_access(
+            self.room.clone(),
+            &self.roles,
+            Some(m.member.clone()),
+            &m.role_ids,
+            user,
+            m.adult,
+            m.moved.clone(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = access::require_age(&access, &channel) {
+            return Some(Err(e));
+        }
+        let perms = access::channel_perms_with(&access, &channel, &self.overrides, &user.id);
+        Some(Ok(access::Conv {
+            id: channel.id.clone(),
+            encrypted: channel.encrypted != 0,
+            perms,
+            kind: access::ConvKind::Channel { access: Box::new(access), channel },
+        }))
+    }
+
     /// Does the member hold `bits` room-wide (roles only, no channel)?
     pub fn holds(&self, user_id: &str, bits: permissions::Perms) -> bool {
         self.access(user_id).is_some_and(|a| permissions::has(a.room_perms, bits))

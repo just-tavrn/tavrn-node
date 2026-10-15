@@ -476,10 +476,19 @@ pub async fn conversation(state: &AppState, conversation_id: &str, user: &UserRo
         return Err(conversation_not_found());
     }
     let row = store::social::conversation(&state.db, conversation_id).await?.ok_or_else(conversation_not_found)?;
+    conversation_of_row(state, row, user).await
+}
+
+/// [`conversation`] for an already loaded conversation row.
+pub async fn conversation_of_row(
+    state: &AppState,
+    row: crate::store::social::ConversationRow,
+    user: &UserRow,
+) -> Result<Conv, ApiError> {
     match (row.kind.as_str(), &row.room_id) {
         ("channel", Some(room_id)) => {
             let access = room_access(state, room_id, user).await?;
-            let channel = channel_in_room(state, room_id, conversation_id).await?;
+            let channel = channel_in_room(state, room_id, &row.id).await?;
             channel_conv(state, access, channel, user).await
         }
         ("dm" | "group", _) => direct_conversation(state, row, &user.id).await,
