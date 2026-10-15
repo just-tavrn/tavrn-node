@@ -185,9 +185,14 @@ fn title_of(kind: &str) -> &'static str {
 
 /// `/legal/{kind}`: the document as a standalone HTML page in the app's dark style (crawlers, other clients, links
 /// in mails). Other paths below `/legal/` (the notice form) belong to the web client.
-pub async fn page_html(State(state): State<AppState>, Path(kind): Path<String>, uri: axum::http::Uri) -> Response {
+pub async fn page_html(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !documents::valid_kind(&kind) {
-        return crate::webapp::handler(State(state), uri).await;
+        return crate::webapp::handler(State(state), uri, headers).await;
     }
     let doc = documents::get(&state.db, &kind).await.ok().flatten();
     let others: String = documents::all(&state.db)
