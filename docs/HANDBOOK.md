@@ -335,7 +335,7 @@ marked "entitlement" above are the node defaults; node admins extend them per us
 | `TAVRN_FILES_CHANNELS` | `on` | `files_channels.enabled`: files channels may be created (`on`/`off`). |
 | `TAVRN_FILES_CHANNELS_MAX_BYTES` | `0` | `files_channels.max_bytes`, storage per files channel on the node's own storage (never external stores, which have their own limit in the channel's storage settings). |
 | `TAVRN_FILES_EXTERNAL` | `off` | Files channels on external WebDAV/S3 stores (protocol: FILES.md §5). |
-| `TAVRN_FILES_INTERNAL` | `on` | `off`: files channels on external stores only; the node keeps no files of files channels (needs `TAVRN_FILES_EXTERNAL=on`, see [Files channels on external stores](#files-channels-on-external-stores)). |
+| `TAVRN_FILES_INTERNAL` | `on` | `files_channels.internal`: `off` = files channels on external stores only; the node keeps no files of files channels (needs `TAVRN_FILES_EXTERNAL=on`, see [Files channels on external stores](#files-channels-on-external-stores)). A plan or override of the room owner (or a room grant) with `files_channels.internal` `1` allows the node's own storage in that owner's rooms anyway, `0` takes it away on a node that is `on`. |
 | `TAVRN_FILES_EXTERNAL_PRIVATE` | `off` | `on` also allows external stores on private, loopback or link-local addresses and plain `http` (stores in the LAN); this disables the SSRF protection for them. |
 
 ### Media, previews and search
@@ -1006,6 +1006,22 @@ shared folders live on the members' own WebDAV or S3 stores, attachments in chat
   `policies.files_internal` in the discovery document.
 - **The quota**: `TAVRN_FILES_CHANNELS_MAX_BYTES` does not limit the external stores (see "Limits" above), so it
   can stay as it is for the channels that still keep files on the node.
+- **Exceptions per owner**: the entitlement `files_channels.internal` (a room key, node default
+  `TAVRN_FILES_INTERNAL`) decides per room. A plan or per-user override of the room's **owner** with
+  `"files_channels.internal": 1` (or a grant of the room itself) allows the node's own storage in that owner's rooms
+  while the node default is off, e.g. for a paid plan; the quota `files_channels.max_bytes` applies there as usual.
+  The other direction works too: `0` sends an owner's rooms to external stores on a node that keeps files. A grant
+  that does not name the key leaves the node default; among several active grants that name it, `1` wins. A
+  member's own plan does not count in somebody else's room. Clients read the room's value as `internal_allowed` in
+  the channel's files usage and offer "This node" in the storage settings only where it is `true`; `GET
+  /api/v1/node` keeps `files_internal` as the node default. When the grant ends, the room behaves like any channel
+  of a node switched off (below): the stored files stay, new uploads are refused.
+
+  ```sh
+  curl -sX POST https://chat.example/api/v1/admin/entitlements/grants -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"subject":"user:alice","overrides":{"files_channels.internal":1},"note":"node storage for files channels"}'
+  ```
 - **Switching an existing node**: channels that already keep files on the node keep them (listing, downloads,
   renames, moves and deletes work), but take no new uploads; once such a channel is empty its managers can move it
   to an external store. Thumbnails of encrypted channels (at most 1 MiB each) stay on the node, as for every

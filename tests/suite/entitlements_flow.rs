@@ -60,9 +60,20 @@ async fn entitlement_routes_are_for_node_admins_only() {
     let (s, _) = node.post(PLANS, &bob.token, json!({ "name": "x", "limits": {} })).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (_, keys) = node.get_auth("/api/v1/admin/entitlements/keys", &admin.token).await;
-    assert_eq!(keys.as_array().unwrap().len(), 14);
+    assert_eq!(keys.as_array().unwrap().len(), 15);
     let retention = keys.as_array().unwrap().iter().find(|k| k["key"] == "attachments.retention_days").unwrap();
     assert_eq!(retention["rule"], "shortest_non_zero");
+    let internal = keys.as_array().unwrap().iter().find(|k| k["key"] == "files_channels.internal").unwrap();
+    assert_eq!(
+        (
+            internal["rule"].as_str(),
+            internal["scope"].as_str(),
+            internal["max"].as_i64(),
+            internal["node_default"].as_i64()
+        ),
+        (Some("setting"), Some("room"), Some(1), Some(1)),
+        "{internal}"
+    );
 }
 
 #[tokio::test]
@@ -77,6 +88,8 @@ async fn plans_crud_with_validation_and_audit() {
             "entitlements.invalid_limits",
         ),
         (json!({ "name": "Gold", "limits": { "files_channels.enabled": 2 } }), "entitlements.invalid_limits"),
+        (json!({ "name": "Gold", "limits": { "files_channels.internal": 2 } }), "entitlements.invalid_limits"),
+        (json!({ "name": "Gold", "limits": { "files_channels.internal": true } }), "entitlements.invalid_limits"),
         (json!({ "name": "", "limits": {} }), "validation.length"),
     ] {
         let (s, j) = node.post(PLANS, &admin.token, body.clone()).await;

@@ -39,6 +39,12 @@ First public release of the node and its container image.
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
   chosen. `GET /node` and the discovery document carry `files_internal`.
+- **Entitlement `files_channels.internal`** (protocol ENTITLEMENTS.md, FILES.md §5; fixes #64): a room key whose node
+  default is `TAVRN_FILES_INTERNAL`; a value set by the room owner's plan or override, or by a room grant, wins in
+  both directions (rule `setting`), so an operator can allow the node's own storage for some owners on a node with
+  external stores only (the quota `files_channels.max_bytes` applies there), or take it away for some on a node
+  that keeps files. The files usage carries the room's value as `internal_allowed`, `GET …/files/backend` too;
+  `files_internal` in `GET /node` stays the node default.
 - **Voice session timer and channel status** (protocol VOICE.md §5, §2a; fixes #65, #66): every voice state carries
   `session_started_at` (set with the first connected participant of an empty channel, kept while anybody is
   connected or reconnecting, cleared with the last one; in memory with the participants), and voice channels carry

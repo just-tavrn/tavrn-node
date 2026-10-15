@@ -111,7 +111,8 @@ fn expiry(field: &str, value: Option<&str>) -> Result<Option<String>, ApiError> 
 #[derive(Serialize, ToSchema)]
 pub struct KeyInfo {
     pub key: String,
-    /// `max` (highest wins, 0 = unlimited), `flag` (0/1) or `shortest_non_zero` (retention).
+    /// `max` (highest wins, 0 = unlimited), `flag` (0/1), `shortest_non_zero` (retention) or `setting` (0/1, a value
+    /// set by a grant wins over the node default in both directions).
     pub rule: String,
     /// `user` (the acting user's grants count) or `room` (the room owner's grants count).
     pub scope: String,
@@ -134,6 +135,7 @@ pub async fn keys(State(state): State<AppState>, _admin: NodeAdmin) -> Result<Js
                     entitlements::Rule::Max => "max",
                     entitlements::Rule::Flag => "flag",
                     entitlements::Rule::ShortestNonZero => "shortest_non_zero",
+                    entitlements::Rule::Setting => "setting",
                 }
                 .into(),
                 scope: match d.scope {

@@ -12,6 +12,8 @@
 //!   grants; `0` means unlimited and wins. Node admins are unlimited for user keys (what they do
 //!   themselves); rooms they own follow the room rules like every other room.
 //! - [`Rule::Flag`]: `0`/`1`, the highest value wins; node admins get `1` for user keys.
+//! - [`Rule::Setting`] (`files_channels.internal`): `0`/`1`; a value the grants set wins over the node default in
+//!   both directions (`1` among several set values wins); no admin exception.
 //! - [`Rule::ShortestNonZero`] (`attachments.retention_days`): the smallest non-zero value among the node
 //!   default, the room's grants and the room's own setting (`0` = keep). A room can only shorten the node
 //!   value; user grants and node admins play no part.
@@ -39,6 +41,7 @@ pub const SOUNDS_MAX_PERSONAL: &str = "sounds.max_personal";
 pub const ATTACHMENTS_RETENTION_DAYS: &str = "attachments.retention_days";
 pub const FILES_CHANNELS_ENABLED: &str = "files_channels.enabled";
 pub const FILES_CHANNELS_MAX_BYTES: &str = "files_channels.max_bytes";
+pub const FILES_CHANNELS_INTERNAL: &str = "files_channels.internal";
 
 /// How the values of one key combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +52,9 @@ pub enum Rule {
     Flag,
     /// Smallest non-zero wins (`0` = keep); only node default, room grants and the room setting count.
     ShortestNonZero,
+    /// `0`/`1`: the value set by the grants (the highest when several set it), else the node default; a grant can
+    /// switch the node default off as well as on.
+    Setting,
 }
 
 /// Whose grants count for a key besides the room's.
@@ -88,6 +94,7 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef { key: ATTACHMENTS_RETENTION_DAYS, rule: Rule::ShortestNonZero, scope: Scope::Room, max: 36_500 },
     KeyDef { key: FILES_CHANNELS_ENABLED, rule: Rule::Flag, scope: Scope::Room, max: 1 },
     KeyDef { key: FILES_CHANNELS_MAX_BYTES, rule: Rule::Max, scope: Scope::Room, max: PIB },
+    KeyDef { key: FILES_CHANNELS_INTERNAL, rule: Rule::Setting, scope: Scope::Room, max: 1 },
 ];
 
 pub fn def(key: &str) -> Option<&'static KeyDef> {
@@ -118,6 +125,7 @@ pub fn node_default(config: &Config, key: &str) -> i64 {
         ATTACHMENTS_RETENTION_DAYS => config.attachment_retention_days.into(),
         FILES_CHANNELS_ENABLED => i64::from(config.files_channels.on()),
         FILES_CHANNELS_MAX_BYTES => clamp_i64(config.files_channels_max_bytes),
+        FILES_CHANNELS_INTERNAL => i64::from(config.files_internal.on()),
         _ => 0,
     }
 }
@@ -225,6 +233,10 @@ pub fn evaluate(
             }
             let grants = user_grants.iter().chain(room_grants).filter_map(|g| g.get(def.key).copied());
             std::iter::once(node_default).chain(grants).max().unwrap_or(0).clamp(0, 1)
+        }
+        Rule::Setting => {
+            let set = user_grants.iter().chain(room_grants).filter_map(|g| g.get(def.key).copied()).max();
+            set.unwrap_or(node_default).clamp(0, 1)
         }
         Rule::Max => {
             if admin {
@@ -368,10 +380,10 @@ mod tests {
     #[test]
     fn registry_has_every_planned_key_once() {
         let mut keys: Vec<&str> = KEYS.iter().map(|d| d.key).collect();
-        assert_eq!(keys.len(), 14);
+        assert_eq!(keys.len(), 15);
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), 14);
+        assert_eq!(keys.len(), 15);
         let config = Config::default();
         assert_eq!(node_default(&config, ROOMS_MAX_OWNED), 5);
         assert_eq!(node_default(&config, UPLOAD_MAX_BYTES), 25 * 1024 * 1024);
@@ -380,7 +392,7 @@ mod tests {
         assert_eq!(node_default(&config, SOUNDS_MAX_PER_ROOM), 50);
         assert_eq!(node_default(&config, FILES_CHANNELS_ENABLED), 1);
         assert_eq!(node_default(&config, ATTACHMENTS_RETENTION_DAYS), 0);
-        assert_eq!(node_defaults(&config).len(), 14);
+        assert_eq!(node_defaults(&config).len(), 15);
     }
 
     #[test]
@@ -413,6 +425,40 @@ mod tests {
         assert_eq!(evaluate(k, 0, false, &[], &[&on], None), 1);
         let off = limits(&[(FILES_CHANNELS_ENABLED, 0)]);
         assert_eq!(evaluate(k, 1, false, &[&off], &[], None), 1, "0 is off here, not unlimited");
+    }
+
+    #[test]
+    fn setting_rule_takes_a_set_value_over_the_node_default_in_both_directions() {
+        let k = d(FILES_CHANNELS_INTERNAL);
+        assert_eq!(k.scope, Scope::Room);
+        assert_eq!(evaluate(k, 0, false, &[], &[], None), 0, "the node default without grants");
+        assert_eq!(evaluate(k, 1, false, &[], &[], None), 1);
+        let on = limits(&[(FILES_CHANNELS_INTERNAL, 1)]);
+        let off = limits(&[(FILES_CHANNELS_INTERNAL, 0)]);
+        let other = limits(&[(FILES_CHANNELS_MAX_BYTES, 5)]);
+        assert_eq!(evaluate(k, 0, false, &[&on], &[], None), 1, "a grant allows on a node that is off");
+        assert_eq!(evaluate(k, 0, false, &[], &[&on], None), 1, "a room grant as well");
+        assert_eq!(evaluate(k, 1, false, &[&off], &[], None), 0, "a grant takes it away on a node that is on");
+        assert_eq!(evaluate(k, 1, false, &[&other], &[], None), 1, "a grant without the key keeps the default");
+        assert_eq!(evaluate(k, 0, false, &[&off], &[&on], None), 1, "1 wins among set values");
+        assert_eq!(evaluate(k, 1, true, &[&off], &[], None), 0, "no admin exception");
+        let config = Config { files_internal: crate::config::Switch::Off, ..Config::default() };
+        assert_eq!(node_default(&config, FILES_CHANNELS_INTERNAL), 0);
+        assert_eq!(node_default(&Config::default(), FILES_CHANNELS_INTERNAL), 1);
+        assert!(parse_limits("limits", &serde_json::json!({ "files_channels.internal": 2 })).is_err());
+        assert!(parse_limits("limits", &serde_json::json!({ "files_channels.internal": true })).is_err());
+        assert_eq!(parse_limits("limits", &serde_json::json!({ "files_channels.internal": 0 })).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_room_owners_setting_counts_not_the_actors() {
+        let node = node_defaults(&Config { files_internal: crate::config::Switch::Off, ..Config::default() });
+        let granted = (false, vec![limits(&[(FILES_CHANNELS_INTERNAL, 1)])]);
+        let plain = (false, vec![]);
+        let member = Entitlements::from_parts(node.clone(), Some(granted.clone()), Some(plain), vec![], None);
+        assert_eq!(member.get(FILES_CHANNELS_INTERNAL), 0, "a member's own plan does not count");
+        let owner = Entitlements::from_parts(node, Some((false, vec![])), Some(granted), vec![], None);
+        assert_eq!(owner.get(FILES_CHANNELS_INTERNAL), 1, "the owner's plan does");
     }
 
     #[test]
