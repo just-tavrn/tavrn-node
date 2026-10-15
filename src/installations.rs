@@ -835,7 +835,7 @@ pub async fn handle_changed(
     if let Some(updated) = store::users::by_id(&state.db, &bot.id).await? {
         let rooms = store::rooms::room_ids_of_user(&state.db, &bot.id).await?;
         for room_id in rooms {
-            state.hub.room(&room_id, "user.update", updated.to_public());
+            state.hub.room(&room_id, "user.update", serde_json::json!({ "user": updated.to_public() }));
         }
     }
     Ok("handled")
