@@ -412,6 +412,9 @@ pub struct Config {
     pub federation_rate_inbox: u32,
     /// API requests of all users of one remote domain per minute (FEDERATION.md §3.2).
     pub federation_rate_api: u32,
+    /// API requests of one remote user per minute, counted before the domain's budget and capped by it, so one
+    /// account cannot use up the budget its whole domain shares.
+    pub federation_rate_api_per_user: u32,
     /// KeyPackage claims per requesting node and minute (served by this node as home node, §3.5).
     pub federation_rate_claims: u32,
     /// Remote users in total.
@@ -594,7 +597,9 @@ impl Default for Config {
             name: "tavrn".into(),
             description: String::new(),
             listen: "0.0.0.0:8080".into(),
-            trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7".into(),
+            // Loopback only: every listed address may choose its rate-limit identity with `X-Forwarded-For`; operators
+            // list their proxies (the compose file adds Docker's private ranges).
+            trusted_proxies: "127.0.0.0/8,::1/128".into(),
             public_url: None,
             webauthn_origin: None,
             webauthn_rp_id: None,
@@ -692,6 +697,7 @@ impl Default for Config {
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
+            federation_rate_api_per_user: 600,
             federation_rate_claims: 120,
             federation_max_remote_users: 10_000,
             federation_max_remote_users_per_domain: 1000,
@@ -764,12 +770,14 @@ impl Default for Config {
 }
 
 /// A URL as `check-config`, logs and error messages show it: the password of `user:password@` and the values of
-/// query parameters that carry secrets (`password=`, `…token=`, `…key=`, `…secret=`) become `***`. A password with
-/// an unencoded `@` is covered too (everything up to the last `@` is the user information).
+/// query parameters that carry secrets (`password=`, `…token=`, `…key=`, `…secret=`) become `***`. The user
+/// information ends at the last `@` before the path, query or fragment, so a password with an unencoded `@` is
+/// covered, and an `@` in a query value is not taken for one.
 pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let (userinfo, rest) = match rest.rsplit_once('@') {
-        Some((info, host)) => (Some(info), host),
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, rest) = match rest[..authority_end].rfind('@') {
+        Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
         None => (None, rest),
     };
     let (before_fragment, fragment) = match rest.split_once('#') {
@@ -896,6 +904,8 @@ impl Config {
             c.app_allow_private_urls = true;
             // End-to-end tests submit many notices from one address.
             c.legal_notice_rate_per_hour = 1000;
+            // One test user may use a remote domain's whole API budget.
+            c.federation_rate_api_per_user = c.federation_rate_api;
         }
         c
     }
@@ -982,7 +992,7 @@ impl Config {
         if let Some(url) = self.smtp_url.as_deref().map(str::trim).filter(|u| !u.is_empty())
             && crate::mail::SmtpSettings::parse(url).is_none()
         {
-            problems.push(format!("TAVRN_SMTP_URL='{url}' is invalid (smtp://, smtps:// or smtp+starttls://host:port, optionally user:pass@)"));
+            problems.push(format!("TAVRN_SMTP_URL='{}' is invalid (smtp://, smtps:// or smtp+starttls://host:port, optionally user:pass@)", redact_url(url)));
         }
         if let Some(from) = self.smtp_from.as_deref().map(str::trim).filter(|f| !f.is_empty())
             && from.parse::<lettre::message::Mailbox>().is_err()
@@ -1498,6 +1508,9 @@ impl Config {
         }
         if self.federation_rate_api == 0 {
             problems.push("TAVRN_FEDERATION_RATE_API must be greater than 0".into());
+        }
+        if self.federation_rate_api_per_user == 0 {
+            problems.push("TAVRN_FEDERATION_RATE_API_PER_USER must be greater than 0".into());
         }
         if self.federation_rate_claims == 0 {
             problems.push("TAVRN_FEDERATION_RATE_CLAIMS must be greater than 0".into());
@@ -2022,7 +2035,8 @@ mod tests {
     #[test]
     fn trusted_proxies_are_parsed_and_validated() {
         let c = prod();
-        assert!(c.is_trusted_proxy("172.18.0.2".parse().unwrap()), "the Docker network is trusted by default");
+        assert!(c.is_trusted_proxy("127.0.0.1".parse().unwrap()) && c.is_trusted_proxy("::1".parse().unwrap()));
+        assert!(!c.is_trusted_proxy("172.18.0.2".parse().unwrap()), "only loopback by default (compose lists Docker)");
         assert!(!c.is_trusted_proxy("203.0.113.5".parse().unwrap()));
         let c = Config { trusted_proxies: "203.0.113.5, 2001:db8::/32".into(), ..prod() };
         c.validate().unwrap();
@@ -2701,11 +2715,12 @@ mod tests {
             federation_rate_logins: 0,
             federation_rate_inbox: 0,
             federation_rate_api: 0,
+            federation_rate_api_per_user: 0,
             federation_rate_claims: 0,
             ..prod()
         };
         let err = c.validate().unwrap_err();
-        for var in ["LOGINS", "INBOX", "API", "CLAIMS"] {
+        for var in ["LOGINS", "INBOX", "API", "API_PER_USER", "CLAIMS"] {
             assert!(err.problems.iter().any(|p| p.contains(&format!("TAVRN_FEDERATION_RATE_{var}"))), "{err}");
         }
     }
@@ -3173,8 +3188,38 @@ mod tests {
             ("redis://:pw@valkey:6379/1", "redis://:***@valkey:6379/1"),
             ("sqlite://data-dev/tavrn.db?mode=rwc", "sqlite://data-dev/tavrn.db?mode=rwc"),
             ("sqlite::memory:", "sqlite::memory:"),
+            ("postgres://tavrn@db/tavrn?password=p@ssw0rd", "postgres://tavrn@db/tavrn?password=***"),
+            ("postgres://db?password=p@ss#x", "postgres://db?password=***#x"),
+            ("smtps://mailer:pw@mail.example.org:465", "smtps://mailer:***@mail.example.org:465"),
         ] {
             assert_eq!(redact_url(url), printed, "{url}");
+        }
+    }
+
+    /// An unparsable `TAVRN_SMTP_URL` is named in the error without its password.
+    #[test]
+    fn invalid_smtp_url_is_reported_without_its_password() {
+        let config = Config {
+            domain: "chat.example.org".into(),
+            database_url: "postgres://tavrn:pw@db/tavrn".into(),
+            smtp_url: Some("smtp+tls://mailer:S3cretSmtpPw@mail.example.org:587".into()),
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("TAVRN_SMTP_URL"), "{err}");
+        assert!(!err.to_string().contains("S3cretSmtpPw"), "{err}");
+    }
+
+    /// Only loopback is a trusted proxy by default: on a node reached directly from a private network, clients
+    /// must not choose their rate-limit identity with `X-Forwarded-For`.
+    #[test]
+    fn only_loopback_is_a_trusted_proxy_by_default() {
+        let c = Config::default();
+        let ip = |peer: &str, xff: &str| crate::auth::resolve_client_ip(&c, Some(peer.parse().unwrap()), Some(xff));
+        assert_eq!(ip("127.0.0.1", "203.0.113.7"), "203.0.113.7");
+        assert_eq!(ip("::1", "203.0.113.7"), "203.0.113.7");
+        for lan in ["10.1.2.3", "172.17.0.1", "192.168.1.20", "fd00::5"] {
+            assert_eq!(ip(lan, "203.0.113.7"), lan, "{lan} is not trusted by default");
         }
     }
 }

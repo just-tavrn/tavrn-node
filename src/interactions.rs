@@ -1719,7 +1719,12 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
     {
         return Err(ApiError::Forbidden { code: "room.not_member", detail: "The bot is not a member here".into() });
     }
-    conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
+    // An answer is a message of the bot: the checks of every message (channel kind, blocks, permissions, and for
+    // stored answers slowmode, role mentions and the content rules) apply as to its own posts.
+    msgs::check_writable(state, auth, &conv).await?;
+    if !ephemeral {
+        msgs::check_slowmode(state, &conv, conv.perms, &auth.user.id).await?;
+    }
     let thread = match thread_id.or(info.thread_id.as_deref()) {
         Some(t) => {
             let row = crate::threads::of_conversation(state, &conv, t).await?;
@@ -1730,6 +1735,13 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
     };
     let v = msgs::validate_content(msgs::gif_hosts(state), conv.encrypted, &content, mentions)
         .map_err(as_interaction_error)?;
+    msgs::check_role_mentions(&conv, &v.mentions)?;
+    // Content rules of unencrypted conversations (MODERATION.md §2.2), as for the bot's own messages.
+    let hit =
+        if conv.encrypted || ephemeral { None } else { crate::automod::evaluate(state, &conv, &content, &[]).await? };
+    if let Some(h) = hit.as_ref().filter(|h| h.blocks()) {
+        return Err(crate::automod::blocked(state, &conv, &auth.user, h).await);
+    }
     // A plaintext poll as an answer needs `create_polls` like any poll the node can see (PROTOCOL.md §7g).
     if !conv.encrypted && content.get("type").and_then(Value::as_str) == Some(crate::polls::POLL_TYPE) {
         conv.require(p::CREATE_POLLS, "message.poll_forbidden", "Create polls")?;
@@ -1789,11 +1801,24 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
     let envelope = serde_json::to_string(&info.envelope()).map_err(|e| ApiError::Internal(e.into()))?;
     store::messages::set_interaction(&state.db, &id, &envelope).await?;
     let message = msgs::enrich_one(state, &auth.user.id, &id).await?;
+    // `delete` and `timeout` rules: accepted, but never shown to anyone else.
+    if let Some(h) = &hit {
+        crate::automod::remove(state, &conv, &auth.user, h, &id).await?;
+        return Ok(Ack::Reply(Box::new(message)));
+    }
+    if let ConvKind::Channel { access, channel } = &conv.kind
+        && let Some(alert) = msgs::automod_check(state, access, channel, &auth.user).await?
+    {
+        return Err(alert);
+    }
     if let Some(t) = &thread {
         crate::threads::after_message(state, &t.id, &message).await?;
     }
     conv.publish_recorded(state, "message.create", &message).await;
     crate::federation::social::notify_members(state, &conv, &message, &auth.user.id).await;
+    if !conv.encrypted {
+        crate::search::index(state, &message, matches!(conv.kind, ConvKind::Channel { .. })).await;
+    }
     Ok(Ack::Reply(Box::new(message)))
 }
 

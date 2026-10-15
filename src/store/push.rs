@@ -88,8 +88,10 @@ pub async fn upsert(db: &Pool, s: NewSubscription<'_>) -> Result<Upsert, ApiErro
     let (id, created) = match existing {
         Some((id, _, _)) => {
             sqlx::query(
-                "UPDATE push_subscriptions SET user_id = $1, device_id = $2, p256dh = $3, auth = $4, expires_at = $5,
-                 failures = 0, retry_at = NULL WHERE id = $6",
+                "UPDATE push_subscriptions SET device_id = $2, p256dh = $3, auth = $4, expires_at = $5,
+                 failures = CASE WHEN user_id = $1 THEN failures ELSE 0 END,
+                 retry_at = CASE WHEN user_id = $1 THEN retry_at ELSE NULL END, user_id = $1
+                 WHERE id = $6",
             )
             .bind(s.user_id)
             .bind(s.device_id)

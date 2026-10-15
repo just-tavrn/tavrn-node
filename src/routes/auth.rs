@@ -277,6 +277,14 @@ pub async fn login(
     // Every attempt counts per address; per account only failed attempts count (below), so nobody can lock an
     // account out by signing in as it, and a valid device proof passes even a locked account key.
     state.login_limiter.check_all(&[format!("ip:{ip}")]).await?;
+    // A name no account can have is refused before it is looked up or counted as an account key: the per-account
+    // limit never keeps names of an attacker's choosing.
+    if !util::valid_username(&username) {
+        return Err(bad(
+            "auth.username_invalid",
+            "Username: 2–32 characters from a-z, 0-9, _ . -, starting with a letter or digit",
+        ));
+    }
     // TAVRN_OIDC_ONLY: only the break-glass accounts of TAVRN_ADMIN_USERS sign in with a password.
     crate::oidc::check_password_login(&state.config, &username)?;
     state.captcha.check(state.config.captcha_required(CaptchaAction::Login), req.captcha_token.as_deref(), &ip).await?;

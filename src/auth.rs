@@ -378,6 +378,8 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
         {
             return Err(invalid("auth.token_invalid"));
         }
+        // The user's own share first: requests it refuses do not use up the budget of the whole domain.
+        state.federation_user_api_limiter.check_all(&[format!("user:{}", user.id)])?;
         state.federation_api_limiter.check_all(&[format!("domain:{}", user.domain)])?;
         let app = if user.is_bot() {
             Some(crate::applications::remote_principal(state, &mut user, &extra.dev).await?)
@@ -536,11 +538,23 @@ pub fn normalize_key(key: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(key)
 }
 
+/// The key a limiter stores for `key`: client addresses normalised ([`normalize_key`]), keys longer than
+/// [`MAX_KEY_LEN`] (they may carry user input such as a username) as their SHA-256, so no request makes a limiter
+/// keep more than a small fixed size per key.
+pub fn limiter_key(key: &str) -> std::borrow::Cow<'_, str> {
+    let key = normalize_key(key);
+    if key.len() > MAX_KEY_LEN { std::borrow::Cow::Owned(crate::util::sha256_b64(&key)) } else { key }
+}
+
 /// Keys above this count make the limiter sweep expired windows (at most once per [`SWEEP_INTERVAL`]).
 const SWEEP_ABOVE: usize = 10_000;
 /// Hard bound of a limiter's map: when even live windows fill it, keys that are not over their limit are dropped.
 const MAX_KEYS: usize = 100_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// Absolute bound of a limiter's map, also between sweeps: a new key beyond it is refused until a sweep makes room.
+const HARD_MAX_KEYS: usize = 2 * MAX_KEYS;
+/// Keys longer than this (they may carry user input such as a username) are stored as their SHA-256.
+pub const MAX_KEY_LEN: usize = 128;
 
 /// Simple counter per key in a fixed window. Sufficient for a single instance;
 /// multiple instances will use Valkey (phase 5).
@@ -561,7 +575,7 @@ impl RateLimiter {
     }
 
     /// Lazy eviction: expired windows go at most once per second, never on every call; a map full of live windows
-    /// keeps only the keys that are over their limit.
+    /// keeps only the keys that are at or over their limit.
     fn sweep(&self, hits: &mut Hits, now: Instant) {
         if hits.map.len() <= SWEEP_ABOVE || now.duration_since(hits.swept) < SWEEP_INTERVAL {
             return;
@@ -569,16 +583,22 @@ impl RateLimiter {
         hits.swept = now;
         hits.map.retain(|_, (_, start)| now.duration_since(*start) < self.window);
         if hits.map.len() >= MAX_KEYS {
-            hits.map.retain(|_, (n, _)| *n > self.max);
+            // Keys at their limit are locked (`peek` refuses them): they stay, only keys below it go.
+            hits.map.retain(|_, (n, _)| *n >= self.max);
         }
     }
 
     /// `Ok(())` or `Err(seconds until the next attempt)`.
     pub fn check(&self, key: &str) -> Result<(), u32> {
-        let key = normalize_key(key);
+        let key = limiter_key(key);
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         self.sweep(&mut hits, now);
+        // Full even after the sweep (every key in it is locked or the sweep is not due): a new key is refused, not
+        // stored, until a sweep makes room.
+        if hits.map.len() >= HARD_MAX_KEYS && !hits.map.contains_key(key.as_ref()) {
+            return Err(1);
+        }
         let entry = hits.map.entry(key.into_owned()).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
             *entry = (0, now);
@@ -594,7 +614,7 @@ impl RateLimiter {
 
     /// Like [`RateLimiter::check`] without counting: `Err(seconds)` while `key` is over its limit.
     pub fn peek(&self, key: &str) -> Result<(), u32> {
-        let key = normalize_key(key);
+        let key = limiter_key(key);
         let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         match hits.map.get(key.as_ref()) {
@@ -643,9 +663,11 @@ mod tests {
 
     #[test]
     fn client_ip_resolution_resists_spoofing() {
+        // The proxies of a Docker setup (the compose file lists Docker's private ranges).
         let config = crate::config::Config {
             domain: "x".into(),
             database_url: "postgres://x".into(),
+            trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12".into(),
             ..crate::config::Config::default()
         };
         let ip = |s: &str| s.parse::<std::net::IpAddr>().ok();
@@ -694,8 +716,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1100));
         let _ = rl.check("fresh");
         assert_eq!(rl.len(), 1, "expired windows go in one sweep");
-        // A map full of live windows keeps only the keys over their limit.
-        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        // A map full of live windows keeps only the keys at or over their limit.
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
         let _ = rl.check("blocked");
         let _ = rl.check("blocked");
         for i in 0..MAX_KEYS {
@@ -705,6 +727,50 @@ mod tests {
         let _ = rl.check("next");
         assert!(rl.len() <= 2, "{}", rl.len());
         assert!(rl.peek("blocked").is_err(), "a blocked key stays blocked");
+    }
+
+    /// A key AT its limit is locked (`peek` refuses); the overflow sweep of a full map keeps it.
+    #[test]
+    fn overflow_sweep_keeps_locked_keys() {
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        let _ = rl.check("user:victim");
+        let _ = rl.check("user:victim");
+        assert!(rl.peek("user:victim").is_err(), "locked at the limit");
+        for i in 0..MAX_KEYS {
+            let _ = rl.check(&format!("k{i}"));
+        }
+        rl.hits.lock().unwrap().swept = Instant::now() - SWEEP_INTERVAL;
+        let _ = rl.check("next");
+        assert!(rl.peek("user:victim").is_err(), "the locked key survived the sweep");
+    }
+
+    /// Keys carry user input (a username): long ones are stored as a fixed-size hash, and still count as themselves.
+    #[test]
+    fn long_keys_are_stored_hashed() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        let long = format!("user:{}", "a".repeat(64 * 1024));
+        assert!(rl.check(&long).is_ok());
+        assert!(rl.check(&long).is_err(), "the same long key counts twice");
+        assert!(rl.peek(&long).is_err());
+        let other = format!("user:{}b", "a".repeat(64 * 1024 - 1));
+        assert!(rl.check(&other).is_ok(), "a different long key is a different key");
+        let stored = rl.hits.lock().unwrap().map.keys().map(String::len).max().unwrap();
+        assert!(stored <= MAX_KEY_LEN, "{stored} bytes stored");
+    }
+
+    /// The map never grows beyond its hard bound, even when every key in it is locked: new keys are then refused
+    /// until a sweep makes room.
+    #[test]
+    fn the_number_of_keys_is_bounded() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        for i in 0..HARD_MAX_KEYS + 10 {
+            let k = format!("k{i}");
+            let _ = rl.check(&k);
+            let _ = rl.check(&k);
+        }
+        assert!(rl.len() <= HARD_MAX_KEYS, "{}", rl.len());
+        assert!(rl.check("fresh").is_err(), "no room for a new key: refused, not unbounded");
+        assert!(rl.peek("k0").is_err(), "locked keys stay locked");
     }
 
     #[test]

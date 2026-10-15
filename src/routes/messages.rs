@@ -400,7 +400,7 @@ async fn check_body_emojis(state: &AppState, conv: &Conv, content: &Value) -> Re
 
 /// Role mentions (`role:<id>`): only in room channels, only roles of the room, and roles that are not
 /// mentionable only with `mention_everyone`.
-fn check_role_mentions(conv: &Conv, mentions: &[String]) -> Result<(), ApiError> {
+pub(crate) fn check_role_mentions(conv: &Conv, mentions: &[String]) -> Result<(), ApiError> {
     let roles: Vec<&str> = mentions.iter().filter_map(|m| m.strip_prefix("role:")).collect();
     if roles.is_empty() {
         return Ok(());
@@ -590,17 +590,10 @@ pub(crate) async fn check_direct_write(state: &AppState, auth: &AuthUser, conv: 
     Ok(())
 }
 
-/// Writes a message into `conv` or one of its threads.
-pub(crate) async fn create_in(
-    state: &AppState,
-    auth: &AuthUser,
-    conv: &Conv,
-    req: CreateMessageRequest,
-) -> Result<(StatusCode, Json<Message>), ApiError> {
-    // Bots: 5 messages per 5 seconds and conversation (APPLICATIONS.md §2.7).
-    if auth.user.is_bot() {
-        state.bot_message_limiter.check_all(&[format!("bot-msg:{}:{}", auth.user.id, conv.id)])?;
-    }
+/// Where a message may be written, whoever writes it (the message routes, a bot's interaction reply or follow-up):
+/// a member of a text channel, no block between the members of a DM, no pending message request, `view_channel`
+/// and `send_messages`.
+pub(crate) async fn check_writable(state: &AppState, auth: &AuthUser, conv: &Conv) -> Result<(), ApiError> {
     if let ConvKind::Channel { access, channel } = &conv.kind {
         if access.member.is_none() {
             return Err(ApiError::Forbidden { code: "room.not_member", detail: "Only members can write".into() });
@@ -625,8 +618,38 @@ pub(crate) async fn create_in(
             detail: "Accept the message request first, then reply".into(),
         });
     }
+    conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")
+}
+
+/// The channel's slowmode for a stored message of `user_id` (members with `manage_messages` are exempt).
+pub(crate) async fn check_slowmode(state: &AppState, conv: &Conv, perms: u64, user_id: &str) -> Result<(), ApiError> {
+    if let ConvKind::Channel { channel, .. } = &conv.kind
+        && channel.slowmode_secs > 0
+        && !p::has(perms, p::MANAGE_MESSAGES)
+        && let Some(last) = store::messages::last_created_by_author(&state.db, &conv.id, user_id).await?
+        && let Some(last_t) = util::parse_time(&last)
+    {
+        let elapsed = (chrono::Utc::now() - last_t).num_seconds();
+        if elapsed < channel.slowmode_secs {
+            return Err(ApiError::RateLimited { retry_after_secs: (channel.slowmode_secs - elapsed) as u32 });
+        }
+    }
+    Ok(())
+}
+
+/// Writes a message into `conv` or one of its threads.
+pub(crate) async fn create_in(
+    state: &AppState,
+    auth: &AuthUser,
+    conv: &Conv,
+    req: CreateMessageRequest,
+) -> Result<(StatusCode, Json<Message>), ApiError> {
+    // Bots: 5 messages per 5 seconds and conversation (APPLICATIONS.md §2.7).
+    if auth.user.is_bot() {
+        state.bot_message_limiter.check_all(&[format!("bot-msg:{}:{}", auth.user.id, conv.id)])?;
+    }
+    check_writable(state, auth, conv).await?;
     let perms = conv.perms;
-    conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES, "message.send_forbidden", "Send messages")?;
     // Threads, forum and announcement channels (PROTOCOL.md §7e).
     let thread = match &req.thread_id {
         Some(t) => Some(crate::threads::of_conversation(state, conv, t).await?),
@@ -636,17 +659,7 @@ pub(crate) async fn create_in(
     if req.mentions_everyone {
         conv.require(p::MENTION_EVERYONE, "message.mention_everyone_forbidden", "Mention @everyone")?;
     }
-    if let ConvKind::Channel { channel, .. } = &conv.kind
-        && channel.slowmode_secs > 0
-        && !p::has(perms, p::MANAGE_MESSAGES)
-        && let Some(last) = store::messages::last_created_by_author(&state.db, &conv.id, &auth.user.id).await?
-        && let Some(last_t) = util::parse_time(&last)
-    {
-        let elapsed = (chrono::Utc::now() - last_t).num_seconds();
-        if elapsed < channel.slowmode_secs {
-            return Err(ApiError::RateLimited { retry_after_secs: (channel.slowmode_secs - elapsed) as u32 });
-        }
-    }
+    check_slowmode(state, conv, perms, &auth.user.id).await?;
     if let Some(reply) = &req.reply_to_id {
         match store::messages::by_id(&state.db, reply).await? {
             Some(m) if m.conversation_id == conv.id => {}
@@ -771,7 +784,7 @@ pub(crate) async fn create_in(
 
 /// Detects message floods from metadata (works with E2EE too): deletes the burst, sets a timeout and
 /// informs moderators and node admins.
-async fn automod_check(
+pub(crate) async fn automod_check(
     state: &AppState,
     access: &access::RoomAccess,
     channel: &ChannelRow,
@@ -796,7 +809,9 @@ async fn automod_check(
     let deleted = purge_with_blobs(state, &filter).await?;
     let minutes = i64::from(state.config.automod_timeout_minutes);
     let until = (minutes > 0).then(|| util::in_seconds(minutes * 60));
-    store::rooms::set_timeout(&state.db, &access.room.id, &user.id, until.as_deref()).await?;
+    if until.is_some() {
+        crate::routes::rooms::set_timeout_announced(state, &access.room.id, &user.id, until.as_deref()).await?;
+    }
     store::rooms::audit(&state.db, Some(&access.room.id), None, "automod.spam", &user.address(), "Message flood", serde_json::json!({ "channel_id": channel.id, "deleted": deleted, "window_secs": AUTOMOD_WINDOW_SECS, "timeout_minutes": minutes })).await?;
     state.hub.room(&access.room.id, "message.purge", serde_json::json!({ "room_id": access.room.id, "conversation_ids": [channel.id], "author_id": user.id, "from": since, "to": Value::Null, "deleted": deleted }));
     let mut recipients = store::rooms::moderator_ids(&state.db, &access.room.id).await?;

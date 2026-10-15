@@ -680,11 +680,38 @@ pub async fn can_see(state: &AppState, user: &UserRow, row: &ReportRow) -> Resul
     if row.scope != "room" || row.target_user_id.as_deref() == Some(user.id.as_str()) {
         return Ok(false);
     }
+    // A bot never sees the reports about its owner or the owner's other bots, as its owner would not (§1.4a).
+    if user.is_bot() && about_owner_of(state, user, row).await? {
+        return Ok(false);
+    }
     let Some(room_id) = row.room_id.as_deref() else { return Ok(false) };
     match access::room_access(state, room_id, user).await {
         Ok(a) => Ok(a.member.is_some() && a.has(p::MODERATE_MEMBERS)),
         Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// The address of a bot's owner (`None` when it cannot be told).
+async fn owner_address(state: &AppState, bot: &UserRow) -> Result<Option<String>, ApiError> {
+    if let Some(address) = &bot.owner_address {
+        return Ok(Some(address.to_ascii_lowercase()));
+    }
+    let Some(owner_id) = &bot.owner_id else { return Ok(None) };
+    Ok(store::users::by_id(&state.db, owner_id).await?.map(|o| o.address().to_ascii_lowercase()))
+}
+
+/// Is the report about the owner of `bot`, or about another bot of the same owner? Fails closed: a bot whose owner
+/// cannot be told counts as the owner's.
+async fn about_owner_of(state: &AppState, bot: &UserRow, row: &ReportRow) -> Result<bool, ApiError> {
+    let Some(owner) = owner_address(state, bot).await? else { return Ok(true) };
+    if row.target_address.to_ascii_lowercase() == owner {
+        return Ok(true);
+    }
+    let Some(target_id) = &row.target_user_id else { return Ok(false) };
+    match store::users::by_id(&state.db, target_id).await? {
+        Some(target) if target.is_bot() => Ok(owner_address(state, &target).await?.is_none_or(|o| o == owner)),
+        _ => Ok(false),
     }
 }
 
@@ -900,9 +927,15 @@ pub async fn page(state: &AppState, filter: ListFilter, limit: i64) -> Result<Re
 pub async fn app_page(
     state: &AppState,
     bot: &UserRow,
-    filter: ListFilter,
+    mut filter: ListFilter,
     limit: i64,
 ) -> Result<AppReportList, ApiError> {
+    // Never the reports about the bot's owner or the owner's other bots (§1.4a); an owner that cannot be told
+    // leaves nothing to show.
+    let Some(owner) = owner_address(state, bot).await? else {
+        return Ok(AppReportList { reports: Vec::new(), open: 0 });
+    };
+    filter.exclude_owner = Some((owner, bot.owner_id.clone()));
     let list = page(state, filter, limit).await?;
     let reports = list.reports.into_iter().map(|r| AppReport::for_app_token(state, bot, r)).collect();
     Ok(AppReportList { reports, open: list.open })

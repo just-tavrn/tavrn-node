@@ -90,7 +90,8 @@ pub fn verify(cluster: &Cluster, value: &str, method: &str, path: &str) -> bool 
     let mut parts = value.splitn(3, ';');
     let (Some(instance), Some(at), Some(tag)) = (parts.next(), parts.next(), parts.next()) else { return false };
     let (Ok(at), Ok(tag)) = (at.parse::<i64>(), URL_SAFE_NO_PAD.decode(tag)) else { return false };
-    if !crate::cache::valid_instance_id(instance) || (crate::jwt::now_unix() - at).abs() > MAX_AGE_SECS {
+    // `at` comes from the request: compared without arithmetic that could overflow on extreme values.
+    if !crate::cache::valid_instance_id(instance) || crate::jwt::now_unix().abs_diff(at) > MAX_AGE_SECS.unsigned_abs() {
         return false;
     }
     relay_mac(cluster, instance, method, path, at).verify_slice(&tag).is_ok()
@@ -290,6 +291,19 @@ mod tests {
         for forged in [a.instance_id.clone(), String::new(), format!("{head};"), format!("{head};AAAA"), "a;b;c".into()]
         {
             assert!(!verify(&a, &forged, "POST", path), "{forged}");
+        }
+    }
+
+    /// Times at the ends of the `i64` range are refused, never a panic (the mark comes from the client).
+    #[test]
+    fn extreme_relay_times_are_refused() {
+        let a = Cluster::standalone("x.test", &[7u8; 32]);
+        for at in [i64::MIN, i64::MAX, i64::MIN + 1] {
+            let mark = format!("i1;{at};AAAA");
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                verify(&a, &mark, "POST", "/api/v1/voice/webhook")
+            }));
+            assert_eq!(ok.ok(), Some(false), "{mark}");
         }
     }
 

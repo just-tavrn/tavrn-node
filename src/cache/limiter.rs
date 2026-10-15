@@ -13,9 +13,6 @@ use crate::{auth::RateLimiter, error::ApiError};
 
 use super::Cluster;
 
-/// Keys longer than this are hashed (they may carry user input such as a username).
-const MAX_KEY: usize = 128;
-
 pub struct SharedLimiter {
     name: &'static str,
     max: u32,
@@ -52,10 +49,9 @@ impl SharedLimiter {
         }
     }
 
-    /// The key in the cache: client addresses normalised (`auth::normalize_key`), long keys hashed.
+    /// The key in the cache: client addresses normalised, long keys hashed (`auth::limiter_key`).
     fn cache_key(&self, key: &str) -> String {
-        let key = crate::auth::normalize_key(key);
-        if key.len() > MAX_KEY { crate::util::sha256_b64(&key) } else { key.into_owned() }
+        crate::auth::limiter_key(key).into_owned()
     }
 
     /// Like [`SharedLimiter::check`] without counting: `Err(seconds)` while `key` is at or over its limit.

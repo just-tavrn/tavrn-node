@@ -95,6 +95,49 @@ async fn upload_limits(
     Ok((e.upload_max_bytes(&state.config), e.limit(entitlements::STORAGE_MAX_BYTES_PER_ROOM)))
 }
 
+/// Bytes held by uploads that are still streaming, per quota scope (`<domain>|room:<id>` or `<domain>|dm:<id>`):
+/// each upload reserves what it may still write before its body arrives, so uploads running at the same time on
+/// this instance cannot all count on the same free space. (Across instances the usage is checked again once the
+/// file is stored.)
+static RESERVED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// An upload's share of [`RESERVED`], given back when it ends (stored, refused or aborted).
+pub(crate) struct Reservation {
+    scope: String,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = reserved.get_mut(&self.scope) {
+            *n = n.saturating_sub(self.bytes);
+            if *n == 0 {
+                reserved.remove(&self.scope);
+            }
+        }
+    }
+}
+
+/// What an upload may still write in `scope` under `quota` with `usage` stored (`None` = no quota), after the
+/// uploads still streaming there; reserves `min(left, max, declared)` of it until the returned guard is dropped.
+pub(crate) fn reserve(
+    scope: String,
+    quota: Option<i64>,
+    usage: i64,
+    max: u64,
+    declared: Option<u64>,
+) -> (Reservation, Option<u64>) {
+    let Some(quota) = quota else { return (Reservation { scope, bytes: 0 }, None) };
+    let mut reserved = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let held = reserved.get(&scope).copied().unwrap_or(0);
+    let left = u64::try_from(quota.saturating_sub(usage)).unwrap_or(0).saturating_sub(held);
+    let bytes = left.min(max).min(declared.unwrap_or(u64::MAX));
+    *reserved.entry(scope.clone()).or_insert(0) += bytes;
+    (Reservation { scope, bytes }, Some(left))
+}
+
 fn too_large(max: u64) -> ApiError {
     ApiError::PayloadTooLarge {
         code: "upload.too_large",
@@ -132,7 +175,11 @@ async fn upload_in(
         detail: "The storage quota of this room is exhausted".into(),
         meta: serde_json::json!({ "quota_bytes": quota, "used_bytes": usage }),
     };
-    let remaining = quota.map(|q| u64::try_from(q.saturating_sub(usage)).unwrap_or(0));
+    let scope = match room_id {
+        Some(room_id) => format!("{}|room:{room_id}", cfg.domain),
+        None => format!("{}|dm:{}", cfg.domain, conv.id),
+    };
+    let (_reservation, remaining) = reserve(scope, quota, usage, max, declared);
     if remaining.is_some_and(|left| declared.unwrap_or(1) > left) {
         return Err(quota_exceeded());
     }
@@ -220,6 +267,18 @@ async fn upload_in(
             return Err(e);
         }
     };
+    // Uploads on other instances reserve nothing here: the stored usage decides once the file is in.
+    if let Some(q) = quota {
+        let usage = match room_id {
+            Some(room_id) => store::blobs::room_usage(&state.db, room_id).await?,
+            None => store::blobs::conversation_usage(&state.db, &conv.id).await?,
+        };
+        if usage > q {
+            store::blobs::delete_rows(&state.db, std::slice::from_ref(&id)).await?;
+            state.storage.delete(&id).await;
+            return Err(quota_exceeded());
+        }
+    }
     state.metrics.upload_bytes.inc_by(size as u64);
     Ok((StatusCode::CREATED, Json(blob.to_api())))
 }

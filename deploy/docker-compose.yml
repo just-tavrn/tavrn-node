@@ -33,6 +33,9 @@ services:
       # Peer directory (docs/HANDBOOK.md "Getting listed in the directory"): empty by default (not listed anywhere);
       # TAVRN_REFERENCE_NODES=tavrn.org (the .env.example default) lists the node in the official directory; empty = none.
       TAVRN_REFERENCE_NODES: ${TAVRN_REFERENCE_NODES-}
+      # The port above is published on 127.0.0.1 only: the host's reverse proxy reaches the node through Docker's
+      # gateway address, so Docker's private ranges count as proxies here (the node's own default is loopback only).
+      TAVRN_TRUSTED_PROXIES: ${TAVRN_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,172.16.0.0/12,192.168.0.0/16,fc00::/7}
     volumes:
       - ./data:/data
     depends_on:

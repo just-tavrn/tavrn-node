@@ -141,19 +141,76 @@ fn occurrences(text: &str, part: &str) -> Vec<usize> {
     out
 }
 
-/// For every byte position, the position of the next whitespace character at or after it (or the text's end).
-fn next_whitespace(text: &str) -> Vec<usize> {
-    let mut out = vec![text.len(); text.len() + 1];
-    let mut next = text.len();
+/// The runs of non-space characters of a text, per byte position: `next[i]` is the position of the next
+/// whitespace character at or after `i` (or the text's end), `start[i]` the position after the last whitespace
+/// character before `i` (or 0).
+struct Runs {
+    next: Vec<usize>,
+    start: Vec<usize>,
+}
+
+fn runs(text: &str) -> Runs {
+    let mut next = vec![text.len(); text.len() + 1];
+    let mut at = text.len();
     for (i, c) in text.char_indices().rev() {
         if c.is_whitespace() {
-            next = i;
+            at = i;
         }
-        for slot in out.iter_mut().skip(i).take(c.len_utf8()) {
-            *slot = next;
+        for slot in next.iter_mut().skip(i).take(c.len_utf8()) {
+            *slot = at;
         }
     }
-    out
+    let mut start = vec![0; text.len() + 1];
+    let mut from = 0;
+    for (i, c) in text.char_indices() {
+        for slot in start.iter_mut().skip(i).take(c.len_utf8()) {
+            *slot = from;
+        }
+        if c.is_whitespace() {
+            from = i + c.len_utf8();
+        }
+    }
+    start[text.len()] = from;
+    Runs { next, start }
+}
+
+/// The work [`Terms::find_within`] may do for one message (a unit is a tried start of a term or an occurrence of
+/// a literal): enough for any ordinary message against the largest rule set, a bound for crafted ones.
+pub const MATCH_BUDGET: u64 = 2_000_000;
+
+/// What is left of [`MATCH_BUDGET`] while one message is checked.
+#[derive(Debug)]
+pub struct Budget {
+    left: std::cell::Cell<u64>,
+}
+
+impl Budget {
+    pub fn new(units: u64) -> Self {
+        Self { left: std::cell::Cell::new(units) }
+    }
+
+    /// Unlimited (node lists, tests).
+    fn unlimited() -> Self {
+        Self::new(u64::MAX)
+    }
+
+    /// Takes `n` units; `false` (and nothing left) when they are not there.
+    fn spend(&self, n: u64) -> bool {
+        match self.left.get().checked_sub(n) {
+            Some(left) => {
+                self.left.set(left);
+                true
+            }
+            None => {
+                self.left.set(0);
+                false
+            }
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.left.get() == 0
+    }
 }
 
 /// The earliest position in the sorted `list` that is at least `from` and at most `until`.
@@ -171,7 +228,7 @@ fn earliest(list: &[usize], from: usize, until: usize) -> Option<usize> {
 /// blow up.
 pub fn term_matches(text: &str, parts: &[String], whole_word: bool) -> bool {
     let ws = std::cell::OnceCell::new();
-    matches_with(text, parts, whole_word, &|_, lit| Cow::Owned(occurrences(text, lit)), &ws)
+    matches_with(text, parts, whole_word, &|_, lit| Cow::Owned(occurrences(text, lit)), &ws, &Budget::unlimited())
 }
 
 /// [`term_matches`] with the occurrences of the term's `j`-th literal given by `occurrences_of` (one automaton pass
@@ -182,7 +239,8 @@ fn matches_with<'a>(
     parts: &[String],
     whole_word: bool,
     occurrences_of: &dyn Fn(usize, &str) -> Cow<'a, [usize]>,
-    ws: &std::cell::OnceCell<Vec<usize>>,
+    ws: &std::cell::OnceCell<Runs>,
+    budget: &Budget,
 ) -> bool {
     let literals: Vec<&str> = parts.iter().map(String::as_str).filter(|p| !p.is_empty()).collect();
     let Some(first) = literals.first() else { return false };
@@ -210,16 +268,38 @@ fn matches_with<'a>(
     if literals.len() == 1 {
         return true;
     }
-    let ws = ws.get_or_init(|| next_whitespace(text));
-    'starts: for &start in lists[0].iter() {
+    let runs = ws.get_or_init(|| runs(text));
+    // Literals after a `*` contain no spaces, so a term's match after its first literal lies in one run of non-space
+    // characters, and the positions the chain takes never decrease with the start: a chain that fails at literal `j`
+    // fails for every later start whose first literal ends before the run of literal `j`'s next occurrence. Those
+    // starts are skipped, so crafted texts (a long run of the first literal) cost a step per run, not per start.
+    let skip = literals[1..].iter().all(|l| !l.contains(char::is_whitespace));
+    let starts = &lists[0];
+    let mut i = 0;
+    while let Some(&start) = starts.get(i) {
+        if !budget.spend(1) {
+            return false;
+        }
         let mut pos = start + first.len();
+        let mut failed = None;
         for j in 1..literals.len() {
-            match earliest(&lists[j], pos, ws[pos]) {
+            match earliest(&lists[j], pos, runs.next[pos]) {
                 Some(at) => pos = at + literals[j].len(),
-                None => continue 'starts,
+                None => {
+                    failed = Some((j, pos));
+                    break;
+                }
             }
         }
-        return true;
+        let Some((j, pos)) = failed else { return true };
+        if !skip {
+            i += 1;
+            continue;
+        }
+        // The next occurrence of literal `j` at or after `pos`: none, and no later start can match.
+        let Some(&next) = lists[j].get(lists[j].partition_point(|&p| p < pos)) else { return false };
+        let from = runs.start[next].saturating_sub(first.len());
+        i = starts.partition_point(|&p| p < from).max(i + 1);
     }
     false
 }
@@ -358,6 +438,11 @@ impl Terms {
 
     /// The first term found in the normalized `text`.
     pub fn find(&self, text: &str) -> Option<String> {
+        self.find_within(text, &Budget::unlimited())
+    }
+
+    /// [`Terms::find`] within `budget`: `None` once it is used up ([`Budget::exhausted`] tells).
+    pub fn find_within(&self, text: &str, budget: &Budget) -> Option<String> {
         if !self.exact.is_empty() {
             for word in text.split(|c: char| !is_word(c)).filter(|w| !w.is_empty()) {
                 if self.exact.contains(word) {
@@ -379,6 +464,9 @@ impl Terms {
         // Every occurrence (overlapping ones included) of every literal, in one pass.
         let mut found: Vec<Vec<usize>> = vec![Vec::new(); self.literals];
         for m in automaton.find_overlapping_iter(text) {
+            if !budget.spend(1) {
+                return None;
+            }
             found[m.pattern().as_usize()].push(m.start());
         }
         for list in &mut found {
@@ -388,7 +476,14 @@ impl Terms {
             .iter()
             .find(|p| {
                 p.ids.iter().all(|&id| !found[id].is_empty())
-                    && matches_with(text, &p.parts, self.whole_word, &|j, _| Cow::Borrowed(&found[p.ids[j]]), &ws)
+                    && matches_with(
+                        text,
+                        &p.parts,
+                        self.whole_word,
+                        &|j, _| Cow::Borrowed(&found[p.ids[j]]),
+                        &ws,
+                        budget,
+                    )
             })
             .map(|p| p.term.clone())
     }
@@ -423,9 +518,9 @@ fn find_link(texts: &[String], mode: Links, domains: &[String]) -> Option<Matche
     None
 }
 
-fn find_in(texts: &[String], terms: &Terms, links: Links, domains: &[String]) -> Option<Matched> {
+fn find_in(texts: &[String], terms: &Terms, links: Links, domains: &[String], budget: &Budget) -> Option<Matched> {
     if !terms.is_empty()
-        && let Some(value) = texts.iter().find_map(|t| terms.find(t))
+        && let Some(value) = texts.iter().find_map(|t| terms.find_within(t, budget))
     {
         return Some(Matched { kind: "word", value });
     }
@@ -438,11 +533,24 @@ struct Compiled {
     rule: AutomodRule,
     terms: Terms,
     links: Links,
+    /// The rank of the rules' author ([`Document`]): `delete` and `timeout` act only on members ranked below it.
+    author_rank: Option<i64>,
 }
 
 impl Compiled {
     fn new(rule: AutomodRule) -> Self {
-        Self { terms: Terms::new(&rule.terms, rule.whole_word), links: Links::parse(&rule.links), rule }
+        Self {
+            terms: Terms::new(&rule.terms, rule.whole_word),
+            links: Links::parse(&rule.links),
+            rule,
+            author_rank: None,
+        }
+    }
+
+    /// A `delete` or `timeout` rule acts on a member only when its author outranks them, as a moderator's own
+    /// action would (permissions.md "Hierarchy"); `block` rules filter everyone's messages.
+    fn reaches(&self, rank: i64) -> bool {
+        self.rule.action == "block" || self.author_rank.is_none_or(|author| author > rank)
     }
 }
 
@@ -560,7 +668,32 @@ pub async fn room_rules(state: &AppState, room_id: &str) -> Result<Vec<AutomodRu
 }
 
 fn parse_rules(raw: &str) -> Vec<AutomodRule> {
-    serde_json::from_str(raw).unwrap_or_default()
+    parse_document(raw).0
+}
+
+/// The stored document of a room's rules: `{"author_rank": …, "rules": […]}` (or a bare list, written before the
+/// rank was recorded).
+#[derive(Debug, Serialize, Deserialize)]
+struct Document {
+    /// The highest role position of the member who last wrote the rules (`i64::MAX` for the owner or a node admin).
+    #[serde(default)]
+    author_rank: Option<i64>,
+    #[serde(default)]
+    rules: Vec<AutomodRule>,
+}
+
+/// The rules and the rank of their author ([`Document`]); `None` for a list stored without it.
+fn parse_document(raw: &str) -> (Vec<AutomodRule>, Option<i64>) {
+    if let Ok(rules) = serde_json::from_str::<Vec<AutomodRule>>(raw) {
+        return (rules, None);
+    }
+    serde_json::from_str::<Document>(raw).map(|d| (d.rules, d.author_rank)).unwrap_or_default()
+}
+
+/// The document [`parse_document`] reads: the rules with the rank of the member who writes them (`top_position`).
+pub fn encode_rules(rules: &[AutomodRule], author_rank: i64) -> Result<String, ApiError> {
+    serde_json::to_string(&json!({ "author_rank": author_rank, "rules": rules }))
+        .map_err(|e| ApiError::Internal(e.into()))
 }
 
 /// The compiled rules of a room, shared between messages (parsing and compiling 20 rules × 500 terms per message
@@ -603,8 +736,10 @@ async fn compiled_rules(state: &AppState, room_id: &str) -> Result<Arc<Vec<Compi
         hit.checked = Instant::now();
         return Ok(hit.rules.clone());
     }
-    let rules: Arc<Vec<Compiled>> =
-        Arc::new(parse_rules(&raw).into_iter().filter(|r| r.enabled).map(Compiled::new).collect());
+    let (rules, author_rank) = parse_document(&raw);
+    let rules: Arc<Vec<Compiled>> = Arc::new(
+        rules.into_iter().filter(|r| r.enabled).map(|r| Compiled { author_rank, ..Compiled::new(r) }).collect(),
+    );
     let mut cache = rule_cache();
     if cache.len() >= MAX_CACHED_ROOMS {
         cache.clear();
@@ -752,7 +887,7 @@ impl NodeFilter {
     pub fn find(&self, texts: &[String]) -> Option<Matched> {
         let lists = self.read();
         let links = if lists.domains.is_empty() { Links::Off } else { Links::BlockList };
-        find_in(texts, &lists.terms, links, &lists.domains)
+        find_in(texts, &lists.terms, links, &lists.domains, &Budget::unlimited())
     }
 }
 
@@ -849,24 +984,67 @@ pub async fn evaluate(
         return Ok(None);
     }
     let rules = compiled_rules(state, &access.room.id).await?;
-    for c in rules.iter() {
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    let channel_id = channel.id.clone();
+    let role_ids: Vec<String> = access.member_roles.iter().map(|r| r.id.clone()).collect();
+    let rank = access.top_position();
+    // Matching is CPU work bounded by `MATCH_BUDGET`: off the request threads.
+    let found = tokio::task::spawn_blocking(move || match_room_rules(&rules, &texts, &channel_id, &role_ids, rank))
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    match found {
+        RoomMatch::None => Ok(None),
+        RoomMatch::Hit(hit) => Ok(Some(hit)),
+        // A message that needs more matching work than any ordinary one is refused, not let through unchecked.
+        RoomMatch::TooComplex(rule) => Err(ApiError::ForbiddenMeta {
+            code: "automod.blocked",
+            detail: "This message is too complex for the room's auto-moderation rules".into(),
+            meta: json!({ "rule": rule, "scope": "room" }),
+        }),
+    }
+}
+
+enum RoomMatch {
+    None,
+    Hit(Hit),
+    /// [`MATCH_BUDGET`] ran out while the named rule was checked.
+    TooComplex(String),
+}
+
+/// The first of a room's rules that matches `texts` for a member with `role_ids` and the highest role position
+/// `rank` in `channel_id`, within [`MATCH_BUDGET`].
+fn match_room_rules(
+    rules: &[Compiled],
+    texts: &[String],
+    channel_id: &str,
+    role_ids: &[String],
+    rank: i64,
+) -> RoomMatch {
+    let budget = Budget::new(MATCH_BUDGET);
+    for c in rules {
         let rule = &c.rule;
-        if rule.exempt_channels.contains(&channel.id)
-            || access.member_roles.iter().any(|r| rule.exempt_roles.contains(&r.id))
+        if rule.exempt_channels.iter().any(|c| c == channel_id)
+            || role_ids.iter().any(|r| rule.exempt_roles.contains(r))
+            || !c.reaches(rank)
         {
             continue;
         }
-        if let Some(matched) = find_in(&texts, &c.terms, c.links, &rule.domains) {
-            return Ok(Some(Hit {
+        if let Some(matched) = find_in(texts, &c.terms, c.links, &rule.domains, &budget) {
+            return RoomMatch::Hit(Hit {
                 rule: rule.name.clone(),
                 scope: "room",
                 matched,
                 action: rule.action.clone(),
                 timeout_minutes: rule.timeout_minutes,
-            }));
+            });
+        }
+        if budget.exhausted() {
+            return RoomMatch::TooComplex(rule.name.clone());
         }
     }
-    Ok(None)
+    RoomMatch::None
 }
 
 /// A `block` hit: the alert, then the error for the sender (`403 automod.blocked`).
@@ -904,12 +1082,7 @@ pub async fn remove(
     );
     if let (Some(minutes), Some(room_id)) = (hit.timeout_minutes.filter(|_| hit.action == "timeout"), conv.room_id()) {
         let until = util::in_seconds(minutes * 60);
-        store::rooms::set_timeout(&state.db, room_id, &author.id, Some(&until)).await?;
-        let (room, user) = (room_id.to_string(), author.id.clone());
-        crate::voice::spawn_effect(
-            state,
-            move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await },
-        );
+        crate::routes::rooms::set_timeout_announced(state, room_id, &author.id, Some(&until)).await?;
     }
     alert(state, conv, author, hit, Some(message_id)).await;
     Ok(())
@@ -972,6 +1145,88 @@ mod tests {
 
     fn m(text: &str, term: &str, whole: bool) -> bool {
         term_matches(&normalize(text), &parts(&normalize(term)), whole)
+    }
+
+    /// Every way the term could match, tried one by one (tiny inputs only): the reference for [`term_matches`].
+    fn brute(text: &str, parts: &[String], whole: bool) -> bool {
+        let lits: Vec<&str> = parts.iter().map(String::as_str).filter(|p| !p.is_empty()).collect();
+        let Some(first) = lits.first() else { return false };
+        let leading = parts.first().is_some_and(String::is_empty);
+        let trailing = parts.len() > 1 && parts.last().is_some_and(String::is_empty);
+        fn rec(text: &str, lits: &[&str], j: usize, pos: usize, whole: bool, trailing: bool) -> bool {
+            if j == lits.len() {
+                return !whole || trailing || boundary_after(text, pos);
+            }
+            occurrences(text, lits[j]).into_iter().any(|q| {
+                q >= pos
+                    && !text[pos..q].contains(char::is_whitespace)
+                    && rec(text, lits, j + 1, q + lits[j].len(), whole, trailing)
+            })
+        }
+        occurrences(text, first).into_iter().any(|p| {
+            (!whole || leading || boundary_before(text, p)) && rec(text, &lits, 1, p + first.len(), whole, trailing)
+        })
+    }
+
+    /// The skipping matcher finds exactly the matches of trying every way, on many small texts and terms.
+    #[test]
+    fn skipping_starts_never_loses_a_match() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = ['a', 'b', 'c', ' '];
+        let pieces = ["a", "b", "ab", "ba", "aa", "c"];
+        for _ in 0..20_000 {
+            let len = next(24) as usize;
+            let text: String = (0..len).map(|_| alphabet[next(4) as usize]).collect();
+            let text = normalize(&text);
+            let n = 1 + next(3) as usize;
+            let mut term = String::new();
+            if next(4) == 0 {
+                term.push('*');
+            }
+            for k in 0..n {
+                if k > 0 {
+                    term.push('*');
+                }
+                term.push_str(pieces[next(pieces.len() as u64) as usize]);
+            }
+            if next(4) == 0 {
+                term.push('*');
+            }
+            let parts = parts(&term);
+            for whole in [false, true] {
+                assert_eq!(
+                    term_matches(&text, &parts, whole),
+                    brute(&text, &parts, whole),
+                    "{term:?} in {text:?} ({whole})"
+                );
+            }
+        }
+    }
+
+    /// A long run of a term's first literal costs a step per run, not per start.
+    #[test]
+    fn crafted_runs_stay_within_a_small_budget() {
+        let terms: Vec<String> = (b'b'..=b'z').map(|c| format!("a*{}{}", c as char, c as char)).collect();
+        let t = Terms::new(&terms, false);
+        for text in ["a".repeat(60_000), "a ".repeat(30_000), format!("{} bb", "a".repeat(60_000))] {
+            let budget = Budget::new(10 * text.len() as u64);
+            let found = t.find_within(&text, &budget);
+            assert!(!budget.exhausted(), "budget used up");
+            assert_eq!(found, None);
+        }
+        let budget = Budget::new(MATCH_BUDGET);
+        let text = format!("{}bb", "a".repeat(60_000));
+        assert_eq!(t.find_within(&text, &budget).as_deref(), Some("a*bb"));
+        // A budget that runs out ends the search without a match and says so.
+        let small = Budget::new(10);
+        assert_eq!(t.find_within(&"a".repeat(1000), &small), None);
+        assert!(small.exhausted());
     }
 
     #[test]

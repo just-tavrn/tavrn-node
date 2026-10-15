@@ -145,6 +145,52 @@ First public release of the node and its container image.
 
 ### Security
 
+- An account has at most 100 devices, the limit clients apply to a keys document: a login that would create the 101st
+  is refused with `403 auth.device_limit`, the keys document lists at most the newest 100 devices, and an identity key
+  is not rotated beyond 100 continuity statements (`409 e2ee.rotation_limit`), so a keys document always stays within
+  what clients accept.
+- Attachment uploads that stream at the same time reserve their share of the room's (or DM's) storage quota before
+  their body arrives, and the usage is checked again once a file is stored, so parallel uploads can no longer overrun
+  the quota.
+- Web push: a user's subscriptions are sent to at once within one 10-second deadline, a push for a user whose previous
+  one is still under way is skipped, and registering an endpoint again keeps its failure count, so endpoints that
+  never answer can no longer hold the node's push senders.
+- Banning a bot's owner from a room needs the rank over each of the owner's bots in the room, as banning the bot
+  itself does.
+- A moderation bot never sees reports about its owner or the owner's other bots, in lists, single reads and events, as
+  its owner would not.
+- One node may hold at most 500 entries of a bot's install index (of 10 000), so it can no longer fill the index and
+  make the bot miss other nodes' installations.
+- A bot's interaction replies and follow-ups pass the checks of an ordinary message: role mentions, the room's and the
+  node's content rules, slowmode, blocks and the channel kind; they are indexed for search like the bot's own
+  messages.
+- Room auto-moderation rules are matched off the request threads within a fixed work budget per message, and the
+  matcher skips the starts of a term that cannot match, so crafted rules and messages no longer cost seconds of CPU
+  per message; a message that would need more work than the budget is refused with `403 automod.blocked`.
+- Auto-moderation `delete` and `timeout` rules act only on members ranked below the member who last saved the rules
+  (the rank is recorded with them), so a low-ranked room manager can no longer time out or silence higher moderators
+  through a rule.
+- Auto-moderation timeouts (keyword rules and the flood limit) publish `member.update` like a moderator's timeout, so
+  clients learn them and ephemeral events and typing are refused at once.
+- Several instances: when events may have been lost on the cache bus, an instance drops its channel visibility
+  snapshots and every WebSocket reloads the rooms it receives, so a membership whose `member.leave` was lost no longer
+  receives the room's events.
+- A remote user counts against their own limit (`TAVRN_FEDERATION_RATE_API_PER_USER`, default 600 per minute) before
+  the budget of their home domain, and federated logins against a share per account and per client address, so one
+  account can no longer lock the other users of its domain out; a rate-limited WebSocket hello closes with `4002
+  rate_limited` instead of `4001`.
+- `TAVRN_TRUSTED_PROXIES` defaults to loopback only (it listed every private network, so on a node reached directly
+  from a private network every client could choose its rate-limit address with `X-Forwarded-For` and read `/metrics`).
+  `deploy/docker-compose.yml` sets Docker's private ranges, where the reverse proxy connects through Docker's gateway;
+  other setups list their proxy (docs/HANDBOOK.md).
+- Configuration printouts no longer show a password from a query parameter that contains `@`, and an invalid
+  `TAVRN_SMTP_URL` is named in the error without its password.
+- `POST /auth/login` refuses a username no account can have (`400 auth.username_invalid`) before it is looked up or
+  counted; the anonymous sign-in routes take bodies of at most 16 KiB; rate limiters store long keys as hashes and
+  keep a hard bound on their number of keys, also on single-instance nodes.
+- The in-memory rate limiter keeps keys that reached their limit when its map is full, so a full map no longer unlocks
+  locked accounts.
+- A `Tavrn-Relayed` value with an extreme time is refused instead of overflowing the age check.
 - `check-config` prints the passwords of `TAVRN_DATABASE_URL` and `TAVRN_SMTP_URL`, secret query parameters, the
   Turnstile secret and the GIF key as `***`. The image's health check is the new `tavrn-node health` (one request to
   `/healthz`, nothing printed), so the container state no longer holds the configuration and the identity provider

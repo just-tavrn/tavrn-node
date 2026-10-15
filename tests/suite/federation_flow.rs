@@ -463,7 +463,8 @@ async fn remote_user_quotas() {
 
 #[tokio::test]
 async fn federated_logins_are_rate_limited_per_domain() {
-    let (a, b) = two_nodes_with(|_| {}, |c| c.federation_rate_logins = 2).await;
+    // Eight per domain, a quarter of them per account.
+    let (a, b) = two_nodes_with(|_| {}, |c| c.federation_rate_logins = 8).await;
     let alice = a.register("alice").await;
     b.sign_in_from(&a, &alice).await;
     b.sign_in_from(&a, &alice).await;

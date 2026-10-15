@@ -243,8 +243,23 @@ pub async fn session_device(
         store::users::reuse_device(&state.db, &user.id, id, client).await?;
         return Ok(id.to_string());
     }
+    // A user's keys document lists every device; clients refuse documents with more than `MAX_DEVICES_PER_USER`
+    // of them, so the node never makes the 101st (ENCRYPTION.md §3).
+    if store::users::device_count(&state.db, &user.id).await? >= MAX_DEVICES_PER_USER {
+        return Err(ApiError::ForbiddenMeta {
+            code: "auth.device_limit",
+            detail: format!(
+                "This account already has {MAX_DEVICES_PER_USER} devices: remove devices you no longer use in the \
+                 device settings of a signed-in device first"
+            ),
+            meta: serde_json::json!({ "max_devices": MAX_DEVICES_PER_USER }),
+        });
+    }
     Ok(store::users::create_device(&state.db, &user.id, device_name, client).await?.id)
 }
+
+/// Devices one account may have: the limit clients apply to a keys document (`federation::keys::MAX_DEVICES`).
+pub const MAX_DEVICES_PER_USER: i64 = crate::federation::keys::MAX_DEVICES as i64;
 
 /// Session for a fully authenticated user: on the device proven at login (`reuse`) or a new one. `proof`: the
 /// login just proved the account's credentials (password with the second factor, a passkey); only then does the

@@ -106,10 +106,12 @@ async fn run(state: AppState, mut socket: WebSocket) {
     };
     // The close reason carries the error code (`auth.token_expired`, `app.disabled`, …): clients refresh and reconnect.
     // Only a refused token or session is `4001` (clients end the session when it repeats); a failing database (a 5xx
-    // error) is not.
+    // error) or a rate limit is not.
     let auth = match auth::authenticate(&state, &token).await {
         Ok(a) => a,
         Err(e) if e.status().is_server_error() => return close_unavailable(socket, &e).await,
+        // A rate limit is no refused session: the client tries again later (`4002 rate_limited`, as below).
+        Err(ApiError::RateLimited { .. }) => return close(socket, CLOSE_PROTOCOL, "rate_limited").await,
         Err(e) => return close(socket, CLOSE_AUTH, e.code()).await,
     };
     // The general per-user limit applies to connecting as to every other request (`TAVRN_RATE_USER_PER_MINUTE`).
@@ -230,6 +232,25 @@ async fn run(state: AppState, mut socket: WebSocket) {
                 match event {
                     Ok(ev) if ev.scope == Scope::All => {
                         // The local resync hint (cache bus disrupted, `Hub::resync_all`): every connection, bots too.
+                        // A lost `member.leave` or `member.join` may be among the lost events: the rooms the
+                        // connection receives are loaded again (a failing database ends the connection; the client
+                        // reconnects).
+                        if ev.kind == crate::hub::RESYNC_KIND {
+                            match store::rooms::rooms_of_user(&state.db, &auth.user.id).await {
+                                Ok(now) => {
+                                    let now: HashSet<String> = now.into_iter().map(|r| r.id).collect();
+                                    for gone in rooms.difference(&now) {
+                                        visible.forget(gone);
+                                    }
+                                    rooms = now;
+                                    visible.know(&state, &rooms, &auth.user.id).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "rooms of a connection not reloaded after a resync");
+                                    break;
+                                }
+                            }
+                        }
                         if sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
                             break;
                         }
