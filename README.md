@@ -124,10 +124,9 @@ just test-services   # PostgreSQL and Valkey test containers
 just check           # what the CI runs: SPDX headers, licenses, fmt, clippy, tests on SQLite and PostgreSQL
 ```
 
-While the repositories are private, the protocol submodule and the git dependency `tavrn-crypto` need your
-GitHub credentials. Cargo uses the git command line for that when `CARGO_NET_GIT_FETCH_WITH_CLI=true` is set
-(the `justfile` sets it; for plain `cargo` export it yourself), and git needs a credential helper for
-github.com, for example `gh auth setup-git`.
+`tavrn-crypto` comes from [crates.io](https://crates.io/crates/tavrn-crypto). To build against an unreleased
+revision, point the dependency at the repository (`git = "https://github.com/just-tavrn/tavrn-crypto", rev = "…"`);
+cargo then fetches it with the git command line (`CARGO_NET_GIT_FETCH_WITH_CLI=true`, which the `justfile` sets).
 
 The node embeds the web client from `web/dist/` at compile time. Without a bundle there (only the tracked
 placeholder `web/dist/.gitkeep`) the node builds and serves the API, and `/` answers that the web client is not
@@ -182,8 +181,8 @@ The Dockerfile builds the web client from tavrn-web at the build argument `TAVRN
 branch, tag or commit; release images use a tavrn-web release tag, and docs/GITHUB.md "Verifying an image" shows how
 to check an image's provenance). With `--build-arg TAVRN_WEB_SOURCE=local` it embeds a prebuilt bundle from `web/dist/`
 of the build context instead. The token (secret `read_token`, or `TAVRN_WEB_TOKEN` for the web stage only) is
-needed while the repositories are private: cargo fetches `tavrn-crypto` with it and the web stage clones
-tavrn-web. It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
+only needed for private checkouts (the web stage clones tavrn-web; cargo would fetch a git revision of
+`tavrn-crypto` with it). It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
 `just docker-build git v0.1.0`).
 
 The Rust build is split in two layers with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef): the

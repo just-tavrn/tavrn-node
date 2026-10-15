@@ -98,7 +98,7 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `sha2` | 0.11.0 | MIT OR Apache-2.0 | runtime |
 | `sqlx` | 0.8.6 | MIT OR Apache-2.0 | runtime |
 | `subtle` | 2.6.1 | BSD-3-Clause | runtime |
-| `tavrn-crypto` | 0.1.0 | MPL-2.0 | runtime (git dependency, [tavrn-crypto](https://github.com/just-tavrn/tavrn-crypto)) |
+| `tavrn-crypto` | 0.1.0 | MPL-2.0 | runtime ([crates.io](https://crates.io/crates/tavrn-crypto), [tavrn-crypto](https://github.com/just-tavrn/tavrn-crypto)) |
 | `thiserror` | 2.0.21 | MIT OR Apache-2.0 | runtime |
 | `tokio` | 1.53.2 | MIT | runtime |
 | `tokio-tungstenite` | 0.29.0 | MIT | runtime |
