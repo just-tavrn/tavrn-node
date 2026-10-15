@@ -882,7 +882,7 @@ impl Job<'_> {
         let mut child = cmd.spawn().map_err(|e| ApiError::Internal(anyhow::anyhow!("cannot start ffmpeg: {e}")))?;
         let mut stdin =
             child.stdin.take().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("ffmpeg without stdin")))?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(2);
         let source = frames.source.clone();
         let max_ms = u64::from(self.kind.loop_secs()) * 1000;
         let decoder = tokio::task::spawn_blocking(move || RawFrames::stream(&source, fps, max_ms, &tx));
@@ -969,7 +969,7 @@ impl RawFrames {
     }
 
     /// Decodes all frames again and sends them, repeated to a constant `fps`, for at most `max_ms`.
-    fn stream(source: &Bytes, fps: u32, max_ms: u64, tx: &tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), ApiError> {
+    fn stream(source: &Bytes, fps: u32, max_ms: u64, tx: &tokio::sync::mpsc::Sender<Bytes>) -> Result<(), ApiError> {
         let mut d = Self::decoder(source)?;
         let size = d.output_buffer_size().ok_or_else(|| invalid("Corrupt WebP"))?;
         let mut ticker = Ticker::new(fps, max_ms);
@@ -981,6 +981,8 @@ impl RawFrames {
                 Err(_) => return Err(invalid("Corrupt WebP")),
             };
             let Some(repeats) = ticker.next(duration) else { break };
+            // A repeated frame shares the decoded buffer (a reference count, not a copy of the RGBA frame).
+            let frame = Bytes::from(frame);
             for _ in 0..repeats {
                 if tx.blocking_send(frame.clone()).is_err() {
                     return Ok(());
