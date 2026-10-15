@@ -152,7 +152,7 @@ struct Eval {
 /// on first use.
 pub struct RoomView {
     pub room: Room,
-    roles: Vec<RoleRow>,
+    roles: Arc<Vec<RoleRow>>,
     /// The @everyone role's id and permissions (`None`: a broken room; nobody views anything).
     everyone: Option<(String, permissions::Perms)>,
     channels: HashMap<String, ChannelRow>,
@@ -318,6 +318,36 @@ impl RoomView {
         self.evaluate(self.member(user_id)?, channel, category, own, false)
     }
 
+    /// The channel `channel_id` as a conversation of the member `user` (the requester's own row: its kind, scopes and
+    /// node admin flag count), evaluated on the snapshot with the REST routes' rules (`access::conversation`):
+    /// `None` when `user` is no member of the snapshot or the channel is not in it (the caller asks the database).
+    pub fn conversation(&self, channel_id: &str, user: &UserRow) -> Option<Result<access::Conv, ApiError>> {
+        let channel = self.channels.get(channel_id)?.clone();
+        let m = self.members.get(&user.id)?;
+        let access = match access::member_access(
+            self.room.clone(),
+            &self.roles,
+            Some(m.member.clone()),
+            &m.role_ids,
+            user,
+            m.adult,
+            m.moved.clone(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = access::require_age(&access, &channel) {
+            return Some(Err(e));
+        }
+        let perms = access::channel_perms_with(&access, &channel, &self.overrides, &user.id);
+        Some(Ok(access::Conv {
+            id: channel.id.clone(),
+            encrypted: channel.encrypted != 0,
+            perms,
+            kind: access::ConvKind::Channel { access: Box::new(access), channel },
+        }))
+    }
+
     /// Does the member hold `bits` room-wide (roles only, no channel)?
     pub fn holds(&self, user_id: &str, bits: permissions::Perms) -> bool {
         self.everyone.is_some() && self.member(user_id).is_some_and(|m| permissions::has(m.eval.room_perms, bits))
@@ -417,7 +447,7 @@ fn eval_of(
 pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, ApiError> {
     let db = &state.db;
     let Some(room) = store::rooms::room_by_id(db, room_id).await? else { return Ok(None) };
-    let roles = store::rooms::roles(db, room_id).await?;
+    let roles = Arc::new(store::rooms::roles(db, room_id).await?);
     let channels: HashMap<String, ChannelRow> =
         store::rooms::channels(db, room_id).await?.into_iter().map(|c| (c.id.clone(), c)).collect();
     let overrides = store::rooms::overrides_of_room(db, room_id).await?;

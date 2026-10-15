@@ -138,6 +138,47 @@ type CachedAudience = (Instant, Arc<Vec<String>>);
 pub struct Whiteboards {
     sessions: Mutex<HashMap<String, Entry>>,
     audiences: Mutex<HashMap<String, CachedAudience>>,
+    /// The checks of encrypted ephemeral content, each cached for [`AUDIENCE_TTL`]: the current MLS epoch per
+    /// conversation and the user whose attested device sent (per device).
+    epochs: Mutex<HashMap<String, (Instant, i64)>>,
+    attested: Mutex<HashMap<String, (Instant, String)>>,
+}
+
+/// A small map of values that are valid for [`AUDIENCE_TTL`]: the current one, if any.
+fn fresh<T: Clone>(map: &Mutex<HashMap<String, (Instant, T)>>, key: &str, now: Instant) -> Option<T> {
+    let map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(key).filter(|(at, _)| now.duration_since(*at) < AUDIENCE_TTL).map(|(_, v)| v.clone())
+}
+
+fn remember<T>(map: &Mutex<HashMap<String, (Instant, T)>>, key: &str, value: T, now: Instant) {
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 1000 {
+        map.retain(|_, (at, _)| now.duration_since(*at) < AUDIENCE_TTL);
+    }
+    map.insert(key.to_string(), (now, value));
+}
+
+/// Does the node know the MLS epoch `epoch` of the conversation (at most its current one)? An epoch above the cached
+/// one asks the database again (a commit may just have started it).
+pub async fn epoch_known(state: &AppState, conversation_id: &str, epoch: i64) -> Result<bool, ApiError> {
+    let now = Instant::now();
+    if fresh(&state.whiteboards.epochs, conversation_id, now).is_some_and(|current| epoch <= current) {
+        return Ok(true);
+    }
+    let Some(current) = store::e2ee::group_epoch(&state.db, conversation_id).await? else { return Ok(false) };
+    remember(&state.whiteboards.epochs, conversation_id, current, now);
+    Ok(epoch <= current)
+}
+
+/// Encrypted content needs an attested sending device (`e2ee::attested_session_key`); a success is cached per device.
+pub async fn require_attested(state: &AppState, auth: &crate::auth::AuthUser) -> Result<(), ApiError> {
+    let now = Instant::now();
+    if fresh(&state.whiteboards.attested, &auth.device_id, now).is_some_and(|user| user == auth.user.id) {
+        return Ok(());
+    }
+    crate::e2ee::attested_session_key(state, auth).await?;
+    remember(&state.whiteboards.attested, &auth.device_id, auth.user.id.clone(), now);
+    Ok(())
 }
 
 impl Whiteboards {

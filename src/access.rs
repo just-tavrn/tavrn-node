@@ -17,6 +17,8 @@ pub struct RoomAccess {
     pub everyone: RoleRow,
     /// The member's roles, without @everyone.
     pub member_roles: Vec<RoleRow>,
+    /// Every role of the room, @everyone included (loaded with the access; later steps of the request use it).
+    pub roles: std::sync::Arc<Vec<RoleRow>>,
     pub is_owner: bool,
     pub is_node_admin: bool,
     /// Room-level permissions; for bots already capped by the scopes (0 in a "no bots" room).
@@ -101,7 +103,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
             detail: "You are not a member of this room".into(),
         });
     }
-    let roles = store::rooms::roles(&state.db, room_id).await?;
+    let roles = std::sync::Arc::new(store::rooms::roles(&state.db, room_id).await?);
     let role_ids = match &member {
         Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
         None => Vec::new(),
@@ -117,7 +119,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
 /// (`visibility.rs`) for every member of a room at once.
 pub fn member_access(
     room: Room,
-    roles: &[RoleRow],
+    roles: &std::sync::Arc<Vec<RoleRow>>,
     member: Option<MemberRow>,
     role_ids: &[String],
     user: &UserRow,
@@ -156,6 +158,7 @@ pub fn member_access(
         member,
         everyone,
         member_roles,
+        roles: roles.clone(),
         is_owner,
         is_node_admin,
         room_perms,
@@ -206,11 +209,7 @@ pub async fn channel_perms(
     if access.is_owner || access.is_node_admin {
         return Ok(channel_perms_with(access, channel, &[], user_id));
     }
-    let mut overrides = match &channel.category_id {
-        Some(cat) => store::rooms::overrides_for(&state.db, "category", cat).await?,
-        None => Vec::new(),
-    };
-    overrides.extend(store::rooms::overrides_for(&state.db, "channel", &channel.id).await?);
+    let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
     Ok(channel_perms_with(access, channel, &overrides, user_id))
 }
 
@@ -363,11 +362,7 @@ pub async fn upload_categories(
 ) -> Result<crate::uploads::Categories, ApiError> {
     match &conv.kind {
         ConvKind::Channel { access, channel } => {
-            let mut overrides = match &channel.category_id {
-                Some(cat) => store::rooms::overrides_for(&state.db, "category", cat).await?,
-                None => Vec::new(),
-            };
-            overrides.extend(store::rooms::overrides_for(&state.db, "channel", &channel.id).await?);
+            let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
             Ok(channel_upload_categories_with(access, channel, &overrides, user_id))
         }
         ConvKind::Direct { .. } => Ok(state.config.upload_dm_categories()),
@@ -473,7 +468,42 @@ impl Conv {
     }
 }
 
-fn conversation_not_found() -> ApiError {
+/// Does [`message`] apply the requester's history window?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// Reading the message (or acting on it in a way that serves it): an encrypted message older than the
+    /// requester's history window (ENCRYPTION.md §7b) is not found, as on a page of messages.
+    Apply,
+    /// Writes addressed to the message by id that serve no older content (edit, delete, the read marker).
+    Ignore,
+}
+
+/// The message `message_id` (any case) of `conv`: `404 message.not_found` when there is no such message in this
+/// conversation or, with [`Window::Apply`], when it lies before the requester's history window. The one lookup of
+/// a conversation's message by id; the caller has checked the permissions it needs.
+pub async fn message(
+    state: &AppState,
+    user: &UserRow,
+    conv: &Conv,
+    message_id: &str,
+    window: Window,
+) -> Result<crate::models::MessageRow, ApiError> {
+    let missing = || not_found("Message", "message.not_found");
+    let message = store::messages::by_id(&state.db, &message_id.to_ascii_uppercase())
+        .await?
+        .filter(|m| m.conversation_id == conv.id)
+        .ok_or_else(missing)?;
+    if window == Window::Apply
+        && message.encrypted != 0
+        && let Some(cut) = crate::history::list_cutoff(state, conv, user).await?
+        && message.id.as_str() < cut.as_str()
+    {
+        return Err(missing());
+    }
+    Ok(message)
+}
+
+pub(crate) fn conversation_not_found() -> ApiError {
     not_found("Conversation", "conversation.not_found")
 }
 
@@ -512,10 +542,19 @@ pub async fn conversation(state: &AppState, conversation_id: &str, user: &UserRo
         return Err(conversation_not_found());
     }
     let row = store::social::conversation(&state.db, conversation_id).await?.ok_or_else(conversation_not_found)?;
+    conversation_of_row(state, row, user).await
+}
+
+/// [`conversation`] for an already loaded conversation row.
+pub async fn conversation_of_row(
+    state: &AppState,
+    row: crate::store::social::ConversationRow,
+    user: &UserRow,
+) -> Result<Conv, ApiError> {
     match (row.kind.as_str(), &row.room_id) {
         ("channel", Some(room_id)) => {
             let access = room_access(state, room_id, user).await?;
-            let channel = channel_in_room(state, room_id, conversation_id).await?;
+            let channel = channel_in_room(state, room_id, &row.id).await?;
             channel_conv(state, access, channel, user).await
         }
         ("dm" | "group", _) => direct_conversation(state, row, &user.id).await,
@@ -555,18 +594,47 @@ async fn direct_conversation(
 /// Is `user` entitled to be in the conversation (§4.5)? Used for other users than the requester
 /// (added devices, removed leaves). Disabled accounts are never entitled.
 pub async fn user_entitled(state: &AppState, conv: &Conv, user: &UserRow) -> Result<bool, ApiError> {
-    if user.disabled_at.is_some() {
-        return Ok(false);
+    Ok(entitled_users(state, conv, &[user]).await?.contains(&user.id))
+}
+
+/// [`user_entitled`] for several users at once (the added and removed devices of an MLS commit): the ids of the
+/// entitled ones, with a constant number of statements. For channels: room members with `view_channel`, evaluated
+/// like [`room_access`] and [`channel_perms`] with the room and roles of `conv` (loaded by this request).
+pub async fn entitled_users(
+    state: &AppState,
+    conv: &Conv,
+    users: &[&UserRow],
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let candidates: Vec<&UserRow> = users.iter().copied().filter(|u| u.disabled_at.is_none()).collect();
+    let (access, channel) = match &conv.kind {
+        ConvKind::Direct { member_ids, .. } => {
+            return Ok(candidates.iter().filter(|u| member_ids.contains(&u.id)).map(|u| u.id.clone()).collect());
+        }
+        ConvKind::Channel { access, channel } => (access, channel),
+    };
+    let room_id = &access.room.id;
+    let mut ids: Vec<String> = candidates.iter().map(|u| u.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    let mut out = std::collections::HashSet::new();
+    if ids.is_empty() {
+        return Ok(out);
     }
-    match &conv.kind {
-        ConvKind::Channel { access, channel } => match room_access(state, &access.room.id, user).await {
-            Ok(a) if a.member.is_some() => {
-                let perms = channel_perms(state, &a, channel, &user.id).await?;
-                Ok(permissions::has(perms, permissions::VIEW_CHANNEL))
-            }
-            Ok(_) | Err(ApiError::Forbidden { .. }) => Ok(false),
-            Err(e) => Err(e),
-        },
-        ConvKind::Direct { member_ids, .. } => Ok(member_ids.contains(&user.id)),
+    let members = store::rooms::members_by_ids(&state.db, room_id, &ids).await?;
+    let role_ids = store::rooms::member_role_ids_of(&state.db, room_id, &ids).await?;
+    let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
+    for user in candidates {
+        let Some(member) = members.get(&user.id) else { continue };
+        if out.contains(&user.id) {
+            continue;
+        }
+        let adult = crate::age::is_adult(state, user).await?;
+        let moved = crate::voice::moved::channel_of(state, room_id, &user.id);
+        let roles = role_ids.get(&user.id).map(Vec::as_slice).unwrap_or_default();
+        let a = member_access(access.room.clone(), &access.roles, Some(member.clone()), roles, user, adult, moved)?;
+        if permissions::has(channel_perms_with(&a, channel, &overrides, &user.id), permissions::VIEW_CHANNEL) {
+            out.insert(user.id.clone());
+        }
     }
+    Ok(out)
 }

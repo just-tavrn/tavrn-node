@@ -185,3 +185,36 @@ async fn delete_room_only_by_owner_or_node_admin() {
     let (s, _) = node.delete(&format!("/api/v1/rooms/{}", room2["id"].as_str().unwrap()), &alice.token).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
 }
+
+/// Discover lists each public room with its member count; anonymous callers are limited per address like the other
+/// public directory reads, signed-in users are not counted there.
+#[tokio::test]
+async fn discover_counts_members_and_limits_anonymous_callers() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    for (name, joins) in [("Busy", true), ("Quiet", false)] {
+        let room = node.create_room(&alice.token, name).await;
+        let id = room["id"].as_str().unwrap().to_string();
+        let (s, j) = node
+            .patch(&format!("/api/v1/rooms/{id}"), &alice.token, json!({ "join_mode": "public", "discoverable": true }))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        if joins {
+            let (s, j) = node.post(&format!("/api/v1/rooms/{id}/join"), &bob.token, json!({})).await;
+            assert_eq!(s, StatusCode::OK, "{j}");
+        }
+    }
+    let (s, list) = node.req(Method::GET, "/api/v1/rooms/discover", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    let count =
+        |name: &str| list.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["member_count"].clone();
+    assert_eq!((count("Busy"), count("Quiet")), (json!(2), json!(1)));
+
+    // The in-process router has no peer address: every anonymous request here comes from "unknown".
+    while node.state.directory_limiter.check_all(&["discover-ip:unknown".to_string()]).is_ok() {}
+    let (s, j) = node.req(Method::GET, "/api/v1/rooms/discover", None, None).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")), "{j}");
+    let (s, j) = node.get_auth("/api/v1/rooms/discover", &bob.token).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}

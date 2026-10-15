@@ -80,11 +80,8 @@ pub async fn advance(
     let conv = access::conversation(state, conversation_id, user).await?;
     conv.require_entitled()?;
     validate::ulid("last_read_message_id", message_id)?;
-    match store::messages::by_id(&state.db, message_id).await? {
-        Some(m) if m.conversation_id == conv.id => {}
-        _ => return Err(access::not_found("Message", "message.not_found")),
-    }
-    let (marker, moved) = store::messages::advance_read_marker(&state.db, &conv.id, &user.id, message_id).await?;
+    let message = access::message(state, user, &conv, message_id, access::Window::Ignore).await?;
+    let (marker, moved) = store::messages::advance_read_marker(&state.db, &conv.id, &user.id, &message.id).await?;
     if moved {
         state.hub.users(
             vec![user.id.clone()],

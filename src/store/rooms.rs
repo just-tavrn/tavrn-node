@@ -251,6 +251,26 @@ pub async fn member_count(db: &Pool, room_id: &str) -> Result<i64, ApiError> {
     Ok(row.try_get::<i64, _>("n")?)
 }
 
+/// Member counts of several rooms (room id → count; rooms without members are absent), one grouped query per
+/// [`super::IN_CHUNK`] rooms.
+pub async fn member_counts(db: &Pool, room_ids: &[String]) -> Result<std::collections::HashMap<String, i64>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in room_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT room_id, CAST(COUNT(*) AS BIGINT) AS n FROM room_members WHERE room_id IN ({}) GROUP BY room_id",
+            super::placeholders(1, chunk.len())
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.insert(r.try_get::<String, _>("room_id")?, r.try_get::<i64, _>("n")?);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- Members
 
 pub async fn member(db: &Pool, room_id: &str, user_id: &str) -> Result<Option<MemberRow>, ApiError> {
@@ -270,6 +290,30 @@ pub async fn members(db: &Pool, room_id: &str, limit: i64, after: Option<&str>) 
     .bind(limit)
     .fetch_all(db)
     .await?)
+}
+
+/// The memberships of several users in a room (user id → row; non-members are absent), one query per
+/// [`super::IN_CHUNK`] users.
+pub async fn members_by_ids(
+    db: &Pool,
+    room_id: &str,
+    user_ids: &[String],
+) -> Result<std::collections::HashMap<String, MemberRow>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in user_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT {MEMBER_COLS} FROM room_members WHERE room_id = $1 AND user_id IN ({})",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query_as::<_, MemberRow>(&sql).bind(room_id);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for m in q.fetch_all(db).await? {
+            out.insert(m.user_id.clone(), m);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn add_member(db: &Pool, room_id: &str, user_id: &str, rules_accepted: bool) -> Result<(), ApiError> {
@@ -383,6 +427,30 @@ pub async fn member_role_ids(db: &Pool, room_id: &str, user_id: &str) -> Result<
         .fetch_all(db)
         .await?;
     rows.iter().map(|r| r.try_get::<String, _>("role_id").map_err(Into::into)).collect()
+}
+
+/// The role ids of several members of a room (user id → role ids; members without roles are absent), with one
+/// query per [`super::IN_CHUNK`] users.
+pub async fn member_role_ids_of(
+    db: &Pool,
+    room_id: &str,
+    user_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, ApiError> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for chunk in user_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT user_id, role_id FROM member_roles WHERE room_id = $1 AND user_id IN ({}) ORDER BY role_id",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query(&sql).bind(room_id);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.entry(r.try_get::<String, _>("user_id")?).or_default().push(r.try_get::<String, _>("role_id")?);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn set_member_roles(db: &Pool, room_id: &str, user_id: &str, role_ids: &[String]) -> Result<(), ApiError> {
@@ -725,6 +793,18 @@ pub async fn overrides_for(db: &Pool, target_type: &str, target_id: &str) -> Res
     .await?)
 }
 
+/// The overrides of a channel and of its category (the layers of its permissions), in one query.
+pub async fn overrides_of_channel(db: &Pool, channel: &ChannelRow) -> Result<Vec<OverrideRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {OVERRIDE_COLS} FROM permission_overrides
+         WHERE (target_type = 'channel' AND target_id = $1) OR (target_type = 'category' AND target_id = $2) ORDER BY id"
+    ))
+    .bind(&channel.id)
+    .bind(channel.category_id.as_deref().unwrap_or(""))
+    .fetch_all(db)
+    .await?)
+}
+
 pub struct SetOverride<'a> {
     pub room_id: &'a str,
     pub target_type: &'a str,
@@ -899,6 +979,33 @@ pub async fn shared_rooms(db: &Pool, a: &str, b: &str) -> Result<Vec<(String, St
     .fetch_all(db)
     .await?;
     rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("name")?))).collect()
+}
+
+/// The rooms `a` shares with each of `others` (other user id → `(id, name)` ordered by name; users without a shared
+/// room are absent), with one query per [`super::IN_CHUNK`] users.
+pub async fn shared_rooms_with(
+    db: &Pool,
+    a: &str,
+    others: &[String],
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, ApiError> {
+    let mut out: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    for chunk in others.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT m2.user_id AS user_id, r.id AS id, r.name AS name FROM rooms r
+             JOIN room_members m1 ON m1.room_id = r.id AND m1.user_id = $1
+             JOIN room_members m2 ON m2.room_id = r.id AND m2.user_id IN ({})
+             ORDER BY r.name",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query(&sql).bind(a);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.entry(r.try_get::<String, _>("user_id")?).or_default().push((r.try_get("id")?, r.try_get("name")?));
+        }
+    }
+    Ok(out)
 }
 
 /// Rooms a user is a member of (ids).

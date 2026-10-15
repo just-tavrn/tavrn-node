@@ -173,7 +173,8 @@ pub struct AppState {
     pub profile_changed_limiter: Arc<SharedLimiter>,
     /// Received `node.announce` per sending domain (`domain:<domain>`, 1 per 10 minutes, FEDERATION.md §7.2).
     pub directory_announce_limiter: Arc<RateLimiter>,
-    /// Public directory reads per client IP (`dir-ip:<ip>`, 120 per minute).
+    /// Public directory reads per client IP (`dir-ip:<ip>`; anonymous room discovery `discover-ip:<ip>`; 120 per
+    /// minute each).
     pub directory_limiter: Arc<RateLimiter>,
     /// Wakes the outbox worker when a notification was queued.
     pub outbox_wakeup: Arc<tokio::sync::Notify>,

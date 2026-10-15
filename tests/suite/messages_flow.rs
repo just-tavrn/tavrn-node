@@ -247,3 +247,33 @@ async fn purge_requires_preview_and_confirmation() {
     assert_eq!(log[0]["meta"]["deleted"], 1);
     let _ = perms(&[p::PURGE]);
 }
+
+/// Message ids in paths and bodies are ULIDs in any case: edit, read marker and delete address the message whatever
+/// the case of its id, and act on the stored (canonical) id.
+#[tokio::test]
+async fn message_ids_are_accepted_in_any_case() {
+    let (node, _alice, bob, room_id, channel_id) = setup().await;
+    let path = format!("/api/v1/rooms/{room_id}/channels/{channel_id}/messages");
+    let (s, m) = node.send(&bob.token, &room_id, &channel_id, "Hello").await;
+    assert_eq!(s, StatusCode::CREATED, "{m}");
+    let id = m["id"].as_str().unwrap().to_string();
+    let lower = id.to_lowercase();
+    let (s, j) = node
+        .patch(&format!("{path}/{lower}"), &bob.token, json!({ "content": { "type": "text", "body": "Edited" } }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!((j["id"].as_str(), j["content"]["body"].as_str()), (Some(id.as_str()), Some("Edited")));
+    let (s, j) = node
+        .put(&format!("/api/v1/conversations/{channel_id}/read"), &bob.token, json!({ "last_read_message_id": lower }))
+        .await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(
+        tavrn_node::store::messages::read_marker(&node.state.db, &channel_id, &bob.user_id).await.unwrap().as_deref(),
+        Some(id.as_str()),
+        "the marker holds the canonical id"
+    );
+    let (s, j) = node.delete(&format!("{path}/{lower}"), &bob.token).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    let (_, list) = node.get_auth(&path, &bob.token).await;
+    assert!(list.as_array().unwrap().iter().all(|m| m["id"] != id.as_str()), "deleted: {list}");
+}
