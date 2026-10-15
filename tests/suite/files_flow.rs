@@ -598,3 +598,56 @@ async fn housekeeping_keeps_file_entries_out_of_retention_and_sweeps_orphans() {
     assert_eq!(s.down(&s.bob.token, &id(&f), None).await.2, b"keep me");
     assert!(s.node.state.storage.read(&stray).await.unwrap().is_none());
 }
+
+// ---------------------------------------------------------------- renames, quotas and aborted uploads
+
+#[tokio::test]
+async fn a_rename_is_classified_like_an_upload() {
+    let s = setup().await;
+    let script = b"@echo off\r\nstart calc.exe\r\n";
+    // The node refuses the script under its real name and accepts the same bytes as text.
+    let (st, j) = s.up(&s.bob.token, "run.bat", None, "text/plain", script).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload.type_forbidden")), "{j}");
+    let (st, j) = s.up(&s.bob.token, "run.txt", None, "text/plain", script).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let entry = id(&j);
+    // Renaming it to an executable name is refused like the upload.
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.bat" })).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload.type_forbidden")), "{j}");
+    assert_eq!(j["meta"]["executable"], true);
+    let (st, h, _) = s.down(&s.bob.token, &entry, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h["content-disposition"].to_str().unwrap().contains("run.txt"));
+    // A harmless new name passes.
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.md" })).await;
+    assert_eq!((st, j["name"].as_str()), (StatusCode::OK, Some("run.md")), "{j}");
+
+    // Role-restricted categories: a member who may upload documents only cannot rename into an archive.
+    let everyone = {
+        let (_, room) = s.node.get_auth(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
+        room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (st, j) = s
+        .node
+        .patch(
+            &format!("/api/v1/rooms/{}/roles/{everyone}", s.room_id),
+            &s.alice.token,
+            json!({ "allowed_upload_categories": ["documents"] }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.zip" })).await;
+    assert_eq!(
+        (st, j["code"].as_str(), j["meta"]["category"].as_str()),
+        (StatusCode::FORBIDDEN, Some("upload.type_forbidden"), Some("archives")),
+        "{j}"
+    );
+    // Moving without a new name is no rename.
+    let (_, folder) = s.folder(&s.bob.token, None, "Docs").await;
+    let (st, j) =
+        s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "parent_id": id(&folder) })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+}

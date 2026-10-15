@@ -231,3 +231,4 @@ First public release of the node and its container image.
   received, so the sender's retry is handled.
 - Forwarded reports give evidence authors other than the reported user pseudonyms of that report only (never the
   reporter's) and leave out their message ids.
+- Files channels: a rename is classified like an upload (executable rule and upload categories).

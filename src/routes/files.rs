@@ -1227,6 +1227,13 @@ pub async fn update(
         Some(n) => files::entry_name(n)?,
         None => entry.name.clone(),
     };
+    // A new name is classified like an upload under that name (the stored type, the new extension): the executable
+    // rule and the uploader's categories apply, so a rename cannot turn a text file into a script. The content was
+    // checked at the upload (executable content is never stored unless the node allows it).
+    if !conv.encrypted && !entry.is_folder() && name != entry.name {
+        let class = crate::uploads::classify(&[], &name, &entry.mime);
+        crate::routes::attachments::check_category(&state, &conv, &auth.user.id, class).await?;
+    }
     let parent_id = match &req.parent_id {
         None => entry.parent_id.clone(),
         Some(target) => {
