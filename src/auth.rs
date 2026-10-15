@@ -561,7 +561,7 @@ impl RateLimiter {
     }
 
     /// Lazy eviction: expired windows go at most once per second, never on every call; a map full of live windows
-    /// keeps only the keys that are over their limit.
+    /// keeps only the keys that are at or over their limit.
     fn sweep(&self, hits: &mut Hits, now: Instant) {
         if hits.map.len() <= SWEEP_ABOVE || now.duration_since(hits.swept) < SWEEP_INTERVAL {
             return;
@@ -569,7 +569,8 @@ impl RateLimiter {
         hits.swept = now;
         hits.map.retain(|_, (_, start)| now.duration_since(*start) < self.window);
         if hits.map.len() >= MAX_KEYS {
-            hits.map.retain(|_, (n, _)| *n > self.max);
+            // Keys at their limit are locked (`peek` refuses them): they stay, only keys below it go.
+            hits.map.retain(|_, (n, _)| *n >= self.max);
         }
     }
 
@@ -694,8 +695,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1100));
         let _ = rl.check("fresh");
         assert_eq!(rl.len(), 1, "expired windows go in one sweep");
-        // A map full of live windows keeps only the keys over their limit.
-        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        // A map full of live windows keeps only the keys at or over their limit.
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
         let _ = rl.check("blocked");
         let _ = rl.check("blocked");
         for i in 0..MAX_KEYS {
@@ -705,6 +706,21 @@ mod tests {
         let _ = rl.check("next");
         assert!(rl.len() <= 2, "{}", rl.len());
         assert!(rl.peek("blocked").is_err(), "a blocked key stays blocked");
+    }
+
+    /// A key AT its limit is locked (`peek` refuses); the overflow sweep of a full map keeps it.
+    #[test]
+    fn overflow_sweep_keeps_locked_keys() {
+        let rl = RateLimiter::new(2, Duration::from_secs(60));
+        let _ = rl.check("user:victim");
+        let _ = rl.check("user:victim");
+        assert!(rl.peek("user:victim").is_err(), "locked at the limit");
+        for i in 0..MAX_KEYS {
+            let _ = rl.check(&format!("k{i}"));
+        }
+        rl.hits.lock().unwrap().swept = Instant::now() - SWEEP_INTERVAL;
+        let _ = rl.check("next");
+        assert!(rl.peek("user:victim").is_err(), "the locked key survived the sweep");
     }
 
     #[test]

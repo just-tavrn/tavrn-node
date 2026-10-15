@@ -145,6 +145,8 @@ First public release of the node and its container image.
 
 ### Security
 
+- The in-memory rate limiter keeps keys that reached their limit when its map is full, so a full map no longer unlocks
+  locked accounts.
 - A `Tavrn-Relayed` value with an extreme time is refused instead of overflowing the age check.
 - `check-config` prints the passwords of `TAVRN_DATABASE_URL` and `TAVRN_SMTP_URL`, secret query parameters, the
   Turnstile secret and the GIF key as `***`. The image's health check is the new `tavrn-node health` (one request to
