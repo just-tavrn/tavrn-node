@@ -139,6 +139,21 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/conversations/{conversation_id}", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis/{emoji_id}/image", Scope("messages:read")),
+    // files channels (FILES.md §3 "Bots"): reading under messages:read, writing under messages:write (the channel's
+    // attach_files; others' entries need manage_files, i.e. rooms:manage). The storage backend (`…/files/backend`,
+    // `…/files/backend/test`) is deliberately absent: bots never see or set store credentials.
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/download", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/records", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/mine", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/usage", Scope("messages:read")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/folders", Scope("messages:write")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/upload", Scope("messages:write")),
+    ("PATCH", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:write")),
+    ("DELETE", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:write")),
+    ("PUT", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", Scope("messages:write")),
     // threads (PROTOCOL.md §7e): reading under messages:read, writing under messages:write
     ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/threads", Scope("messages:read")),
     ("GET", "/api/v1/threads/{thread_id}", Scope("messages:read")),
@@ -306,7 +321,9 @@ pub fn event_allowed(kind: &str, data: &Value, scopes: &[String]) -> bool {
         | (_, "override.update" | "identity.changed" | "identity.rotated" | "devices.changed")
         | (_, crate::federation::inbox::SESSION_REVOKED_EVENT) => !matches!(kind, "room.invite"),
         ("message" | "reaction" | "pin" | "poll" | "emoji" | "conversation" | "thread", _)
-        | (_, "typing" | "read.update") => kind != "conversation.invite" && has("messages:read"),
+        | (_, "typing" | "read.update" | "files.update" | "files.backend") => {
+            kind != "conversation.invite" && has("messages:read")
+        }
         ("member" | "presence", _) | (_, "user.update") => has("members:read"),
         ("voice" | "call" | "soundboard", _) => has("voice"),
         ("whiteboard", _) => has("whiteboard"),
@@ -841,6 +858,41 @@ mod tests {
     }
 
     #[test]
+    fn files_routes_follow_the_scope_split() {
+        let f = "/api/v1/rooms/{room_id}/channels/{channel_id}/files";
+        let reads = [
+            f.to_string(),
+            format!("{f}/{{entry_id}}"),
+            format!("{f}/{{entry_id}}/download"),
+            format!("{f}/{{entry_id}}/thumbnail"),
+            format!("{f}/records"),
+            format!("{f}/mine"),
+            format!("{f}/usage"),
+        ];
+        for p in &reads {
+            assert_eq!(route_access(&Method::GET, p), Some(Scope("messages:read")), "{p}");
+        }
+        let writes = [
+            (Method::POST, format!("{f}/folders")),
+            (Method::POST, format!("{f}/upload")),
+            (Method::PATCH, format!("{f}/{{entry_id}}")),
+            (Method::DELETE, format!("{f}/{{entry_id}}")),
+            (Method::PUT, format!("{f}/{{entry_id}}/thumbnail")),
+        ];
+        for (m, p) in &writes {
+            assert_eq!(route_access(m, p), Some(Scope("messages:write")), "{m} {p}");
+        }
+        // The storage backend (store credentials) stays closed whatever the scopes.
+        for (m, p) in [
+            (Method::GET, format!("{f}/backend")),
+            (Method::PUT, format!("{f}/backend")),
+            (Method::POST, format!("{f}/backend/test")),
+        ] {
+            assert_eq!(check_route(&permissions::all_scopes(), &m, Some(&p)).unwrap_err().code(), "app.bot_forbidden");
+        }
+    }
+
+    #[test]
     fn every_scope_in_the_table_exists() {
         for (m, p, a) in APP_ROUTES {
             match a {
@@ -873,6 +925,10 @@ mod tests {
         assert!(!event_allowed("ephemeral", &wb, &s(&["messages:read"])));
         assert!(event_allowed("ephemeral", &wb, &s(&["whiteboard"])));
         assert!(event_allowed("ephemeral", &json!({ "type": "cursor" }), &s(&["messages:read"])));
+        for kind in ["files.update", "files.backend"] {
+            assert!(event_allowed(kind, &d, &s(&["messages:read"])), "{kind}");
+            assert!(!event_allowed(kind, &d, &s(&["messages:write", "members:read", "rooms:manage"])), "{kind}");
+        }
         assert!(event_allowed("command.invoke", &d, &s(&["commands"])));
         assert!(event_allowed("commands.update", &d, &s(&["commands"])));
         assert!(!event_allowed("command.invoke", &d, &s(&["messages:read", "messages:write"])));
