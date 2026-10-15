@@ -120,6 +120,8 @@ jobs:
         env:
           # Comma-separated private domains, hosts and addresses (repository or organization secret).
           PUBLISH_CHECK_PRIVATE: ${{ secrets.PUBLISH_CHECK_PRIVATE }}
+          # Dependabot's pull requests see only Dependabot secrets; the push to main runs the full check.
+          PUBLISH_CHECK_ALLOW_UNCONFIGURED: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' && '1' || '' }}
         run: scripts/publish-check.sh
       - name: Unit tests of the performance report
         run: node --test perf/report.test.ts
