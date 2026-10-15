@@ -852,3 +852,220 @@ async fn switching_internal_storage_off_keeps_the_existing_files() {
     let (st, _) = s.node.delete(&format!("{}/{fid}", s.base()), &s.alice.token).await;
     assert_eq!(st, StatusCode::OK);
 }
+
+// ---------------------------------------------------------------- Entitlement files_channels.internal
+
+const GRANTS: &str = "/api/v1/admin/entitlements/grants";
+
+/// The rooms of an owner on a node configured by `tweak`: a node admin (registered first), the room owner Olive with
+/// an unencrypted files channel, and Bob, a member of her room (tavrn-node#64).
+struct Owned {
+    node: TestNode,
+    admin: Session,
+    olive: Session,
+    bob: Session,
+    room_id: String,
+    base: String,
+}
+
+impl Owned {
+    async fn new(tweak: impl FnOnce(&mut tavrn_node::config::Config)) -> Self {
+        let node = test_node_with(DOMAIN, |c| {
+            c.files_external = Switch::On;
+            c.files_external_private = Switch::On;
+            tweak(c);
+        })
+        .await;
+        let admin = node.register("admin").await;
+        let olive = node.register("olive").await;
+        let bob = node.register("bob").await;
+        let room_id = node.create_room(&olive.token, "R").await["id"].as_str().unwrap().to_string();
+        let (st, ch) = node
+            .post(
+                &format!("/api/v1/rooms/{room_id}/channels"),
+                &olive.token,
+                json!({ "kind": "files", "name": "f", "encrypted": false }),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{ch}");
+        let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &olive.token, json!({})).await;
+        let (st, j) = node
+            .post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({}))
+            .await;
+        assert!(st.is_success(), "{j}");
+        let base = format!("/api/v1/rooms/{room_id}/channels/{}/files", ch["id"].as_str().unwrap());
+        Self { node, admin, olive, bob, room_id, base }
+    }
+
+    async fn up(&self, who: &Session, name: &str, data: &[u8]) -> (StatusCode, Value) {
+        let len = data.len().to_string();
+        let headers =
+            [("tavrn-file-name", name), ("content-type", "application/octet-stream"), ("content-length", len.as_str())];
+        let (s, _, body) =
+            self.node.raw(Method::POST, &format!("{}/upload", self.base), &who.token, &headers, data.to_vec()).await;
+        (s, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    async fn usage(&self, who: &Session) -> Value {
+        let (st, j) = self.node.get_auth(&format!("{}/usage", self.base), &who.token).await;
+        assert_eq!(st, StatusCode::OK, "{j}");
+        j
+    }
+
+    /// A grant for `subject` with `body` (plan_id and/or overrides); returns its id.
+    async fn grant(&self, subject: String, mut body: Value) -> String {
+        body["subject"] = json!(subject);
+        let (st, g) = self.node.post(GRANTS, &self.admin.token, body).await;
+        assert_eq!(st, StatusCode::CREATED, "{g}");
+        g["id"].as_str().unwrap().to_string()
+    }
+
+    async fn revoke(&self, grant: &str) {
+        let (st, j) = self.node.delete(&format!("{GRANTS}/{grant}"), &self.admin.token).await;
+        assert!(st.is_success(), "{j}");
+    }
+}
+
+fn refused_internal((st, j): (StatusCode, Value), what: &str) {
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("files.internal_disabled")), "{what}: {j}");
+}
+
+/// On a node with external stores only, the room owner's plan or per-user override `files_channels.internal: 1`
+/// allows the node's own storage in her rooms; the node quota applies as usual, `GET /node` keeps the node default,
+/// and the exception ends with the grant (the files already stored stay).
+#[tokio::test]
+async fn the_room_owners_plan_or_override_allows_the_node_storage_on_a_node_without_it() {
+    let o = Owned::new(|c| {
+        c.files_internal = Switch::Off;
+        c.files_channels_max_bytes = 100_000;
+    })
+    .await;
+    // The default refuses.
+    let usage = o.usage(&o.olive).await;
+    assert_eq!(
+        (usage["internal_allowed"].as_bool(), usage["backend"].as_str(), usage["can_upload"].as_bool()),
+        (Some(false), Some("none"), Some(false)),
+        "{usage}"
+    );
+    refused_internal(o.up(&o.olive, "a.txt", b"hello").await, "upload by default");
+    refused_internal(
+        o.node.put(&format!("{}/backend", o.base), &o.olive.token, json!({ "kind": "internal" })).await,
+        "PUT",
+    );
+
+    // A plan grants it.
+    let (st, plan) = o
+        .node
+        .post(
+            "/api/v1/admin/entitlements/plans",
+            &o.admin.token,
+            json!({ "name": "Node storage", "limits": { "files_channels.internal": 1 } }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{plan}");
+    let grant = o.grant(format!("user:{}", o.olive.user_id), json!({ "plan_id": plan["id"] })).await;
+    let usage = o.usage(&o.olive).await;
+    assert_eq!(
+        (usage["internal_allowed"].as_bool(), usage["backend"].as_str(), usage["can_upload"].as_bool()),
+        (Some(true), Some("internal"), Some(true)),
+        "{usage}"
+    );
+    assert_eq!(usage["limit_bytes"], 100_000, "the node quota applies: {usage}");
+    let (_, info) = o.node.get_auth(&format!("{}/backend", o.base), &o.olive.token).await;
+    assert_eq!((info["kind"].as_str(), info["internal_allowed"].as_bool()), (Some("internal"), Some(true)), "{info}");
+    let (st, info) = o.node.put(&format!("{}/backend", o.base), &o.olive.token, json!({ "kind": "internal" })).await;
+    assert_eq!((st, info["kind"].as_str()), (StatusCode::OK, Some("internal")), "{info}");
+    let (st, j) = o.node.post(&format!("{}/folders", o.base), &o.olive.token, json!({ "name": "Docs" })).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (st, f) = o.up(&o.olive, "kept.dat", &sample(60_000)).await;
+    assert_eq!(st, StatusCode::CREATED, "{f}");
+    let (st, j) = o.up(&o.olive, "big.dat", &sample(60_000)).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("files.quota_exceeded")), "{j}");
+    let (_, node) = o.node.req(Method::GET, "/api/v1/node", None, None).await;
+    assert_eq!(node["files_internal"], false, "GET /node keeps the node default: {node}");
+
+    // The grant ends: no new uploads, the stored file stays.
+    o.revoke(&grant).await;
+    refused_internal(o.up(&o.olive, "b.txt", b"x").await, "upload after the grant");
+    let usage = o.usage(&o.olive).await;
+    assert_eq!((usage["backend"].as_str(), usage["files"].as_i64()), (Some("none"), Some(1)), "{usage}");
+    let fid = f["id"].as_str().unwrap();
+    let (st, _, body) =
+        o.node.raw(Method::GET, &format!("{}/{fid}/download", o.base), &o.olive.token, &[], Vec::new()).await;
+    assert_eq!((st, body.len()), (StatusCode::OK, 60_000));
+
+    // A per-user override grants it as well.
+    o.grant(format!("user:{}", o.olive.user_id), json!({ "overrides": { "files_channels.internal": 1 } })).await;
+    let (st, j) = o.up(&o.olive, "c.txt", b"x").await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+}
+
+/// Only the room owner's grants and the room's own grants count: a member's own plan does not open the node's
+/// storage in somebody else's room.
+#[tokio::test]
+async fn a_members_own_grant_does_not_count_the_room_owners_and_the_rooms_do() {
+    let o = Owned::new(|c| c.files_internal = Switch::Off).await;
+    let mine =
+        o.grant(format!("user:{}", o.bob.user_id), json!({ "overrides": { "files_channels.internal": 1 } })).await;
+    assert_eq!(o.usage(&o.bob).await["internal_allowed"], false);
+    refused_internal(o.up(&o.bob, "a.txt", b"x").await, "a member's own grant");
+    o.revoke(&mine).await;
+
+    o.grant(format!("room:{}", o.room_id), json!({ "overrides": { "files_channels.internal": 1 } })).await;
+    assert_eq!(o.usage(&o.bob).await["internal_allowed"], true);
+    let (st, j) = o.up(&o.bob, "a.txt", b"x").await;
+    assert_eq!(st, StatusCode::CREATED, "a room grant counts: {j}");
+}
+
+/// On a node that keeps files, the room owner's override `files_channels.internal: 0` takes the node's storage away
+/// in her rooms (an external store still works); other owners' rooms keep the node default.
+#[tokio::test]
+async fn an_override_off_takes_the_node_storage_away_on_a_node_that_keeps_files() {
+    let (_m, port) = mock(Flavor::WebDav).await;
+    let o = Owned::new(|_| {}).await;
+    assert_eq!(o.usage(&o.olive).await["internal_allowed"], true);
+    o.grant(format!("user:{}", o.olive.user_id), json!({ "overrides": { "files_channels.internal": 0 } })).await;
+    let usage = o.usage(&o.olive).await;
+    assert_eq!(
+        (usage["internal_allowed"].as_bool(), usage["backend"].as_str(), usage["can_upload"].as_bool()),
+        (Some(false), Some("none"), Some(false)),
+        "{usage}"
+    );
+    refused_internal(o.up(&o.olive, "a.txt", b"x").await, "upload");
+    refused_internal(
+        o.node.post(&format!("{}/folders", o.base), &o.olive.token, json!({ "name": "D" })).await,
+        "folder",
+    );
+    refused_internal(
+        o.node.put(&format!("{}/backend", o.base), &o.olive.token, json!({ "kind": "internal" })).await,
+        "PUT",
+    );
+    let (_, node) = o.node.req(Method::GET, "/api/v1/node", None, None).await;
+    assert_eq!(node["files_internal"], true, "{node}");
+
+    let channel = o.base.rsplit('/').nth(1).unwrap().to_string();
+    webdav_for(&o.node, &o.olive.token, &o.room_id, &channel, port).await;
+    let (st, j) = o.up(&o.olive, "a.txt", b"on the store").await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+
+    // Bob's own room follows the node default.
+    let room = o.node.create_room(&o.bob.token, "B").await["id"].as_str().unwrap().to_string();
+    let (st, ch) = o
+        .node
+        .post(
+            &format!("/api/v1/rooms/{room}/channels"),
+            &o.bob.token,
+            json!({ "kind": "files", "name": "f", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{ch}");
+    let (_, usage) = o
+        .node
+        .get_auth(&format!("/api/v1/rooms/{room}/channels/{}/files/usage", ch["id"].as_str().unwrap()), &o.bob.token)
+        .await;
+    assert_eq!(
+        (usage["internal_allowed"].as_bool(), usage["backend"].as_str()),
+        (Some(true), Some("internal")),
+        "{usage}"
+    );
+}
