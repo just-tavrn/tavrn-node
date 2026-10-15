@@ -163,6 +163,7 @@ pub fn parse_document(domain: &str, id: &str, body: &[u8]) -> Result<PublicAppli
 
 /// Fetches the public document of an application of another node (128 KiB cap, vetted client).
 pub async fn fetch_document(state: &AppState, domain: &str, id: &str) -> Result<PublicApplication, ApiError> {
+    crate::federation::check_policy(state, domain).await?;
     let path = format!("/api/v1/applications/{id}/public");
     match state.federation.get(domain, &path, Kind::Application).await {
         Ok(f) => parse_document(domain, id, &f.body)

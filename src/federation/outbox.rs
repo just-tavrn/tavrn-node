@@ -218,6 +218,18 @@ async fn deliver_target(
     now: DateTime<Utc>,
 ) -> Result<DeliveryReport, ApiError> {
     let mut report = DeliveryReport::default();
+    // The domain policy of every outbound request (§1.5): nothing reaches a domain this node banned or a peer it
+    // blocked (operator block, automatic block, key conflict), whatever was queued before.
+    if let Err(e) = super::check_policy(state, &target).await {
+        if !e.status().is_client_error() {
+            return Err(e);
+        }
+        for row in &rows {
+            give_up(state, row, e.code()).await?;
+            report.given_up += 1;
+        }
+        return Ok(report);
+    }
     let now_s = util::format_time(now);
     for row in rows {
         if row.expires_at <= now_s {

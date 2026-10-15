@@ -43,6 +43,7 @@ mod suite {
     mod entitlements_flow;
     mod everyone_safety_flow;
     mod federation_flow;
+    mod federation_policy_flow;
     mod federation_rooms_flow;
     mod federation_social_flow;
     mod files_backends_flow;

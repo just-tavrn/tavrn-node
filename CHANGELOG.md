@@ -219,4 +219,6 @@ First public release of the node and its container image.
 - The Dockerfile pins every base image by digest; CI and the `just` install recipes check livekit-server and ffmpeg
   downloads against pinned checksums, and the CI Valkey is pinned by digest.
 - The publication check prints only file and line of a private match, never the matching text.
-
+- Outbound federation honours node bans of a domain and blocks of a peer (operator, automatic, key conflict) on every
+  path: outbox entries for such a domain are dropped as undeliverable (also those queued before), and profiles,
+  avatars and application documents are no longer fetched from it.

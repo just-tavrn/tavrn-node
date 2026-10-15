@@ -1125,6 +1125,8 @@ The operator decides which nodes this node federates with and how much load othe
   subdomains (a ban of `evil.example` refuses `a.evil.example`).
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
   blocklist still wins.
+- Blocks and node bans of a domain stop the outgoing traffic too: queued notifications for it are dropped as
+  undeliverable, and profiles, avatars and application documents are no longer fetched from it.
 - Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;
   quotas of remote users: `TAVRN_FEDERATION_MAX_REMOTE_USERS`, `…_PER_DOMAIN`.
 - Remote users with nothing left on this node are deleted after `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`.

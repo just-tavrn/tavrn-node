@@ -46,6 +46,10 @@ pub fn peer_blocked(domain: &str) -> ApiError {
 
 /// Domain policy (§1.5 steps 1–3): disabled federation, blocklist, allowlist, node bans of the domain
 /// and blocks of the peer (key conflicts, operator and automatic blocks of §9.4). Rate limits (step 4) are applied by the callers.
+///
+/// This is the one "may this node talk to that domain" check: every inbound request and every outbound path calls it
+/// before the network (outbox delivery, profile and image mirroring, key refreshes, claims, application documents,
+/// directory fetches, emoji and sound copies). The client's own check covers only the configured lists.
 pub async fn check_policy(state: &AppState, domain: &str) -> Result<(), ApiError> {
     state.federation.check_policy(domain).map_err(|e| e.to_api())?;
     if store::federation::domain_banned(&state.db, domain).await? {
