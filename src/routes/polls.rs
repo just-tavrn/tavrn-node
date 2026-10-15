@@ -16,7 +16,7 @@ use crate::{
     access::{self, Conv, ConvKind},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ProblemDetails},
     models::MessageRow,
     polls, store,
     store::polls::VoteRow,
@@ -145,7 +145,7 @@ pub async fn put_poll_vote(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((conversation_id, message_id)): Path<(String, String)>,
-    Json(req): Json<PollVoteRequest>,
+    ApiJson(req): ApiJson<PollVoteRequest>,
 ) -> Result<Json<PollVote>, ApiError> {
     let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
     let message = poll_message(&state, &auth, &conv, &message_id).await?;

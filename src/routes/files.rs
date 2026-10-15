@@ -20,7 +20,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
     routing::{get, post},
@@ -34,7 +34,7 @@ use crate::{
     app::AppState,
     auth::{AuthUser, RateLimiter},
     entitlements::{self, Entitlements},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     files::{
         self, ByteStream, FileEntry, MAX_DEPTH, MAX_ENTRIES_PER_CHANNEL,
         remote::{self, Kind, RemoteConfig, RemoteStore},
@@ -711,7 +711,7 @@ pub async fn create_folder(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<CreateFolderRequest>,
+    ApiJson(req): ApiJson<CreateFolderRequest>,
 ) -> Result<(StatusCode, Json<FileEntry>), ApiError> {
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
@@ -1201,7 +1201,7 @@ pub async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id, entry_id)): Path<(String, String, String)>,
-    Json(req): Json<UpdateEntryRequest>,
+    ApiJson(req): ApiJson<UpdateEntryRequest>,
 ) -> Result<Json<FileEntry>, ApiError> {
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let entry = entry_in(&state, &conv, &entry_id).await?;
@@ -1792,7 +1792,7 @@ pub async fn put_backend(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<BackendRequest>,
+    ApiJson(req): ApiJson<BackendRequest>,
 ) -> Result<Json<BackendInfo>, ApiError> {
     let conv = backend_access(&state, &room_id, &channel_id, &auth).await?;
     backend_limiter().check_all(&[format!("files-backend:{}", auth.user.id)])?;

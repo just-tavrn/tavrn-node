@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     routing::{get, post, put},
 };
@@ -23,7 +23,7 @@ use crate::{
         self, CommandArg, CommandDefinition, CommandOption, CommandSet, CommandSettings, PaletteApplication,
         PaletteCommand, PutCommandSettings, PutCommandsRequest, RoomCommand, RoomCommands,
     },
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     installations,
     interactions::{
         self, Callback, ComponentInvokeRequest, EphemeralReply, FollowUp, FollowUpResponse, InvokeRequest,

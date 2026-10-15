@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::Deserialize;
@@ -15,7 +15,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     e2ee,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     models::{Channel, ChannelRow, Message, MessageRow, UserRow},
     permissions as p, store,
     store::messages::NewMessage,
@@ -552,7 +552,7 @@ pub async fn create_message(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<CreateMessageRequest>,
+    ApiJson(req): ApiJson<CreateMessageRequest>,
 ) -> Result<(StatusCode, Json<Message>), ApiError> {
     let conv = access::channel_conversation(&state, &room_id, &channel_id, &auth.user).await?;
     create_in(&state, &auth, &conv, req).await
@@ -565,7 +565,7 @@ pub async fn create_conversation_message(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(conversation_id): Path<String>,
-    Json(req): Json<CreateMessageRequest>,
+    ApiJson(req): ApiJson<CreateMessageRequest>,
 ) -> Result<(StatusCode, Json<Message>), ApiError> {
     let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
     create_in(&state, &auth, &conv, req).await
@@ -859,7 +859,7 @@ pub async fn edit_message(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id, message_id)): Path<(String, String, String)>,
-    Json(req): Json<EditMessageRequest>,
+    ApiJson(req): ApiJson<EditMessageRequest>,
 ) -> Result<Json<Message>, ApiError> {
     let conv = access::channel_conversation(&state, &room_id, &channel_id, &auth.user).await?;
     edit_in(&state, &auth, &conv, &message_id, req).await
@@ -871,7 +871,7 @@ pub async fn edit_conversation_message(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((conversation_id, message_id)): Path<(String, String)>,
-    Json(req): Json<EditMessageRequest>,
+    ApiJson(req): ApiJson<EditMessageRequest>,
 ) -> Result<Json<Message>, ApiError> {
     let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
     edit_in(&state, &auth, &conv, &message_id, req).await

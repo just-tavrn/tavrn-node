@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 use crate::{
     app::{AppState, SOFTWARE_VERSION, capabilities},
     auth::NodeAdmin,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     jwt,
     models::{AccountInvite, AuditEntry, Ban, User},
     store,
@@ -136,7 +136,7 @@ pub async fn update_user(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(user_id): Path<String>,
-    Json(req): Json<UpdateUserRequest>,
+    ApiJson(req): ApiJson<UpdateUserRequest>,
 ) -> Result<Json<AdminUser>, ApiError> {
     let target = store::users::by_id(&state.db, &user_id)
         .await?
@@ -283,7 +283,7 @@ pub async fn purge_user(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(user_id): Path<String>,
-    Json(req): Json<PurgeUserRequest>,
+    ApiJson(req): ApiJson<PurgeUserRequest>,
 ) -> Result<Json<PurgeUserResponse>, ApiError> {
     let target = store::users::by_id(&state.db, &user_id)
         .await?
@@ -370,7 +370,7 @@ fn one() -> i64 {
 pub async fn create_invite(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
-    body: Option<Json<CreateAccountInviteRequest>>,
+    body: Option<ApiJson<CreateAccountInviteRequest>>,
 ) -> Result<(StatusCode, Json<AccountInvite>), ApiError> {
     let req = body.map(|b| b.0).unwrap_or_default();
     let note = validate::text("note", &req.note, 0, 200)?;
@@ -443,7 +443,7 @@ pub struct NodeBanRequest {
 pub async fn ban(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
-    Json(req): Json<NodeBanRequest>,
+    ApiJson(req): ApiJson<NodeBanRequest>,
 ) -> Result<(StatusCode, Json<Ban>), ApiError> {
     let subject = req.subject.trim().to_lowercase();
     let reason = validate::text("reason", &req.reason, 0, 500)?;

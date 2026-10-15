@@ -4,7 +4,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -17,7 +17,7 @@ use crate::{
     app::AppState,
     auth::{AuthUser, NodeAdmin},
     automod::{self, AutomodRule},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     permissions as p,
     reports::{
         self, CreateReportRequest, EvidenceEntry, MessageSnapshot, ModerationReport, ReportActionRecord,

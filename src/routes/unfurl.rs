@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `GET /api/v1/unfurl`: a link preview for the sender's client (`crate::unfurl`).
 
-use axum::{
-    Json,
-    extract::{Query, State},
-};
+use axum::{Json, extract::State};
 use serde::Deserialize;
 
 use crate::{
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiQuery as Query, ProblemDetails},
     unfurl::UnfurlResponse,
 };
 

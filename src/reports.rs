@@ -960,7 +960,7 @@ async fn run_action(
             } else {
                 require_admin(auth)?;
                 let body = admin::NodeBanRequest { subject, reason: req.reason.clone() };
-                let _ = admin::ban(s(), NodeAdmin(auth.clone()), Json(body)).await?;
+                let _ = admin::ban(s(), NodeAdmin(auth.clone()), crate::error::ApiJson(body)).await?;
             }
             Ok(None)
         }
@@ -979,7 +979,8 @@ async fn run_action(
             } else {
                 require_admin(auth)?;
                 let body = admin::PurgeUserRequest { confirm_token: req.confirm_token.clone() };
-                let Json(r) = admin::purge_user(s(), NodeAdmin(auth.clone()), Path(target), Json(body)).await?;
+                let Json(r) =
+                    admin::purge_user(s(), NodeAdmin(auth.clone()), Path(target), crate::error::ApiJson(body)).await?;
                 Ok(Some(rooms::PurgeResponse {
                     dry_run: r.dry_run,
                     messages: r.messages,

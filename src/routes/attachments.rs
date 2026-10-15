@@ -4,7 +4,7 @@
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -18,7 +18,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     entitlements::{self, Entitlements},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiQuery as Query, ProblemDetails},
     models::{Attachment, Message, MessageRow, MessageUpdate, ReactionChange},
     permissions as p,
     storage::mime_allowed,

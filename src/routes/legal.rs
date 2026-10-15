@@ -4,7 +4,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -15,7 +15,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::{
     app::AppState,
     auth::{AuthUser, ClientIp, NodeAdmin},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     legal::{
         self, LegalContact, LegalInfo,
         account::{self, AccountDeletion, DeleteAccountRequest, DeletionStarted},

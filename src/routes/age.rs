@@ -13,7 +13,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::{
     app::AppState,
     auth::{AuthUser, NodeAdmin},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ProblemDetails},
     models::UserPrivate,
     routes::auth::own_account,
     store,
@@ -46,7 +46,7 @@ pub struct DateOfBirthRequest {
 pub async fn set_date_of_birth(
     State(state): State<AppState>,
     mut auth: AuthUser,
-    Json(req): Json<DateOfBirthRequest>,
+    ApiJson(req): ApiJson<DateOfBirthRequest>,
 ) -> Result<Json<UserPrivate>, ApiError> {
     if auth.user.kind != "user" {
         return Err(crate::applications::bot_forbidden());
@@ -92,7 +92,7 @@ pub async fn admin_set_date_of_birth(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(user_id): Path<String>,
-    Json(req): Json<AdminDateOfBirthRequest>,
+    ApiJson(req): ApiJson<AdminDateOfBirthRequest>,
 ) -> Result<StatusCode, ApiError> {
     let target = store::users::by_id(&state.db, &user_id)
         .await?
