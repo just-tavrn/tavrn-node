@@ -700,19 +700,24 @@ pub(crate) async fn to_member(
     m: &crate::models::MemberRow,
 ) -> Result<Option<Member>, ApiError> {
     let Some(user) = store::users::by_id(&state.db, &m.user_id).await? else { return Ok(None) };
+    Ok(Some(member_of(m, &user, store::rooms::member_role_ids(&state.db, room_id, &m.user_id).await?)))
+}
+
+/// The `Member` of a membership row from the loaded user and role ids.
+fn member_of(m: &crate::models::MemberRow, user: &UserRow, roles: Vec<String>) -> Member {
     let avatar = m.avatar_media_id.as_deref();
-    Ok(Some(Member {
+    Member {
         user: user.to_public(),
         nickname: m.nickname.clone(),
         joined_at: m.joined_at.clone(),
-        roles: store::rooms::member_role_ids(&state.db, room_id, &m.user_id).await?,
+        roles,
         timeout_until: m.timeout_until.clone().filter(|t| t.as_str() > now().as_str()),
         nick: m.nickname.clone(),
         room_avatar: crate::models::media_url(avatar, m.avatar_animated != 0),
         room_avatar_still: crate::models::media_url(avatar, false),
         room_avatar_animated: avatar.is_some() && m.avatar_animated != 0,
         room_bio: Some(m.bio.clone()).filter(|b| !b.is_empty()),
-    }))
+    }
 }
 
 /// Members (paginated via `after` = last user ID).
@@ -726,13 +731,16 @@ pub async fn list_members(
     access::room_access(&state, &room_id, &auth.user).await?;
     let rows =
         store::rooms::members(&state.db, &room_id, validate::limit(q.limit, 100, 500), q.after.as_deref()).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for m in &rows {
-        if let Some(member) = to_member(&state, &room_id, m).await? {
-            out.push(member);
-        }
-    }
-    Ok(Json(out))
+    // A constant number of statements per page: the users and the role ids of all its members at once.
+    let user_ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
+    let users: std::collections::HashMap<String, UserRow> =
+        store::users::by_ids(&state.db, &user_ids).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    let mut roles = store::rooms::member_role_ids_of(&state.db, &room_id, &user_ids).await?;
+    Ok(Json(
+        rows.iter()
+            .filter_map(|m| Some(member_of(m, users.get(&m.user_id)?, roles.remove(&m.user_id).unwrap_or_default())))
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize, ToSchema)]

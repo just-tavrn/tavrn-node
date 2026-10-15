@@ -22,15 +22,23 @@ pub async fn by_username(db: &Pool, username: &str, domain: &str) -> Result<Opti
         .await?)
 }
 
+/// The users of `ids` in the order of `ids` (unknown ids are left out), with one query per [`super::IN_CHUNK`] ids.
 pub async fn by_ids(db: &Pool, ids: &[String]) -> Result<Vec<UserRow>, ApiError> {
-    let mut out = Vec::with_capacity(ids.len());
-    // Small sets (member lists are paginated); single queries stay portable.
-    for id in ids {
-        if let Some(u) = by_id(db, id).await? {
-            out.push(u);
+    let mut found: std::collections::HashMap<String, UserRow> = std::collections::HashMap::with_capacity(ids.len());
+    let mut unique: Vec<&String> = ids.iter().collect();
+    unique.sort();
+    unique.dedup();
+    for chunk in unique.chunks(super::IN_CHUNK) {
+        let sql = format!("SELECT {USER_COLS} FROM users WHERE id IN ({})", super::placeholders(1, chunk.len()));
+        let mut q = sqlx::query_as::<_, UserRow>(&sql);
+        for id in chunk {
+            q = q.bind(*id);
+        }
+        for user in q.fetch_all(db).await? {
+            found.insert(user.id.clone(), user);
         }
     }
-    Ok(out)
+    Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
 }
 
 /// The user rows of a room's members, in one query (the channel visibility snapshot, `visibility.rs`).

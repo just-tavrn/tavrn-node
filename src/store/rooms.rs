@@ -385,6 +385,30 @@ pub async fn member_role_ids(db: &Pool, room_id: &str, user_id: &str) -> Result<
     rows.iter().map(|r| r.try_get::<String, _>("role_id").map_err(Into::into)).collect()
 }
 
+/// The role ids of several members of a room (user id → role ids; members without roles are absent), with one
+/// query per [`super::IN_CHUNK`] users.
+pub async fn member_role_ids_of(
+    db: &Pool,
+    room_id: &str,
+    user_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, ApiError> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for chunk in user_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT user_id, role_id FROM member_roles WHERE room_id = $1 AND user_id IN ({}) ORDER BY role_id",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query(&sql).bind(room_id);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.entry(r.try_get::<String, _>("user_id")?).or_default().push(r.try_get::<String, _>("role_id")?);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn set_member_roles(db: &Pool, room_id: &str, user_id: &str, role_ids: &[String]) -> Result<(), ApiError> {
     let mut tx = db.begin().await?;
     sqlx::query("DELETE FROM member_roles WHERE room_id = $1 AND user_id = $2")

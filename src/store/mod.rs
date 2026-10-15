@@ -38,6 +38,15 @@ pub mod whiteboards;
 
 use crate::error::ApiError;
 
+/// Bound values per `IN (…)` list: list queries split longer id lists into chunks of this size (well below the
+/// parameter limits of PostgreSQL and SQLite).
+pub(crate) const IN_CHUNK: usize = 500;
+
+/// `$start, $start+1, …` for `n` bound values (the values themselves are always bound, never inlined).
+pub(crate) fn placeholders(start: usize, n: usize) -> String {
+    (start..start + n).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
+}
+
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         match e {
