@@ -288,3 +288,65 @@ async fn gif_search_is_proxied_and_gif_messages_validated() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{j}");
     assert_eq!(j["code"], "message.gif_invalid");
 }
+
+/// GIF answers are cached (one provider call per query and limit), each user is limited per minute, and a provider
+/// error (a wrong key, the quota) is `503 gif.unavailable`, never a `500`.
+#[tokio::test]
+async fn gif_search_is_cached_limited_per_user_and_maps_provider_errors() {
+    use axum::{Json, Router, extract::Query, http::StatusCode as S, response::IntoResponse, routing::get};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(serde::Deserialize)]
+    struct Q {
+        q: Option<String>,
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let fake = Router::new().route(
+        "/v1/gifs/search",
+        get(move |Query(q): Query<Q>| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                match q.q.as_deref() {
+                    Some("quota") => (S::TOO_MANY_REQUESTS, "slow down").into_response(),
+                    Some("garbled") => "<html>".into_response(),
+                    _ => Json(json!({ "data": [] })).into_response(),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+    let mut node = test_node("t.local").await;
+    node.state.gifs = Some(tavrn_node::gifs::GifClient::new(
+        tavrn_node::config::GifProvider::Giphy,
+        "k".into(),
+        &format!("http://{addr}"),
+    ));
+    node.router = tavrn_node::app::router(node.state.clone());
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    for _ in 0..3 {
+        let (s, j) = node.get_auth("/api/v1/gifs?q=Dog", &alice.token).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+    }
+    node.get_auth("/api/v1/gifs?q=dog", &bob.token).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one provider call for the same query");
+    let (s, j) = node.get_auth("/api/v1/gifs?q=quota", &alice.token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("gif.unavailable")), "{j}");
+    let (s, j) = node.get_auth("/api/v1/gifs?q=garbled", &alice.token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("gif.unavailable")), "{j}");
+    // 5 searches so far; the limit per user and minute is 30.
+    for _ in 5..tavrn_node::gifs::PER_USER_PER_MINUTE {
+        let (s, _) = node.get_auth("/api/v1/gifs?q=dog", &alice.token).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let (s, _) = node.get_auth("/api/v1/gifs?q=dog", &alice.token).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    let (s, _) = node.get_auth("/api/v1/gifs?q=dog", &bob.token).await;
+    assert_eq!(s, StatusCode::OK, "the limit is per user");
+}

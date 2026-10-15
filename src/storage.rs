@@ -369,11 +369,21 @@ impl ChunkSealer {
     }
 
     fn seal(&mut self, plain: &[u8], last: bool, out: &mut Vec<u8>) -> anyhow::Result<()> {
-        let ct = self
-            .cipher
-            .encrypt((&chunk_nonce(self.index, last)).into(), plain)
+        Self::seal_with(&self.cipher, &mut self.index, plain, last, out)
+    }
+
+    /// Seals one chunk; an associated function so that `push` can seal straight out of `pending` (no copy).
+    fn seal_with(
+        cipher: &Aes256Gcm,
+        index: &mut u64,
+        plain: &[u8],
+        last: bool,
+        out: &mut Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let ct = cipher
+            .encrypt((&chunk_nonce(*index, last)).into(), plain)
             .map_err(|_| anyhow!("chunk could not be encrypted"))?;
-        self.index += 1;
+        *index += 1;
         out.extend_from_slice(&ct);
         Ok(())
     }
@@ -389,8 +399,7 @@ impl ChunkSealer {
         self.pending.extend_from_slice(data);
         let mut start = 0;
         while self.pending.len() - start > CHUNK {
-            let chunk = self.pending[start..start + CHUNK].to_vec();
-            self.seal(&chunk, false, &mut out)?;
+            Self::seal_with(&self.cipher, &mut self.index, &self.pending[start..start + CHUNK], false, &mut out)?;
             start += CHUNK;
         }
         self.pending.drain(..start);

@@ -179,16 +179,18 @@ fn valid_name(s: &str) -> bool {
 }
 
 fn text(path: &str, v: Option<&Value>, max: usize) -> Result<String, ApiError> {
-    let s = v.and_then(Value::as_str).ok_or_else(|| invalid(path, format!("{path}: a string is required")))?;
-    let n = s.chars().count();
-    if n == 0 || n > max || s.trim().is_empty() || s.chars().any(char::is_control) {
-        return Err(invalid(path, format!("{path}: 1 to {max} characters without control characters")));
+    let rules = crate::validate::TextRules { min: 1, max, trim: false, controls: false };
+    match crate::validate::json_text(v, rules) {
+        Ok(Some(s)) if !s.trim().is_empty() => Ok(s.to_string()),
+        Ok(None) | Err(crate::validate::TextError::NotText) => {
+            Err(invalid(path, format!("{path}: a string is required")))
+        }
+        Ok(Some(_)) | Err(_) => Err(invalid(path, format!("{path}: 1 to {max} characters without control characters"))),
     }
-    Ok(s.to_string())
 }
 
 fn only_keys(path: &str, obj: &Map<String, Value>, allowed: &[&str]) -> Result<(), ApiError> {
-    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+    match crate::validate::unknown_key(obj, allowed) {
         Some(k) => Err(invalid(format!("{path}.{k}"), format!("Unknown field {k:.40}"))),
         None => Ok(()),
     }

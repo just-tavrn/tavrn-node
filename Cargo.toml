@@ -41,6 +41,8 @@ name = "tavrn-node"
 path = "src/main.rs"
 
 [dependencies]
+# One pass over a message for all literals of an auto-moderation rule (already in the tree through regex).
+aho-corasick = "1"
 anyhow.workspace = true
 argon2 = { version = "0.5", features = ["std"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
@@ -51,6 +53,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # add a second Ed25519 implementation beside the one that verifies device proofs.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 figment = { version = "0.10", features = ["env", "toml"] }
+# gzip of the embedded web client's assets, once per file (webapp.rs).
+flate2 = "1"
 futures = "0.3"
 # SRV lookups for the server-to-server DNS fallback `_tavrn._tcp.<domain>`; the system resolver
 # (getaddrinfo) cannot query SRV records.

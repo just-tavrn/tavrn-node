@@ -49,6 +49,9 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// After a failed publish, further publishes are dropped (and counted as lost) for this long.
 const PUBLISH_PAUSE: Duration = Duration::from_secs(1);
+/// Messages waiting for the bus forwarder; beyond, new ones are dropped and counted as lost (the other instances'
+/// clients resync), so a slow cache never lets the queue grow without bound.
+pub const BUS_QUEUE: usize = 16_384;
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{0}")]
@@ -221,6 +224,33 @@ pub enum Outbound {
     Message(Box<Message>),
 }
 
+/// The bounded queue to the bus forwarder ([`BUS_QUEUE`]): a full queue drops the message and counts it, and the
+/// forwarder then publishes [`Message::Resync`] first, as after a failed publish.
+#[derive(Clone)]
+pub struct BusSender {
+    tx: mpsc::Sender<Outbound>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl BusSender {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<Outbound>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx, dropped: Arc::default() }, rx)
+    }
+
+    /// Queues `out`; never waits.
+    pub fn send(&self, out: Outbound) {
+        if self.tx.try_send(out).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Messages dropped since the last call.
+    fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+}
+
 struct Peer {
     url: String,
     seen: Instant,
@@ -232,8 +262,8 @@ pub struct Cluster {
     prefix: String,
     cache: Arc<dyn Cache>,
     shared: bool,
-    tx: mpsc::UnboundedSender<Outbound>,
-    rx: Mutex<Option<mpsc::UnboundedReceiver<Outbound>>>,
+    tx: BusSender,
+    rx: Mutex<Option<mpsc::Receiver<Outbound>>>,
     /// Unix milliseconds until which this instance holds the leader lease (`u64::MAX` standalone).
     leader_until: AtomicU64,
     /// The instance id of the current leader as last read.
@@ -317,7 +347,7 @@ impl Cluster {
         secret: &[u8; 32],
         url: String,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = BusSender::channel(BUS_QUEUE);
         Self {
             instance_id,
             prefix: format!("tavrn:{domain}:"),
@@ -449,12 +479,12 @@ impl Cluster {
     /// Hands a message to the bus (in order with the hub's events); nothing standalone.
     pub fn send(&self, msg: Message) {
         if self.shared {
-            let _ = self.tx.send(Outbound::Message(Box::new(msg)));
+            self.tx.send(Outbound::Message(Box::new(msg)));
         }
     }
 
     /// The sender the hub publishes its events through (only when shared).
-    pub fn event_sender(&self) -> Option<mpsc::UnboundedSender<Outbound>> {
+    pub fn event_sender(&self) -> Option<BusSender> {
         self.shared.then(|| self.tx.clone())
     }
 
@@ -543,11 +573,21 @@ pub fn start(state: &AppState) {
 
 /// Publishes outbound messages in order. A failed publish loses messages: once the cache answers again the
 /// instance publishes [`Message::Resync`] first, so the clients of the others reload instead of missing events.
-async fn forward(cluster: Arc<Cluster>, mut rx: mpsc::UnboundedReceiver<Outbound>) {
+async fn forward(cluster: Arc<Cluster>, mut rx: mpsc::Receiver<Outbound>) {
     let channel = cluster.channel();
     let mut lost: u64 = 0;
     let mut paused_until: Option<Instant> = None;
     while let Some(out) = rx.recv().await {
+        let dropped = cluster.tx.take_dropped();
+        if dropped > 0 {
+            if lost == 0 {
+                tracing::warn!(
+                    dropped,
+                    "cache bus queue full: events of this instance are lost, the other instances' clients resync"
+                );
+            }
+            lost += dropped;
+        }
         if paused_until.is_some_and(|t| Instant::now() < t) {
             lost += 1;
             continue;
@@ -746,6 +786,30 @@ mod tests {
         assert_eq!(target_of("rediss://u:p@h.example"), "h.example");
         assert!(valid_instance_id("tavrn-1") && valid_instance_id("a.b_c"));
         assert!(!valid_instance_id("") && !valid_instance_id("a b") && !valid_instance_id(&"x".repeat(65)));
+    }
+
+    /// A full bus queue drops new messages and counts them; the forwarder then publishes a resync before the
+    /// next message, so the other instances' clients reload instead of missing events.
+    #[tokio::test]
+    async fn a_full_bus_queue_drops_and_the_forwarder_resyncs() {
+        let (tx, _rx) = BusSender::channel(2);
+        for _ in 0..3 {
+            tx.send(Outbound::Message(Box::new(Message::Resync)));
+        }
+        assert_eq!((tx.take_dropped(), tx.take_dropped()), (1, 0));
+
+        let cache: Arc<dyn Cache> = Arc::new(memory::InProcess::default());
+        let cluster = Arc::new(Cluster::shared_with("n.test", "a", cache.clone(), &[0; 32], ""));
+        let mut bus = cache.subscribe(&cluster.channel()).await.unwrap();
+        for _ in 0..BUS_QUEUE + 3 {
+            cluster.send(Message::Wake { job: Job::Outbox });
+        }
+        let rx = lock(&cluster.rx).take().unwrap();
+        tokio::spawn(forward(cluster.clone(), rx));
+        let first: Envelope = serde_json::from_str(&bus.next().await.unwrap()).unwrap();
+        assert!(matches!(first.msg, Message::Resync), "the resync goes first");
+        let second: Envelope = serde_json::from_str(&bus.next().await.unwrap()).unwrap();
+        assert!(matches!(second.msg, Message::Wake { .. }));
     }
 
     #[tokio::test]

@@ -22,9 +22,13 @@ pub struct NewBlob<'a> {
 }
 
 pub async fn insert(db: &Pool, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
-    let id = ulid();
+    insert_as(db, &ulid(), b).await
+}
+
+/// [`insert`] with the id chosen by the caller (the file was stored under it first, streamed).
+pub async fn insert_as(db: &Pool, id: &str, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
     sqlx::query("INSERT INTO blobs (id, uploader_id, conversation_id, room_id, name, mime, size, sha256, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
-        .bind(&id)
+        .bind(id)
         .bind(b.uploader_id)
         .bind(b.conversation_id)
         .bind(b.room_id)
@@ -35,7 +39,7 @@ pub async fn insert(db: &Pool, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
         .bind(now())
         .execute(db)
         .await?;
-    by_id(db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("blob not found after INSERT")))
+    by_id(db, id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("blob not found after INSERT")))
 }
 
 pub async fn by_id(db: &Pool, id: &str) -> Result<Option<BlobRow>, ApiError> {

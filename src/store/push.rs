@@ -31,6 +31,9 @@ pub struct SubscriptionRow {
 
 const COLS: &str =
     "id, user_id, device_id, endpoint, p256dh, auth, expires_at, created_at, last_used_at, failures, retry_at";
+/// [`COLS`] of the table aliased `p` (in joins).
+const P_COLS: &str = "p.id, p.user_id, p.device_id, p.endpoint, p.p256dh, p.auth, p.expires_at, p.created_at, \
+    p.last_used_at, p.failures, p.retry_at";
 
 pub struct NewSubscription<'a> {
     pub user_id: &'a str,
@@ -150,6 +153,76 @@ pub async fn deliverable(db: &Pool, user_id: &str) -> Result<Vec<SubscriptionRow
     .await?)
 }
 
+/// A local user a message may push to, with what the decision needs: [`recipients`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipient {
+    pub user_id: String,
+    pub username: String,
+    /// The stored notification settings (JSON), `None` for the defaults.
+    pub settings: Option<String>,
+    /// The user and the author blocked each other (either direction).
+    pub blocked: bool,
+    /// The deliverable subscriptions ([`deliverable`]), oldest first.
+    pub subscriptions: Vec<SubscriptionRow>,
+}
+
+#[derive(FromRow)]
+struct RecipientRow {
+    #[sqlx(flatten)]
+    subscription: SubscriptionRow,
+    username: String,
+    settings: Option<String>,
+    blocked: i64,
+}
+
+/// Of `user_ids`, the enabled users of `domain` with a deliverable subscription ([`deliverable`]), with their
+/// notification settings and whether they and `author_id` blocked each other: one statement per 500 users instead
+/// of four per user (the push fan-out of a message). Ordered by user id.
+pub async fn recipients(
+    db: &Pool,
+    user_ids: &[String],
+    author_id: &str,
+    domain: &str,
+) -> Result<Vec<Recipient>, ApiError> {
+    let ts = now();
+    let mut out: Vec<Recipient> = Vec::new();
+    for chunk in user_ids.chunks(500) {
+        let placeholders: Vec<String> = (4..4 + chunk.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "SELECT {P_COLS}, u.username, n.settings,
+                    CASE WHEN EXISTS (SELECT 1 FROM user_blocks b
+                                      WHERE (b.user_id = p.user_id AND b.blocked_id = $1)
+                                         OR (b.user_id = $1 AND b.blocked_id = p.user_id)) THEN 1 ELSE 0 END AS blocked
+             FROM push_subscriptions p
+             JOIN users u ON u.id = p.user_id
+             LEFT JOIN notification_settings n ON n.user_id = p.user_id
+             WHERE p.user_id IN ({}) AND u.domain = $3 AND u.disabled_at IS NULL
+               AND (p.expires_at IS NULL OR p.expires_at > $2) AND (p.retry_at IS NULL OR p.retry_at <= $2)
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = p.device_id AND s.revoked_at IS NULL
+                           AND s.expires_at > $2)
+             ORDER BY p.user_id, p.created_at, p.id",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query_as::<_, RecipientRow>(&sql).bind(author_id).bind(&ts).bind(domain);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for row in q.fetch_all(db).await? {
+            match out.last_mut() {
+                Some(last) if last.user_id == row.subscription.user_id => last.subscriptions.push(row.subscription),
+                _ => out.push(Recipient {
+                    user_id: row.subscription.user_id.clone(),
+                    username: row.username,
+                    settings: row.settings,
+                    blocked: row.blocked != 0,
+                    subscriptions: vec![row.subscription],
+                }),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Of `user_ids`, those with at least one subscription (cheap pre-filter before notification rules are evaluated).
 pub async fn users_with_subscriptions(db: &Pool, user_ids: &[String]) -> Result<Vec<String>, ApiError> {
     let mut out = Vec::new();
@@ -212,6 +285,24 @@ pub async fn mark_used(db: &Pool, id: &str) -> Result<(), ApiError> {
         .bind(id)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+/// Successful deliveries of one push job: [`mark_used`] for many subscriptions in one statement per 500.
+pub async fn mark_used_many(db: &Pool, ids: &[String]) -> Result<(), ApiError> {
+    let ts = now();
+    for chunk in ids.chunks(500) {
+        let placeholders: Vec<String> = (2..2 + chunk.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "UPDATE push_subscriptions SET last_used_at = $1, failures = 0, retry_at = NULL WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query(&sql).bind(&ts);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        q.execute(db).await?;
+    }
     Ok(())
 }
 
@@ -332,6 +423,36 @@ mod tests {
         assert!(delete(&db, "u2", &a.id).await.unwrap());
         assert!(list(&db, "u2").await.unwrap().is_empty());
         assert_eq!(users_with_subscriptions(&db, &["u1".into(), "u2".into(), "u3".into()]).await.unwrap(), vec!["u1"]);
+    }
+
+    #[tokio::test]
+    async fn recipients_carry_settings_blocks_and_deliverable_subscriptions() {
+        let db = db_with_user(&["u1", "u2", "u3", "author"]).await;
+        let (a, _) = upsert(&db, sub("u1", "u1-d1", "https://push.example/a")).await.unwrap().unwrap();
+        let (b, _) = upsert(&db, sub("u1", "u1-d2", "https://push.example/b")).await.unwrap().unwrap();
+        let (c, _) = upsert(&db, sub("u2", "u2-d1", "https://push.example/c")).await.unwrap().unwrap();
+        upsert(&db, sub("u3", "u3-d1", "https://push.example/d")).await.unwrap().unwrap();
+        sqlx::query("INSERT INTO notification_settings (user_id, settings, updated_at) VALUES ('u1', '{}', $1)")
+            .bind(now())
+            .execute(&db)
+            .await
+            .unwrap();
+        crate::store::social::block(&db, "author", "u2", "").await.unwrap();
+        // u3 is disabled; u1's second device is held back.
+        sqlx::query("UPDATE users SET disabled_at = $1 WHERE id = 'u3'").bind(now()).execute(&db).await.unwrap();
+        mark_failed(&db, &b.id, &crate::util::in_seconds(60)).await.unwrap();
+        let ids = ["u1", "u2", "u3", "nobody"].map(String::from);
+        let got = recipients(&db, &ids, "author", "n.test").await.unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got[0].user_id.as_str(), got[0].settings.as_deref(), got[0].blocked), ("u1", Some("{}"), false));
+        assert_eq!(got[0].subscriptions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [a.id.as_str()]);
+        assert_eq!((got[1].user_id.as_str(), got[1].settings.as_deref(), got[1].blocked), ("u2", None, true));
+        assert_eq!(got[1].subscriptions[0], c);
+        assert!(recipients(&db, &ids, "author", "other.test").await.unwrap().is_empty(), "local users only");
+        mark_used_many(&db, &[b.id.clone(), c.id.clone()]).await.unwrap();
+        let rows = list(&db, "u1").await.unwrap();
+        let row = rows.iter().find(|r| r.id == b.id).unwrap();
+        assert_eq!((row.failures, row.retry_at.is_none(), row.last_used_at.is_some()), (0, true, true));
     }
 
     #[tokio::test]

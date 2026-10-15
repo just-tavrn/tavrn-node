@@ -42,10 +42,8 @@ fn valid_id(s: &str) -> bool {
 
 /// Trimmed text of 1..=max characters.
 fn text(v: Option<&Value>, max: usize) -> bool {
-    v.and_then(Value::as_str).is_some_and(|s| {
-        let n = s.trim().chars().count();
-        n >= 1 && n <= max
-    })
+    let rules = crate::validate::TextRules { min: 1, max, trim: true, controls: true };
+    matches!(crate::validate::json_text(v, rules), Ok(Some(_)))
 }
 
 /// An RFC 3339 date-time with seconds and an explicit offset (`Z` or `±hh:mm`), as polls and votes use them: the

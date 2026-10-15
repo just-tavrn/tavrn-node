@@ -101,6 +101,39 @@ pub async fn enqueue(
     Ok(id)
 }
 
+/// [`enqueue`] for many notifications of one kind from `from`: `(target node, recipient address, payload)` each, in
+/// one statement per 500 and with one wake-up of the sender.
+pub async fn enqueue_many(
+    state: &AppState,
+    kind: &str,
+    from: &str,
+    items: Vec<(String, String, Value)>,
+) -> Result<(), ApiError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut built = Vec::with_capacity(items.len());
+    for (target, to, payload) in items {
+        let (id, at, body, expires_at) = envelope(kind, from, &to, payload)?;
+        built.push((target, id, at, body, expires_at));
+    }
+    let entries: Vec<store::federation::NewOutbox<'_>> = built
+        .iter()
+        .map(|(target, id, at, body, expires_at)| store::federation::NewOutbox {
+            id,
+            target,
+            kind,
+            body,
+            created_at: at,
+            expires_at,
+        })
+        .collect();
+    store::federation::enqueue_many(&state.db, &entries).await?;
+    tracing::debug!(kind, count = entries.len(), "federation notifications queued");
+    crate::cache::wake(state, crate::cache::Job::Outbox);
+    Ok(())
+}
+
 /// Queues a notification that replaces the queued ones of the same `kind` from `from` to `target` (at most one
 /// stays) and leaves at the earliest `delay_secs` from now, so a burst of changes becomes one message carrying
 /// the latest state (`profile.changed`, FEDERATION.md §5.2). A replaced entry's due time is kept.
@@ -143,10 +176,16 @@ impl DeliveryReport {
 
 /// Delivers every entry due at `now`. Paused while federation is disabled.
 pub async fn deliver_due(state: &AppState, now: DateTime<Utc>) -> Result<DeliveryReport, ApiError> {
+    deliver_round(state, now).await.map(|(report, _)| report)
+}
+
+/// [`deliver_due`] for at most [`BATCH`] entries; also returns how many were due (a full batch: more are waiting).
+async fn deliver_round(state: &AppState, now: DateTime<Utc>) -> Result<(DeliveryReport, usize), ApiError> {
     if !state.config.federation_enabled {
-        return Ok(DeliveryReport::default());
+        return Ok((DeliveryReport::default(), 0));
     }
     let rows = store::federation::due(&state.db, &util::format_time(now), BATCH).await?;
+    let fetched = rows.len();
     let mut by_target: Vec<(String, Vec<OutboxRow>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for row in rows {
@@ -167,7 +206,7 @@ pub async fn deliver_due(state: &AppState, now: DateTime<Utc>) -> Result<Deliver
     for r in results {
         report.add(&r?);
     }
-    Ok(report)
+    Ok((report, fetched))
 }
 
 /// Delivers the due entries of one target in order; stops at the first retryable failure and delays
@@ -289,8 +328,16 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             if !state.cluster.is_leader() {
                 continue;
             }
-            if let Err(e) = deliver_due(&state, Utc::now()).await {
-                tracing::warn!(error = %e, "federation outbox round failed");
+            // A full batch means more are due (a backlog after an outage): the next round follows at once.
+            loop {
+                match deliver_round(&state, Utc::now()).await {
+                    Ok((_, fetched)) if fetched as i64 >= BATCH => {}
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "federation outbox round failed");
+                        break;
+                    }
+                }
             }
         }
     })

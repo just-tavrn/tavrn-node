@@ -25,6 +25,11 @@ use crate::{
 
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// A frame (or the frames of one event) the client does not take within this long ends the connection: a peer
+/// that stopped reading (a frozen tab, a half-open mobile link) would otherwise block the connection's task, keep
+/// the user "online" (which also holds back web push) until the kernel gives up, and miss the pings. A reconnect
+/// resyncs.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 pub const CLOSE_RESTART: u16 = 4000;
 pub const CLOSE_AUTH: u16 = 4001;
 pub const CLOSE_PROTOCOL: u16 = 4002;
@@ -108,6 +113,8 @@ async fn run(state: AppState, mut socket: WebSocket) {
     };
     let mut visible = crate::visibility::Filter::default();
     let mut rx = state.hub.subscribe();
+    let local_session = auth.app.is_none() && auth.user.domain == state.config.domain;
+    let _watched = local_session.then(|| crate::sessions::watch(&state.live_sessions, &auth.user.id, &auth.device_id));
     let _presence = state.hub.connect(&auth.user.id);
     let _status = crate::presence::Registry::connect(&state, &auth.user.id, &auth.device_id);
     // App tokens (APPLICATIONS.md §2.6): at most two connections per token, events filtered by scope,
@@ -153,7 +160,8 @@ async fn run(state: AppState, mut socket: WebSocket) {
         return;
     }
 
-    let (mut sink, mut stream) = socket.split();
+    let (sink, mut stream) = socket.split();
+    let mut sink = Timed { sink, timeout: state.ws_send_timeout };
     let mut ping = tokio::time::interval(state.ws_ping);
     ping.tick().await;
     let mut missed_pongs = 0u8;
@@ -214,10 +222,11 @@ async fn run(state: AppState, mut socket: WebSocket) {
                         }
                         let relevant = match &ev.scope {
                             Scope::Room(r) => rooms.contains(r),
-                            Scope::Users(u) => u.contains(&auth.user.id),
-                            Scope::Devices(d) => d.contains(&auth.device_id),
+                            // Sorted by the hub: a binary search, not a scan of the audience per connection.
+                            Scope::Users(u) => Scope::listed(u, &auth.user.id),
+                            Scope::Devices(d) => Scope::listed(d, &auth.device_id),
                             Scope::UsersExceptDevice { users, device } => {
-                                users.contains(&auth.user.id) && device != &auth.device_id
+                                Scope::listed(users, &auth.user.id) && device != &auth.device_id
                             }
                             Scope::All => true,
                             Scope::Connection(id) => connection_id == Some(*id),
@@ -235,7 +244,7 @@ async fn run(state: AppState, mut socket: WebSocket) {
                             // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                             let event = delivery.event.then(|| ev.frame.clone());
                             let frames = delivery.before.into_iter().map(Into::into).chain(event).chain(delivery.after.into_iter().map(Into::into));
-                            if send_all(&mut sink, frames).await.is_err() {
+                            if sink.send_all(frames).await.is_err() {
                                 break;
                             }
                             continue;
@@ -264,8 +273,9 @@ async fn run(state: AppState, mut socket: WebSocket) {
                 break;
             }
             _ = ping.tick() => {
-                // A belt for the `session.revoked` event: the session must still be live at every ping.
-                if !still_authorized(&state, &auth).await {
+                // A belt for the `session.revoked` event: the session must still be live at every ping (checked for
+                // every connected device at once, `sessions::still_live`).
+                if local_session && !crate::sessions::still_live(&state, &auth.device_id, state.ws_ping).await {
                     let frame = axum::extract::ws::CloseFrame { code: CLOSE_AUTH, reason: "session revoked".into() };
                     let _ = sink.send(WsMessage::Close(Some(frame))).await;
                     break;
@@ -279,39 +289,45 @@ async fn run(state: AppState, mut socket: WebSocket) {
     }
 }
 
-/// Sends the frames in order; fails when the connection is closed.
-async fn send_all<S>(
-    sink: &mut S,
-    frames: impl IntoIterator<Item = axum::extract::ws::Utf8Bytes>,
-) -> Result<(), S::Error>
+/// The sending half of a connection with [`SEND_TIMEOUT`] on every send: a peer that stops reading ends the
+/// connection instead of blocking it. App tokens end with their expiry or revocation; remote sessions through
+/// `session.revoked` (FEDERATION.md §2.9), so only local sessions are re-checked at the pings.
+struct Timed<S> {
+    sink: S,
+    timeout: Duration,
+}
+
+/// A send that failed or timed out: the connection ends.
+struct SendFailed;
+
+impl<S> Timed<S>
 where
     S: futures::Sink<WsMessage> + Unpin,
 {
-    for frame in frames {
-        sink.send(WsMessage::Text(frame)).await?;
-    }
-    Ok(())
-}
-
-/// `false` once a local user's device has no live session any more or the account is disabled (checked at every
-/// ping; database errors keep the connection).
-async fn still_authorized(state: &AppState, auth: &AuthUser) -> bool {
-    if auth.app.is_some() || auth.user.domain != state.config.domain {
-        // App tokens end with their expiry or revocation; remote sessions through `session.revoked` (FEDERATION.md §2.9).
-        return true;
-    }
-    match crate::sessions::device_live(state, &auth.device_id).await {
-        Ok(false) => return false,
-        Ok(true) => {}
-        Err(e) => {
-            tracing::debug!(error = %e, "session check at ping failed");
-            return true;
+    async fn send(&mut self, message: WsMessage) -> Result<(), SendFailed> {
+        match tokio::time::timeout(self.timeout, self.sink.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(SendFailed),
+            Err(_) => {
+                tracing::debug!("WebSocket client stopped reading, connection closed");
+                Err(SendFailed)
+            }
         }
     }
-    match store::users::by_id(&state.db, &auth.user.id).await {
-        Ok(Some(u)) => u.disabled_at.is_none(),
-        Ok(None) => false,
-        Err(_) => true,
+
+    /// Sends the frames in order, all within one [`SEND_TIMEOUT`].
+    async fn send_all(
+        &mut self,
+        frames: impl IntoIterator<Item = axum::extract::ws::Utf8Bytes>,
+    ) -> Result<(), SendFailed> {
+        let sink = &mut self.sink;
+        let all = async move {
+            for frame in frames {
+                sink.send(WsMessage::Text(frame)).await.map_err(|_| SendFailed)?;
+            }
+            Ok(())
+        };
+        tokio::time::timeout(self.timeout, all).await.unwrap_or(Err(SendFailed))
     }
 }
 

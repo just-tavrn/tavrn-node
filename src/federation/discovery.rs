@@ -133,23 +133,18 @@ async fn document_for(state: &AppState, domain: &str, unverified: bool) -> Resul
     super::check_policy(state, domain).await?;
     let row = store::federation::peer(&state.db, domain).await?;
     if !state.federation.take_stale_document(domain)
-        && let Some(row) = &row
-        && row.status == STATUS_OK
-        && row.expires_at > util::now()
-        && let Ok(doc) = validate(domain, row.document.as_bytes())
+        && let Some(doc) = cached(state, domain, row.as_ref())
     {
-        let left = util::parse_time(&row.expires_at).map(|t| (t - Utc::now()).num_seconds().max(0) as u64);
-        state.federation.seed_delegation(domain, row.document.as_bytes(), left.unwrap_or(0));
         return Ok(doc);
     }
     if !unverified {
-        return fetch(state, domain).await;
+        return fetch_once(state, domain).await;
     }
     if let Some(e) = state.federation.recent_discovery_failure(domain) {
         return Err(e);
     }
     if row.is_some() {
-        return fetch(state, domain).await;
+        return fetch_once(state, domain).await;
     }
     // An issuer this node knows nothing of, named by a request nobody verified yet.
     if store::federation::count_unverified_peers(&state.db).await?
@@ -171,6 +166,36 @@ async fn document_for(state: &AppState, domain: &str, unverified: bool) -> Resul
         });
     };
     fetch_with(state, domain, Some("request")).await
+}
+
+/// The stored document of `domain` while it is current (and the delegation cache seeded from it).
+fn cached(state: &AppState, domain: &str, row: Option<&store::federation::PeerRow>) -> Option<PeerDocument> {
+    let row = row.filter(|r| r.status == STATUS_OK && r.expires_at > util::now())?;
+    let doc = validate(domain, row.document.as_bytes()).ok()?;
+    let left = util::parse_time(&row.expires_at).map(|t| (t - Utc::now()).num_seconds().max(0) as u64);
+    state.federation.seed_delegation(domain, row.document.as_bytes(), left.unwrap_or(0));
+    Some(doc)
+}
+
+/// [`fetch`] once for concurrent requests: the first fetches, the others wait and then take the document it stored
+/// (or the failure it noted) instead of fetching again each, e.g. a page of 50 remote profiles after the cached
+/// document expired.
+async fn fetch_once(state: &AppState, domain: &str) -> Result<PeerDocument, ApiError> {
+    let flight = state.federation.single_flight(&format!("document|{domain}"));
+    let (_one, waited) = match flight.try_lock() {
+        Ok(guard) => (guard, false),
+        Err(_) => (flight.lock().await, true),
+    };
+    if waited {
+        let row = store::federation::peer(&state.db, domain).await?;
+        if let Some(doc) = cached(state, domain, row.as_ref()) {
+            return Ok(doc);
+        }
+        if let Some(e) = state.federation.recent_discovery_failure(domain) {
+            return Err(e);
+        }
+    }
+    fetch(state, domain).await
 }
 
 /// Fetches, validates and caches the document of `domain`. A failure is remembered for 60 seconds (§1.4).

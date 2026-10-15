@@ -44,7 +44,7 @@ impl From<sqlx::Error> for ApiError {
             sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
                 ApiError::Unavailable { code: "db.unavailable", detail: "Database unreachable".into() }
             }
-            other => ApiError::Internal(anyhow::Error::new(other).context("Datenbankfehler")),
+            other => ApiError::Internal(anyhow::Error::new(other).context("database error")),
         }
     }
 }

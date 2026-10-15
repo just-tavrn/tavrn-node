@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Log captures for tests that prove a secret never reaches a log line.
+//! Log captures for tests that prove a secret never reaches a log line, and statement counts of a piece of work.
 //!
 //! Every integration test shares one process. A thread-local subscriber (`set_default`) is not enough there: while it
 //! is the only live dispatcher, tracing-core computes the interest of a callsite another test's thread registers with
@@ -63,17 +63,34 @@ impl Drop for Guard {
     }
 }
 
-/// Starts capturing every event at every level (hold [`CAPTURE`] first); dropping the guard stops.
-pub fn start() -> (Capture, Guard) {
+/// Installs the process-wide subscriber once: the capture layer and the node's statement counter
+/// ([`statements`]).
+fn install() {
     INSTALLED.get_or_init(|| {
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(|| ToActive)
             .with_ansi(false)
             // Dynamic: asked for every event (a `filter_fn` caches its first answer per callsite).
             .with_filter(dynamic_filter_fn(|_, _| CAPTURING.load(Ordering::SeqCst)));
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
-            .expect("no other global subscriber in the test process");
+        let registry = tracing_subscriber::registry().with(tavrn_node::telemetry::statement_counter()).with(layer);
+        tracing::subscriber::set_global_default(registry).expect("no other global subscriber in the test process");
     });
+}
+
+/// Runs `fut` and counts the database statements it runs (in its own task; work it spawns does not count), the
+/// counter of the slow request log (`telemetry.rs`). Concurrent tests do not disturb the count.
+pub async fn statements<F: std::future::Future>(fut: F) -> (F::Output, u64) {
+    use tracing::Instrument;
+    install();
+    let span = tracing::trace_span!(target: tavrn_node::telemetry::REQUEST_SPAN, "request");
+    let out = fut.instrument(span.clone()).await;
+    let n = tavrn_node::telemetry::statements(&span).expect("the statement counter is installed");
+    (out, n)
+}
+
+/// Starts capturing every event at every level (hold [`CAPTURE`] first); dropping the guard stops.
+pub fn start() -> (Capture, Guard) {
+    install();
     let capture = Capture::default();
     *ACTIVE.lock().unwrap() = Some(capture.clone());
     CAPTURING.store(true, Ordering::SeqCst);

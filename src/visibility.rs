@@ -61,6 +61,31 @@ pub fn changes_visibility(kind: &str) -> bool {
     CHANGING_PREFIXES.iter().any(|p| kind.starts_with(p))
 }
 
+/// Fields of a channel and of the room that no evaluation reads (the snapshot keeps them, but nothing it answers
+/// depends on them): an update that changes only these keeps the snapshot.
+const COSMETIC_CHANNEL: &[&str] =
+    &["topic", "status", "slowmode_secs", "bitrate_kbps", "user_limit", "auto_archive_minutes", "tags", "has_webhooks"];
+const COSMETIC_ROOM: &[&str] = &[
+    "description",
+    "rules",
+    "icon",
+    "icon_still",
+    "icon_animated",
+    "icon_blob_id",
+    "banner_blob_id",
+    "discoverable",
+    "join_mode",
+    "attachment_retention_days",
+    "message_retention_days",
+];
+
+/// Do `new` and `old` (JSON objects) differ only in `cosmetic` keys?
+fn same_but(old: &Value, new: &Value, cosmetic: &[&str]) -> bool {
+    let (Some(old), Some(new)) = (old.as_object(), new.as_object()) else { return false };
+    let keys = old.keys().chain(new.keys()).filter(|k| !cosmetic.contains(&k.as_str()));
+    keys.into_iter().all(|k| old.get(k) == new.get(k))
+}
+
 /// The channels a room event is about.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Refs<'a> {
@@ -109,6 +134,18 @@ pub struct Member {
     pub adult: bool,
     /// The voice channel of the member's moved participation (`voice::moved`): they view it while it lasts.
     pub moved: Option<String>,
+    /// What every channel's evaluation needs of the member, computed once per snapshot.
+    eval: Eval,
+}
+
+/// The member's part of the permission evaluation, computed once when the snapshot is loaded (with one clock
+/// reading for the timeouts) instead of once per member and channel.
+struct Eval {
+    member_roles: Vec<(String, permissions::Perms)>,
+    is_owner: bool,
+    is_node_admin: bool,
+    timed_out: bool,
+    room_perms: permissions::Perms,
 }
 
 /// A snapshot of one room: everything the permission evaluation needs, and the viewers per channel, each computed
@@ -116,15 +153,58 @@ pub struct Member {
 pub struct RoomView {
     pub room: Room,
     roles: Vec<RoleRow>,
+    /// The @everyone role's id and permissions (`None`: a broken room; nobody views anything).
+    everyone: Option<(String, permissions::Perms)>,
     channels: HashMap<String, ChannelRow>,
     categories: HashMap<String, Category>,
     overrides: Vec<OverrideRow>,
-    members: HashMap<String, Member>,
-    viewers: HashMap<String, OnceLock<HashSet<String>>>,
+    /// `overrides` ready for the evaluation, per channel and per category.
+    channel_overrides: HashMap<String, Vec<permissions::Override>>,
+    category_overrides: HashMap<String, Vec<permissions::Override>>,
+    /// The members, in a fixed order: the viewer and lister sets are bit sets over it (one bit per member and
+    /// channel instead of a copy of the member's id).
+    members: Vec<Member>,
+    /// Member id → position in `members`.
+    index: HashMap<String, usize>,
+    viewers: HashMap<String, OnceLock<Bits>>,
     /// Per channel the members to whom it is listed: viewers when the age gate is left aside (PROTOCOL.md §5e).
-    listers: HashMap<String, OnceLock<HashSet<String>>>,
+    listers: HashMap<String, OnceLock<Bits>>,
     /// Members with `manage_channels` room-wide: every category is listed to them.
     managers: OnceLock<HashSet<String>>,
+}
+
+/// A set of members as bits over [`RoomView`]'s member order.
+type Bits = Vec<u64>;
+
+fn bit(bits: &[u64], i: usize) -> bool {
+    bits.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+}
+
+/// The members of one channel's viewer or lister set ([`RoomView::viewers`], [`RoomView::listers`]).
+#[derive(Clone, Copy)]
+pub struct Members<'a> {
+    view: &'a RoomView,
+    bits: &'a [u64],
+}
+
+impl<'a> Members<'a> {
+    pub fn contains(&self, user_id: &str) -> bool {
+        self.view.index.get(user_id).is_some_and(|&i| bit(self.bits, i))
+    }
+
+    pub fn len(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|w| *w == 0)
+    }
+
+    /// The user ids in the set.
+    pub fn iter(&self) -> impl Iterator<Item = &'a String> + use<'a> {
+        let (members, bits) = (&self.view.members, self.bits);
+        members.iter().enumerate().filter(move |(i, _)| bit(bits, *i)).map(|(_, m)| &m.member.user_id)
+    }
 }
 
 /// What a member knows of a room: the channels and categories listed to them.
@@ -140,29 +220,29 @@ impl RoomView {
     }
 
     pub fn member(&self, user_id: &str) -> Option<&Member> {
-        self.members.get(user_id)
+        self.index.get(user_id).map(|&i| &self.members[i])
     }
 
     pub fn members(&self) -> impl Iterator<Item = &Member> {
-        self.members.values()
+        self.members.iter()
     }
 
-    /// User ids of the members who may view the channel (empty for an id that is no channel of this room).
-    pub fn viewers(&self, channel_id: &str) -> &HashSet<String> {
-        static NONE: OnceLock<HashSet<String>> = OnceLock::new();
-        match (self.viewers.get(channel_id), self.channels.get(channel_id)) {
-            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, false)),
-            _ => NONE.get_or_init(HashSet::new),
-        }
+    /// The members who may view the channel (empty for an id that is no channel of this room).
+    pub fn viewers(&self, channel_id: &str) -> Members<'_> {
+        let bits = match (self.viewers.get(channel_id), self.channels.get(channel_id)) {
+            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, false)).as_slice(),
+            _ => &[],
+        };
+        Members { view: self, bits }
     }
 
-    /// User ids of the members to whom the channel is listed (its viewers, age gate aside).
-    pub fn listers(&self, channel_id: &str) -> &HashSet<String> {
-        static NONE: OnceLock<HashSet<String>> = OnceLock::new();
-        match (self.listers.get(channel_id), self.channels.get(channel_id)) {
-            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, true)),
-            _ => NONE.get_or_init(HashSet::new),
-        }
+    /// The members to whom the channel is listed (its viewers, age gate aside).
+    pub fn listers(&self, channel_id: &str) -> Members<'_> {
+        let bits = match (self.listers.get(channel_id), self.channels.get(channel_id)) {
+            (Some(cell), Some(channel)) => cell.get_or_init(|| self.compute(channel, true)).as_slice(),
+            _ => &[],
+        };
+        Members { view: self, bits }
     }
 
     /// The channels and categories listed to `user_id` (as in `GET /rooms/{id}`).
@@ -170,7 +250,12 @@ impl RoomView {
         let channels: HashSet<String> =
             self.channels.keys().filter(|c| self.listers(c).contains(user_id)).cloned().collect();
         let manager = self.managers.get_or_init(|| {
-            self.members.keys().filter(|u| self.holds(u, permissions::MANAGE_CHANNELS)).cloned().collect()
+            self.members
+                .iter()
+                .map(|m| &m.member.user_id)
+                .filter(|u| self.holds(u, permissions::MANAGE_CHANNELS))
+                .cloned()
+                .collect()
         });
         let categories = if manager.contains(user_id) {
             self.categories.keys().cloned().collect()
@@ -212,76 +297,120 @@ impl RoomView {
     /// category's take part): the evaluation of the REST routes, for a planned change (`routes::channels`).
     pub fn perms_with(&self, channel: &ChannelRow, overrides: &[OverrideRow]) -> HashMap<String, permissions::Perms> {
         // Only this channel's and its category's overrides take part.
-        let overrides: Vec<OverrideRow> = overrides
-            .iter()
-            .filter(|o| {
-                (o.target_type == "channel" && o.target_id == channel.id)
-                    || (o.target_type == "category" && channel.category_id.as_deref() == Some(o.target_id.as_str()))
-            })
-            .cloned()
-            .collect();
+        let of = |target_type: &str, target_id: Option<&str>| -> Vec<permissions::Override> {
+            overrides
+                .iter()
+                .filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id)
+                .map(OverrideRow::to_eval)
+                .collect()
+        };
+        let (category, own) = (of("category", channel.category_id.as_deref()), of("channel", Some(&channel.id)));
         self.members
-            .keys()
-            .filter_map(|user_id| Some((user_id.clone(), self.member_perms_with(channel, &overrides, user_id, false)?)))
+            .iter()
+            .filter_map(|m| Some((m.member.user_id.clone(), self.evaluate(m, channel, &category, &own, false)?)))
             .collect()
     }
 
     /// A member's permissions in a channel of the room (`None`: no member, or no such channel).
     pub fn perms(&self, channel_id: &str, user_id: &str) -> Option<permissions::Perms> {
-        self.member_perms_with(self.channels.get(channel_id)?, &self.overrides, user_id, false)
+        let channel = self.channels.get(channel_id)?;
+        let (category, own) = self.overrides_of(channel);
+        self.evaluate(self.member(user_id)?, channel, category, own, false)
     }
 
     /// Does the member hold `bits` room-wide (roles only, no channel)?
     pub fn holds(&self, user_id: &str, bits: permissions::Perms) -> bool {
-        self.access(user_id).is_some_and(|a| permissions::has(a.room_perms, bits))
+        self.everyone.is_some() && self.member(user_id).is_some_and(|m| permissions::has(m.eval.room_perms, bits))
     }
 
-    fn access(&self, user_id: &str) -> Option<access::RoomAccess> {
-        let m = self.members.get(user_id)?;
-        access::member_access(
-            self.room.clone(),
-            &self.roles,
-            Some(m.member.clone()),
-            &m.role_ids,
-            &m.user,
-            m.adult,
-            m.moved.clone(),
+    /// The overrides of the channel's category and of the channel.
+    fn overrides_of(&self, channel: &ChannelRow) -> (&[permissions::Override], &[permissions::Override]) {
+        let category = channel.category_id.as_ref().and_then(|c| self.category_overrides.get(c));
+        (
+            category.map_or(&[][..], Vec::as_slice),
+            self.channel_overrides.get(&channel.id).map_or(&[][..], Vec::as_slice),
         )
-        .ok()
     }
 
+    /// The member's permissions in `channel` ([`access::channel_perms_of`], the evaluation of the REST routes);
     /// `ignore_age`: as if the member passed every age gate (the channel is listed below the gate, §5e).
-    fn member_perms_with(
+    fn evaluate(
         &self,
+        m: &Member,
         channel: &ChannelRow,
-        overrides: &[OverrideRow],
-        user_id: &str,
+        category_overrides: &[permissions::Override],
+        channel_overrides: &[permissions::Override],
         ignore_age: bool,
     ) -> Option<permissions::Perms> {
-        let mut access = self.access(user_id)?;
-        access.adult |= ignore_age;
-        Some(access::channel_perms_with(&access, channel, overrides, user_id))
+        let (everyone_role_id, everyone_permissions) = self.everyone.as_ref()?;
+        let subject = access::Subject {
+            user_id: &m.member.user_id,
+            is_owner: m.eval.is_owner,
+            is_node_admin: m.eval.is_node_admin,
+            everyone_role_id,
+            everyone_permissions: *everyone_permissions,
+            member_roles: &m.eval.member_roles,
+            timed_out: m.eval.timed_out,
+            kind: &m.user.kind,
+            scopes: m.user.app_scopes.as_deref(),
+            adult: m.adult || ignore_age,
+            moved_channel: m.moved.as_deref(),
+        };
+        Some(access::channel_perms_of(&subject, channel, category_overrides, channel_overrides))
     }
 
-    fn compute(&self, channel: &ChannelRow, ignore_age: bool) -> HashSet<String> {
-        let overrides: Vec<OverrideRow> = self
-            .overrides
-            .iter()
-            .filter(|o| {
-                (o.target_type == "channel" && o.target_id == channel.id)
-                    || (o.target_type == "category" && channel.category_id.as_deref() == Some(o.target_id.as_str()))
-            })
-            .cloned()
-            .collect();
-        self.members
-            .keys()
-            .filter(|user_id| {
-                self.member_perms_with(channel, &overrides, user_id, ignore_age)
-                    .is_some_and(|perms| permissions::has(perms, permissions::VIEW_CHANNEL))
-            })
-            .cloned()
-            .collect()
+    fn compute(&self, channel: &ChannelRow, ignore_age: bool) -> Bits {
+        let (category, own) = self.overrides_of(channel);
+        let mut bits = vec![0u64; self.members.len().div_ceil(64)];
+        for (i, m) in self.members.iter().enumerate() {
+            if self
+                .evaluate(m, channel, category, own, ignore_age)
+                .is_some_and(|perms| permissions::has(perms, permissions::VIEW_CHANNEL))
+            {
+                bits[i / 64] |= 1 << (i % 64);
+            }
+        }
+        bits
     }
+}
+
+/// The member's part of the evaluation ([`Eval`]), as [`access::member_access`] computes it for one request.
+fn eval_of(
+    room: &Room,
+    roles: &[RoleRow],
+    everyone: Option<&(String, permissions::Perms)>,
+    member: &MemberRow,
+    role_ids: &[String],
+    user: &UserRow,
+    now: &str,
+) -> Eval {
+    let member_roles: Vec<(String, permissions::Perms)> = roles
+        .iter()
+        .filter(|r| r.is_everyone == 0 && role_ids.contains(&r.id))
+        .map(|r| (r.id.clone(), r.perms()))
+        .collect();
+    let is_owner = room.owner_id == user.id;
+    let is_node_admin = user.is_node_admin();
+    let timed_out = member.timeout_until.as_deref().is_some_and(|t| t > now);
+    let room_perms = everyone.map_or(0, |(id, perms)| {
+        access::room_perms_of(
+            &access::Subject {
+                user_id: &user.id,
+                is_owner,
+                is_node_admin,
+                everyone_role_id: id,
+                everyone_permissions: *perms,
+                member_roles: &member_roles,
+                timed_out,
+                kind: &user.kind,
+                scopes: user.app_scopes.as_deref(),
+                adult: true,
+                moved_channel: None,
+            },
+            room.no_bots != 0,
+        )
+    });
+    Eval { member_roles, is_owner, is_node_admin, timed_out, room_perms }
 }
 
 /// Loads the room's current state from the database (no cache).
@@ -295,12 +424,25 @@ pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView
     let mut users: HashMap<String, UserRow> =
         store::users::members_of_room(db, room_id).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
     let mut moved = crate::voice::moved::of_room(state, room_id);
-    let mut members = HashMap::new();
+    let everyone = roles.iter().find(|r| r.is_everyone != 0).map(|r| (r.id.clone(), r.perms()));
+    let now = crate::util::now();
+    let mut members = Vec::new();
+    let mut index = HashMap::new();
     for (member, role_ids) in store::rooms::members_with_roles(db, room_id).await? {
         let Some(user) = users.remove(&member.user_id) else { continue };
         let adult = crate::age::is_adult(state, &user).await?;
         let moved = moved.remove(&member.user_id);
-        members.insert(member.user_id.clone(), Member { member, role_ids, user, adult, moved });
+        let eval = eval_of(&room, &roles, everyone.as_ref(), &member, &role_ids, &user, &now);
+        index.insert(member.user_id.clone(), members.len());
+        members.push(Member { member, role_ids, user, adult, moved, eval });
+    }
+    let (mut channel_overrides, mut category_overrides): (HashMap<String, Vec<_>>, HashMap<String, Vec<_>>) =
+        (HashMap::new(), HashMap::new());
+    for o in &overrides {
+        let map = if o.target_type == "category" { &mut category_overrides } else { &mut channel_overrides };
+        if o.target_type == "category" || o.target_type == "channel" {
+            map.entry(o.target_id.clone()).or_default().push(o.to_eval());
+        }
     }
     let categories = store::rooms::categories(db, room_id).await?.into_iter().map(|c| (c.id.clone(), c)).collect();
     let viewers = channels.keys().map(|id| (id.clone(), OnceLock::new())).collect();
@@ -308,10 +450,14 @@ pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView
     Ok(Some(Arc::new(RoomView {
         room,
         roles,
+        everyone,
         channels,
         categories,
         overrides,
+        channel_overrides,
+        category_overrides,
         members,
+        index,
         viewers,
         listers,
         managers: OnceLock::new(),
@@ -340,6 +486,33 @@ pub struct Cache {
 impl Cache {
     fn rooms(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Slot>>> {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Does an update event (`member.update`, `channel.update`, `room.update`) leave the room's loaded snapshot as it
+    /// is? Only when the snapshot is loaded and the event changes nothing an evaluation reads: a nickname, an
+    /// avatar, a channel's topic or voice status, a room's description. Every other event of
+    /// [`changes_visibility`] drops it.
+    pub fn unchanged_by(&self, room_id: &str, kind: &str, data: &Value) -> bool {
+        let Some(slot) = self.rooms().get(room_id).cloned() else { return false };
+        let Some(Some(view)) = slot.view.get() else { return false };
+        match kind {
+            "member.update" => {
+                let member = &data["member"];
+                let Some(m) = member["user"]["id"].as_str().and_then(|id| view.member(id)) else { return false };
+                let Some(roles) = member["roles"].as_array() else { return false };
+                let roles: HashSet<&str> = roles.iter().filter_map(Value::as_str).collect();
+                let everyone = view.everyone.as_ref().map(|(id, _)| id.as_str());
+                let roles: HashSet<&str> = roles.into_iter().filter(|r| Some(*r) != everyone).collect();
+                roles == m.role_ids.iter().map(String::as_str).collect::<HashSet<_>>()
+                    && member["timeout_until"].as_str() == m.member.timeout_until.as_deref()
+            }
+            "channel.update" => {
+                let Some(old) = data["id"].as_str().and_then(|id| view.channels.get(id)) else { return false };
+                serde_json::to_value(old.to_api()).is_ok_and(|old| same_but(&old, data, COSMETIC_CHANNEL))
+            }
+            "room.update" => serde_json::to_value(&view.room).is_ok_and(|old| same_but(&old, data, COSMETIC_ROOM)),
+            _ => false,
+        }
     }
 
     /// Drops the room's snapshot: the next check loads the current state.

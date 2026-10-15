@@ -1,10 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! GIF search via Giphy or Tenor. The API key stays on the node; clients only ask the node.
+//! GIF search via Giphy or Tenor. The API key stays on the node; clients only ask the node. Answers are cached
+//! (trending for [`TRENDING_TTL`], searches for [`SEARCH_TTL`]) and each user may search [`PER_USER_PER_MINUTE`]
+//! times a minute, so a few users cannot use up the node's quota at the provider; a provider error is a `503`
+//! (`gif.unavailable`), an unreadable answer a `502`.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{config::GifProvider, error::ApiError};
+use crate::{auth::RateLimiter, config::GifProvider, error::ApiError};
+
+/// How long an answer is reused: the trending list, a search.
+pub const TRENDING_TTL: Duration = Duration::from_secs(5 * 60);
+pub const SEARCH_TTL: Duration = Duration::from_secs(10 * 60);
+/// Answers kept; more empty the cache.
+const MAX_CACHED: usize = 512;
+/// Searches (cached ones included) per user and minute.
+pub const PER_USER_PER_MINUTE: u32 = 30;
+
+/// Cached answers by (query, limit).
+type Cache = Mutex<HashMap<(Option<String>, u32), (Instant, Arc<Vec<Gif>>)>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct Gif {
@@ -24,6 +44,8 @@ pub struct GifClient {
     key: String,
     http: reqwest::Client,
     base: String,
+    cache: Arc<Cache>,
+    users: Arc<RateLimiter>,
 }
 
 impl GifClient {
@@ -45,7 +67,41 @@ impl GifClient {
             key,
             http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default(),
             base: base.trim_end_matches('/').to_string(),
+            cache: Arc::default(),
+            users: Arc::new(RateLimiter::new(PER_USER_PER_MINUTE, Duration::from_secs(60))),
         }
+    }
+
+    /// Counts a search of `user_id`: `429` beyond [`PER_USER_PER_MINUTE`].
+    pub fn check_user(&self, user_id: &str) -> Result<(), ApiError> {
+        self.users.check(user_id).map_err(|retry_after_secs| ApiError::RateLimited { retry_after_secs })
+    }
+
+    /// [`GifClient::fetch`] through the cache.
+    pub async fn search(&self, query: Option<&str>, limit: u32) -> Result<Arc<Vec<Gif>>, ApiError> {
+        let limit = limit.clamp(1, 50);
+        let key = (query.map(str::to_lowercase), limit);
+        let ttl = if query.is_some() { SEARCH_TTL } else { TRENDING_TTL };
+        let cached = |c: &Cache| {
+            c.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < ttl)
+                .map(|e| e.1.clone())
+        };
+        if let Some(hit) = cached(&self.cache) {
+            return Ok(hit);
+        }
+        let found = Arc::new(self.fetch(query, limit).await?);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MAX_CACHED {
+            cache.retain(|(q, _), (at, _)| at.elapsed() < if q.is_some() { SEARCH_TTL } else { TRENDING_TTL });
+            if cache.len() >= MAX_CACHED {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (Instant::now(), found.clone()));
+        Ok(found)
     }
 
     pub fn provider(&self) -> GifProvider {
@@ -69,7 +125,8 @@ impl GifClient {
         }
     }
 
-    pub async fn search(&self, query: Option<&str>, limit: u32) -> Result<Vec<Gif>, ApiError> {
+    /// Asks the provider (no cache).
+    async fn fetch(&self, query: Option<&str>, limit: u32) -> Result<Vec<Gif>, ApiError> {
         let limit = limit.clamp(1, 50).to_string();
         let unavailable = |e: reqwest::Error| {
             tracing::warn!(error = %e, "GIF provider unreachable");
@@ -86,10 +143,7 @@ impl GifClient {
                 params.push(("rating", "pg-13".into()));
                 let resp =
                     self.http.get(format!("{}{path}", self.base)).query(&params).send().await.map_err(unavailable)?;
-                let body: GiphyResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("unreadable Giphy response: {e}")))?;
+                let body: GiphyResponse = answer(resp, "Giphy").await?;
                 Ok(body
                     .data
                     .into_iter()
@@ -118,10 +172,7 @@ impl GifClient {
                 params.push(("contentfilter", "medium".into()));
                 let resp =
                     self.http.get(format!("{}{path}", self.base)).query(&params).send().await.map_err(unavailable)?;
-                let body: TenorResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("unreadable Tenor response: {e}")))?;
+                let body: TenorResponse = answer(resp, "Tenor").await?;
                 Ok(body
                     .results
                     .into_iter()
@@ -146,6 +197,20 @@ impl GifClient {
             GifProvider::None => Ok(Vec::new()),
         }
     }
+}
+
+/// The provider's JSON answer: an error status (a wrong key, the quota, an outage) is `503 gif.unavailable`, an
+/// unreadable body `502`, never a `500` of the node.
+async fn answer<T: serde::de::DeserializeOwned>(resp: reqwest::Response, provider: &str) -> Result<T, ApiError> {
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!(provider, status = status.as_u16(), "GIF provider answered with an error");
+        return Err(ApiError::Unavailable { code: "gif.unavailable", detail: "GIF service unavailable".into() });
+    }
+    resp.json().await.map_err(|_| {
+        tracing::warn!(provider, "unreadable GIF provider answer");
+        ApiError::BadGateway { code: "gif.unavailable", detail: "GIF service answered unreadably".into() }
+    })
 }
 
 #[derive(Deserialize)]
@@ -230,7 +295,7 @@ mod tests {
         let giphy = GifClient::new(GifProvider::Giphy, "k".into(), &base);
         let r = giphy.search(Some("dog"), 10).await.unwrap();
         assert_eq!(
-            r,
+            *r,
             vec![Gif {
                 id: "g1".into(),
                 title: "dog".into(),

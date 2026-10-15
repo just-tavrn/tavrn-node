@@ -1081,25 +1081,12 @@ fn check_sound_emoji(emoji: Option<&str>) -> Result<(), ApiError> {
     }
 }
 
-/// `%XX` sequences of a header value (names are UTF-8, header values ASCII).
+/// `%XX` sequences of a header value (names are UTF-8, header values ASCII); `None` without any or when invalid.
 fn percent_decode(s: &str) -> Option<String> {
     if !s.contains('%') {
         return None;
     }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = s.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
+    crate::util::percent_decode_strict(s)
 }
 
 /// Delete a clip (`manage_emojis`).

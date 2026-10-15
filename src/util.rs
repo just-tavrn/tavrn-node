@@ -92,9 +92,75 @@ pub fn parse_address(s: &str) -> Option<(&str, &str)> {
     (valid_username(user) && valid_domain(domain)).then_some((user, domain))
 }
 
+/// The byte of a `%XX` escape at the front of `hex` (two hex digits, nothing else: `u8::from_str_radix` alone would
+/// also take `+5`).
+fn hex_byte(hex: &[u8]) -> Option<u8> {
+    match hex {
+        [a, b] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit() => {
+            let digit = |c: u8| (c as char).to_digit(16).and_then(|d| u8::try_from(d).ok());
+            Some(digit(*a)? << 4 | digit(*b)?)
+        }
+        _ => None,
+    }
+}
+
+/// Decodes `%XX` escapes (no `+` handling: not a form). Lenient: a `%` without two hex digits stays as it is, and
+/// invalid UTF-8 becomes U+FFFD (URL user info, header values, file names).
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i] == b'%').then(|| bytes.get(i + 1..i + 3).and_then(hex_byte)).flatten() {
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decodes `%XX` escapes strictly: `None` for a `%` without two hex digits or invalid UTF-8.
+pub fn percent_decode_strict(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            out.push(hex_byte(bytes.get(i + 1..i + 3)?)?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(percent_decode("Image%20%C3%A4.png"), "Image ä.png");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%2"), "a%2", "an incomplete sequence is kept");
+        assert_eq!(percent_decode("%+5x"), "%+5x", "only hex digits");
+        assert_eq!(percent_decode("p%40ss%3Aw"), "p@ss:w");
+        assert_eq!(percent_decode("%ff"), "\u{fffd}");
+        assert_eq!(percent_decode_strict("Fanfare%20%F0%9F%8E%BA").as_deref(), Some("Fanfare 🎺"));
+        assert_eq!(percent_decode_strict("plain").as_deref(), Some("plain"));
+        assert_eq!(percent_decode_strict("bad%zz"), None);
+        assert_eq!(percent_decode_strict("%+5"), None);
+        assert_eq!(percent_decode_strict("%ff"), None);
+        assert_eq!(percent_decode_strict("end%4"), None);
+    }
 
     #[test]
     fn os_randomness_fills_every_byte_freshly() {

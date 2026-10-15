@@ -459,14 +459,25 @@ pub fn resolve_client_ip(
     peer: Option<std::net::IpAddr>,
     forwarded_for: Option<&str>,
 ) -> String {
+    resolve_client_ip_with(&config.trusted_proxies(), peer, forwarded_for)
+}
+
+/// [`resolve_client_ip`] with the trusted proxies parsed already (`AppState::trusted_proxies`, once at start: the
+/// list is consulted for the peer and every forwarded hop of every request).
+pub fn resolve_client_ip_with(
+    trusted: &[ipnet::IpNet],
+    peer: Option<std::net::IpAddr>,
+    forwarded_for: Option<&str>,
+) -> String {
+    let is_trusted = |ip: std::net::IpAddr| trusted.iter().any(|n| n.contains(&ip));
     let Some(peer) = peer else { return "unknown".into() };
-    if !config.is_trusted_proxy(peer) {
+    if !is_trusted(peer) {
         return peer.to_string();
     }
     let chain: Vec<std::net::IpAddr> =
         forwarded_for.unwrap_or("").split(',').filter_map(|s| s.trim().parse().ok()).collect();
     for ip in chain.iter().rev() {
-        if !config.is_trusted_proxy(*ip) {
+        if !is_trusted(*ip) {
             return ip.to_string();
         }
     }
@@ -480,7 +491,7 @@ impl FromRequestParts<AppState> for ClientIp {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         let peer = parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
         let forwarded = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        Ok(ClientIp(resolve_client_ip(&state.config, peer, forwarded)))
+        Ok(ClientIp(resolve_client_ip_with(&state.trusted_proxies, peer, forwarded)))
     }
 }
 

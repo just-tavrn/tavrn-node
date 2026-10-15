@@ -79,10 +79,20 @@ impl CaptchaVerifier {
                         detail: "Captcha service unreachable, please try again later".into(),
                     }
                 })?;
-                let verdict: SiteVerify = resp
-                    .json()
-                    .await
-                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("unreadable Turnstile response: {e}")))?;
+                // An error status or an unreadable answer (an outage page, a quota) is the service's problem, not
+                // a wrong token and not a fault of the node.
+                let unavailable = || ApiError::Unavailable {
+                    code: "auth.captcha_unavailable",
+                    detail: "Captcha service unavailable, please try again later".into(),
+                };
+                if !resp.status().is_success() {
+                    tracing::warn!(status = resp.status().as_u16(), "Turnstile answered with an error");
+                    return Err(unavailable());
+                }
+                let verdict: SiteVerify = resp.json().await.map_err(|_| {
+                    tracing::warn!("unreadable Turnstile answer");
+                    unavailable()
+                })?;
                 if verdict.success {
                     Ok(())
                 } else {
@@ -127,10 +137,16 @@ mod tests {
             secret: String,
             response: String,
         }
-        let app = Router::new().route(
-            "/verify",
-            post(|Form(f): Form<F>| async move { Json(serde_json::json!({ "success": f.secret == "secret" && f.response == "good", "error-codes": ["invalid-input-response"] })) }),
-        );
+        let app = Router::new()
+            .route(
+                "/verify",
+                post(|Form(f): Form<F>| async move { Json(serde_json::json!({ "success": f.secret == "secret" && f.response == "good", "error-codes": ["invalid-input-response"] })) }),
+            )
+            .route(
+                "/broken",
+                post(|| async { (axum::http::StatusCode::BAD_GATEWAY, axum::response::Html("<h1>down</h1>")) }),
+            )
+            .route("/garbled", post(|| async { "not json" }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -147,5 +163,15 @@ mod tests {
             url: "http://127.0.0.1:1/verify".into(),
         };
         assert_eq!(down.check(true, Some("good"), "x").await.unwrap_err().code(), "auth.captcha_unavailable");
+        // An error page or an unreadable answer: unavailable (503), not a fault of the node.
+        for path in ["broken", "garbled"] {
+            let v = CaptchaVerifier::Turnstile {
+                secret: "secret".into(),
+                http: reqwest::Client::new(),
+                url: format!("http://{addr}/{path}"),
+            };
+            let e = v.check(true, Some("good"), "x").await.unwrap_err();
+            assert_eq!((e.code(), e.status().as_u16()), ("auth.captcha_unavailable", 503), "{path}");
+        }
     }
 }

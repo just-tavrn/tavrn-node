@@ -330,10 +330,10 @@ impl Unfurler {
         if literal.is_some() {
             return Ok(());
         }
-        match self.resolver.vetted(&host).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.is::<crate::federation::client::AddressForbidden>() => Err(Failure::Forbidden),
-            Err(_) => Err(Failure::Fetch),
+        match self.resolver.precheck(&host).await {
+            crate::federation::client::Precheck::Allowed => Ok(()),
+            crate::federation::client::Precheck::Forbidden => Err(Failure::Forbidden),
+            crate::federation::client::Precheck::Unresolved => Err(Failure::Fetch),
         }
     }
 }

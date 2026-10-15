@@ -294,8 +294,20 @@ pub struct Processed {
 fn too_large(max: usize, code: &'static str, what: &str) -> ApiError {
     ApiError::PayloadTooLarge {
         code,
-        detail: format!("{what}: at most {} MB", max / (1024 * 1024)),
+        detail: format!("{what}: at most {}", size_text(max)),
         meta: serde_json::json!({ "max_bytes": max }),
+    }
+}
+
+/// A byte limit for people: MB from 1 MiB on, KB below (the emoji and preview limits are KiB).
+fn size_text(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MB", bytes / MIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
     }
 }
 
@@ -795,7 +807,7 @@ impl Job<'_> {
                 None => return Err(invalid("The file could not be converted")),
             }
         }
-        Err(too_large(max, "media.output_too_large", "Das Ergebnis bleibt zu groß"))
+        Err(too_large(max, "media.output_too_large", "The result stays too large"))
     }
 
     /// Animated WebP from `input`; `raw` = the input is a raw frame stream on stdin (animated WebP
@@ -842,7 +854,7 @@ impl Job<'_> {
                 None => return Err(invalid("The animation could not be converted")),
             }
         }
-        Err(too_large(max, "media.output_too_large", "Die Animation bleibt zu groß"))
+        Err(too_large(max, "media.output_too_large", "The animation stays too large"))
     }
 
     /// Animated WebP input: frames decoded with `image-webp`, resampled to a constant rate, piped raw.
@@ -870,7 +882,7 @@ impl Job<'_> {
         let mut child = cmd.spawn().map_err(|e| ApiError::Internal(anyhow::anyhow!("cannot start ffmpeg: {e}")))?;
         let mut stdin =
             child.stdin.take().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("ffmpeg without stdin")))?;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(2);
         let source = frames.source.clone();
         let max_ms = u64::from(self.kind.loop_secs()) * 1000;
         let decoder = tokio::task::spawn_blocking(move || RawFrames::stream(&source, fps, max_ms, &tx));
@@ -957,7 +969,7 @@ impl RawFrames {
     }
 
     /// Decodes all frames again and sends them, repeated to a constant `fps`, for at most `max_ms`.
-    fn stream(source: &Bytes, fps: u32, max_ms: u64, tx: &tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), ApiError> {
+    fn stream(source: &Bytes, fps: u32, max_ms: u64, tx: &tokio::sync::mpsc::Sender<Bytes>) -> Result<(), ApiError> {
         let mut d = Self::decoder(source)?;
         let size = d.output_buffer_size().ok_or_else(|| invalid("Corrupt WebP"))?;
         let mut ticker = Ticker::new(fps, max_ms);
@@ -969,6 +981,8 @@ impl RawFrames {
                 Err(_) => return Err(invalid("Corrupt WebP")),
             };
             let Some(repeats) = ticker.next(duration) else { break };
+            // A repeated frame shares the decoded buffer (a reference count, not a copy of the RGBA frame).
+            let frame = Bytes::from(frame);
             for _ in 0..repeats {
                 if tx.blocking_send(frame.clone()).is_err() {
                     return Ok(());
@@ -1000,6 +1014,16 @@ mod tests {
         b.extend_from_slice(&h.to_be_bytes());
         b.extend_from_slice(&[8, 6, 0, 0, 0]);
         b
+    }
+
+    #[test]
+    fn limits_read_in_kb_below_one_mb() {
+        assert_eq!(size_text(256 * 1024), "256 KB");
+        assert_eq!(size_text(40 * 1024), "40 KB");
+        assert_eq!(size_text(8 * 1024 * 1024), "8 MB");
+        assert_eq!(size_text(1536 * 1024), "1.5 MB");
+        let e = too_large(256 * 1024, "media.output_too_large", "The result stays too large");
+        assert!(e.to_string().contains("at most 256 KB") || format!("{e:?}").contains("at most 256 KB"), "{e:?}");
     }
 
     #[test]

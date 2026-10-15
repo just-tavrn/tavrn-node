@@ -721,3 +721,68 @@ async fn s2s_claims_are_budgeted_per_requesting_node() {
     let (st, code) = s2s(&a, &b, path, json!({ "user": "carol@b.test", "requester": "alice@a.test" }), false).await;
     assert_eq!(st, StatusCode::OK, "{code}");
 }
+
+/// An `@everyone` message queues the `notify` hints of all remote members of a room in one statement: the cost of
+/// the fan-out does not grow with the number of remote members.
+#[tokio::test]
+async fn notify_hints_to_many_remote_members_are_queued_at_once() {
+    let node = common::test_node("a.test").await;
+    let alice = node.register("alice").await;
+    let author = tavrn_node::store::users::by_id(&node.state.db, &alice.user_id).await.unwrap().unwrap();
+    let mut cost = Vec::new();
+    for members in [1usize, 20] {
+        let room = node.plaintext_room(&alice.token, &format!("Room {members}")).await;
+        let room_id = room["id"].as_str().unwrap().to_string();
+        let channel = common::TestNode::text_channel(&room);
+        for i in 0..members {
+            let user = tavrn_node::federation::remote::ensure_remote_user(
+                &node.state,
+                &format!("r{members}x{i}"),
+                "b.test",
+                "user",
+                None,
+            )
+            .await
+            .unwrap();
+            tavrn_node::store::rooms::add_member(&node.state.db, &room_id, &user.id, true).await.unwrap();
+        }
+        let body = json!({ "content": { "type": "text", "body": "hear ye" }, "mentions_everyone": true });
+        let path = format!("/api/v1/conversations/{channel}/messages");
+        let (st, m) = node.post(&path, &alice.token, body).await;
+        assert_eq!(st, StatusCode::CREATED, "{m}");
+        let count = || async {
+            let n: i64 =
+                sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM federation_outbox WHERE type = 'notify'")
+                    .fetch_one(&node.state.db)
+                    .await
+                    .unwrap();
+            n
+        };
+        let before = count().await;
+        // The same message in a second channel of the room (no hint went out for it yet), its fan-out counted.
+        let (st, c) = node
+            .post(
+                &format!("/api/v1/rooms/{room_id}/channels"),
+                &alice.token,
+                json!({ "name": "second", "kind": "text" }),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{c}");
+        let second = c["id"].as_str().unwrap().to_string();
+        let mut message: tavrn_node::models::Message = serde_json::from_value(m).unwrap();
+        message.conversation_id = second.clone();
+        let conv = tavrn_node::access::conversation(&node.state, &second, &author).await.unwrap();
+        tavrn_node::visibility::room(&node.state, &room_id).await.unwrap();
+        let ((), statements) = common::logs::statements(tavrn_node::federation::social::notify_members(
+            &node.state,
+            &conv,
+            &message,
+            &alice.user_id,
+        ))
+        .await;
+        assert_eq!(count().await - before, members as i64, "one hint per remote member");
+        cost.push(statements);
+    }
+    println!("notify fan-out statements with 1 and 20 remote members: {cost:?}");
+    assert!(cost[1] > 0 && cost[1] <= cost[0] + 1, "statements grow with remote members: {cost:?}");
+}

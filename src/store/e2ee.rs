@@ -196,6 +196,29 @@ pub async fn device_key(db: &Pool, device_id: &str) -> Result<Option<DeviceKeyRo
     .await?)
 }
 
+/// [`device_key`] of many devices: one statement per 500 (device id → row; unknown ids are missing).
+pub async fn device_keys(
+    db: &Pool,
+    device_ids: &[String],
+) -> Result<std::collections::HashMap<String, DeviceKeyRow>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in device_ids.chunks(500) {
+        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "SELECT {DEVICE_KEY_COLS} FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query_as::<_, DeviceKeyRow>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for row in q.fetch_all(db).await? {
+            out.insert(row.id.clone(), row);
+        }
+    }
+    Ok(out)
+}
+
 /// Devices of a user attested under the current identity key.
 pub async fn attested_devices(db: &Pool, user_id: &str) -> Result<Vec<DeviceKeyRow>, ApiError> {
     let rows: Vec<DeviceKeyRow> = sqlx::query_as(&format!(

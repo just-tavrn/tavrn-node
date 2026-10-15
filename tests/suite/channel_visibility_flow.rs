@@ -543,3 +543,132 @@ async fn a_lagging_connection_tells_a_new_category_and_its_channel_once_and_in_o
         vec![("channel.create".to_string(), open2["id"].clone())]
     );
 }
+
+/// The visibility snapshot of a big room: 2000 members, 50 channels, a few overrides. Prints how long the first
+/// evaluation of every channel's viewers and listers takes and checks the result against the REST evaluation for a
+/// sample (run with `--ignored --nocapture` for the numbers).
+#[tokio::test]
+#[ignore = "benchmark"]
+async fn bench_visibility_snapshot_of_a_big_room() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Big").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut channels = vec![TestNode::text_channel(&room)];
+    while channels.len() < 50 {
+        let (s, c) = node
+            .post(
+                &format!("/api/v1/rooms/{room_id}/channels"),
+                &alice.token,
+                json!({ "name": format!("c{}", channels.len()), "kind": "text" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{c}");
+        channels.push(c["id"].as_str().unwrap().to_string());
+    }
+    let db = &node.state.db;
+    let now = tavrn_node::util::now();
+    let mut ids = Vec::new();
+    for i in 0..2000 {
+        let id = tavrn_node::util::ulid();
+        sqlx::query(
+            "INSERT INTO users (id, username, domain, display_name, password_hash, created_at)
+             VALUES ($1, $2, 't.local', $2, '', $3)",
+        )
+        .bind(&id)
+        .bind(format!("m{i}"))
+        .bind(&now)
+        .execute(db)
+        .await
+        .unwrap();
+        tavrn_node::store::rooms::add_member(db, &room_id, &id, true).await.unwrap();
+        ids.push(id);
+    }
+    for c in &channels[..5] {
+        node.put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            &alice.token,
+            json!({ "target_type": "channel", "target_id": c, "subject_type": "role", "subject_id": everyone,
+                    "allow": "0", "deny": p::VIEW_CHANNEL.to_string() }),
+        )
+        .await;
+        node.put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            &alice.token,
+            json!({ "target_type": "channel", "target_id": c, "subject_type": "member", "subject_id": ids[7],
+                    "allow": p::VIEW_CHANNEL.to_string(), "deny": "0" }),
+        )
+        .await;
+    }
+    let started = std::time::Instant::now();
+    let view = tavrn_node::visibility::load(&node.state, &room_id).await.unwrap().unwrap();
+    let loaded = started.elapsed();
+    let started = std::time::Instant::now();
+    let mut pairs = 0;
+    for c in &channels {
+        pairs += view.viewers(c).len() + view.listers(c).len();
+    }
+    let known = view.known_by(&ids[7]);
+    let evaluated = started.elapsed();
+    println!(
+        "snapshot of 2000 members x 50 channels: load {loaded:?}, first evaluation of every channel {evaluated:?} ({pairs} viewer and lister entries)"
+    );
+    assert!(!view.can_view(&channels[0], &ids[0]) && view.can_view(&channels[0], &ids[7]));
+    assert!(view.can_view(&channels[9], &ids[0]));
+    assert_eq!(known.channels.len(), view.channels().count());
+    assert_eq!(view.viewers(&channels[0]).len(), 2, "the owner and the member with the override");
+    assert_eq!(view.viewers(&channels[49]).len(), 2001);
+}
+
+/// Updates that change nothing the visibility evaluation reads (a room nickname, a channel topic, a room
+/// description) keep the room's snapshot; a rename, a role change or a timeout drop it.
+#[tokio::test]
+async fn cosmetic_updates_keep_the_visibility_snapshot() {
+    use std::sync::Arc;
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel = TestNode::text_channel(&room);
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    let snapshot = || async { tavrn_node::visibility::room(&node.state, &room_id).await.unwrap().unwrap() };
+    let first = snapshot().await;
+    let (st, j) = node
+        .put(&format!("/api/v1/rooms/{room_id}/members/me/profile"), &bob.token, json!({ "nickname": "Bobby" }))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let channel_path = format!("/api/v1/rooms/{room_id}/channels/{channel}");
+    let (st, j) = node.patch(&channel_path, &alice.token, json!({ "topic": "ale and stories" })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) =
+        node.patch(&format!("/api/v1/rooms/{room_id}"), &alice.token, json!({ "description": "A cozy place" })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert!(Arc::ptr_eq(&first, &snapshot().await), "nickname, topic and description keep the snapshot");
+    let (st, j) = node.patch(&channel_path, &alice.token, json!({ "name": "taproom" })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let renamed = snapshot().await;
+    assert!(!Arc::ptr_eq(&first, &renamed), "a rename drops it");
+    assert_eq!(renamed.channel(&channel).unwrap().name, "taproom");
+    let (st, role) = node
+        .post(&format!("/api/v1/rooms/{room_id}/roles"), &alice.token, json!({ "name": "Regular", "permissions": "0" }))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{role}");
+    let before_role = snapshot().await;
+    let (st, j) = node
+        .patch(
+            &format!("/api/v1/rooms/{room_id}/members/{}", bob.user_id),
+            &alice.token,
+            json!({ "roles": [role["id"]] }),
+        )
+        .await;
+    assert!(st.is_success(), "{st} {j}");
+    let after_role = snapshot().await;
+    assert!(!Arc::ptr_eq(&before_role, &after_role), "a role assignment drops it");
+    assert_eq!(after_role.member(&bob.user_id).unwrap().role_ids, vec![role["id"].as_str().unwrap().to_string()]);
+}

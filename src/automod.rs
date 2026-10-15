@@ -7,7 +7,14 @@
 //! `block`. A match writes an audit entry with the matched term (never the message text), alerts the moderators
 //! and opens or updates an automod entry in the moderation inbox.
 
-use std::collections::HashSet;
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+
+use aho_corasick::AhoCorasick;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -163,34 +170,48 @@ fn earliest(list: &[usize], from: usize, until: usize) -> Option<usize> {
 /// cost is linear in the text per literal plus a binary search per start: no backtracking a crafted text could
 /// blow up.
 pub fn term_matches(text: &str, parts: &[String], whole_word: bool) -> bool {
+    let ws = std::cell::OnceCell::new();
+    matches_with(text, parts, whole_word, &|_, lit| Cow::Owned(occurrences(text, lit)), &ws)
+}
+
+/// [`term_matches`] with the occurrences of the term's `j`-th literal given by `occurrences_of` (one automaton pass
+/// over the text finds those of every term at once, [`Terms::find`]) and the whitespace table shared between the
+/// terms of one text.
+fn matches_with<'a>(
+    text: &str,
+    parts: &[String],
+    whole_word: bool,
+    occurrences_of: &dyn Fn(usize, &str) -> Cow<'a, [usize]>,
+    ws: &std::cell::OnceCell<Vec<usize>>,
+) -> bool {
     let literals: Vec<&str> = parts.iter().map(String::as_str).filter(|p| !p.is_empty()).collect();
     let Some(first) = literals.first() else { return false };
     // A leading (trailing) star extends the match to the start (end) of its non-space run, which is a boundary.
     let leading_star = parts.first().is_some_and(String::is_empty);
     let trailing_star = parts.len() > 1 && parts.last().is_some_and(String::is_empty);
     let last = literals.len() - 1;
-    let lists: Vec<Vec<usize>> = literals
-        .iter()
-        .enumerate()
-        .map(|(j, lit)| {
-            let mut list = occurrences(text, lit);
-            if whole_word && j == 0 && !leading_star {
-                list.retain(|&p| boundary_before(text, p));
-            }
-            if whole_word && j == last && !trailing_star {
-                list.retain(|&p| boundary_after(text, p + lit.len()));
-            }
-            list
-        })
-        .collect();
-    if lists.iter().any(Vec::is_empty) {
-        return false;
+    let mut lists: Vec<Cow<'a, [usize]>> = Vec::with_capacity(literals.len());
+    for (j, lit) in literals.iter().enumerate() {
+        let mut list = occurrences_of(j, lit);
+        if list.is_empty() {
+            return false;
+        }
+        if whole_word && j == 0 && !leading_star {
+            list.to_mut().retain(|&p| boundary_before(text, p));
+        }
+        if whole_word && j == last && !trailing_star {
+            list.to_mut().retain(|&p| boundary_after(text, p + lit.len()));
+        }
+        if list.is_empty() {
+            return false;
+        }
+        lists.push(list);
     }
     if literals.len() == 1 {
         return true;
     }
-    let ws = next_whitespace(text);
-    'starts: for &start in &lists[0] {
+    let ws = ws.get_or_init(|| next_whitespace(text));
+    'starts: for &start in lists[0].iter() {
         let mut pos = start + first.len();
         for j in 1..literals.len() {
             match earliest(&lists[j], pos, ws[pos]) {
@@ -280,24 +301,54 @@ impl Links {
     }
 }
 
-/// A word list ready for matching: literal single words of whole-word lists are looked up in a set.
+/// A word list ready for matching: literal single words of whole-word lists are looked up in a set; the literals
+/// of every other term are found in one pass over the text (an Aho-Corasick automaton, linear in the text and the
+/// matches), and only then are the boundary and `*` rules of each term checked on those positions.
 #[derive(Debug, Default, Clone)]
 pub struct Terms {
     whole_word: bool,
     exact: HashSet<String>,
-    patterns: Vec<(String, Vec<String>)>,
+    patterns: Vec<Pattern>,
+    /// Over the distinct literals of `patterns` (`None` without patterns).
+    automaton: Option<AhoCorasick>,
+    literals: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Pattern {
+    term: String,
+    parts: Vec<String>,
+    /// The automaton's ids of the non-empty parts, in order.
+    ids: Vec<usize>,
 }
 
 impl Terms {
     pub fn new(terms: &[String], whole_word: bool) -> Self {
         let mut t = Self { whole_word, ..Default::default() };
+        let mut literals: Vec<String> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for term in terms {
             if whole_word && term.chars().all(is_word) {
                 t.exact.insert(term.clone());
-            } else {
-                t.patterns.push((term.clone(), parts(term)));
+                continue;
             }
+            let parts = parts(term);
+            let ids = parts
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| {
+                    *index.entry(p.clone()).or_insert_with(|| {
+                        literals.push(p.clone());
+                        literals.len() - 1
+                    })
+                })
+                .collect();
+            t.patterns.push(Pattern { term: term.clone(), parts, ids });
         }
+        t.literals = literals.len();
+        // Building fails only for automata beyond its size limits, far above 500 terms × 100 characters (room
+        // rules) or 10 000 entries (node lists); the term-by-term scan stays as the fallback.
+        t.automaton = (!literals.is_empty()).then(|| AhoCorasick::new(&literals).ok()).flatten();
         t
     }
 
@@ -314,7 +365,32 @@ impl Terms {
                 }
             }
         }
-        self.patterns.iter().find(|(_, p)| term_matches(text, p, self.whole_word)).map(|(t, _)| t.clone())
+        if self.patterns.is_empty() {
+            return None;
+        }
+        let ws = std::cell::OnceCell::new();
+        let Some(automaton) = &self.automaton else {
+            return self
+                .patterns
+                .iter()
+                .find(|p| term_matches(text, &p.parts, self.whole_word))
+                .map(|p| p.term.clone());
+        };
+        // Every occurrence (overlapping ones included) of every literal, in one pass.
+        let mut found: Vec<Vec<usize>> = vec![Vec::new(); self.literals];
+        for m in automaton.find_overlapping_iter(text) {
+            found[m.pattern().as_usize()].push(m.start());
+        }
+        for list in &mut found {
+            list.sort_unstable();
+        }
+        self.patterns
+            .iter()
+            .find(|p| {
+                p.ids.iter().all(|&id| !found[id].is_empty())
+                    && matches_with(text, &p.parts, self.whole_word, &|j, _| Cow::Borrowed(&found[p.ids[j]]), &ws)
+            })
+            .map(|p| p.term.clone())
     }
 }
 
@@ -357,6 +433,7 @@ fn find_in(texts: &[String], terms: &Terms, links: Links, domains: &[String]) ->
 }
 
 /// A room rule ready for matching.
+#[derive(Debug)]
 struct Compiled {
     rule: AutomodRule,
     terms: Terms,
@@ -479,7 +556,61 @@ pub fn validate_rules(
 /// The stored rules of a room (an unreadable document counts as no rules).
 pub async fn room_rules(state: &AppState, room_id: &str) -> Result<Vec<AutomodRule>, ApiError> {
     let raw = store::automod::rules(&state.db, room_id).await?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    Ok(parse_rules(&raw))
+}
+
+fn parse_rules(raw: &str) -> Vec<AutomodRule> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// The compiled rules of a room, shared between messages (parsing and compiling 20 rules × 500 terms per message
+/// would cost more than the matching).
+struct CachedRules {
+    /// The stored document they were compiled from.
+    raw: String,
+    rules: Arc<Vec<Compiled>>,
+    checked: Instant,
+}
+
+/// Compiled rules per room (`<domain>|<room id>`). A change on this instance replaces them at once
+/// ([`rules_changed`]); a change on another instance is seen within [`RULES_RECHECK`], when the stored document is
+/// read again and compiled only if it differs.
+static ROOM_RULES: LazyLock<Mutex<HashMap<String, CachedRules>>> = LazyLock::new(Mutex::default);
+const RULES_RECHECK: Duration = Duration::from_secs(5);
+/// Rooms kept; more empty the cache (it refills from the messages that follow).
+const MAX_CACHED_ROOMS: usize = 4096;
+
+fn cache_key(state: &AppState, room_id: &str) -> String {
+    format!("{}|{room_id}", state.config.domain)
+}
+
+fn rule_cache() -> std::sync::MutexGuard<'static, HashMap<String, CachedRules>> {
+    ROOM_RULES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The room's rules were replaced on this instance (`PUT /rooms/{id}/automod`).
+pub fn rules_changed(state: &AppState, room_id: &str) {
+    rule_cache().remove(&cache_key(state, room_id));
+}
+
+async fn compiled_rules(state: &AppState, room_id: &str) -> Result<Arc<Vec<Compiled>>, ApiError> {
+    let key = cache_key(state, room_id);
+    if let Some(hit) = rule_cache().get(&key).filter(|c| c.checked.elapsed() < RULES_RECHECK) {
+        return Ok(hit.rules.clone());
+    }
+    let raw = store::automod::rules(&state.db, room_id).await?;
+    if let Some(hit) = rule_cache().get_mut(&key).filter(|c| c.raw == raw) {
+        hit.checked = Instant::now();
+        return Ok(hit.rules.clone());
+    }
+    let rules: Arc<Vec<Compiled>> =
+        Arc::new(parse_rules(&raw).into_iter().filter(|r| r.enabled).map(Compiled::new).collect());
+    let mut cache = rule_cache();
+    if cache.len() >= MAX_CACHED_ROOMS {
+        cache.clear();
+    }
+    cache.insert(key, CachedRules { raw, rules: rules.clone(), checked: Instant::now() });
+    Ok(rules)
 }
 
 // ---------------------------------------------------------------- node lists
@@ -717,21 +848,21 @@ pub async fn evaluate(
     if access.is_owner || access.is_node_admin {
         return Ok(None);
     }
-    let rules = room_rules(state, &access.room.id).await?;
-    for rule in rules.into_iter().filter(|r| r.enabled) {
+    let rules = compiled_rules(state, &access.room.id).await?;
+    for c in rules.iter() {
+        let rule = &c.rule;
         if rule.exempt_channels.contains(&channel.id)
             || access.member_roles.iter().any(|r| rule.exempt_roles.contains(&r.id))
         {
             continue;
         }
-        let c = Compiled::new(rule);
-        if let Some(matched) = find_in(&texts, &c.terms, c.links, &c.rule.domains) {
+        if let Some(matched) = find_in(&texts, &c.terms, c.links, &rule.domains) {
             return Ok(Some(Hit {
-                rule: c.rule.name,
+                rule: rule.name.clone(),
                 scope: "room",
                 matched,
-                action: c.rule.action,
-                timeout_minutes: c.rule.timeout_minutes,
+                action: rule.action.clone(),
+                timeout_minutes: rule.timeout_minutes,
             }));
         }
     }
@@ -924,6 +1055,106 @@ mod tests {
         assert_eq!(t.find("two words here"), Some("two words".into()));
         assert_eq!(t.find("xzzy"), Some("x*y".into()));
         assert!(Terms::new(&[], true).is_empty());
+    }
+
+    /// One pass over the text finds what the term-by-term scan finds, for every kind of term.
+    #[test]
+    fn the_automaton_finds_what_each_term_finds_alone() {
+        let terms: Vec<String> = [
+            "bad",
+            "two words",
+            "x*y",
+            "spam*",
+            "*coin",
+            "fr*e",
+            "a*b",
+            "a*a*a*b",
+            "buy now*",
+            "ärg*",
+            "テキ",
+            "e",
+            "case",
+            "forbidden phrase",
+        ]
+        .iter()
+        .map(|t| normalize(t))
+        .collect();
+        let texts = [
+            "so bad",
+            "badly",
+            "two words here",
+            "xzzy",
+            "spammity",
+            "x-bitcoin",
+            "frEEEe",
+            "fr e",
+            "abxb",
+            "abxbc",
+            "aaaaab",
+            "so buy nowadays",
+            "größe ärger",
+            "日本語のテキスト",
+            "ééé",
+            "snake_case_word",
+            "a forbidden  phrase.",
+            "nothing at all",
+        ];
+        for whole in [true, false] {
+            for term in &terms {
+                let one = Terms::new(std::slice::from_ref(term), whole);
+                for text in texts {
+                    let text = normalize(text);
+                    let expected = term_matches(&text, &parts(term), whole);
+                    let exact = whole && term.chars().all(is_word);
+                    if !exact {
+                        assert_eq!(one.find(&text).is_some(), expected, "{term:?} in {text:?} (whole {whole})");
+                    }
+                }
+            }
+            // All terms together report the first matching term of the list.
+            let all = Terms::new(&terms, whole);
+            for text in texts {
+                let text = normalize(text);
+                let expected = terms.iter().find(|t| {
+                    if whole && t.chars().all(is_word) {
+                        text.split(|c: char| !is_word(c)).any(|w| w == t.as_str())
+                    } else {
+                        term_matches(&text, &parts(t), whole)
+                    }
+                });
+                assert_eq!(all.find(&text).is_some(), expected.is_some(), "{text:?} (whole {whole})");
+            }
+        }
+    }
+
+    /// 20 rules × 500 terms against a 4000-character message: the automaton against the scan per term (run with
+    /// `--ignored --nocapture` for the numbers).
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_room_rules() {
+        let rules: Vec<Vec<String>> = (0..20)
+            .map(|r| (0..500).map(|t| format!("w{r}x{t}*{}", if t % 3 == 0 { "z" } else { "" })).collect())
+            .collect();
+        let text = normalize(&"lorem ipsum dolor sit amet, consectetur adipiscing elit ".repeat(72)[..4000]);
+        let started = Instant::now();
+        let compiled: Vec<Terms> = rules.iter().map(|r| Terms::new(r, true)).collect();
+        let compile = started.elapsed();
+        let rounds = 20;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for t in &compiled {
+                assert!(t.find(&text).is_none());
+            }
+        }
+        let automaton = started.elapsed() / rounds;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for r in &rules {
+                assert!(!r.iter().any(|t| term_matches(&text, &parts(t), true)));
+            }
+        }
+        let scan = started.elapsed() / rounds;
+        println!("compile {compile:?} once; per message: automaton {automaton:?}, term by term {scan:?}");
     }
 
     #[test]

@@ -161,8 +161,8 @@ pub struct AppState {
     pub direct_invite_limiter: Arc<RateLimiter>,
     /// Received `room.invite` notifications per sender and recipient (10 per hour, §5.2).
     pub room_invite_inbox_limiter: Arc<RateLimiter>,
-    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2).
-    pub notify_limiter: Arc<RateLimiter>,
+    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2), counted for the whole node.
+    pub notify_limiter: Arc<SharedLimiter>,
     /// Key cache refetches through `federation::keys::ensure` per remote user (1 per minute, §3.5).
     pub keys_fetch_limiter: Arc<RateLimiter>,
     /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
@@ -282,6 +282,10 @@ pub struct AppState {
     pub live_sessions: Arc<crate::sessions::LiveCache>,
     /// Heartbeat of WebSockets (`ws::PING_INTERVAL`; tests shorten it to watch the session re-check).
     pub ws_ping: Duration,
+    /// `TAVRN_TRUSTED_PROXIES`, parsed once (`auth::ClientIp` consults it for every request).
+    pub trusted_proxies: Arc<[ipnet::IpNet]>,
+    /// How long a WebSocket send may take before the connection ends (`ws::SEND_TIMEOUT`; tests shorten it).
+    pub ws_send_timeout: Duration,
     /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
     pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
@@ -393,7 +397,7 @@ impl AppState {
             ),
             direct_invite_limiter: limiter(invites.1, 3600),
             room_invite_inbox_limiter: limiter(invites.2, 3600),
-            notify_limiter: limiter(1, 60),
+            notify_limiter: shared("fed-notify", 1, 60),
             keys_fetch_limiter: limiter(1, 60),
             profile_refresh_limiter: limiter(1, 60),
             profile_changed_limiter: shared(
@@ -453,6 +457,8 @@ impl AppState {
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             live_sessions: Arc::default(),
             ws_ping: crate::ws::PING_INTERVAL,
+            trusted_proxies: config.trusted_proxies().into(),
+            ws_send_timeout: crate::ws::SEND_TIMEOUT,
             password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
                 0 => crate::auth::default_hash_concurrency(),
                 n => n as usize,

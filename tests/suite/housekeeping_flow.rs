@@ -82,7 +82,9 @@ async fn prunes_old_epochs_beyond_1000_and_old_welcomes() {
 
     // Idempotent; recent commits beyond 1000 epochs stay until they are 90 days old.
     insert_commits(db, &busy, 1006..=1010, &recent).await;
-    let report = housekeeping::prune_handshake_log(db, Utc::now()).await.unwrap();
+    // In batches of 2: still all of them in one round.
+    let report =
+        housekeeping::prune_handshake_log_with(db, Utc::now(), 2, std::time::Duration::from_secs(60)).await.unwrap();
     assert_eq!((report.commits, report.welcomes), (5, 0), "epochs 6..=10 are old and now beyond the newest 1000");
     let report = housekeeping::prune_handshake_log(db, Utc::now()).await.unwrap();
     assert_eq!((report.commits, report.welcomes), (0, 0));

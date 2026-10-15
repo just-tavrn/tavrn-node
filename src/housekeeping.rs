@@ -26,20 +26,46 @@ pub struct PruneReport {
     pub welcomes: u64,
 }
 
+/// Commits deleted per statement of [`prune_handshake_log`].
+pub const COMMIT_PRUNE_BATCH: i64 = 5000;
+
 /// Deletes commits that are both older than 90 days and not among the newest 1000 epochs of their
-/// conversation, and Welcomes older than 30 days. A client further behind rejoins by external commit.
+/// conversation, and Welcomes older than 30 days. A client further behind rejoins by external commit. Commits go
+/// in batches within [`RETENTION_BUDGET`] (a backlog, e.g. the first run after 90 days, is no single huge
+/// transaction); the rest follows in the next round.
 pub async fn prune_handshake_log(db: &Pool, now: DateTime<Utc>) -> Result<PruneReport, ApiError> {
+    prune_handshake_log_with(db, now, COMMIT_PRUNE_BATCH, RETENTION_BUDGET).await
+}
+
+/// [`prune_handshake_log`] with the batch size and time budget given (tests).
+pub async fn prune_handshake_log_with(
+    db: &Pool,
+    now: DateTime<Utc>,
+    batch: i64,
+    budget: Duration,
+) -> Result<PruneReport, ApiError> {
     let commit_cutoff = util::format_time(now - chrono::Duration::days(COMMIT_MAX_AGE_DAYS));
     let welcome_cutoff = util::format_time(now - chrono::Duration::days(WELCOME_MAX_AGE_DAYS));
-    let commits = sqlx::query(
-        "DELETE FROM mls_commits WHERE created_at < $1
-         AND epoch <= (SELECT MAX(c.epoch) FROM mls_commits c WHERE c.conversation_id = mls_commits.conversation_id) - $2",
-    )
-    .bind(commit_cutoff)
-    .bind(KEEP_EPOCHS)
-    .execute(db)
-    .await?
-    .rows_affected();
+    let started = std::time::Instant::now();
+    let mut commits = 0;
+    loop {
+        let n = sqlx::query(
+            "DELETE FROM mls_commits WHERE (conversation_id, epoch) IN (
+                SELECT c.conversation_id, c.epoch FROM mls_commits c WHERE c.created_at < $1
+                AND c.epoch <= (SELECT MAX(m.epoch) FROM mls_commits m WHERE m.conversation_id = c.conversation_id) - $2
+                LIMIT $3)",
+        )
+        .bind(&commit_cutoff)
+        .bind(KEEP_EPOCHS)
+        .bind(batch)
+        .execute(db)
+        .await?
+        .rows_affected();
+        commits += n;
+        if n < u64::try_from(batch).unwrap_or(0) || started.elapsed() >= budget {
+            break;
+        }
+    }
     let welcomes = sqlx::query("DELETE FROM mls_welcomes WHERE created_at < $1")
         .bind(welcome_cutoff)
         .execute(db)
