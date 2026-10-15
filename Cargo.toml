@@ -41,6 +41,8 @@ name = "tavrn-node"
 path = "src/main.rs"
 
 [dependencies]
+# One pass over a message for all literals of an auto-moderation rule (already in the tree through regex).
+aho-corasick = "1"
 anyhow.workspace = true
 argon2 = { version = "0.5", features = ["std"] }
 axum = { version = "0.8", features = ["ws", "macros"] }

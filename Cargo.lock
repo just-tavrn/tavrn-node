@@ -4960,6 +4960,7 @@ name = "tavrn-node"
 version = "0.4.0-rc.8"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aho-corasick",
  "anyhow",
  "argon2",
  "axum",

@@ -339,6 +339,7 @@ pub async fn put_automod(
     let rules = automod::validate_rules(req.rules, &roles, &channels)?;
     let encoded = serde_json::to_string(&rules).map_err(|e| ApiError::Internal(e.into()))?;
     store::automod::set_rules(&state.db, &access.room.id, &encoded, &util::now()).await?;
+    automod::rules_changed(&state, &access.room.id);
     store::rooms::audit(
         &state.db,
         Some(&access.room.id),
