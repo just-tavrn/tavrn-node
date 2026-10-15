@@ -248,6 +248,8 @@ pub struct Cluster {
     /// When this instance last received its own heartbeat back (proves the subscription works).
     last_echo: Mutex<Instant>,
     seal: Zeroizing<[u8; 32]>,
+    /// Key of the `Tavrn-Relayed` marks between instances ([`relay`]), derived from `secrets.key` like `seal`.
+    relay: Zeroizing<[u8; 32]>,
 }
 
 pub fn now_ms() -> u64 {
@@ -259,9 +261,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn seal_key(secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    derive_key(secret, b"tavrn cache seal v1")
+}
+
+fn derive_key(secret: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, secret);
     let mut out = Zeroizing::new([0u8; 32]);
-    if hk.expand(b"tavrn cache seal v1", out.as_mut()).is_err() {
+    if hk.expand(info, out.as_mut()).is_err() {
         out.fill(0);
     }
     out
@@ -333,6 +339,7 @@ impl Cluster {
             restart: Notify::new(),
             last_echo: Mutex::new(Instant::now()),
             seal: seal_key(secret),
+            relay: derive_key(secret, b"tavrn instance relay v1"),
         }
     }
 
@@ -364,6 +371,11 @@ impl Cluster {
         let me = detect_url(config, url);
         tracing::info!(instance = %instance_id, cache = %target, relay_url = %me, "joined the node's instances through the cache");
         Ok(Self::shared_with(&config.domain, &instance_id, Arc::new(backend), secret, &me))
+    }
+
+    /// The key of the relay marks (`relay::header_value`).
+    pub(crate) fn relay_key(&self) -> &[u8; 32] {
+        &self.relay
     }
 
     /// Several instances share state (a cache URL, or a shared test cache).

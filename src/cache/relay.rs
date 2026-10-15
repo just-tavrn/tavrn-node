@@ -5,8 +5,11 @@
 //! The relay is a plain HTTP request to the leader's relay address (`TAVRN_INSTANCE_URL`, announced in its
 //! heartbeat) with the original method, path, headers and body, plus `X-Forwarded-For` extended by the address
 //! this instance saw (the leader resolves the client address through `TAVRN_TRUSTED_PROXIES` as usual) and
-//! `Tavrn-Relayed: <instance id>`, which stops a second hop. Standalone, on the leader, for an already relayed
-//! request or while no leader is known the request is served locally. A leader that does not answer gives
+//! `Tavrn-Relayed: <instance id>;<unix seconds>;<mac>`, which stops a second hop. The mark is an HMAC-SHA256 over
+//! instance id, method, path and time with a key derived from `secrets.key` (which every instance shares) and holds
+//! for [`MAX_AGE_SECS`]: only the instances can make one. A mark that does not verify (a client setting the header
+//! itself) is removed and the request is treated like any other. Standalone, on the leader, for a relayed request or
+//! while no leader is known the request is served locally. A leader that does not answer gives
 //! `503 node.leader_unavailable` with `Retry-After`.
 //!
 //! Interaction callbacks and follow-ups (`/interactions/{id}/callback|messages`, APPLICATIONS.md §5.7) go the same
@@ -23,9 +26,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{app::AppState, error::ApiError};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{KeyInit, Mac};
+
+use crate::{app::AppState, cache::Cluster, error::ApiError};
 
 pub const HEADER: &str = "tavrn-relayed";
+/// How long a relay mark is accepted after it was made, and how far ahead (clocks of the instances drift).
+pub const MAX_AGE_SECS: i64 = 60;
 /// Bodies of the relayed routes are small (ephemeral events ≤ 80 KiB, webhooks, JSON).
 const MAX_BODY: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,6 +63,37 @@ pub fn interaction_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/v1/interactions/")?;
     let (id, tail) = rest.split_once('/')?;
     (matches!(tail, "callback" | "messages") && !id.is_empty() && id.len() <= 64).then_some(id)
+}
+
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+fn relay_mac(cluster: &Cluster, instance: &str, method: &str, path: &str, at: i64) -> HmacSha256 {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(cluster.relay_key())
+        .unwrap_or_else(|_| unreachable!("HMAC takes any key"));
+    mac.update(format!("tavrn relay v1\n{instance}\n{method}\n{path}\n{at}").as_bytes());
+    mac
+}
+
+/// The `Tavrn-Relayed` value with which this instance relays `method path` (path with the query) now.
+pub fn header_value(cluster: &Cluster, method: &str, path: &str) -> String {
+    header_value_at(cluster, method, path, crate::jwt::now_unix())
+}
+
+/// [`header_value`] made at the unix time `at`.
+pub fn header_value_at(cluster: &Cluster, method: &str, path: &str, at: i64) -> String {
+    let tag = relay_mac(cluster, &cluster.instance_id, method, path, at).finalize().into_bytes();
+    format!("{};{at};{}", cluster.instance_id, URL_SAFE_NO_PAD.encode(tag))
+}
+
+/// Whether `value` is a fresh mark of one of the node's instances for `method path`.
+pub fn verify(cluster: &Cluster, value: &str, method: &str, path: &str) -> bool {
+    let mut parts = value.splitn(3, ';');
+    let (Some(instance), Some(at), Some(tag)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let (Ok(at), Ok(tag)) = (at.parse::<i64>(), URL_SAFE_NO_PAD.decode(tag)) else { return false };
+    if !crate::cache::valid_instance_id(instance) || (crate::jwt::now_unix() - at).abs() > MAX_AGE_SECS {
+        return false;
+    }
+    relay_mac(cluster, instance, method, path, at).verify_slice(&tag).is_ok()
 }
 
 fn client() -> &'static reqwest::Client {
@@ -97,9 +136,19 @@ fn unavailable() -> Response {
 
 /// Axum middleware on the whole router: relays [`leader_path`] requests to the leader and interaction callbacks to
 /// the instance owning the interaction.
-pub async fn middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+pub async fn middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let cluster = &state.cluster;
-    if !cluster.is_shared() || req.headers().contains_key(HEADER) {
+    if let Some(value) = req.headers().get(HEADER) {
+        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let genuine = value.to_str().is_ok_and(|v| verify(cluster, v, req.method().as_str(), path));
+        if genuine {
+            return next.run(req).await;
+        }
+        // Set by someone else than an instance: ignored, the request is relayed like any other.
+        tracing::debug!(path = req.uri().path(), "a relay mark that does not verify was removed");
+        req.headers_mut().remove(HEADER);
+    }
+    if !cluster.is_shared() {
         return next.run(req).await;
     }
     if let Some(id) = interaction_path(req.uri().path()) {
@@ -159,7 +208,7 @@ async fn forward(state: &AppState, req: Request, target: &str, failed: fn() -> R
     {
         headers.insert(HeaderName::from_static("x-forwarded-for"), v);
     }
-    if let Ok(v) = HeaderValue::from_str(&cluster.instance_id) {
+    if let Ok(v) = HeaderValue::from_str(&header_value(cluster, parts.method.as_str(), path)) {
         headers.insert(HeaderName::from_static(HEADER), v);
     }
     let response =
@@ -187,6 +236,7 @@ async fn forward(state: &AppState, req: Request, target: &str, failed: fn() -> R
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -218,6 +268,28 @@ mod tests {
             "/api/v1/users/me/whiteboards".into(),
         ] {
             assert!(!leader_path(&p), "{p}");
+        }
+    }
+
+    #[test]
+    fn relay_marks_verify_only_for_their_request_and_time() {
+        let secret = [7u8; 32];
+        let a = Cluster::standalone("x.test", &secret);
+        let other_node = Cluster::standalone("x.test", &[8u8; 32]);
+        let path = "/api/v1/conversations/c/ephemeral?x=1";
+        let mark = header_value(&a, "POST", path);
+        assert!(verify(&a, &mark, "POST", path));
+        assert!(!verify(&a, &mark, "GET", path), "bound to the method");
+        assert!(!verify(&a, &mark, "POST", "/api/v1/conversations/c/ephemeral"), "bound to the path and query");
+        assert!(!verify(&other_node, &mark, "POST", path), "keyed with the node's secret");
+        let now = crate::jwt::now_unix();
+        assert!(verify(&a, &header_value_at(&a, "POST", path, now - MAX_AGE_SECS + 5), "POST", path));
+        assert!(!verify(&a, &header_value_at(&a, "POST", path, now - MAX_AGE_SECS - 5), "POST", path), "stale");
+        assert!(!verify(&a, &header_value_at(&a, "POST", path, now + MAX_AGE_SECS + 5), "POST", path), "future");
+        let (head, _) = mark.rsplit_once(';').unwrap();
+        for forged in [a.instance_id.clone(), String::new(), format!("{head};"), format!("{head};AAAA"), "a;b;c".into()]
+        {
+            assert!(!verify(&a, &forged, "POST", path), "{forged}");
         }
     }
 

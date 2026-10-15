@@ -697,3 +697,44 @@ async fn a_standalone_node_reports_no_cache_and_leads() {
     assert!(node.state.cluster.is_leader() && !node.state.cluster.is_shared());
     assert!(tavrn_node::cache::leader::spawn(&node.state, LEASE).is_none(), "nothing to elect");
 }
+
+/// `Tavrn-Relayed` marks a request one instance relayed to another: only a value the instances made (keyed with the
+/// node's shared secret, bound to method and path, fresh) is served where it lands. A client that sets the header
+/// itself is relayed to the leader like any other client.
+async fn only_instances_can_mark_a_request_as_relayed(cache: Arc<dyn Cache>) {
+    let nodes = cluster::instances(&domain(), cache, 2).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    elect(&nodes, 0, Duration::from_secs(30)).await;
+    let alice = a.node.register("alice").await;
+    let (_, channel) = room(a, &alice, &[]).await;
+    let path = format!("/api/v1/conversations/{channel}/ephemeral");
+    let open = json!({ "type": "whiteboard.open", "content": { "type": "whiteboard.open" } }).to_string().into_bytes();
+    let post = |headers: Vec<(&'static str, String)>| {
+        let (path, open, token) = (path.clone(), open.clone(), alice.token.clone());
+        async move {
+            let mut h: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+            h.extend(headers.iter().map(|(k, v)| (*k, v.as_str())));
+            let (st, _, body) = b.node.raw(Method::POST, &path, &token, &h, open).await;
+            (st, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+        }
+    };
+    let on_b = || b.node.state.whiteboards.get(&channel, std::time::Instant::now()).is_some();
+    let relay = tavrn_node::cache::relay::HEADER;
+    // Forged: a bare instance id, a value of another path, a stale or tampered value.
+    let other_path = tavrn_node::cache::relay::header_value(&b.node.state.cluster, "POST", "/api/v1/other");
+    let stale = tavrn_node::cache::relay::header_value_at(&b.node.state.cluster, "POST", &path, 1_000);
+    let mut tampered = tavrn_node::cache::relay::header_value(&b.node.state.cluster, "POST", &path);
+    tampered.replace_range(tampered.len() - 2.., "AA");
+    for forged in ["i0".to_string(), "i1".to_string(), other_path, stale, tampered] {
+        let (st, j) = post(vec![(relay, forged.clone())]).await;
+        assert_eq!(st, StatusCode::OK, "{forged}: {j}");
+        assert!(!on_b(), "{forged}: relayed to the leader, not served on B");
+    }
+    assert!(a.node.state.whiteboards.get(&channel, std::time::Instant::now()).is_some(), "the session lives on A");
+    // A value B's instances made itself (as when the leader relays here): served on B.
+    let genuine = tavrn_node::cache::relay::header_value(&b.node.state.cluster, "POST", &path);
+    let (st, j) = post(vec![(relay, genuine)]).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert!(on_b(), "a relayed request is served where it lands");
+}
+both!(only_instances_can_mark_a_request_as_relayed, relayed_header_in_process, relayed_header_valkey);
