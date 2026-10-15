@@ -878,7 +878,7 @@ pub async fn reset_token(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((id, token_id)): Path<(String, String)>,
-    body: Option<Json<ResetTokenRequest>>,
+    body: Option<ApiJson<ResetTokenRequest>>,
 ) -> Result<Json<TokenSecret>, ApiError> {
     require_person(&auth)?;
     let app = owned(&state, &auth, &id).await?;
@@ -983,12 +983,12 @@ pub struct DevNotifyExpiring {
 /// (APPLICATIONS.md §2.2) at once, so SDK and e2e tests can watch the event. Answers the number of notices.
 pub async fn dev_notify_expiring_tokens(
     State(state): State<AppState>,
-    body: Option<Json<DevNotifyExpiring>>,
+    body: Option<ApiJson<DevNotifyExpiring>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !state.config.dev {
         return Err(ApiError::NotFound { code: "route.not_found", what: "Route".into() });
     }
-    let now = match body.and_then(|Json(b)| b.now) {
+    let now = match body.and_then(|ApiJson(b)| b.now) {
         Some(t) => chrono::DateTime::parse_from_rfc3339(&t)
             .map_err(|_| bad("validation.time", "now must be an RFC 3339 time"))?
             .with_timezone(&chrono::Utc),

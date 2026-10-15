@@ -4,7 +4,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     e2ee,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     permissions as p, store,
     validate::{self, bad},
 };

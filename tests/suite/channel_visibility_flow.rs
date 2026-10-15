@@ -671,4 +671,26 @@ async fn cosmetic_updates_keep_the_visibility_snapshot() {
     let after_role = snapshot().await;
     assert!(!Arc::ptr_eq(&before_role, &after_role), "a role assignment drops it");
     assert_eq!(after_role.member(&bob.user_id).unwrap().role_ids, vec![role["id"].as_str().unwrap().to_string()]);
+
+/// The shared visibility snapshot of a room keeps what the permission evaluation needs, not the members' password
+/// hashes, e-mail addresses or dates of birth.
+#[tokio::test]
+async fn the_visibility_snapshot_keeps_no_account_secrets() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap();
+    let stored = tavrn_node::store::users::by_id(&node.state.db, &alice.user_id).await.unwrap().unwrap();
+    assert!(stored.password_hash.is_some() && stored.date_of_birth.is_some(), "the account has them");
+    let view = tavrn_node::visibility::room(&node.state, room_id).await.unwrap().unwrap();
+    let member = view.member(&alice.user_id).unwrap();
+    assert!(member.adult, "the age gate was evaluated");
+    let u = &member.user;
+    assert_eq!(
+        (u.id.as_str(), u.is_node_admin(), u.kind.as_str()),
+        (alice.user_id.as_str(), stored.is_node_admin(), "user")
+    );
+    assert!(
+        u.password_hash.is_none() && u.email.is_none() && u.email_verified_at.is_none() && u.date_of_birth.is_none()
+    );
 }

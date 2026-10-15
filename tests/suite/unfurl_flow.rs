@@ -81,13 +81,10 @@ async fn a_page_is_previewed_through_the_route() {
     let mut node = test_node("t.local").await;
     let alice = node.register("alice").await;
     let dns = FakeDns(HashMap::from([("site.test".to_string(), vec!["127.0.0.1".parse().unwrap()])]));
-    node.state.unfurl = Some(Arc::new(Unfurler::new(
-        "t.local",
-        Arc::new(dns),
-        HashSet::from(["site.test".to_string()]),
-        Duration::from_secs(3),
-        1000,
-    )));
+    node.state.unfurl = Some(Arc::new(
+        Unfurler::new("t.local", Arc::new(dns), HashSet::from(["site.test".to_string()]), Duration::from_secs(3), 1000)
+            .unwrap(),
+    ));
     node.router = tavrn_node::app::router(node.state.clone());
     let url = format!("http://site.test:{port}/page");
     let (s, j) = node.get_auth(&q(&url), &alice.token).await;

@@ -8,7 +8,7 @@
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -20,7 +20,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     emoji::{personal_limits, valid_name as valid_emoji_name},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     gifs::Gif,
     media::{MediaKind, Processed},
     models::Emoji,
@@ -452,7 +452,7 @@ pub async fn rename_personal(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(emoji_id): Path<String>,
-    Json(req): Json<RenameEmoji>,
+    ApiJson(req): ApiJson<RenameEmoji>,
 ) -> Result<Json<store::emojis::UserEmoji>, ApiError> {
     local_only(&state, &auth)?;
     let name = req.name.trim().to_ascii_lowercase();

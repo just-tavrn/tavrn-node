@@ -124,7 +124,8 @@ pub fn may_see(refs: &Refs<'_>, can_view: impl Fn(&str) -> bool) -> bool {
     refs.each.iter().all(|c| can_view(c)) && (refs.any.is_empty() || refs.any.iter().any(|c| can_view(c)))
 }
 
-/// A member of the room as the snapshot holds it.
+/// A member of the room as the snapshot holds it. `user` carries no password hash, e-mail address or date of birth
+/// (the age gate is already evaluated in `adult`).
 pub struct Member {
     pub member: MemberRow,
     /// Role ids without @everyone.
@@ -459,8 +460,13 @@ pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView
     let mut members = Vec::new();
     let mut index = HashMap::new();
     for (member, role_ids) in store::rooms::members_with_roles(db, room_id).await? {
-        let Some(user) = users.remove(&member.user_id) else { continue };
+        let Some(mut user) = users.remove(&member.user_id) else { continue };
         let adult = crate::age::is_adult(state, &user).await?;
+        // The snapshot lives on (shared, cached): it keeps nothing the permission evaluation does not need.
+        user.password_hash = None;
+        user.email = None;
+        user.email_verified_at = None;
+        user.date_of_birth = None;
         let moved = moved.remove(&member.user_id);
         let eval = eval_of(&room, &roles, everyone.as_ref(), &member, &role_ids, &user, &now);
         index.insert(member.user_id.clone(), members.len());

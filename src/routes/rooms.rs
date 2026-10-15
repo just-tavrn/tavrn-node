@@ -1407,7 +1407,7 @@ pub async fn purge(
             Ok(Json(PurgeResponse { dry_run: true, messages: count, confirm_token: Some(token) }))
         }
         Some(token) => {
-            let (_, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
+            let (claims, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
                 .map_err(|_| {
                     bad(
                         "moderation.confirm_invalid",
@@ -1417,6 +1417,7 @@ pub async fn purge(
             if extra.filter_hash != filter_hash {
                 return Err(bad("moderation.confirm_mismatch", "The filter changed after the preview"));
             }
+            crate::routes::spend_confirmation(&state, &claims).await?;
             // Channel by channel: each `message.purge` names one channel and reaches only its viewers, so no member
             // learns of channels hidden from them (PROTOCOL.md §6).
             let mut deleted = 0;

@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use crate::{
     access,
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     models::{CHANNEL_KINDS, Category, Channel, ChannelRow, OverrideRow, PermissionOverride},
     permissions as p, store,
     validate::{self, bad},
@@ -31,7 +31,7 @@ pub async fn create_category(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<CreateCategoryRequest>,
+    ApiJson(req): ApiJson<CreateCategoryRequest>,
 ) -> Result<(StatusCode, Json<Category>), ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
@@ -57,7 +57,7 @@ pub async fn update_category(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, category_id)): Path<(String, String)>,
-    Json(req): Json<UpdateCategoryRequest>,
+    ApiJson(req): ApiJson<UpdateCategoryRequest>,
 ) -> Result<Json<Category>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
@@ -406,7 +406,7 @@ pub async fn create_channel(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<CreateChannelRequest>,
+    ApiJson(req): ApiJson<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<Channel>), ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_CHANNELS, "channel.manage_forbidden", "Manage channels")?;
@@ -562,7 +562,7 @@ pub async fn update_channel(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<UpdateChannelRequest>,
+    ApiJson(req): ApiJson<UpdateChannelRequest>,
 ) -> Result<Json<Channel>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     let status_only = req.status_only();
@@ -910,7 +910,7 @@ pub async fn set_override(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<SetOverrideRequest>,
+    ApiJson(req): ApiJson<SetOverrideRequest>,
 ) -> Result<Json<Vec<PermissionOverride>>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;

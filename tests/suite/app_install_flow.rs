@@ -1008,3 +1008,45 @@ async fn a_bot_account_is_never_turned_into_a_user() {
     let (s, j) = b.federated_login(&token).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("federation.kind_mismatch")), "{j}");
 }
+
+/// After `app.changed` the rooms of the remote bot hear its new profile as `user.update { user }` (PROTOCOL.md §6),
+/// like every other `user.update`: never the bare user object.
+#[tokio::test]
+async fn a_remote_bot_profile_refresh_sends_user_update_with_the_user() {
+    use futures::StreamExt;
+    let (a, b) = federation::two_nodes().await;
+    let alice = a.register("alice").await;
+    let requested = mask(&[p::SEND_MESSAGES]);
+    let traveller =
+        bot(&a, &alice, json!({ "name": "Traveller", "public": true, "requested_permissions": requested }), None).await;
+    let carol = b.register("carol").await;
+    let room = b.plaintext_room(&carol.token, "Remote room").await;
+    let room_id = room["id"].as_str().unwrap();
+    let (s, inst) = install(
+        &b,
+        &carol.token,
+        room_id,
+        json!({ "application": traveller.reference(federation::A), "permissions": requested }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{inst}");
+    b.deliver().await;
+    let mut ws = crossnode::ws(&b, &carol.token).await;
+    a.patch(&format!("/api/v1/applications/{}", traveller.app_id), &alice.token, json!({ "name": "Wanderer" })).await;
+    a.deliver().await;
+    // Every user.update until the connection is quiet.
+    let mut updates = Vec::new();
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(std::time::Duration::from_millis(700), ws.next()).await {
+        if let Ok(v) = serde_json::from_str::<Value>(msg.to_text().unwrap_or(""))
+            && v["op"] == "event"
+            && v["type"] == "user.update"
+        {
+            updates.push(v["data"].clone());
+        }
+    }
+    assert!(!updates.is_empty(), "the rename is announced");
+    for data in &updates {
+        assert_eq!(data["user"]["display_name"], "Wanderer", "user.update {{ user }}: {data}");
+        assert_eq!(data["user"]["kind"], "bot", "{data}");
+    }
+}

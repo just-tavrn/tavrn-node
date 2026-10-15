@@ -18,7 +18,7 @@ use crate::{
     access::{self, RoomAccess},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ApiJson, ApiJsonOrEmpty, ProblemDetails},
+    error::{ApiError, ApiJson, ApiJsonOrEmpty, ApiQuery as Query, ProblemDetails},
     models::{ChannelRow, UserRow},
     permissions::{self as p, Perms},
     store,
@@ -1176,7 +1176,7 @@ pub async fn update_sound(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, sound_id)): Path<(String, String)>,
-    Json(req): Json<UpdateSound>,
+    ApiJson(req): ApiJson<UpdateSound>,
 ) -> Result<Json<store::voice::Sound>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_EMOJIS, "soundboard.manage_forbidden", "Manage emojis and sounds")?;
@@ -1197,7 +1197,7 @@ pub async fn public_sound_audio(
     State(state): State<AppState>,
     crate::auth::ClientIp(ip): crate::auth::ClientIp,
     Path(sound_id): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<SoundQuery>,
+    Query(q): Query<SoundQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     validate::ulid("sound_id", &sound_id)?;
@@ -1311,7 +1311,7 @@ pub async fn update_personal_sound(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(sound_id): Path<String>,
-    Json(req): Json<UpdateSound>,
+    ApiJson(req): ApiJson<UpdateSound>,
 ) -> Result<Json<store::voice::UserSound>, ApiError> {
     local_only(&state, &auth)?;
     let (name, emoji) = req.checked()?;
@@ -1365,7 +1365,7 @@ pub async fn play_sound(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<PlaySound>,
+    ApiJson(req): ApiJson<PlaySound>,
 ) -> Result<Json<PlayAllowed>, ApiError> {
     validate::ulid("sound_id", &req.sound_id)?;
     let vc = voice_channel(&state, &room_id, &channel_id, &auth.user).await?;

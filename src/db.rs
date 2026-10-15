@@ -105,16 +105,7 @@ fn sqlite_parent_dir(url: &str) -> Option<String> {
 
 /// Removes the password from a connection URL for logs and error messages.
 pub fn redact(url: &str) -> String {
-    match (url.find("://"), url.find('@')) {
-        (Some(s), Some(a)) if a > s => {
-            let creds = &url[s + 3..a];
-            match creds.split_once(':') {
-                Some((user, _)) => format!("{}://{}:***@{}", &url[..s], user, &url[a + 1..]),
-                None => url.to_string(),
-            }
-        }
-        _ => url.to_string(),
-    }
+    crate::config::redact_url(url)
 }
 
 #[cfg(test)]
@@ -127,6 +118,8 @@ mod tests {
         assert_eq!(redact("postgres://tavrn:secret@db/tavrn"), "postgres://tavrn:***@db/tavrn");
         assert_eq!(redact("sqlite://x.db"), "sqlite://x.db");
         assert_eq!(redact("postgres://user@db/x"), "postgres://user@db/x");
+        assert_eq!(redact("postgres://tavrn:p@ss@db/tavrn"), "postgres://tavrn:***@db/tavrn", "an unencoded @");
+        assert_eq!(redact("postgres://db/tavrn?password=secret"), "postgres://db/tavrn?password=***");
     }
 
     #[test]

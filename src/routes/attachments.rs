@@ -4,7 +4,7 @@
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -17,7 +17,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     entitlements::{self, Entitlements},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiQuery as Query, ProblemDetails},
     files,
     models::{Attachment, Message, MessageRow, MessageUpdate, ReactionChange},
     permissions as p,
@@ -383,8 +383,11 @@ fn valid_emoji(e: &str) -> bool {
     crate::emoji::valid_reaction(e)
 }
 
+/// A message the caller may read ([`crate::routes::messages::readable`]: `view_channel` and the history window of
+/// ENCRYPTION.md §7b) and act on with `needed`.
 async fn message_in_conv(
     state: &AppState,
+    auth: &AuthUser,
     conv: &Conv,
     message_id: &str,
     needed: u64,
@@ -392,10 +395,7 @@ async fn message_in_conv(
     what: &str,
 ) -> Result<MessageRow, ApiError> {
     conv.require(p::VIEW_CHANNEL | needed, code, what)?;
-    store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))
+    crate::routes::messages::readable(state, auth, conv, message_id).await
 }
 
 async fn react(
@@ -410,14 +410,14 @@ async fn react(
         if !valid_emoji(emoji) {
             return Err(bad("reaction.invalid", "Invalid emoji"));
         }
-        message_in_conv(state, conv, message_id, p::ADD_REACTIONS, "reaction.forbidden", "Add reactions").await?;
+        message_in_conv(state, auth, conv, message_id, p::ADD_REACTIONS, "reaction.forbidden", "Add reactions").await?;
         crate::routes::messages::check_direct_write(state, auth, conv).await?;
         if let Some(token) = crate::emoji::parse_token(emoji) {
             crate::emoji::check_external(state, conv, &[token]).await?;
         }
         store::blobs::add_reaction(&state.db, message_id, &auth.user.id, emoji).await?
     } else {
-        message_in_conv(state, conv, message_id, 0, "channel.view_forbidden", "View channel").await?;
+        message_in_conv(state, auth, conv, message_id, 0, "channel.view_forbidden", "View channel").await?;
         store::blobs::remove_reaction(&state.db, message_id, &auth.user.id, emoji).await?
     };
     let message = crate::routes::messages::enrich_one(state, &auth.user.id, message_id).await?;
@@ -445,7 +445,7 @@ async fn set_pin(
     message_id: &str,
     pinned: bool,
 ) -> Result<Json<Message>, ApiError> {
-    message_in_conv(state, conv, message_id, p::PIN_MESSAGES, "pin.forbidden", "Pin messages").await?;
+    message_in_conv(state, auth, conv, message_id, p::PIN_MESSAGES, "pin.forbidden", "Pin messages").await?;
     crate::routes::messages::check_direct_write(state, auth, conv).await?;
     if pinned {
         if store::blobs::pin_count(&state.db, &conv.id).await? >= 50 {
@@ -460,11 +460,16 @@ async fn set_pin(
     Ok(Json(message))
 }
 
+/// The pinned messages the caller may read: encrypted ones only inside the history window (ENCRYPTION.md §7b), as
+/// for a page of messages.
 async fn pins_of(state: &AppState, auth: &AuthUser, conv: &Conv) -> Result<Json<PinList>, ApiError> {
     conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
+    let cut = crate::history::list_cutoff(state, conv, &auth.user).await?;
     let mut rows = Vec::new();
     for id in store::blobs::pinned_ids(&state.db, &conv.id).await? {
-        if let Some(m) = store::messages::by_id(&state.db, &id).await? {
+        if let Some(m) = store::messages::by_id(&state.db, &id).await?
+            && (m.encrypted == 0 || cut.as_deref().is_none_or(|cut| m.id.as_str() >= cut))
+        {
             rows.push(m);
         }
     }

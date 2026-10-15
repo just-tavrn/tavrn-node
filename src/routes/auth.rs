@@ -12,7 +12,7 @@ use crate::{
     app::AppState,
     auth::{self, AuthUser, ClientIp, TokenPair},
     config::{CaptchaAction, EmailMode, Registration},
-    error::ApiError,
+    error::{ApiError, ApiJson, ApiQuery as Query},
     models::{UserPrivate, UserRow},
     second_factor::{self, Stage},
     sessions::Reason,
@@ -105,7 +105,7 @@ pub async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     headers: axum::http::HeaderMap,
-    Json(req): Json<RegisterRequest>,
+    ApiJson(req): ApiJson<RegisterRequest>,
 ) -> Result<(StatusCode, Json<PreAuthResponse>), ApiError> {
     state.register_limiter.check_all(&[format!("ip:{ip}")]).await?;
     let cfg = &state.config;
@@ -270,7 +270,7 @@ pub struct LoginRequest {
 pub async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(req): Json<LoginRequest>,
+    ApiJson(req): ApiJson<LoginRequest>,
 ) -> Result<Json<PreAuthResponse>, ApiError> {
     let username = req.username.trim().to_lowercase();
     let username = username.strip_suffix(&format!("@{}", state.config.domain)).unwrap_or(&username).to_string();
@@ -358,7 +358,7 @@ pub struct RefreshRequest {
 #[utoipa::path(post, path = "/api/v1/auth/refresh", request_body = RefreshRequest, responses((status = 200, body = TokenPair), (status = 401, body = crate::error::ProblemDetails)))]
 pub async fn refresh(
     State(state): State<AppState>,
-    Json(req): Json<RefreshRequest>,
+    ApiJson(req): ApiJson<RefreshRequest>,
 ) -> Result<Json<TokenPair>, ApiError> {
     Ok(Json(auth::refresh_session(&state, &req.refresh_token).await?))
 }
@@ -378,7 +378,7 @@ pub struct LogoutQuery {
 pub async fn logout(
     State(state): State<AppState>,
     auth: AuthUser,
-    axum::extract::Query(q): axum::extract::Query<LogoutQuery>,
+    Query(q): Query<LogoutQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
     let end_session_url = crate::routes::oidc::logout_url(&state, &auth.device_id).await?;
@@ -409,7 +409,7 @@ pub struct VerifyEmailRequest {
 #[utoipa::path(post, path = "/api/v1/auth/verify-email", request_body = VerifyEmailRequest, responses((status = 204), (status = 400, body = crate::error::ProblemDetails)))]
 pub async fn verify_email(
     State(state): State<AppState>,
-    Json(req): Json<VerifyEmailRequest>,
+    ApiJson(req): ApiJson<VerifyEmailRequest>,
 ) -> Result<StatusCode, ApiError> {
     match store::users::consume_email_verification(&state.db, &util::sha256_b64(&req.token)).await? {
         Some(_) => Ok(StatusCode::NO_CONTENT),
@@ -434,7 +434,7 @@ pub struct ResendVerificationRequest {
 pub async fn resend_verification(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(req): Json<ResendVerificationRequest>,
+    ApiJson(req): ApiJson<ResendVerificationRequest>,
 ) -> Result<StatusCode, ApiError> {
     if !state.mailer.can_deliver() {
         return Err(ApiError::Unavailable { code: "mail.unavailable", detail: "This node sends no e-mail".into() });
@@ -488,7 +488,7 @@ pub struct ForgotPasswordRequest {
 pub async fn forgot_password(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(req): Json<ForgotPasswordRequest>,
+    ApiJson(req): ApiJson<ForgotPasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
     if !state.mailer.can_deliver() {
         return Err(ApiError::Unavailable {
@@ -559,7 +559,7 @@ pub struct ResetPasswordRequest {
 #[utoipa::path(post, path = "/api/v1/auth/reset-password", request_body = ResetPasswordRequest, responses((status = 204), (status = 400, body = crate::error::ProblemDetails)))]
 pub async fn reset_password(
     State(state): State<AppState>,
-    Json(req): Json<ResetPasswordRequest>,
+    ApiJson(req): ApiJson<ResetPasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
     if !auth::valid_password(&req.new_password) {
         return Err(bad("auth.password_weak", "Password: at least 10 characters"));
@@ -613,7 +613,7 @@ pub struct ChangePasswordRequest {
 pub async fn change_password(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<ChangePasswordRequest>,
+    ApiJson(req): ApiJson<ChangePasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
     if auth.user.password_hash.is_none() && !auth.is_remote() {
         return Err(sso_password_unavailable());
@@ -739,7 +739,7 @@ pub struct DevForgetRetired {
 /// devices never kept one, so the e2e tests can exercise the re-attestation path (ENCRYPTION.md §5.2).
 pub async fn dev_forget_retired_device(
     State(state): State<AppState>,
-    Json(req): Json<DevForgetRetired>,
+    ApiJson(req): ApiJson<DevForgetRetired>,
 ) -> Result<StatusCode, ApiError> {
     if !state.config.dev {
         return Ok(StatusCode::NOT_FOUND);

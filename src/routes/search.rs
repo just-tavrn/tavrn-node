@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     routing::get,
 };
 use chrono::{DateTime, NaiveDate, Utc};
@@ -17,7 +17,7 @@ use crate::{
     access,
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiQuery as Query, ProblemDetails},
     history,
     models::Message,
     permissions as p,

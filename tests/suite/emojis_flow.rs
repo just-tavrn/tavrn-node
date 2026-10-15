@@ -349,4 +349,33 @@ async fn gif_search_is_cached_limited_per_user_and_maps_provider_errors() {
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     let (s, _) = node.get_auth("/api/v1/gifs?q=dog", &bob.token).await;
     assert_eq!(s, StatusCode::OK, "the limit is per user");
+
+/// An unreachable GIF provider answers `503 gif.unavailable`; the log line names the failure and the request (route,
+/// request id), never the provider URL with the node's API key and the user's search term.
+#[tokio::test]
+async fn an_unreachable_gif_provider_is_logged_without_the_key() {
+    let mut node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    // A port nothing listens on.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    node.state.gifs = Some(tavrn_node::gifs::GifClient::new(
+        tavrn_node::config::GifProvider::Giphy,
+        "GifKeyDoNotLog".into(),
+        &format!("http://127.0.0.1:{port}"),
+    ));
+    node.router = tavrn_node::app::router(node.state.clone());
+    let _capture = common::logs::CAPTURE.lock().await;
+    let (capture, guard) = common::logs::start();
+    let (s, headers, body) =
+        node.raw(Method::GET, "/api/v1/gifs?q=SecretSearchTerm", &alice.token, &[], Vec::new()).await;
+    drop(guard);
+    let j: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((s, j["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("gif.unavailable")), "{j}");
+    let log = capture.text();
+    let line = log.lines().find(|l| l.contains("GIF provider unreachable"));
+    assert!(line.is_some(), "no log line: {log}");
+    let line = line.unwrap();
+    assert!(!log.contains("GifKeyDoNotLog") && !log.contains("SecretSearchTerm"), "{log}");
+    assert!(line.contains("/api/v1/gifs"), "the route: {line}");
+    assert!(line.contains(headers["x-request-id"].to_str().unwrap()), "the request id: {line}");
 }

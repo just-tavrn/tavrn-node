@@ -22,7 +22,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
     routing::{get, post},
@@ -36,7 +36,7 @@ use crate::{
     app::AppState,
     auth::{AuthUser, RateLimiter},
     entitlements::{self, Entitlements},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     files::{
         self, ByteStream, FileEntry, MAX_DEPTH, MAX_ENTRIES_PER_CHANNEL,
         remote::{self, Kind, RemoteConfig, RemoteStore},
@@ -163,17 +163,18 @@ async fn entry_in(state: &AppState, conv: &Conv, entry_id: &str) -> Result<Entry
     store::files::entry(&state.db, &conv.id, entry_id).await?.ok_or_else(entry_not_found)
 }
 
-/// Start of the requester's history window for entry records (RFC 3339; FILES.md §8.7), `None` = no limit.
-/// Only encrypted channels and room members (node admins who are not members cannot decrypt anyway).
+/// Start of the requester's history window for entry records (RFC 3339; FILES.md §8.7), `None` = no limit: the
+/// member's window of messages ([`crate::history::member_window`]: policy, `read_history` and, after a key reset
+/// without an approved restore, never before `key_reset_at`). Only encrypted channels and room members (node admins
+/// who are not members cannot decrypt anyway).
 fn record_cut(conv: &Conv) -> Option<String> {
     if !conv.encrypted {
         return None;
     }
     let ConvKind::Channel { access, channel } = &conv.kind else { return None };
     let member = access.member.as_ref()?;
-    let joined = util::parse_time(&member.joined_at)?;
     let policy = crate::history::Policy::of(channel.history_for_new_members.as_deref());
-    crate::history::cutoff(policy, p::has(conv.perms, p::READ_HISTORY), joined).map(util::format_time)
+    crate::history::member_window(policy, p::has(conv.perms, p::READ_HISTORY), member).map(util::format_time)
 }
 
 /// Checks an entry record like message content (FILES.md §8.4) and returns it as stored with the session's user
@@ -712,7 +713,7 @@ pub async fn create_folder(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<CreateFolderRequest>,
+    ApiJson(req): ApiJson<CreateFolderRequest>,
 ) -> Result<(StatusCode, Json<FileEntry>), ApiError> {
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
@@ -1202,7 +1203,7 @@ pub async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id, entry_id)): Path<(String, String, String)>,
-    Json(req): Json<UpdateEntryRequest>,
+    ApiJson(req): ApiJson<UpdateEntryRequest>,
 ) -> Result<Json<FileEntry>, ApiError> {
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     let entry = entry_in(&state, &conv, &entry_id).await?;
@@ -1796,7 +1797,7 @@ pub async fn put_backend(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, channel_id)): Path<(String, String)>,
-    Json(req): Json<BackendRequest>,
+    ApiJson(req): ApiJson<BackendRequest>,
 ) -> Result<Json<BackendInfo>, ApiError> {
     let conv = backend_access(&state, &room_id, &channel_id, &auth).await?;
     backend_limiter().check_all(&[format!("files-backend:{}", auth.user.id)])?;

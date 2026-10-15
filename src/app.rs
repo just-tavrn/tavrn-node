@@ -1060,9 +1060,12 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::legal::page_routes())
         .fallback(crate::webapp::handler)
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
-        .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
-        // Request spans log the path with webhook secrets redacted (APPLICATIONS.md §9.4), never the query.
+        // Problem Details name the request id (`request_id`), from the header set below.
+        .layer(axum::middleware::from_fn(crate::error::request_scope))
+        // Request spans carry the route, the request id and the path with webhook secrets redacted (APPLICATIONS.md
+        // §9.4), never the query: every log line of a request (an internal error too) can be matched to its report.
         .layer(TraceLayer::new_for_http().make_span_with(crate::webhooks::RedactedSpan))
+        .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         // Files channel uploads stream large files: outside the 30-second limit.
         .route(

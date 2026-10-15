@@ -13,7 +13,7 @@ use crate::{
     access,
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ProblemDetails},
     models::Role,
     permissions as p, store,
     validate::{self, bad},
@@ -81,7 +81,7 @@ pub async fn create_role(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<CreateRoleRequest>,
+    ApiJson(req): ApiJson<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<Role>), ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
@@ -147,7 +147,7 @@ pub async fn update_role(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, role_id)): Path<(String, String)>,
-    Json(req): Json<UpdateRoleRequest>,
+    ApiJson(req): ApiJson<UpdateRoleRequest>,
 ) -> Result<Json<Role>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;

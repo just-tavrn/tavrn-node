@@ -623,4 +623,29 @@ async fn leaving_a_room_reaches_the_users_other_devices() {
     }
     // Exactly once on the leaving user's device.
     assert!(silent(&mut bob_ws, 300).await);
+
+/// The close frame (code and reason) that ends a hello.
+async fn hello_close(url: &str, token: &str) -> (u16, String) {
+    let mut ws = connect(url).await;
+    ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
+    loop {
+        match common::within(Duration::from_secs(15), "the close frame", ws.next()).await {
+            Some(Ok(Message::Close(Some(frame)))) => return (u16::from(frame.code), frame.reason.to_string()),
+            Some(Ok(Message::Text(t))) => assert!(!t.contains("\"ready\""), "no ready without a database: {t}"),
+            other => return (0, format!("expected a close frame, got {other:?}")),
+        }
+    }
+}
+
+/// A database outage during the hello is no authentication failure: clients would refresh and then end the session
+/// on `4001`. The node closes with `1013` (try again later) and a neutral reason instead; a bad token stays `4001`.
+#[tokio::test]
+async fn a_database_outage_during_the_hello_does_not_end_the_session() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let url = serve(&node).await;
+    assert_eq!(hello_close(&url, "broken").await.0, 4001);
+    node.state.db.close().await;
+    let (code, reason) = hello_close(&url, &alice.token).await;
+    assert_eq!((code, reason.as_str()), (1013, "db.unavailable"));
 }

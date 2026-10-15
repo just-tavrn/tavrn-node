@@ -241,6 +241,7 @@ VOLUME ["/data"]
 # signaling port (7880) stays on 127.0.0.1 inside the container and is never published.
 EXPOSE 8080 7881 61000-61100/udp
 ENV TAVRN_DATA_DIR=/data
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD ["tavrn-node", "check-config"]
+# One local request to /healthz (3 s timeout, nothing printed while healthy); `check-config` stays a manual command.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD ["tavrn-node", "health"]
 ENTRYPOINT ["tini", "--", "tavrn-node"]
 CMD ["serve"]

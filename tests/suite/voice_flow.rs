@@ -1649,3 +1649,19 @@ async fn a_move_and_the_moved_members_join_do_not_wait_for_pending_removals() {
     assert!(voice::removal_pending(&v.node.state, &lobby, &identity), "it did not wait for the removal");
     hold.send(false).unwrap();
 }
+
+/// A LiveKit that does not answer is logged without the request URL: its query carries the client's access token.
+#[tokio::test]
+async fn an_unreachable_livekit_is_logged_without_the_token() {
+    let v = setup().await;
+    let (_, j) = v.join(&v.bob).await;
+    let token = j["token"].as_str().unwrap().to_string();
+    let _capture = common::logs::CAPTURE.lock().await;
+    let (capture, guard) = common::logs::start();
+    let (s, j) = v.node.req(Method::GET, &format!("/rtc/validate?access_token={token}"), None, None).await;
+    drop(guard);
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_GATEWAY, Some("voice.unavailable")), "{j}");
+    let log = capture.text();
+    assert!(log.contains("LiveKit unreachable"), "{log}");
+    assert!(!log.contains(&token), "{log}");
+}

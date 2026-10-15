@@ -93,6 +93,11 @@ pub async fn delete(db: &Pool, message_id: &str, user_id: &str) -> Result<bool, 
 
 /// Sets the plaintext close time of a message (create and close early; the caller checks the rules).
 pub async fn set_closes_at(db: &Pool, message_id: &str, closes_at: &str) -> Result<(), ApiError> {
+    set_closes_at_on(&mut *db.acquire().await?, message_id, closes_at).await
+}
+
+/// [`set_closes_at`] on one connection (a transaction).
+pub async fn set_closes_at_on(db: &mut sqlx::AnyConnection, message_id: &str, closes_at: &str) -> Result<(), ApiError> {
     sqlx::query("UPDATE messages SET poll_closes_at = $1 WHERE id = $2")
         .bind(closes_at)
         .bind(message_id)
