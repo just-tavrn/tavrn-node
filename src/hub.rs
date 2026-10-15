@@ -13,7 +13,7 @@ use std::{
 use axum::extract::ws::Utf8Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::util::ulid;
 
@@ -76,7 +76,7 @@ pub struct Hub {
     /// Open WebSocket connections per user id (for `notify` hints to remote members, FEDERATION.md §5.2).
     online: Arc<Mutex<HashMap<String, usize>>>,
     /// The cache bus of a node with several instances (`None` standalone).
-    bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>,
+    bus: Option<crate::cache::BusSender>,
     /// Who may view which room channel (`crate::visibility`), dropped per room by the events that change it.
     visibility: Arc<crate::visibility::Cache>,
     /// The moved voice participations per room as the leader announced them (`crate::voice::moved`).
@@ -113,7 +113,7 @@ impl Hub {
     }
 
     /// A hub that also hands every event to the cache bus (several instances).
-    pub fn with_bus(bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>) -> Self {
+    pub fn with_bus(bus: Option<crate::cache::BusSender>) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self { tx, online: Arc::default(), bus, visibility: Arc::default(), moved: Arc::default() }
     }
@@ -176,7 +176,7 @@ impl Hub {
         if let Some(bus) = &self.bus
             && !matches!(event.scope, Scope::Connection(_))
         {
-            let _ = bus.send(crate::cache::Outbound::Event(event.clone()));
+            bus.send(crate::cache::Outbound::Event(event.clone()));
         }
         // No receiver is not an error (nobody connected).
         let _ = self.tx.send(event);
@@ -274,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_go_to_the_bus_and_injected_ones_stay_local() {
-        let (tx, mut bus) = mpsc::unbounded_channel();
+        let (tx, mut bus) = crate::cache::BusSender::channel(16);
         let hub = Hub::with_bus(Some(tx));
         let mut rx = hub.subscribe();
         let id = hub.users(vec!["u1".into()], "friend.request", serde_json::json!({ "x": 1 }));
