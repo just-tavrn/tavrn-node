@@ -302,7 +302,7 @@ fn too_large(max: usize, code: &'static str, what: &str) -> ApiError {
 /// A byte limit for people: MB from 1 MiB on, KB below (the emoji and preview limits are KiB).
 fn size_text(bytes: usize) -> String {
     const MIB: usize = 1024 * 1024;
-    if bytes >= MIB && bytes % MIB == 0 {
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MB", bytes / MIB)
     } else if bytes >= MIB {
         format!("{:.1} MB", bytes as f64 / MIB as f64)

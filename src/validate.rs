@@ -120,6 +120,8 @@ pub fn limit(value: Option<i64>, default: i64, max: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     #[test]
     fn json_text_rules() {
         use super::{TextError, TextRules, json_text, text_of, unknown_key};
