@@ -2178,6 +2178,15 @@ deletes resolved and dismissed reports with their evidence; admins can delete a 
 announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
 only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
+Moderation bots can read a room's reports: a bot whose token has the scope `moderation` and that holds "Moderate
+members" in the room (give it a role with that permission) lists the room's reports and receives new ones and changes,
+for example to post a summary in a moderators' channel or to escalate after several reports about one user. Bots
+see metadata only: kind, category, the reported user, status, counts, times and the id of the reported message, never
+the reporter's text, the snapshot, released plaintext, your notes or actions, and the reporter only as a pseudonym
+(the same for the same reporter in that room, never the address). Bots never see reports about themselves or about
+the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
+(MODERATION.md §1.4a). Take the permission away to close the inbox for the bot.
+
 #### Forwarding reports to another node
 
 A report about a user of another node (a member from elsewhere in one of your rooms, or the author of a direct
