@@ -260,3 +260,30 @@ async fn encrypted_cursor_packets_stay_within_their_budget() {
     println!("BUDGET POST ephemeral (encrypted channel): {n}");
     assert!(n <= 3, "POST ephemeral (encrypted): {n} statements");
 }
+
+/// The entitlement check of the devices an MLS commit adds or removes runs once for all their users, with the same
+/// number of statements for 3 and for 20 users.
+#[tokio::test]
+async fn mls_entitlement_checks_cost_the_same_for_many_users() {
+    counting().await;
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let (_room, channel, members) = room_with(&node, &alice, 20, "member").await;
+    let db = &node.state.db;
+    let owner = tavrn_node::store::users::by_id(db, &alice.user_id).await.unwrap().unwrap();
+    let conv = tavrn_node::access::conversation(&node.state, &channel, &owner).await.unwrap();
+    let ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+    let users = tavrn_node::store::users::by_ids(db, &ids).await.unwrap();
+    let mut counts = Vec::new();
+    for n in [3, 20] {
+        let refs: Vec<&tavrn_node::models::UserRow> = users.iter().take(n).collect();
+        let span = tracing::trace_span!(target: tavrn_node::telemetry::REQUEST_SPAN, "request");
+        let entitled =
+            tavrn_node::access::entitled_users(&node.state, &conv, &refs).instrument(span.clone()).await.unwrap();
+        assert_eq!(entitled.len(), n, "every member views the channel");
+        counts.push(tavrn_node::telemetry::statements(&span).unwrap());
+    }
+    println!("BUDGET MLS entitlement: 3 users {}, 20 users {}", counts[0], counts[1]);
+    assert_eq!(counts[0], counts[1]);
+    assert!(counts[1] <= 4, "{counts:?}");
+}

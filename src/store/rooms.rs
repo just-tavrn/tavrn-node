@@ -292,6 +292,30 @@ pub async fn members(db: &Pool, room_id: &str, limit: i64, after: Option<&str>) 
     .await?)
 }
 
+/// The memberships of several users in a room (user id → row; non-members are absent), one query per
+/// [`super::IN_CHUNK`] users.
+pub async fn members_by_ids(
+    db: &Pool,
+    room_id: &str,
+    user_ids: &[String],
+) -> Result<std::collections::HashMap<String, MemberRow>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in user_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT {MEMBER_COLS} FROM room_members WHERE room_id = $1 AND user_id IN ({})",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query_as::<_, MemberRow>(&sql).bind(room_id);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for m in q.fetch_all(db).await? {
+            out.insert(m.user_id.clone(), m);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn add_member(db: &Pool, room_id: &str, user_id: &str, rules_accepted: bool) -> Result<(), ApiError> {
     let ts = now();
     sqlx::query("INSERT INTO room_members (room_id, user_id, joined_at, rules_accepted_at) VALUES ($1, $2, $3, $4)")
