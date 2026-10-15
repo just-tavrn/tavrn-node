@@ -51,7 +51,8 @@ pub struct RoomDetail {
     pub read_states: Vec<crate::store::messages::ReadState>,
 }
 
-pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<RoomDetail, ApiError> {
+/// The room as `user` (whose access `access` is) sees it.
+pub(crate) async fn detail(state: &AppState, access: &RoomAccess, user: &UserRow) -> Result<RoomDetail, ApiError> {
     let db = &state.db;
     let id = &access.room.id;
     let mut channels = store::rooms::channels(db, id).await?;
@@ -74,9 +75,6 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
     let read_states = match &access.member {
         Some(member) => {
             let system: Vec<String> = channels.iter().filter(|c| c.kind == "system").map(|c| c.id.clone()).collect();
-            let user = store::users::by_id(db, &member.user_id)
-                .await?
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("member without user")))?;
             let settings = if user.domain == state.config.domain {
                 Some(crate::notifications::load(db, &user.id).await?)
             } else {
@@ -107,7 +105,7 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
         member_count: store::rooms::member_count(db, id).await?,
         categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
-        roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
+        roles: access.roles.iter().map(|r| r.to_api()).collect(),
         overrides,
         my_roles: access.member_roles.iter().map(|r| r.id.clone()).collect(),
         my_permissions: access.room_perms.to_string(),
@@ -191,7 +189,7 @@ pub async fn create_room(
     .await;
     crate::welcome::joined(&state, &room, &auth.user).await;
     let access = access::room_access(&state, &room.id, &auth.user).await?;
-    Ok((StatusCode::CREATED, Json(detail(&state, &access).await?)))
+    Ok((StatusCode::CREATED, Json(detail(&state, &access, &auth.user).await?)))
 }
 
 /// Rooms I am a member of.
@@ -281,7 +279,7 @@ pub async fn get_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomDetail>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    Ok(Json(detail(&state, &access).await?))
+    Ok(Json(detail(&state, &access, &auth.user).await?))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -426,7 +424,7 @@ pub async fn update_room(
         _ => access,
     };
     state.hub.room(&room_id, "room.update", &access.room);
-    Ok(Json(detail(&state, &access).await?))
+    Ok(Json(detail(&state, &access, &auth.user).await?))
 }
 
 /// Sets the room's age gate (PROTOCOL.md §5e): audited, every channel changes its effective gate (`channel.update`),
@@ -588,7 +586,7 @@ async fn join(state: &AppState, user: &UserRow, room: &Room, accept_rules: bool)
         crate::welcome::joined(state, room, user).await;
     }
     let access = access::room_access(state, &room.id, user).await?;
-    detail(state, &access).await
+    detail(state, &access, user).await
 }
 
 /// Join a public room.
@@ -836,7 +834,7 @@ pub async fn update_member(
     }
     if let Some(role_ids) = req.roles {
         access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
-        let roles = store::rooms::roles(&state.db, &room_id).await?;
+        let roles = &access.roles;
         // Own roles at or above the own top position may stay in the list (they are not assigned anew).
         let current = store::rooms::member_role_ids(&state.db, &room_id, &user_id).await?;
         let mut clean = Vec::new();
@@ -924,8 +922,8 @@ pub(crate) async fn moderation_target(
         });
     }
     let target_roles = store::rooms::member_role_ids(&state.db, &access.room.id, user_id).await?;
-    let roles = store::rooms::roles(&state.db, &access.room.id).await?;
-    let target_top = roles.iter().filter(|r| target_roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
+    let target_top =
+        access.roles.iter().filter(|r| target_roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
     if !access.outranks(target_top) {
         return Err(ApiError::Forbidden {
             code: "member.hierarchy",

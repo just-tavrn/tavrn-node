@@ -242,16 +242,18 @@ async fn channel_conv(state: &AppState, channel: ChannelRow) -> Result<Conv, Api
     let room = store::rooms::room_by_id(&state.db, &channel.room_id)
         .await?
         .ok_or_else(|| crate::access::not_found("Room", "room.not_found"))?;
-    let everyone = store::rooms::roles(&state.db, &room.id)
-        .await?
-        .into_iter()
+    let roles = store::rooms::roles(&state.db, &room.id).await?;
+    let everyone = roles
+        .iter()
         .find(|r| r.is_everyone != 0)
+        .cloned()
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("room without @everyone")))?;
     let access = RoomAccess {
         room,
         member: None,
         everyone,
         member_roles: Vec::new(),
+        roles: std::sync::Arc::new(roles),
         is_owner: false,
         is_node_admin: false,
         room_perms: 0,

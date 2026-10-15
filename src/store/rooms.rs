@@ -769,6 +769,18 @@ pub async fn overrides_for(db: &Pool, target_type: &str, target_id: &str) -> Res
     .await?)
 }
 
+/// The overrides of a channel and of its category (the layers of its permissions), in one query.
+pub async fn overrides_of_channel(db: &Pool, channel: &ChannelRow) -> Result<Vec<OverrideRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {OVERRIDE_COLS} FROM permission_overrides
+         WHERE (target_type = 'channel' AND target_id = $1) OR (target_type = 'category' AND target_id = $2) ORDER BY id"
+    ))
+    .bind(&channel.id)
+    .bind(channel.category_id.as_deref().unwrap_or(""))
+    .fetch_all(db)
+    .await?)
+}
+
 pub struct SetOverride<'a> {
     pub room_id: &'a str,
     pub target_type: &'a str,

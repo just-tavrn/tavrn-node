@@ -17,6 +17,8 @@ pub struct RoomAccess {
     pub everyone: RoleRow,
     /// The member's roles, without @everyone.
     pub member_roles: Vec<RoleRow>,
+    /// Every role of the room, @everyone included (loaded with the access; later steps of the request use it).
+    pub roles: std::sync::Arc<Vec<RoleRow>>,
     pub is_owner: bool,
     pub is_node_admin: bool,
     /// Room-level permissions; for bots already capped by the scopes (0 in a "no bots" room).
@@ -101,7 +103,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
             detail: "You are not a member of this room".into(),
         });
     }
-    let roles = store::rooms::roles(&state.db, room_id).await?;
+    let roles = std::sync::Arc::new(store::rooms::roles(&state.db, room_id).await?);
     let role_ids = match &member {
         Some(_) => store::rooms::member_role_ids(&state.db, room_id, &user.id).await?,
         None => Vec::new(),
@@ -117,7 +119,7 @@ pub async fn room_access(state: &AppState, room_id: &str, user: &UserRow) -> Res
 /// (`visibility.rs`) for every member of a room at once.
 pub fn member_access(
     room: Room,
-    roles: &[RoleRow],
+    roles: &std::sync::Arc<Vec<RoleRow>>,
     member: Option<MemberRow>,
     role_ids: &[String],
     user: &UserRow,
@@ -145,6 +147,7 @@ pub fn member_access(
         member,
         everyone,
         member_roles,
+        roles: roles.clone(),
         is_owner,
         is_node_admin,
         room_perms,
@@ -184,11 +187,7 @@ pub async fn channel_perms(
     if access.is_owner || access.is_node_admin {
         return Ok(channel_perms_with(access, channel, &[], user_id));
     }
-    let mut overrides = match &channel.category_id {
-        Some(cat) => store::rooms::overrides_for(&state.db, "category", cat).await?,
-        None => Vec::new(),
-    };
-    overrides.extend(store::rooms::overrides_for(&state.db, "channel", &channel.id).await?);
+    let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
     Ok(channel_perms_with(access, channel, &overrides, user_id))
 }
 
@@ -292,11 +291,7 @@ pub async fn upload_categories(
 ) -> Result<crate::uploads::Categories, ApiError> {
     match &conv.kind {
         ConvKind::Channel { access, channel } => {
-            let mut overrides = match &channel.category_id {
-                Some(cat) => store::rooms::overrides_for(&state.db, "category", cat).await?,
-                None => Vec::new(),
-            };
-            overrides.extend(store::rooms::overrides_for(&state.db, "channel", &channel.id).await?);
+            let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
             Ok(channel_upload_categories_with(access, channel, &overrides, user_id))
         }
         ConvKind::Direct { .. } => Ok(state.config.upload_dm_categories()),

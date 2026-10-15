@@ -401,7 +401,7 @@ async fn check_body_emojis(state: &AppState, conv: &Conv, content: &Value) -> Re
 
 /// Role mentions (`role:<id>`): only in room channels, only roles of the room, and roles that are not
 /// mentionable only with `mention_everyone`.
-async fn check_role_mentions(state: &AppState, conv: &Conv, mentions: &[String]) -> Result<(), ApiError> {
+fn check_role_mentions(conv: &Conv, mentions: &[String]) -> Result<(), ApiError> {
     let roles: Vec<&str> = mentions.iter().filter_map(|m| m.strip_prefix("role:")).collect();
     if roles.is_empty() {
         return Ok(());
@@ -409,7 +409,7 @@ async fn check_role_mentions(state: &AppState, conv: &Conv, mentions: &[String])
     let ConvKind::Channel { access, .. } = &conv.kind else {
         return Err(bad("message.mention_invalid", "Roles can only be mentioned in room channels"));
     };
-    let room_roles = store::rooms::roles(&state.db, &access.room.id).await?;
+    let room_roles = &access.roles;
     for id in roles {
         let role = room_roles
             .iter()
@@ -673,7 +673,7 @@ pub(crate) async fn create_in(
     if !encrypted {
         crate::components::refuse_unless_bot(&req.content, auth.user.is_bot())?;
     }
-    check_role_mentions(state, conv, &v.mentions).await?;
+    check_role_mentions(conv, &v.mentions)?;
     if !encrypted {
         check_body_emojis(state, conv, &req.content).await?;
     }
@@ -946,7 +946,7 @@ pub(crate) async fn edit_in(
     }
     check_not_blocked(state, auth, conv).await?;
     let v = validate_content(gif_hosts(state), conv.encrypted, content, &req.mentions)?;
-    check_role_mentions(state, conv, &v.mentions).await?;
+    check_role_mentions(conv, &v.mentions)?;
     if !conv.encrypted {
         crate::components::refuse_unless_bot(content, auth.user.is_bot())?;
         check_body_emojis(state, conv, content).await?;

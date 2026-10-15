@@ -409,7 +409,7 @@ pub async fn transfer_room(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     state.hub.room(&room_id, "room.update", &access.room);
     tracing::info!(room = room_id, "room ownership transferred");
-    Ok(Json(crate::routes::rooms::detail(&state, &access).await?))
+    Ok(Json(crate::routes::rooms::detail(&state, &access, &auth.user).await?))
 }
 
 // ---------------------------------------------------------------- node admin: rooms

@@ -115,7 +115,7 @@ pub struct Member {
 /// on first use.
 pub struct RoomView {
     pub room: Room,
-    roles: Vec<RoleRow>,
+    roles: Arc<Vec<RoleRow>>,
     channels: HashMap<String, ChannelRow>,
     categories: HashMap<String, Category>,
     overrides: Vec<OverrideRow>,
@@ -318,7 +318,7 @@ impl RoomView {
 pub async fn load(state: &AppState, room_id: &str) -> Result<Option<Arc<RoomView>>, ApiError> {
     let db = &state.db;
     let Some(room) = store::rooms::room_by_id(db, room_id).await? else { return Ok(None) };
-    let roles = store::rooms::roles(db, room_id).await?;
+    let roles = Arc::new(store::rooms::roles(db, room_id).await?);
     let channels: HashMap<String, ChannelRow> =
         store::rooms::channels(db, room_id).await?.into_iter().map(|c| (c.id.clone(), c)).collect();
     let overrides = store::rooms::overrides_of_room(db, room_id).await?;
