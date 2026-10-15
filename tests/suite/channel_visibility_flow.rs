@@ -671,6 +671,7 @@ async fn cosmetic_updates_keep_the_visibility_snapshot() {
     let after_role = snapshot().await;
     assert!(!Arc::ptr_eq(&before_role, &after_role), "a role assignment drops it");
     assert_eq!(after_role.member(&bob.user_id).unwrap().role_ids, vec![role["id"].as_str().unwrap().to_string()]);
+}
 
 /// The shared visibility snapshot of a room keeps what the permission evaluation needs, not the members' password
 /// hashes, e-mail addresses or dates of birth.
