@@ -56,6 +56,7 @@ perms! {
     RESTORE_HISTORY = 37, "restore_history";
     VOICE_STATUS = 38, "voice_status";
     CREATE_POLLS = 39, "create_polls";
+    USE_COMPONENTS = 40, "use_components";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -87,7 +88,8 @@ pub const DEFAULT_EVERYONE: Perms = VIEW_CHANNEL
     | USE_EXTERNAL_EMOJIS
     | USE_EXTERNAL_SOUNDS
     | READ_HISTORY
-    | CREATE_POLLS;
+    | CREATE_POLLS
+    | USE_COMPONENTS;
 
 /// Management-class permissions that can never be granted to `@everyone`, neither on the role nor by
 /// an `allow` in a channel or category override (`role.everyone_restricted`, protocol/permissions.md).
@@ -144,7 +146,8 @@ pub const CHANNEL_SCOPED: Perms = VIEW_CHANNEL
     | READ_HISTORY
     | MANAGE_THREADS
     | VOICE_STATUS
-    | CREATE_POLLS;
+    | CREATE_POLLS
+    | USE_COMPONENTS;
 
 /// Permissions a member keeps while timed out.
 pub const TIMEOUT_KEEPS: Perms = VIEW_CHANNEL | READ_HISTORY;
@@ -504,7 +507,7 @@ mod tests {
         }
         assert!(ALL <= i64::MAX as u64);
         assert_eq!(parse("abc"), None);
-        assert_eq!(parse(&(1u64 << 40).to_string()), None, "undefined bits are rejected");
+        assert_eq!(parse(&(1u64 << 41).to_string()), None, "undefined bits are rejected");
         assert_eq!(parse(&ALL.to_string()), Some(ALL));
     }
 
@@ -532,9 +535,9 @@ mod tests {
         assert_eq!(scope_mask(&["nonsense".to_string()]), BOT_ALWAYS, "unknown scopes add nothing");
         assert!(!has(scope_mask(&all_scopes()), ADMINISTRATOR), "administrator is never unlocked by a scope");
         assert_eq!(
-            scope_mask(&all_scopes()) | ADMINISTRATOR | RESTORE_HISTORY,
+            scope_mask(&all_scopes()) | ADMINISTRATOR | RESTORE_HISTORY | USE_COMPONENTS,
             ALL,
-            "every other bit is reachable through a scope (restore_history never is)"
+            "every other bit is reachable through a scope (restore_history and use_components never are)"
         );
         assert!(is_scope("dms") && !is_scope("admin"));
     }
@@ -550,7 +553,7 @@ mod tests {
             BOT_ALWAYS | READ_HISTORY,
             "unknown kinds fail closed"
         );
-        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !(ADMINISTRATOR | RESTORE_HISTORY));
+        assert_eq!(cap_bot(ALL, "bot", false, None), ALL & !(ADMINISTRATOR | RESTORE_HISTORY | USE_COMPONENTS));
     }
 
     #[test]
@@ -610,7 +613,7 @@ mod tests {
     #[test]
     fn channel_scoped_matches_the_protocol_table() {
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(CHANNEL_SCOPED, 927_683_510_783);
+        assert_eq!(CHANNEL_SCOPED, 2_027_195_138_559);
         let doc = include_str!("../protocol/permissions.md");
         let section = doc.split("## Channel-scoped bits").nth(1).unwrap().split("\n## ").next().unwrap();
         let from_doc = section
@@ -626,7 +629,19 @@ mod tests {
         for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
             assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
         }
-        assert_eq!(names(CHANNEL_SCOPED).len(), 28);
+        assert_eq!(names(CHANNEL_SCOPED).len(), 29);
+    }
+
+    #[test]
+    fn use_components_is_a_channel_scoped_default_bit_no_scope_covers() {
+        assert_eq!(USE_COMPONENTS, 1 << 40);
+        assert!(has(DEFAULT_EVERYONE, USE_COMPONENTS), "everybody may click buttons in new rooms");
+        assert!(!has(EVERYONE_RESTRICTED, USE_COMPONENTS));
+        assert!(has(CHANNEL_SCOPED, USE_COMPONENTS), "an override can take it away per channel");
+        assert_eq!(CHANNEL_SCOPED, 2_027_195_138_559);
+        assert!(!has(scope_mask(&all_scopes()), USE_COMPONENTS), "bots never click");
+        assert!(has(crate::access::DIRECT_PERMS, USE_COMPONENTS), "both members of a DM may click");
+        assert_eq!(names(USE_COMPONENTS), vec!["use_components"]);
     }
 
     #[test]

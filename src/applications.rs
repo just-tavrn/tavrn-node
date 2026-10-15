@@ -309,7 +309,7 @@ pub fn event_allowed(kind: &str, data: &Value, scopes: &[String]) -> bool {
         ("member" | "presence", _) | (_, "user.update") => has("members:read"),
         ("voice" | "call" | "soundboard", _) => has("voice"),
         ("whiteboard", _) => has("whiteboard"),
-        ("command" | "commands", _) => has("commands"),
+        ("command" | "commands" | "component" | "modal", _) => has("commands"),
         (_, "ephemeral") => {
             let typ = data.get("type").and_then(Value::as_str).unwrap_or("");
             if typ.starts_with("whiteboard.") { has("whiteboard") } else { has("messages:read") }
@@ -875,6 +875,10 @@ mod tests {
         assert!(event_allowed("command.invoke", &d, &s(&["commands"])));
         assert!(event_allowed("commands.update", &d, &s(&["commands"])));
         assert!(!event_allowed("command.invoke", &d, &s(&["messages:read", "messages:write"])));
+        for kind in ["component.invoke", "modal.submit"] {
+            assert!(event_allowed(kind, &d, &s(&["commands"])), "{kind}");
+            assert!(!event_allowed(kind, &d, &s(&["messages:read", "messages:write"])), "{kind}");
+        }
         assert!(!event_allowed("interaction.reply", &d, &permissions::all_scopes()), "only for invokers");
     }
 

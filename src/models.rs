@@ -918,17 +918,27 @@ pub struct Message {
     pub thread: Option<ThreadSummary>,
 }
 
-/// The node-set envelope field of a command answer (APPLICATIONS.md §5.7).
+/// The node-set envelope field of an application's answer to an interaction (APPLICATIONS.md §5.7, §5.10.3).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct InteractionRef {
     /// The interaction id.
     pub id: String,
-    /// The command's name.
-    pub command: String,
+    /// `command`, `component` or `modal` (APPLICATIONS.md §5.10).
+    #[serde(default = "default_interaction_kind")]
+    pub kind: String,
+    /// The command's name; null for components and for modals opened by a component.
+    pub command: Option<String>,
+    /// The message whose component started the interaction; null for commands.
+    #[serde(default)]
+    pub message_id: Option<String>,
     /// The application reference `<domain>/<id>`.
     pub application: String,
     /// The invoker's address.
     pub user: String,
+}
+
+fn default_interaction_kind() -> String {
+    "command".into()
 }
 
 fn default_author_kind() -> String {

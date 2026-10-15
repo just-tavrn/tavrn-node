@@ -32,6 +32,10 @@
 //!   `allow` mask of every override that allows `send_messages` (marker [`CREATE_POLLS_MARKER`]), so whoever could
 //!   write a message can still send a poll (PROTOCOL.md §7g); rooms narrow it afterwards. New rooms get it from
 //!   `DEFAULT_EVERYONE`.
+//! - `use_components` (bit 40) is added once to every role that holds `send_messages`, `@everyone` included (marker
+//!   [`USE_COMPONENTS_MARKER`]; overrides are not touched: the bit is independent of writing), so everybody who could
+//!   use commands can use the buttons of their answers (APPLICATIONS.md §5.10). New rooms get it from
+//!   `DEFAULT_EVERYONE`.
 //! - Overrides carry channel-scoped bits only (`permissions::CHANNEL_SCOPED`, layered overrides of 2026-10-09):
 //!   other bits are removed from the `allow` and `deny` masks of every override, an override left with nothing at
 //!   all is deleted, and each change is audited in the room as `role.override_restricted`.
@@ -61,6 +65,8 @@ pub struct FixupReport {
     pub voice_status_roles: u64,
     /// Roles and overrides allowing `send_messages` that got `create_polls`.
     pub create_polls_grants: u64,
+    /// Roles holding `send_messages` that got `use_components`.
+    pub use_components_roles: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -77,6 +83,9 @@ pub const MANAGE_THREADS_MARKER: &str = "fixup.manage_threads";
 
 /// `node_settings` key: the one-time grant of `create_polls` to roles and overrides with `send_messages` has run.
 pub const CREATE_POLLS_MARKER: &str = "fixup.create_polls";
+
+/// `node_settings` key: the one-time grant of `use_components` to roles holding `send_messages` has run.
+pub const USE_COMPONENTS_MARKER: &str = "fixup.use_components";
 
 /// `node_settings` key: the one-time grant of `voice_status` to roles holding `manage_channels` has run.
 pub const VOICE_STATUS_MARKER: &str = "fixup.voice_status";
@@ -154,6 +163,14 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.override_restricted = strip_unscoped_overrides(db).await?;
     report.voice_status_roles = grant_voice_status(db).await?;
     report.create_polls_grants = grant_create_polls(db).await?;
+    report.use_components_roles = grant_to_roles(
+        db,
+        USE_COMPONENTS_MARKER,
+        permissions::SEND_MESSAGES,
+        permissions::USE_COMPONENTS,
+        Everyone::Included,
+    )
+    .await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }
@@ -300,16 +317,31 @@ async fn marker_set(db: &Pool, key: &str) -> anyhow::Result<bool> {
 
 /// Adds `manage_applications` to every role holding `manage_room`, once per node (see the module docs).
 async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
-    grant_to_holders(db, MANAGE_APPLICATIONS_MARKER, permissions::MANAGE_ROOM, permissions::MANAGE_APPLICATIONS).await
+    grant_to_roles(
+        db,
+        MANAGE_APPLICATIONS_MARKER,
+        permissions::MANAGE_ROOM,
+        permissions::MANAGE_APPLICATIONS,
+        Everyone::Excluded,
+    )
+    .await
 }
 
 /// Adds `manage_threads` to every role holding `manage_messages`, once per node (see the module docs).
 async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
-    grant_to_holders(db, MANAGE_THREADS_MARKER, permissions::MANAGE_MESSAGES, permissions::MANAGE_THREADS).await
+    grant_to_roles(
+        db,
+        MANAGE_THREADS_MARKER,
+        permissions::MANAGE_MESSAGES,
+        permissions::MANAGE_THREADS,
+        Everyone::Excluded,
+    )
+    .await
 }
 
 async fn grant_voice_status(db: &Pool) -> anyhow::Result<u64> {
-    grant_to_holders(db, VOICE_STATUS_MARKER, permissions::MANAGE_CHANNELS, permissions::VOICE_STATUS).await
+    grant_to_roles(db, VOICE_STATUS_MARKER, permissions::MANAGE_CHANNELS, permissions::VOICE_STATUS, Everyone::Excluded)
+        .await
 }
 
 /// Adds `create_polls` to every role holding `send_messages` (`@everyone` included) and to every override allowing it,
@@ -350,16 +382,26 @@ async fn grant_create_polls(db: &Pool) -> anyhow::Result<u64> {
     Ok(changed)
 }
 
-/// Adds `add` to every role (not `@everyone`) holding `have`, once per node (`marker` in `node_settings`).
-async fn grant_to_holders(db: &Pool, marker: &str, have: u64, add: u64) -> anyhow::Result<u64> {
+/// Whether a one-time grant also reaches the `@everyone` roles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Everyone {
+    Included,
+    Excluded,
+}
+
+/// Adds `add` to every role holding `have` (`@everyone` only when `everyone` says so), once per node (`marker` in
+/// `node_settings`).
+async fn grant_to_roles(db: &Pool, marker: &str, have: u64, add: u64, everyone: Everyone) -> anyhow::Result<u64> {
     if marker_set(db, marker).await? {
         return Ok(0);
     }
     let mut tx = db.begin().await?;
-    let roles = sqlx::query("SELECT id, permissions FROM roles WHERE is_everyone = 0 AND (permissions & $1) <> 0")
-        .bind(have as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+    let sql = if everyone == Everyone::Included {
+        "SELECT id, permissions FROM roles WHERE (permissions & $1) <> 0"
+    } else {
+        "SELECT id, permissions FROM roles WHERE is_everyone = 0 AND (permissions & $1) <> 0"
+    };
+    let roles = sqlx::query(sql).bind(have as i64).fetch_all(&mut *tx).await?;
     let mut changed = 0;
     for row in roles {
         let (id, perms): (String, i64) = (row.try_get("id")?, row.try_get("permissions")?);

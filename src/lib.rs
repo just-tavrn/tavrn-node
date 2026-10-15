@@ -13,6 +13,7 @@ pub mod cache;
 pub mod calls;
 pub mod captcha;
 pub mod commands;
+pub mod components;
 pub mod config;
 pub mod connect_sessions;
 pub mod db;

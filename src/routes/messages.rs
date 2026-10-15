@@ -276,7 +276,15 @@ pub(crate) fn validate_content(
                     crate::embeds::validate(embeds)?;
                 }
                 let has_embeds = embeds.and_then(Value::as_array).is_some_and(|e| !e.is_empty());
-                if (n == 0 && gif.is_none() && !has_embeds) || n > MAX_TEXT_CHARS {
+                // Components (APPLICATIONS.md §5.10.1): only in `text`; who may send them is checked by the caller.
+                if let Some(components) = obj.get("components").filter(|c| !c.is_null()) {
+                    if kind != "text" {
+                        return Err(crate::components::invalid("components", "Only text content carries components"));
+                    }
+                    crate::components::validate(components)?;
+                }
+                let has_rows = crate::components::has_rows(content);
+                if (n == 0 && gif.is_none() && !has_embeds && !has_rows) || n > MAX_TEXT_CHARS {
                     return Err(bad("message.body_length", format!("Text: 1 to {MAX_TEXT_CHARS} characters")));
                 }
                 if let Some(preview) = obj.get("preview") {
@@ -291,7 +299,11 @@ pub(crate) fn validate_content(
                 }
             } else if kind == crate::polls::POLL_TYPE {
                 crate::polls::validate_poll(obj)?;
-            } else if kind.starts_with("system.") || kind == crate::polls::VOTE_TYPE {
+            } else if kind.starts_with("system.")
+                || kind == crate::polls::VOTE_TYPE
+                || kind == crate::components::COMPONENT_VALUES_TYPE
+                || kind == crate::components::MODAL_VALUES_TYPE
+            {
                 return Err(bad("message.type_reserved", "System messages and poll votes cannot be sent as messages"));
             }
             serde_json::to_string(content).map_err(|e| ApiError::Internal(e.into()))?
@@ -645,6 +657,10 @@ pub(crate) async fn create_in(
     // (conformance tests, FEDERATION.md §9.1 `msg.plaintext`) takes plaintext in encrypted channels.
     let encrypted = conv.encrypted && !(state.config.misbehaves("plaintext_ok") && req.content.is_object());
     let v = validate_content(gif_hosts(state), encrypted, &req.content, &req.mentions)?;
+    // Components only on bots' messages (APPLICATIONS.md §5.10.1); encrypted content is the clients' business.
+    if !encrypted {
+        crate::components::refuse_unless_bot(&req.content, auth.user.is_bot())?;
+    }
     check_role_mentions(state, conv, &v.mentions).await?;
     if !encrypted {
         check_body_emojis(state, conv, &req.content).await?;
@@ -885,7 +901,7 @@ async fn close_poll(
     Ok(Json(message))
 }
 
-async fn edit_in(
+pub(crate) async fn edit_in(
     state: &AppState,
     auth: &AuthUser,
     conv: &Conv,
@@ -924,6 +940,7 @@ async fn edit_in(
     let v = validate_content(gif_hosts(state), conv.encrypted, content, &req.mentions)?;
     check_role_mentions(state, conv, &v.mentions).await?;
     if !conv.encrypted {
+        crate::components::refuse_unless_bot(content, auth.user.is_bot())?;
         check_body_emojis(state, conv, content).await?;
         // Polls cannot be edited, and no message becomes one by an edit (PROTOCOL.md §7g).
         let was_poll =

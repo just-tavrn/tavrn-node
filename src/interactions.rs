@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Interactions (protocol/APPLICATIONS.md §5.5–§5.8): invoking an application command, delivering it to the
-//! application (one WebSocket connection of the bot, round robin over its devices, or the interactions URL),
-//! waiting at most 3 seconds for the first response, and the callbacks, follow-ups and ephemeral replies.
+//! Interactions (protocol/APPLICATIONS.md §5.5–§5.8, §5.10): invoking an application command or a message component
+//! (button, select menu), submitting a modal, delivering the interaction to the application (one WebSocket connection
+//! of the bot, round robin over its devices, or the interactions URL), waiting at most 3 seconds for the first
+//! response, and the callbacks (`reply`, `defer`, `error`, `update`, `modal`), follow-ups and ephemeral replies.
+//!
+//! Component interactions and modal submits are further *kinds* of the same interaction ([`Kind`]): one registry, one
+//! delivery path and the same responses. A `modal` response keeps the modal definition with its interaction (memory,
+//! and sealed under `interaction-modal:<id>` in a shared cache) until the invoker submits it once (`interaction-
+//! submitted:<id>`) or it expires.
 //!
 //! Interactions live until they expire (15 minutes): the invocation is not a message and is never stored in the
 //! database. All deadlines are read from an injectable [`Clock`], so tests can move time forward. Only the first
@@ -42,7 +48,7 @@ use crate::{
     app::AppState,
     applications::{self as apps, AppPrincipal},
     auth::AuthUser,
-    commands::{self, PaletteApplication, Target},
+    commands::{self, Offer, PaletteApplication, Target},
     error::ApiError,
     hub::Scope,
     models::{InteractionRef, Message},
@@ -90,6 +96,45 @@ fn no_ack() -> ApiError {
 
 fn offline() -> ApiError {
     ApiError::Unavailable { code: "interaction.app_offline", detail: "The application is not connected".into() }
+}
+
+fn update_unsupported() -> ApiError {
+    ApiError::BadRequest {
+        code: "interaction.update_unsupported",
+        detail: "Only interactions of a message component can update their message".into(),
+    }
+}
+
+fn update_forbidden() -> ApiError {
+    ApiError::Forbidden {
+        code: "interaction.update_forbidden",
+        detail: "Only the author of the message can update it".into(),
+    }
+}
+
+fn modal_nested() -> ApiError {
+    ApiError::BadRequest { code: "interaction.modal_nested", detail: "A modal cannot answer a modal".into() }
+}
+
+fn not_invoker() -> ApiError {
+    ApiError::Forbidden { code: "interaction.not_invoker", detail: "Only the invoker can submit this modal".into() }
+}
+
+fn already_submitted() -> ApiError {
+    ApiError::conflict("interaction.already_submitted", "This modal has been submitted already")
+}
+
+/// `404 component.not_found`: no such message here, or its author is not the bot of an installed application.
+pub fn component_not_found() -> ApiError {
+    ApiError::NotFound { code: "component.not_found", what: "Component".into() }
+}
+
+fn component_forbidden() -> ApiError {
+    ApiError::Forbidden { code: "component.forbidden", detail: "You may not use components here".into() }
+}
+
+fn component_expired() -> ApiError {
+    ApiError::Gone { code: "component.expired", detail: "The components of this message have expired".into() }
 }
 
 fn mismatch(detail: &str) -> ApiError {
@@ -171,6 +216,9 @@ pub struct EphemeralReply {
     /// The thread the reply belongs to (null in the conversation itself).
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The message whose component started the interaction (APPLICATIONS.md §5.10.3); null for commands.
+    #[serde(default)]
+    pub message_id: Option<String>,
     pub application: PaletteApplication,
     /// The bot device that produced it (encrypted content is signed by it).
     pub device_id: Option<String>,
@@ -185,11 +233,51 @@ pub struct EphemeralReply {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct InvokeResponse {
     pub interaction_id: String,
-    /// `reply`, `defer` or `error`.
+    /// `reply`, `defer`, `error`, `update` or `modal`.
     pub outcome: String,
+    /// The stored reply (`reply`) or the updated message (`update`).
     pub message: Option<Message>,
     pub ephemeral: Option<EphemeralReply>,
     pub error: Option<String>,
+    /// `modal`: the form to show on the invoking device (APPLICATIONS.md §5.10.3); returned only here.
+    #[schema(value_type = Option<Object>)]
+    pub modal: Option<Value>,
+}
+
+/// `POST /conversations/{conversation_id}/messages/{message_id}/interactions` (APPLICATIONS.md §5.10.2).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentInvokeRequest {
+    /// The button or select (1–100 characters).
+    pub custom_id: String,
+    /// Unencrypted conversations: null for buttons, the selected option values for selects.
+    #[serde(default)]
+    pub values: Option<Vec<Value>>,
+    /// Encrypted conversations: the `component.values` content object encrypted like a message (base64url).
+    #[serde(default)]
+    pub values_ciphertext: Option<String>,
+    /// The epoch of `values_ciphertext`.
+    #[serde(default)]
+    pub epoch: Option<i64>,
+    /// Must be null: the thread is the message's.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub thread_id: Option<Value>,
+}
+
+/// `POST /interactions/{interaction_id}/submit` (APPLICATIONS.md §5.10.4).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModalSubmitRequest {
+    /// Unencrypted conversations: input `custom_id` → text.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub values: Option<Value>,
+    /// Encrypted conversations: the `modal.values` content object encrypted like a message (base64url).
+    #[serde(default)]
+    pub values_ciphertext: Option<String>,
+    #[serde(default)]
+    pub epoch: Option<i64>,
 }
 
 /// `POST /conversations/{conversation_id}/interactions`.
@@ -216,10 +304,10 @@ pub struct InvokeRequest {
 /// The response of an application (`POST /interactions/{id}/callback` or the interactions URL's answer).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct Callback {
-    /// `reply`, `defer` or `error`.
+    /// `reply`, `defer`, `error`, `update` (component interactions) or `modal`.
     #[serde(rename = "type")]
     pub kind: String,
-    /// `reply`: a content object, or ciphertext in encrypted conversations.
+    /// `reply` and `update`: a content object, or ciphertext in encrypted conversations.
     #[serde(default)]
     #[schema(value_type = Value)]
     pub content: Option<Value>,
@@ -239,6 +327,10 @@ pub struct Callback {
     /// `reply`: a thread of the conversation to answer in; defaults to the interaction's thread.
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// `modal`: the form (APPLICATIONS.md §5.10.3).
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub modal: Option<Value>,
 }
 
 /// `POST /interactions/{interaction_id}/messages`.
@@ -270,16 +362,50 @@ pub struct FollowUpResponse {
 
 // ---------------------------------------------------------------- registry
 
+/// What started an interaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Command,
+    Component,
+    Modal,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Component => "component",
+            Self::Modal => "modal",
+        }
+    }
+}
+
 /// The immutable facts of an interaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Info {
     pub id: String,
+    #[serde(default)]
+    pub kind: Kind,
+    /// Components and modal submits of a component: the message that carries the component.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Components (and modal submits of a component): the component's `custom_id`.
+    #[serde(default)]
+    pub custom_id: Option<String>,
+    /// Modal submits: the interaction that answered with the modal, and the modal's `custom_id`.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub modal_custom_id: Option<String>,
     pub application_ref: String,
     pub application_name: String,
     pub bot_user_id: String,
     pub bot_address: String,
     /// Local application with an interactions URL (the URL answer names its device).
     pub local_application_id: Option<String>,
+    /// Commands (and modal submits of a command): the command; empty for components.
     pub command_id: String,
     pub command_name: String,
     pub conversation_id: String,
@@ -306,7 +432,9 @@ impl Info {
     fn envelope(&self) -> InteractionRef {
         InteractionRef {
             id: self.id.clone(),
-            command: self.command_name.clone(),
+            kind: self.kind.as_str().into(),
+            command: (!self.command_name.is_empty()).then(|| self.command_name.clone()),
+            message_id: self.message_id.clone(),
             application: self.application_ref.clone(),
             user: self.user_address.clone(),
         }
@@ -320,6 +448,10 @@ pub enum Ack {
     Ephemeral(Box<EphemeralReply>),
     Defer,
     Error(String),
+    /// The message carrying the component was edited (APPLICATIONS.md §5.10.3).
+    Update(Box<Message>),
+    /// A modal for the invoking device.
+    Modal(Box<Value>),
 }
 
 impl Ack {
@@ -330,9 +462,18 @@ impl Ack {
             message: None,
             ephemeral: None,
             error: None,
+            modal: None,
         };
         match self {
             Self::Reply(m) => r.message = Some((**m).clone()),
+            Self::Update(m) => {
+                r.outcome = "update".into();
+                r.message = Some((**m).clone());
+            }
+            Self::Modal(m) => {
+                r.outcome = "modal".into();
+                r.modal = Some((**m).clone());
+            }
             Self::Ephemeral(e) => r.ephemeral = Some((**e).clone()),
             Self::Defer => r.outcome = "defer".into(),
             Self::Error(e) => {
@@ -360,6 +501,9 @@ struct Entry {
     phase: Phase,
     waiter: Option<oneshot::Sender<Ack>>,
     followups: u32,
+    /// The modal this interaction answered with (APPLICATIONS.md §5.10.3).
+    modal: Option<Arc<Value>>,
+    submitted: bool,
 }
 
 /// A claimed first response: given back with [`Interactions::release`] when it turns out invalid.
@@ -382,6 +526,14 @@ fn claim_key(id: &str) -> String {
 
 fn followups_key(id: &str) -> String {
     format!("interaction-followups:{id}")
+}
+
+fn modal_key(id: &str) -> String {
+    format!("interaction-modal:{id}")
+}
+
+fn submitted_key(id: &str) -> String {
+    format!("interaction-submitted:{id}")
 }
 
 /// How long the cache keeps an interaction: its lifetime and a minute.
@@ -575,13 +727,32 @@ impl Interactions {
         }
         let (tx, rx) = oneshot::channel();
         let id = info.id.clone();
-        entries.insert(id, Entry { info: Arc::new(info), phase: Phase::Pending, waiter: Some(tx), followups: 0 });
+        entries.insert(
+            id,
+            Entry {
+                info: Arc::new(info),
+                phase: Phase::Pending,
+                waiter: Some(tx),
+                followups: 0,
+                modal: None,
+                submitted: false,
+            },
+        );
         Ok(rx)
     }
 
     /// The facts of interaction `id` for the bot `bot_user_id`, from memory or the shared cache:
     /// `404 interaction.not_found`, `403 interaction.not_owner`.
     async fn info(&self, id: &str, bot_user_id: &str) -> Result<Arc<Info>, ApiError> {
+        let info = self.info_any(id).await?;
+        if info.bot_user_id != bot_user_id {
+            return Err(not_owner());
+        }
+        Ok(info)
+    }
+
+    /// The facts of interaction `id`, whoever asks (`404 interaction.not_found`).
+    async fn info_any(&self, id: &str) -> Result<Arc<Info>, ApiError> {
         let local = self.entries().get(id).map(|e| e.info.clone());
         let info = match (local, &self.cluster) {
             (Some(info), _) => info,
@@ -595,10 +766,77 @@ impl Interactions {
             ),
             _ => return Err(not_found()),
         };
-        if info.bot_user_id != bot_user_id {
-            return Err(not_owner());
-        }
         Ok(info)
+    }
+
+    /// Keeps the modal an interaction answered with until the interaction expires (§5.10.3).
+    async fn set_modal(&self, id: &str, modal: &Value) -> Result<(), ApiError> {
+        if let Some(cluster) = &self.cluster {
+            cluster.put_sealed(&modal_key(id), modal, shared_ttl()).await.map_err(crate::cache::unavailable)?;
+        }
+        if let Some(entry) = self.entries().get_mut(id) {
+            entry.modal = Some(Arc::new(modal.clone()));
+        }
+        Ok(())
+    }
+
+    /// The interaction that answered with a modal and the modal, for its invoker (§5.10.4):
+    /// `404 interaction.not_found`, `403 interaction.not_invoker`, `410 interaction.expired`.
+    pub async fn modal_for_submit(&self, id: &str, user_id: &str) -> Result<(Arc<Info>, Arc<Value>), ApiError> {
+        let info = self.info_any(id).await?;
+        if info.user_id != user_id {
+            return Err(not_invoker());
+        }
+        if self.clock().now() > info.expires_at {
+            return Err(expired());
+        }
+        let local = self.entries().get(id).and_then(|e| e.modal.clone());
+        let modal = match (local, &self.cluster) {
+            (Some(m), _) => Some(m),
+            (None, Some(cluster)) => {
+                cluster.get_sealed::<Value>(&modal_key(id)).await.map_err(crate::cache::unavailable)?.map(Arc::new)
+            }
+            (None, None) => None,
+        };
+        let modal = modal.ok_or_else(|| ApiError::NotFound {
+            code: "interaction.not_found",
+            what: "Modal of this interaction".into(),
+        })?;
+        Ok((info, modal))
+    }
+
+    /// The modal of interaction `id` was submitted already (`409 interaction.already_submitted`); read-only, the
+    /// submit itself is recorded with [`Interactions::mark_submitted`].
+    pub async fn check_not_submitted(&self, id: &str) -> Result<(), ApiError> {
+        let done = match &self.cluster {
+            Some(cluster) => cluster
+                .cache()
+                .get(&cluster.key(&submitted_key(id)))
+                .await
+                .map_err(crate::cache::unavailable)?
+                .is_some(),
+            None => self.entries().get(id).is_some_and(|e| e.submitted),
+        };
+        if done { Err(already_submitted()) } else { Ok(()) }
+    }
+
+    /// Records the one submit of a modal (`409 interaction.already_submitted`).
+    pub async fn mark_submitted(&self, id: &str) -> Result<(), ApiError> {
+        if let Some(cluster) = &self.cluster {
+            let key = cluster.key(&submitted_key(id));
+            return if cluster.cache().lease(&key, "submitted", shared_ttl()).await.map_err(crate::cache::unavailable)? {
+                Ok(())
+            } else {
+                Err(already_submitted())
+            };
+        }
+        let mut entries = self.entries();
+        let entry = entries.get_mut(id).ok_or_else(expired)?;
+        if entry.submitted {
+            return Err(already_submitted());
+        }
+        entry.submitted = true;
+        Ok(())
     }
 
     /// Claims the first response (`409 interaction.already_acked`, `410 interaction.expired`).
@@ -775,11 +1013,18 @@ enum Delivery {
 
 /// A bus message [`crate::cache::Message::Invoke`] for this instance: delivers the invocation to one local
 /// receiving connection of the bot. Without one (it closed meanwhile) nothing happens and the owner times out.
-pub fn deliver_from_bus(state: &AppState, bot_user_id: &str, data: &str) {
+pub fn deliver_from_bus(state: &AppState, bot_user_id: &str, event: &str, data: &str) {
     let Ok(data) = serde_json::from_str::<Value>(data) else { return };
+    // Only the three interaction events travel this way (an empty name: a sender from before components).
+    let event = match event {
+        "" | COMMAND_EVENT => COMMAND_EVENT,
+        COMPONENT_EVENT => COMPONENT_EVENT,
+        MODAL_EVENT => MODAL_EVENT,
+        _ => return,
+    };
     match state.interactions.pick(bot_user_id) {
         Some(connection) => {
-            state.hub.publish("command.invoke", Scope::Connection(connection), &data);
+            state.hub.publish(event, Scope::Connection(connection), &data);
         }
         None => tracing::info!(bot = bot_user_id, "invocation from another instance: the bot's connection is gone"),
     }
@@ -830,25 +1075,16 @@ pub async fn invoke(
         }
         None => None,
     };
-    // Delivery: the interactions URL of a local application, else one WebSocket connection of the bot.
-    let url =
-        offer.local.as_ref().and_then(|a| a.interactions_url.as_deref()).and_then(|u| state.hooks.check_url(u).ok());
-    let delivery = match url {
-        Some(u) => Delivery::Url(u),
-        None => match state.interactions.pick(&offer.bot.id) {
-            Some(connection) => Delivery::Connection(connection),
-            None => Delivery::Instance(state.interactions.remote_receiver(&offer.bot.id).await.ok_or_else(offline)?),
-        },
-    };
-
-    let clock = state.interactions.clock();
-    let now = clock.now();
-    let (room_id, channel_id) = match &conv.kind {
-        ConvKind::Channel { access, channel } => (Some(access.room.id.clone()), Some(channel.id.clone())),
-        ConvKind::Direct { .. } => (None, None),
-    };
+    let delivery = delivery_for(state, &offer).await?;
+    let now = state.interactions.clock().now();
+    let (room_id, channel_id) = room_and_channel(conv);
     let info = Info {
         id: util::ulid(),
+        kind: Kind::Command,
+        message_id: None,
+        custom_id: None,
+        parent: None,
+        modal_custom_id: None,
         application_ref: offer.reference.clone(),
         application_name: offer.name.clone(),
         bot_user_id: offer.bot.id.clone(),
@@ -867,7 +1103,7 @@ pub async fn invoke(
     };
     let data = json!({
         "interaction_id": info.id,
-        "application_id": offer.local.as_ref().map_or_else(|| offer.reference.rsplit('/').next().unwrap_or("").to_string(), |a| a.id.clone()),
+        "application_id": application_id(&offer),
         "command": { "id": row.id, "name": def.name },
         "conversation_id": conv.id, "room_id": room_id, "channel_id": channel_id, "thread_id": info.thread_id,
         "encrypted": conv.encrypted,
@@ -877,7 +1113,57 @@ pub async fn invoke(
         "args_ciphertext": args_ciphertext, "epoch": epoch,
         "locale": locale(accept_language), "expires_at": util::format_time(info.expires_at),
     });
+    run(state, delivery, &offer, info, data, COMMAND_EVENT).await
+}
+
+/// The event (WebSocket) and request type (interactions URL) of a command invocation.
+pub const COMMAND_EVENT: &str = "command.invoke";
+/// … of a component interaction (APPLICATIONS.md §5.10.2).
+pub const COMPONENT_EVENT: &str = "component.invoke";
+/// … of a modal submit (§5.10.4).
+pub const MODAL_EVENT: &str = "modal.submit";
+
+/// The application id of `data`: the local application, else the last segment of the reference.
+fn application_id(offer: &Offer) -> String {
+    offer.local.as_ref().map_or_else(|| offer.reference.rsplit('/').next().unwrap_or("").to_string(), |a| a.id.clone())
+}
+
+fn room_and_channel(conv: &Conv) -> (Option<String>, Option<String>) {
+    match &conv.kind {
+        ConvKind::Channel { access, channel } => (Some(access.room.id.clone()), Some(channel.id.clone())),
+        ConvKind::Direct { .. } => (None, None),
+    }
+}
+
+/// Where an interaction for `offer` goes: the interactions URL of a local application, else one WebSocket
+/// connection of the bot (here or on another instance); `503 interaction.app_offline` without any.
+async fn delivery_for(state: &AppState, offer: &Offer) -> Result<Delivery, ApiError> {
+    let url =
+        offer.local.as_ref().and_then(|a| a.interactions_url.as_deref()).and_then(|u| state.hooks.check_url(u).ok());
+    Ok(match url {
+        Some(u) => Delivery::Url(u),
+        None => match state.interactions.pick(&offer.bot.id) {
+            Some(connection) => Delivery::Connection(connection),
+            None => Delivery::Instance(state.interactions.remote_receiver(&offer.bot.id).await.ok_or_else(offline)?),
+        },
+    })
+}
+
+/// Registers the interaction, delivers `data` as `event` and waits for the first response (§5.5, §5.6).
+async fn run(
+    state: &AppState,
+    delivery: Delivery,
+    offer: &Offer,
+    info: Info,
+    data: Value,
+    event: &'static str,
+) -> Result<InvokeResponse, ApiError> {
+    let clock = state.interactions.clock();
+    let now = clock.now();
     let id = info.id.clone();
+    let kind = info.kind;
+    let command = info.command_name.clone();
+    let conversation = info.conversation_id.clone();
     let deadline = info.ack_deadline;
     let started = std::time::Instant::now();
     let mut rx = state.interactions.create(info).await?;
@@ -893,7 +1179,7 @@ pub async fn invoke(
 
     let result = match delivery {
         Delivery::Connection(connection) => {
-            state.hub.publish("command.invoke", Scope::Connection(connection), &data);
+            state.hub.publish(event, Scope::Connection(connection), &data);
             wait(state, &id, &mut rx, clock.sleep_until(deadline)).await
         }
         Delivery::Instance(instance) => {
@@ -901,22 +1187,15 @@ pub async fn invoke(
                 instance,
                 bot: offer.bot.id.clone(),
                 data: data.to_string(),
+                event: event.to_string(),
             });
             wait(state, &id, &mut rx, clock.sleep_until(deadline)).await
         }
         Delivery::Url(url) => {
-            let body =
-                json!({ "type": "command.invoke", "id": id, "at": util::format_time(now), "data": data }).to_string();
+            let body = json!({ "type": event, "id": id, "at": util::format_time(now), "data": data }).to_string();
             let app_id = offer.local.as_ref().map(|a| a.id.clone()).unwrap_or_default();
-            let send = crate::hooks::send(
-                state,
-                &app_id,
-                &url,
-                "command.invoke",
-                &id,
-                body.into_bytes(),
-                crate::hooks::INVOKE_TIMEOUT,
-            );
+            let send =
+                crate::hooks::send(state, &app_id, &url, event, &id, body.into_bytes(), crate::hooks::INVOKE_TIMEOUT);
             tokio::select! {
                 answer = send => {
                     match answer {
@@ -933,17 +1212,255 @@ pub async fn invoke(
         Ok(Ack::Reply(_) | Ack::Ephemeral(_)) => "reply",
         Ok(Ack::Defer) => "defer",
         Ok(Ack::Error(_)) => "error",
+        Ok(Ack::Update(_)) => "update",
+        Ok(Ack::Modal(_)) => "modal",
         Err(_) => "no_ack",
     };
     tracing::info!(
         application = offer.reference,
-        command = def.name,
-        conversation = conv.id,
+        kind = kind.as_str(),
+        command,
+        conversation,
         outcome,
         latency_ms = started.elapsed().as_millis() as u64,
         "interaction"
     );
     Ok(result?.response(&id))
+}
+
+// ---------------------------------------------------------------- components and modals (§5.10)
+
+/// Check 1 of §5.10.2: a person (never a bot) who may view the conversation, is a member, has no pending message
+/// request there and holds `use_components` (`403 component.forbidden`).
+pub fn check_component_caller(auth: &AuthUser, conv: &Conv) -> Result<(), ApiError> {
+    if auth.user.is_bot() || auth.app.is_some() {
+        return Err(apps::bot_forbidden());
+    }
+    if let ConvKind::Channel { access, .. } = &conv.kind
+        && access.member.is_none()
+    {
+        return Err(ApiError::Forbidden { code: "room.not_member", detail: "Only members can use components".into() });
+    }
+    if conv.is_request_for(&auth.user.id) {
+        return Err(ApiError::Forbidden {
+            code: "conversation.request_pending",
+            detail: "Accept the message request first".into(),
+        });
+    }
+    if !p::has(conv.perms, p::VIEW_CHANNEL | p::USE_COMPONENTS) {
+        return Err(component_forbidden());
+    }
+    Ok(())
+}
+
+/// The application whose bot is `bot_user_id`, still installed in the conversation's room (or the bot of the DM),
+/// usable and able to view the channel; `404 component.not_found` otherwise.
+async fn installed_offer(state: &AppState, conv: &Conv, caller_id: &str, bot_user_id: &str) -> Result<Offer, ApiError> {
+    commands::offers(state, conv, caller_id)
+        .await?
+        .into_iter()
+        .find(|o| o.bot.id == bot_user_id && o.bot_can_view)
+        .ok_or_else(component_not_found)
+}
+
+const VALUES_MAX: usize = crate::components::MAX_VALUES_CIPHERTEXT;
+const MODAL_MAX: usize = crate::components::MAX_MODAL_CIPHERTEXT;
+
+/// Encrypted values (`values_ciphertext` + `epoch`), checked like command arguments; returns them with the epoch.
+async fn check_values_ciphertext(
+    state: &AppState,
+    auth: &AuthUser,
+    conv: &Conv,
+    ciphertext: Option<&str>,
+    epoch: Option<i64>,
+    max: usize,
+) -> Result<(String, i64), ApiError> {
+    let ct = ciphertext.unwrap_or("");
+    if ct.is_empty() || ct.len() > max {
+        return Err(ApiError::BadRequest {
+            code: "interaction.ciphertext_invalid",
+            detail: "values_ciphertext: the encrypted values content object".into(),
+        });
+    }
+    let v = msgs::validate_content(&[], true, &Value::String(ct.to_string()), &[]).map_err(as_interaction_error)?;
+    let epoch = msgs::check_ciphertext(state, auth, &conv.id, &v.content, epoch).await.map_err(as_interaction_error)?;
+    Ok((v.content, epoch))
+}
+
+/// `POST /conversations/{conversation_id}/messages/{message_id}/interactions`: checks 1–4 of §5.10.2 in order,
+/// delivery as `component.invoke`, wait for the first response.
+pub async fn invoke_component(
+    state: &AppState,
+    auth: &AuthUser,
+    conv: &Conv,
+    message_id: &str,
+    req: ComponentInvokeRequest,
+    accept_language: Option<&str>,
+) -> Result<InvokeResponse, ApiError> {
+    // 1. a person who may use components here.
+    check_component_caller(auth, conv)?;
+    // 2. a message of this conversation by the bot of an installed application, not too old.
+    let message = store::messages::by_id(&state.db, message_id)
+        .await?
+        .filter(|m| m.conversation_id == conv.id && m.author_kind == "bot")
+        .ok_or_else(component_not_found)?;
+    let offer = installed_offer(state, conv, &auth.user.id, &message.author_id).await?;
+    let now = state.interactions.clock().now();
+    let max_days = i64::from(state.config.component_max_age_days);
+    if max_days > 0 && util::parse_time(&message.created_at).is_some_and(|t| now - t > chrono::Duration::days(max_days))
+    {
+        return Err(component_expired());
+    }
+    // 3. the values in the conversation's mode.
+    if !crate::components::valid_custom_id(&req.custom_id) {
+        return Err(crate::components::values_invalid("custom_id", "custom_id: 1 to 100 characters"));
+    }
+    if req.thread_id.as_ref().is_some_and(|t| !t.is_null()) {
+        return Err(ApiError::BadRequest {
+            code: "validation.thread_id",
+            detail: "thread_id is the message's; send null".into(),
+        });
+    }
+    let values = req.values.map(Value::Array);
+    let (values, values_ciphertext, epoch) = if conv.encrypted {
+        if values.is_some() {
+            return Err(mismatch("This conversation is encrypted: send values_ciphertext, not values"));
+        }
+        let (ct, epoch) =
+            check_values_ciphertext(state, auth, conv, req.values_ciphertext.as_deref(), req.epoch, VALUES_MAX).await?;
+        (Value::Null, Some(ct), Some(epoch))
+    } else {
+        if req.values_ciphertext.is_some() || req.epoch.is_some() {
+            return Err(mismatch("This conversation is not encrypted: send values, not values_ciphertext"));
+        }
+        let content: Value = serde_json::from_str(&message.content).unwrap_or(Value::Null);
+        crate::components::validate_values(&content, &req.custom_id, values.as_ref())?;
+        (values.unwrap_or(Value::Null), None, None)
+    };
+    // 4. 5 interactions per 5 seconds and invoking user, commands included.
+    state.interaction_limiter.check_all(&[format!("interaction:{}", auth.user.id)])?;
+
+    let delivery = delivery_for(state, &offer).await?;
+    let (room_id, channel_id) = room_and_channel(conv);
+    let info = Info {
+        id: util::ulid(),
+        kind: Kind::Component,
+        message_id: Some(message.id.clone()),
+        custom_id: Some(req.custom_id.clone()),
+        parent: None,
+        modal_custom_id: None,
+        application_ref: offer.reference.clone(),
+        application_name: offer.name.clone(),
+        bot_user_id: offer.bot.id.clone(),
+        bot_address: offer.bot.address(),
+        local_application_id: offer.local.as_ref().map(|a| a.id.clone()),
+        command_id: String::new(),
+        command_name: String::new(),
+        conversation_id: conv.id.clone(),
+        thread_id: message.thread_id.clone(),
+        encrypted: conv.encrypted,
+        user_id: auth.user.id.clone(),
+        user_address: auth.user.address(),
+        user_device: auth.device_id.clone(),
+        ack_deadline: now + chrono::Duration::seconds(ACK_TIMEOUT_SECS),
+        expires_at: now + chrono::Duration::seconds(LIFETIME_SECS),
+    };
+    let data = json!({
+        "interaction_id": info.id,
+        "application_id": application_id(&offer),
+        "message_id": message.id, "custom_id": req.custom_id,
+        "values": values, "values_ciphertext": values_ciphertext, "epoch": epoch,
+        "conversation_id": conv.id, "room_id": room_id, "channel_id": channel_id, "thread_id": info.thread_id,
+        "encrypted": conv.encrypted,
+        "user": info.user_address, "user_id": auth.user.id, "device_id": auth.public_device_id(),
+        "permissions": conv.perms.to_string(),
+        "locale": locale(accept_language), "expires_at": util::format_time(info.expires_at),
+    });
+    run(state, delivery, &offer, info, data, COMPONENT_EVENT).await
+}
+
+/// `POST /interactions/{interaction_id}/submit`: the invoker submits the modal an interaction answered with (§5.10.4);
+/// delivered as `modal.submit`, a new interaction of kind `modal`.
+pub async fn submit_modal(
+    state: &AppState,
+    auth: &AuthUser,
+    id: &str,
+    req: ModalSubmitRequest,
+    accept_language: Option<&str>,
+) -> Result<InvokeResponse, ApiError> {
+    if auth.user.is_bot() || auth.app.is_some() {
+        return Err(apps::bot_forbidden());
+    }
+    let (parent, modal) = state.interactions.modal_for_submit(id, &auth.user.id).await?;
+    state.interactions.check_not_submitted(id).await?;
+    // The origin is still usable: the conversation, the permission and the application.
+    let conv = access::conversation(state, &parent.conversation_id, &auth.user).await?;
+    match parent.kind {
+        Kind::Component => check_component_caller(auth, &conv)?,
+        _ => commands::check_caller(auth, &conv)?,
+    }
+    let offer = installed_offer(state, &conv, &auth.user.id, &parent.bot_user_id).await?;
+    let (values, values_ciphertext, epoch) = if conv.encrypted {
+        if req.values.as_ref().is_some_and(|v| !v.is_null()) {
+            return Err(mismatch("This conversation is encrypted: send values_ciphertext, not values"));
+        }
+        let (ct, epoch) =
+            check_values_ciphertext(state, auth, &conv, req.values_ciphertext.as_deref(), req.epoch, MODAL_MAX).await?;
+        (Value::Null, Some(ct), Some(epoch))
+    } else {
+        if req.values_ciphertext.is_some() || req.epoch.is_some() {
+            return Err(mismatch("This conversation is not encrypted: send values, not values_ciphertext"));
+        }
+        (crate::components::validate_modal_values(&modal, req.values.as_ref())?, None, None)
+    };
+    state.interaction_limiter.check_all(&[format!("interaction:{}", auth.user.id)])?;
+    let delivery = delivery_for(state, &offer).await?;
+    state.interactions.mark_submitted(id).await?;
+
+    let now = state.interactions.clock().now();
+    let (room_id, channel_id) = room_and_channel(&conv);
+    let modal_custom_id = modal.get("custom_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let info = Info {
+        id: util::ulid(),
+        kind: Kind::Modal,
+        message_id: parent.message_id.clone(),
+        custom_id: parent.custom_id.clone(),
+        parent: Some(parent.id.clone()),
+        modal_custom_id: Some(modal_custom_id.clone()),
+        application_ref: offer.reference.clone(),
+        application_name: offer.name.clone(),
+        bot_user_id: offer.bot.id.clone(),
+        bot_address: offer.bot.address(),
+        local_application_id: offer.local.as_ref().map(|a| a.id.clone()),
+        command_id: parent.command_id.clone(),
+        command_name: parent.command_name.clone(),
+        conversation_id: conv.id.clone(),
+        thread_id: parent.thread_id.clone(),
+        encrypted: conv.encrypted,
+        user_id: auth.user.id.clone(),
+        user_address: auth.user.address(),
+        user_device: auth.device_id.clone(),
+        ack_deadline: now + chrono::Duration::seconds(ACK_TIMEOUT_SECS),
+        expires_at: now + chrono::Duration::seconds(LIFETIME_SECS),
+    };
+    let command = if parent.command_id.is_empty() {
+        Value::Null
+    } else {
+        json!({ "id": parent.command_id, "name": parent.command_name })
+    };
+    let data = json!({
+        "interaction_id": info.id,
+        "application_id": application_id(&offer),
+        "parent_interaction_id": parent.id, "modal_custom_id": modal_custom_id, "command": command,
+        "message_id": info.message_id, "custom_id": info.custom_id,
+        "values": values, "values_ciphertext": values_ciphertext, "epoch": epoch,
+        "conversation_id": conv.id, "room_id": room_id, "channel_id": channel_id, "thread_id": info.thread_id,
+        "encrypted": conv.encrypted,
+        "user": info.user_address, "user_id": auth.user.id, "device_id": auth.public_device_id(),
+        "permissions": conv.perms.to_string(),
+        "locale": locale(accept_language), "expires_at": util::format_time(info.expires_at),
+    });
+    run(state, delivery, &offer, info, data, MODAL_EVENT).await
 }
 
 /// Waits for the first response until `deadline` resolves; a response being validated gets a short grace.
@@ -1092,8 +1609,81 @@ async fn acknowledge(state: &AppState, auth: &AuthUser, info: &Info, callback: C
             )
             .await
         }
-        _ => Err(ApiError::BadRequest { code: "validation.type", detail: "type: reply, defer or error".into() }),
+        "update" => {
+            if info.message_id.is_none() {
+                return Err(update_unsupported());
+            }
+            let content = callback.content.ok_or_else(|| ApiError::BadRequest {
+                code: "message.content_invalid",
+                detail: "An update needs content".into(),
+            })?;
+            update(state, auth, info, content, callback.epoch, callback.device_id.as_deref(), callback.mentions).await
+        }
+        "modal" => {
+            if info.kind == Kind::Modal {
+                return Err(modal_nested());
+            }
+            let modal = callback.modal.unwrap_or(Value::Null);
+            crate::components::validate_modal(&modal)?;
+            state.interactions.set_modal(&info.id, &modal).await?;
+            Ok(Ack::Modal(Box::new(modal)))
+        }
+        _ => Err(ApiError::BadRequest {
+            code: "validation.type",
+            detail: "type: reply, defer, error, update or modal".into(),
+        }),
     }
+}
+
+/// `update` (§5.10.3): the bot edits the message that carries the component, through the normal edit path.
+async fn update(
+    state: &AppState,
+    auth: &AuthUser,
+    info: &Info,
+    content: Value,
+    epoch: Option<i64>,
+    device_id: Option<&str>,
+    mentions: Vec<String>,
+) -> Result<Ack, ApiError> {
+    let message_id = info.message_id.as_deref().ok_or_else(update_unsupported)?;
+    if let Some(d) = device_id
+        && !auth.device_id.is_empty()
+        && d != auth.public_device_id()
+    {
+        return Err(ApiError::BadRequest {
+            code: "interaction.device_invalid",
+            detail: "device_id must be the token's device".into(),
+        });
+    }
+    let conv = access::conversation(state, &info.conversation_id, &auth.user).await?;
+    if let ConvKind::Channel { access, .. } = &conv.kind
+        && access.member.is_none()
+    {
+        return Err(ApiError::Forbidden { code: "room.not_member", detail: "The bot is not a member here".into() });
+    }
+    let existing = store::messages::by_id(&state.db, message_id)
+        .await?
+        .filter(|m| m.conversation_id == conv.id)
+        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+    if existing.author_id != auth.user.id {
+        return Err(update_forbidden());
+    }
+    if conv.encrypted && auth.device_id.is_empty() {
+        return Err(ApiError::BadRequest {
+            code: "interaction.device_invalid",
+            detail: "Encrypted content needs the device that encrypted it".into(),
+        });
+    }
+    let req = msgs::EditMessageRequest {
+        content: Some(content),
+        mentions,
+        mentions_everyone: false,
+        epoch,
+        signature: None,
+        poll_closes_at: None,
+    };
+    let message = msgs::edit_in(state, auth, &conv, message_id, req).await.map_err(as_interaction_error)?;
+    Ok(Ack::Update(Box::new(message.0)))
 }
 
 /// What a reply or follow-up carries.
@@ -1168,6 +1758,7 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
             interaction_id: info.id.clone(),
             conversation_id: info.conversation_id.clone(),
             thread_id: thread.as_ref().map(|t| t.id.clone()),
+            message_id: info.message_id.clone(),
             application: info.application(),
             device_id: device,
             content: stored,
@@ -1242,6 +1833,11 @@ mod tests {
     fn info(id: &str, bot: &str, now: DateTime<Utc>) -> Info {
         Info {
             id: id.into(),
+            kind: Kind::Command,
+            message_id: None,
+            custom_id: None,
+            parent: None,
+            modal_custom_id: None,
             application_ref: "a.test/X".into(),
             application_name: "App".into(),
             bot_user_id: bot.into(),

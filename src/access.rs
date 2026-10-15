@@ -320,7 +320,8 @@ pub const DIRECT_PERMS: Perms = permissions::VIEW_CHANNEL
     | permissions::ADD_REACTIONS
     | permissions::PIN_MESSAGES
     | permissions::USE_WHITEBOARD
-    | permissions::CREATE_POLLS;
+    | permissions::CREATE_POLLS
+    | permissions::USE_COMPONENTS;
 
 pub enum ConvKind {
     /// A room channel; the conversation id is the channel id.

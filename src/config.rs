@@ -515,6 +515,9 @@ pub struct Config {
     /// Node admins approve every command definition before it is offered in this node's rooms
     /// (APPLICATIONS.md §5.2); a changed definition is pending again.
     pub app_commands_require_approval: bool,
+    /// Components of messages older than this many days answer `410 component.expired` (APPLICATIONS.md §5.10.2);
+    /// 0 = no limit (0–3650).
+    pub component_max_age_days: u32,
     /// Incoming webhooks (APPLICATIONS.md §6.1); `false` refuses creation and execution (`webhook.disabled`).
     pub webhooks_enabled: bool,
     /// Webhooks per channel (1–50; a room has at most 50).
@@ -726,6 +729,7 @@ impl Default for Config {
             apps_federate: true,
             app_allow_private_urls: false,
             app_commands_require_approval: false,
+            component_max_age_days: 30,
             webhooks_enabled: true,
             webhooks_per_channel: 10,
             search_enabled: true,
@@ -1013,6 +1017,9 @@ impl Config {
         }
         if self.apps_per_room > 1000 {
             problems.push("TAVRN_APPS_PER_ROOM must be between 0 and 1000".into());
+        }
+        if self.component_max_age_days > 3650 {
+            problems.push("TAVRN_COMPONENT_MAX_AGE_DAYS must be between 0 and 3650".into());
         }
         if !(1..=3650).contains(&self.app_token_max_days) {
             problems.push("TAVRN_APP_TOKEN_MAX_DAYS must be between 1 and 3650".into());
@@ -2654,6 +2661,7 @@ mod tests {
         assert_eq!(c.apps_per_room, 25);
         assert!(c.apps_federate && c.federation_remote_bots);
         assert!(!c.app_commands_require_approval);
+        assert_eq!(c.component_max_age_days, 30);
         figment::Jail::expect_with(|jail| {
             jail.set_env("TAVRN_DOMAIN", "env.example");
             jail.set_env("TAVRN_DATABASE_URL", "postgres://u:p@h/db");
@@ -2662,8 +2670,10 @@ mod tests {
             jail.set_env("TAVRN_APP_TOKEN_MAX_DAYS", "30");
             jail.set_env("TAVRN_APPS_FEDERATE", "false");
             jail.set_env("TAVRN_APP_COMMANDS_REQUIRE_APPROVAL", "true");
+            jail.set_env("TAVRN_COMPONENT_MAX_AGE_DAYS", "0");
             let c = Config::load(false).unwrap();
             assert!(c.app_commands_require_approval);
+            assert_eq!(c.component_max_age_days, 0, "no limit");
             assert_eq!(c.app_creation, AppCreation::Admins);
             assert_eq!((c.apps_per_user, c.app_token_max_days), (0, 30));
             assert!(!c.apps_federate);
@@ -2672,10 +2682,15 @@ mod tests {
             jail.set_env("TAVRN_APPS_PER_ROOM", "1001");
             jail.set_env("TAVRN_APP_TOKEN_MAX_DAYS", "0");
             jail.set_env("TAVRN_APP_RATE_REQUESTS", "0");
+            jail.set_env("TAVRN_COMPONENT_MAX_AGE_DAYS", "3651");
             let err = Config::load(false).unwrap_err();
-            for var in
-                ["TAVRN_APPS_PER_USER", "TAVRN_APPS_PER_ROOM", "TAVRN_APP_TOKEN_MAX_DAYS", "TAVRN_APP_RATE_REQUESTS"]
-            {
+            for var in [
+                "TAVRN_APPS_PER_USER",
+                "TAVRN_APPS_PER_ROOM",
+                "TAVRN_APP_TOKEN_MAX_DAYS",
+                "TAVRN_APP_RATE_REQUESTS",
+                "TAVRN_COMPONENT_MAX_AGE_DAYS",
+            ] {
                 assert!(err.problems.iter().any(|p| p.contains(var)), "{err}");
             }
             jail.set_env("TAVRN_APP_CREATION", "everyone");

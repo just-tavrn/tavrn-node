@@ -27,6 +27,7 @@ mod suite {
     mod cluster_flow;
     mod cluster_outage_flow;
     mod commands_flow;
+    mod components_flow;
     mod conformance_flow;
     mod connect_flow;
     mod conversation_index_flow;
