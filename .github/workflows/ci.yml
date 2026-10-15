@@ -15,9 +15,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request replaces the run of the older one; on main every push finishes (its image build, about
+# 20 minutes, would otherwise be thrown away by the next merge, and edge would lag further behind).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -54,12 +56,16 @@ jobs:
     with:
       skip: ${{ needs.changes.outputs.code != 'true' }}
       runner: tavrn-heavy
-      # rustfmt, clippy (node and load generator), the tests on PostgreSQL (incl. the protocol test vectors and
-      # the comparison with protocol/openapi.json from the submodule) with a Valkey for the cluster tests,
-      # cargo deny with deny.toml.
+      # cargo deny with deny.toml (bans, licenses, sources; the advisories run in advisories.yml), rustfmt, clippy (node
+      # and load generator), the tests on PostgreSQL (incl. the protocol test vectors and the comparison with
+      # protocol/openapi.json from the submodule) with a Valkey for the cluster tests, then the same tests on SQLite,
+      # the default database of small nodes and of --dev (like `just test` and `just test-pg`).
       clippy-args: --workspace --all-targets --locked
       test-args: --workspace --locked
       postgres: true
+      test-sqlite: true
+      # Two test runs (PostgreSQL, SQLite) after the build.
+      timeout-minutes: 60
       pre-test: |
         if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then
           # The runner image ships livekit-server, ffmpeg and a private Valkey on 127.0.0.1:6379 (the
@@ -107,6 +113,7 @@ jobs:
     name: SPDX headers, publication hygiene, perf report
     if: ${{ vars.CI_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
