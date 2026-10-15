@@ -549,23 +549,24 @@ pub fn router(state: AppState) -> Router {
         (state.config.upload_ceiling() as usize).max(routes::mls::MLS_BODY_LIMIT).max(crate::media::MAX_INPUT_BYTES)
             + 64 * 1024;
     let mls_limit = axum::extract::DefaultBodyLimit::max(routes::mls::MLS_BODY_LIMIT);
+    // Small JSON bodies, among them the anonymous sign-in routes: nothing an anonymous client sends is kept large.
     let small = || axum::extract::DefaultBodyLimit::max(16 * 1024);
     let webauthn_limit = || axum::extract::DefaultBodyLimit::max(routes::second_factor::WEBAUTHN_BODY_LIMIT);
 
     let api = Router::new()
         .route("/node", get(routes::node::get_node))
         .route("/ws", get(ws::ws_handler))
-        .route("/auth/register", post(routes::auth::register))
-        .route("/auth/login", post(routes::auth::login))
-        .route("/auth/refresh", post(routes::auth::refresh))
-        .route("/auth/device-nonce", post(routes::auth::device_nonce))
+        .route("/auth/register", post(routes::auth::register).layer(small()))
+        .route("/auth/login", post(routes::auth::login).layer(small()))
+        .route("/auth/refresh", post(routes::auth::refresh).layer(small()))
+        .route("/auth/device-nonce", post(routes::auth::device_nonce).layer(small()))
         .route("/auth/reauth", post(routes::second_factor::reauth).layer(webauthn_limit()))
         .route("/auth/reauth/webauthn/start", post(routes::second_factor::reauth_webauthn_start))
         .route("/auth/logout", post(routes::auth::logout))
-        .route("/auth/verify-email", post(routes::auth::verify_email))
-        .route("/auth/verify-email/resend", post(routes::auth::resend_verification))
-        .route("/auth/forgot-password", post(routes::auth::forgot_password))
-        .route("/auth/reset-password", post(routes::auth::reset_password))
+        .route("/auth/verify-email", post(routes::auth::verify_email).layer(small()))
+        .route("/auth/verify-email/resend", post(routes::auth::resend_verification).layer(small()))
+        .route("/auth/forgot-password", post(routes::auth::forgot_password).layer(small()))
+        .route("/auth/reset-password", post(routes::auth::reset_password).layer(small()))
         .route("/auth/second-factor/verify", post(routes::second_factor::verify).layer(small()))
         .route("/auth/factors", get(routes::second_factor::factors))
         .route("/auth/totp/enroll", post(routes::second_factor::totp_enroll))

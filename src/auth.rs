@@ -536,11 +536,23 @@ pub fn normalize_key(key: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(key)
 }
 
+/// The key a limiter stores for `key`: client addresses normalised ([`normalize_key`]), keys longer than
+/// [`MAX_KEY_LEN`] (they may carry user input such as a username) as their SHA-256, so no request makes a limiter
+/// keep more than a small fixed size per key.
+pub fn limiter_key(key: &str) -> std::borrow::Cow<'_, str> {
+    let key = normalize_key(key);
+    if key.len() > MAX_KEY_LEN { std::borrow::Cow::Owned(crate::util::sha256_b64(&key)) } else { key }
+}
+
 /// Keys above this count make the limiter sweep expired windows (at most once per [`SWEEP_INTERVAL`]).
 const SWEEP_ABOVE: usize = 10_000;
 /// Hard bound of a limiter's map: when even live windows fill it, keys that are not over their limit are dropped.
 const MAX_KEYS: usize = 100_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// Absolute bound of a limiter's map, also between sweeps: a new key beyond it is refused until a sweep makes room.
+const HARD_MAX_KEYS: usize = 2 * MAX_KEYS;
+/// Keys longer than this (they may carry user input such as a username) are stored as their SHA-256.
+pub const MAX_KEY_LEN: usize = 128;
 
 /// Simple counter per key in a fixed window. Sufficient for a single instance;
 /// multiple instances will use Valkey (phase 5).
@@ -576,10 +588,15 @@ impl RateLimiter {
 
     /// `Ok(())` or `Err(seconds until the next attempt)`.
     pub fn check(&self, key: &str) -> Result<(), u32> {
-        let key = normalize_key(key);
+        let key = limiter_key(key);
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         self.sweep(&mut hits, now);
+        // Full even after the sweep (every key in it is locked or the sweep is not due): a new key is refused, not
+        // stored, until a sweep makes room.
+        if hits.map.len() >= HARD_MAX_KEYS && !hits.map.contains_key(key.as_ref()) {
+            return Err(1);
+        }
         let entry = hits.map.entry(key.into_owned()).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
             *entry = (0, now);
@@ -595,7 +612,7 @@ impl RateLimiter {
 
     /// Like [`RateLimiter::check`] without counting: `Err(seconds)` while `key` is over its limit.
     pub fn peek(&self, key: &str) -> Result<(), u32> {
-        let key = normalize_key(key);
+        let key = limiter_key(key);
         let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         match hits.map.get(key.as_ref()) {
@@ -721,6 +738,35 @@ mod tests {
         rl.hits.lock().unwrap().swept = Instant::now() - SWEEP_INTERVAL;
         let _ = rl.check("next");
         assert!(rl.peek("user:victim").is_err(), "the locked key survived the sweep");
+    }
+
+    /// Keys carry user input (a username): long ones are stored as a fixed-size hash, and still count as themselves.
+    #[test]
+    fn long_keys_are_stored_hashed() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        let long = format!("user:{}", "a".repeat(64 * 1024));
+        assert!(rl.check(&long).is_ok());
+        assert!(rl.check(&long).is_err(), "the same long key counts twice");
+        assert!(rl.peek(&long).is_err());
+        let other = format!("user:{}b", "a".repeat(64 * 1024 - 1));
+        assert!(rl.check(&other).is_ok(), "a different long key is a different key");
+        let stored = rl.hits.lock().unwrap().map.keys().map(String::len).max().unwrap();
+        assert!(stored <= MAX_KEY_LEN, "{stored} bytes stored");
+    }
+
+    /// The map never grows beyond its hard bound, even when every key in it is locked: new keys are then refused
+    /// until a sweep makes room.
+    #[test]
+    fn the_number_of_keys_is_bounded() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        for i in 0..HARD_MAX_KEYS + 10 {
+            let k = format!("k{i}");
+            let _ = rl.check(&k);
+            let _ = rl.check(&k);
+        }
+        assert!(rl.len() <= HARD_MAX_KEYS, "{}", rl.len());
+        assert!(rl.check("fresh").is_err(), "no room for a new key: refused, not unbounded");
+        assert!(rl.peek("k0").is_err(), "locked keys stay locked");
     }
 
     #[test]

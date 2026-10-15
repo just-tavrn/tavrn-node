@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- `POST /auth/login` refuses a username no account can have (`400 auth.username_invalid`) before it is looked up or
+  counted; the anonymous sign-in routes take bodies of at most 16 KiB; rate limiters store long keys as hashes and
+  keep a hard bound on their number of keys, also on single-instance nodes.
 - The in-memory rate limiter keeps keys that reached their limit when its map is full, so a full map no longer unlocks
   locked accounts.
 - A `Tavrn-Relayed` value with an extreme time is refused instead of overflowing the age check.
