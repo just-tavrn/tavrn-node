@@ -186,6 +186,11 @@ needed while the repositories are private: cargo fetches `tavrn-crypto` with it 
 tavrn-web. It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
 `just docker-build git v0.1.0`).
 
+The Rust build is split in two layers with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef): the
+dependencies, compiled from a recipe of the manifests and `Cargo.lock`, and the node itself. A change of the code
+reuses the dependency layer (from the local build cache, and in the CI from the Actions cache, which stores layers but
+not BuildKit cache mounts); a change of `Cargo.toml` or `Cargo.lock` rebuilds both.
+
 A plain `docker build` builds for the host's own architecture. For another one, or both at once, use buildx
 with `--platform linux/amd64,linux/arm64`: the Rust and ffmpeg stages run on the build host and cross-compile
 (Debian's cross gcc), so only the small runtime stage needs QEMU (`docker run --privileged --rm tonistiigi/binfmt

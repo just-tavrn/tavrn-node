@@ -65,15 +65,34 @@ COPY web/dist/ /dist/
 FROM web-${TAVRN_WEB_SOURCE} AS web
 
 # ---- Build the server -----------------------------------------------------------
-# Runs on the build machine. For another target architecture it installs Debian's cross gcc and the Rust target
-# and writes /cross.env (cargo's target, linker and the C compiler of the -sys crates: ring, the bundled SQLite,
-# the vendored OpenSSL); for the host's own architecture there is no /cross.env and cargo builds natively.
-FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS server
-ARG BUILDARCH
-ARG TARGETARCH
+# Runs on the build machine. Two layers: the dependencies, compiled from cargo-chef's recipe (the manifests and
+# Cargo.lock only), then the node itself. A change under src/ reuses the dependency layer: from the local build cache,
+# and in GitHub-hosted runs from the Actions cache, which exports layers (the docker-publish workflow's cache-to), not
+# BuildKit cache mounts. The dependency layer holds the compiled crates and the crates.io sources, never a token: the
+# private git dependency is fetched into a cache mount (the token reaches git only through GIT_CONFIG_* variables of
+# the RUN), so no layer carries its checkout.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS chef
 WORKDIR /src
 # cargo fetches the private git dependency tavrn-crypto (and its protocol submodule) with the git CLI.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install --locked "cargo-chef@${CARGO_CHEF_VERSION}" \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+# The recipe: what the dependency build needs (manifests, Cargo.lock, the layout of the targets), without the code.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src src
+# The perf load generator is a workspace member; cargo needs its manifest even when it is not built.
+COPY perf/loadgen perf/loadgen
+RUN cargo chef prepare --recipe-path recipe.json
+
+# For another target architecture the server stage installs Debian's cross gcc and the Rust target and writes
+# /cross.env (cargo's target, linker and the C compiler of the -sys crates: ring, the bundled SQLite, the vendored
+# OpenSSL); for the host's own architecture there is no /cross.env and cargo builds natively.
+FROM chef AS server
+ARG BUILDARCH
+ARG TARGETARCH
 # Parallel compile jobs (empty: one per CPU); lower it on machines with little memory.
 ARG BUILD_JOBS=
 COPY rust-toolchain.toml ./
@@ -94,19 +113,32 @@ RUN set -eu; \
         echo "ELF_MACHINE='$machine'"; } > /cross.env; \
       cat /cross.env; \
     fi
+# The dependencies (cached until Cargo.toml or Cargo.lock change). cook gets the target explicitly: it removes the
+# placeholder build of the workspace's own crates from that target's directory afterwards.
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
+    --mount=type=cache,target=/usr/local/cargo/git,id=tavrn-node-cargo-git \
+    set -eu; \
+    token="$(cat /run/secrets/read_token 2>/dev/null || cat /run/secrets/TAVRN_WEB_TOKEN 2>/dev/null || true)"; \
+    if [ -n "$token" ]; then \
+      export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.https://x-access-token:${token}@github.com/just-tavrn/.insteadOf" \
+             GIT_CONFIG_VALUE_0="https://github.com/just-tavrn/"; \
+    fi; \
+    if [ -f /cross.env ]; then . /cross.env; fi; \
+    if [ -n "$BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$BUILD_JOBS"; fi; \
+    cargo chef cook --release --locked -p tavrn-node --recipe-path recipe.json ${CARGO_BUILD_TARGET:+--target "$CARGO_BUILD_TARGET"}
 COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY migrations migrations
 COPY templates templates
-# The perf load generator is a workspace member; cargo needs its manifest even when it is not built.
 COPY perf/loadgen perf/loadgen
 # Embed the web build (rust-embed).
 COPY --from=web /dist web/dist
 RUN test -f web/dist/index.html || { echo "no web client bundle (web/dist/index.html missing)" >&2; exit 1; }
+# The node itself. The touch makes cargo rebuild the workspace's crates whatever the files' times are (COPY keeps the
+# build context's modification times, which can be older than the dependency layer).
 RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target,id=tavrn-node-target-$TARGETARCH \
+    --mount=type=cache,target=/usr/local/cargo/git,id=tavrn-node-cargo-git \
     set -eu; \
     token="$(cat /run/secrets/read_token 2>/dev/null || cat /run/secrets/TAVRN_WEB_TOKEN 2>/dev/null || true)"; \
     if [ -n "$token" ]; then \
@@ -114,6 +146,7 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
              GIT_CONFIG_VALUE_0="https://github.com/just-tavrn/"; \
     fi; \
     ELF_MACHINE=; if [ -f /cross.env ]; then . /cross.env; fi; \
+    touch src/main.rs src/lib.rs; \
     cargo build --release --locked -p tavrn-node ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} \
     && cp "target/${CARGO_BUILD_TARGET:-.}/release/tavrn-node" /tavrn-node \
     && if [ -n "$ELF_MACHINE" ]; then file -b /tavrn-node && file -b /tavrn-node | grep -q "^ELF 64-bit LSB pie executable, $ELF_MACHINE,"; fi

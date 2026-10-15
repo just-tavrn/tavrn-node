@@ -40,7 +40,9 @@ First public release of the node and its container image.
   handbook and deployment examples (Docker Compose, reverse proxies).
 - **Container image for `linux/amd64` and `linux/arm64`**: one manifest list per tag (`edge` and the releases), so
   the node runs natively on ARM servers; the arm64 image is cross-compiled on the amd64 build host, and a plain
-  `docker build` still builds for the host's own architecture.
+  `docker build` still builds for the host's own architecture. The image's minimal ffmpeg is 8.1.3, the release the
+  tests run against (README.md "Tool versions"); the Rust dependencies are a layer of their own (cargo-chef), so a
+  build after a code change reuses them.
 - **Files channels on external stores only** (`TAVRN_FILES_INTERNAL=off`, protocol FILES.md §5): the node keeps no
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
