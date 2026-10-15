@@ -9,6 +9,8 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 First public release of the node and its container image.
 
+- **`tavrn-crypto` from crates.io** (0.1.0, the published crate) instead of a git revision; a git revision stays
+  the way to build against unreleased crypto changes (README.md "Building").
 - **Message components** (protocol APPLICATIONS.md §5.10, capability `components.v1`): buttons and select menus in
   bots' messages (refused in plaintext from people and webhooks, `400 message.components_invalid` with `meta.path`),
   `POST /conversations/{id}/messages/{message_id}/interactions` (permission `use_components`, bit 40, granted once

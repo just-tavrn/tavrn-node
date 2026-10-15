@@ -2,8 +2,8 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# tavrn-crypto is a private git dependency for now: let cargo fetch it with the git CLI, which uses your git
-# credentials (for example `gh auth setup-git`), see README.md "Building".
+# Git dependencies (an unreleased tavrn-crypto revision during development) are fetched with the git CLI, which
+# uses your git credentials (for example `gh auth setup-git`), see README.md "Building".
 export CARGO_NET_GIT_FETCH_WITH_CLI := "true"
 
 # LiveKit version the node is tested with (also pinned in deploy/Dockerfile and .github/workflows/ci.yml; `just tool-pins`)

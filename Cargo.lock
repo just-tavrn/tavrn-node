@@ -4932,7 +4932,8 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tavrn-crypto"
 version = "0.1.0"
-source = "git+https://github.com/just-tavrn/tavrn-crypto?rev=19ac87b4b42b13ec07e0eec5f8c17a2b47f70f37#19ac87b4b42b13ec07e0eec5f8c17a2b47f70f37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff97c66ebb266d2f06a72251e470a384ae132a737e0030e57bf85df210d9c86f"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.23.1",
