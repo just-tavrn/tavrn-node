@@ -5,14 +5,105 @@
 use crate::common;
 
 use axum::http::StatusCode;
-use common::test_node;
-use serde_json::json;
+use common::{Session, TestNode, test_node};
+use serde_json::{Value, json};
 use tavrn_node::{hub::Scope, permissions as p};
 
-const D: &str = "t.local";
+const DOMAIN: &str = "t.local";
+const D: &str = DOMAIN;
 
 fn mask(bits: &[u64]) -> String {
     bits.iter().fold(0u64, |a, b| a | b).to_string()
+}
+
+fn code(j: &Value) -> &str {
+    j["code"].as_str().unwrap_or("")
+}
+
+async fn room_with(node: &TestNode, owner: &Session, members: &[&Session]) -> (String, String) {
+    let room = node.plaintext_room(&owner.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel_id = TestNode::text_channel(&room);
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &owner.token, json!({})).await;
+    for m in members {
+        let (s, j) =
+            node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &m.token, json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+    }
+    (room_id, channel_id)
+}
+
+async fn role(node: &TestNode, owner: &str, room_id: &str, name: &str, bits: &[u64], position: i64) -> String {
+    let (s, role) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/roles"),
+            owner,
+            json!({ "name": name, "permissions": common::perms(bits), "position": position }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{role}");
+    role["id"].as_str().unwrap().to_string()
+}
+
+/// permissions.md "Hierarchy" says members only kick or ban members whose highest role is lower. A
+/// moderator cannot kick a bot that outranks them, and banning the bot's owner
+/// (who is not a member) would remove the bot too: that ban needs the rank over the bot.
+#[tokio::test]
+async fn banning_a_bot_owner_respects_the_bots_rank() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await; // room owner
+    let carol = node.register("carol").await; // moderator, low role
+    let dave = node.register("dave").await; // bot developer, not a member
+    let (room_id, _) = room_with(&node, &alice, &[&carol]).await;
+    // dave's public application, installed by alice.
+    let (s, app) = node.post("/api/v1/applications", &dave.token, json!({ "name": "Guard", "public": true })).await;
+    assert_eq!(s, StatusCode::CREATED, "{app}");
+    let bot_id = app["bot"]["id"].as_str().unwrap().to_string();
+    let (s, j) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/applications"),
+            &alice.token,
+            json!({ "application": format!("{DOMAIN}/{}", app["id"].as_str().unwrap()) }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let mods = role(&node, &alice.token, &room_id, "Mod", &[p::KICK_MEMBERS, p::BAN_MEMBERS], 1).await;
+    let high = role(&node, &alice.token, &room_id, "Guard", &[p::VIEW_CHANNEL], 5).await;
+    let (s, j) =
+        node.patch(&format!("/api/v1/rooms/{room_id}/members/{}", carol.user_id), &alice.token, json!({ "roles": [mods] })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) =
+        node.patch(&format!("/api/v1/rooms/{room_id}/members/{bot_id}"), &alice.token, json!({ "roles": [high] })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+
+    // Control: carol may not kick the bot (it outranks her).
+    let (s, j) = node.delete(&format!("/api/v1/rooms/{room_id}/members/{bot_id}"), &carol.token).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.hierarchy"), "{j}");
+    // Nor ban it by its own address.
+    let bot_address = format!("{}@{DOMAIN}", app["bot"]["username"].as_str().unwrap());
+    let (s, j) = node.post(&format!("/api/v1/rooms/{room_id}/bans"), &carol.token, json!({ "subject": bot_address })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.hierarchy"), "{j}");
+
+    // Nor through its owner's address (not a member, nothing to outrank of their own).
+    let (s, j) = node
+        .post(&format!("/api/v1/rooms/{room_id}/bans"), &carol.token, json!({ "subject": format!("dave@{DOMAIN}") }))
+        .await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.hierarchy"), "{j}");
+    let bans = node.get_auth(&format!("/api/v1/rooms/{room_id}/bans"), &alice.token).await.1;
+    assert_eq!(bans, json!([]), "no ban was written");
+    let still: Option<String> =
+        sqlx::query_scalar("SELECT user_id FROM room_members WHERE room_id = $1 AND user_id = $2")
+            .bind(&room_id)
+            .bind(&bot_id)
+            .fetch_optional(&node.state.db)
+            .await
+            .unwrap();
+    assert!(still.is_some(), "the bot stays");
+    // The owner of the room may.
+    let (s, j) = node
+        .post(&format!("/api/v1/rooms/{room_id}/bans"), &alice.token, json!({ "subject": format!("dave@{DOMAIN}") }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
 }
 
 #[tokio::test]

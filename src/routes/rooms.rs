@@ -1048,6 +1048,13 @@ pub async fn ban(
     access.require(p::BAN_MEMBERS, "member.ban_forbidden", "Ban members")?;
     let subject = req.subject.trim().to_lowercase();
     let reason = validate::text("reason", &req.reason, 0, 500)?;
+    // Banning an owner removes their bots from the room (APPLICATIONS.md §1.7): the actor must outrank each of them
+    // as for a ban of the bot itself (permissions.md "Hierarchy"), checked before anything changes.
+    for bot_id in store::applications::bots_of_owner_subject(&state.db, &subject).await? {
+        if store::rooms::member(&state.db, &room_id, &bot_id).await?.is_some() {
+            moderation_target(&state, &access, &bot_id).await?;
+        }
+    }
     if let Some((username, domain)) = util::parse_address(&subject) {
         if let Some(target) = store::users::by_username(&state.db, username, domain).await? {
             if let Some(member) = store::rooms::member(&state.db, &room_id, &target.id).await? {

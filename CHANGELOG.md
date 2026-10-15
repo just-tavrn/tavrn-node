@@ -145,6 +145,8 @@ First public release of the node and its container image.
 
 ### Security
 
+- Banning a bot's owner from a room needs the rank over each of the owner's bots in the room, as banning the bot
+  itself does.
 - A moderation bot never sees reports about its owner or the owner's other bots, in lists, single reads and events, as
   its owner would not.
 - One node may hold at most 500 entries of a bot's install index (of 10 000), so it can no longer fill the index and
