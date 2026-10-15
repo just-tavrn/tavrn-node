@@ -274,8 +274,10 @@ async fn entries_carry_records_and_the_node_stores_no_names() {
     .fetch_all(&s.node.state.db)
     .await
     .unwrap();
+    // Whole plaintext values, not fragments: a three-letter fragment like "pdf" turns up in base64 ciphertext by
+    // chance (one in a few hundred runs), a folder name or a MIME type does not.
     for (row,) in dump {
-        assert!(!row.contains("Board") && !row.contains("secret") && !row.contains("pdf"), "{row}");
+        assert!(!row.contains("Board secrets") && !row.contains(SECRET_NAME) && !row.contains("application/pdf"), "{row}");
     }
     // The node picks the storage id: client-chosen ids never name a stored file.
     let sid: String = sqlx::query_scalar("SELECT storage_id FROM file_entries WHERE id = $1")
