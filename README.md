@@ -138,6 +138,16 @@ Voice needs `livekit-server` next to the node (`just livekit-install`; without i
 `TAVRN_VOICE_ENABLED=false`), the media pipeline `ffmpeg` with libwebp (`just ffmpeg-install`). Tests that need
 them skip themselves with a message when they are missing; the CI installs both.
 
+Tool versions: livekit-server and ffmpeg are pinned in three places of this repository, the `justfile`
+(`livekit_version`, `just ffmpeg-install`), `.github/workflows/ci.yml` (the CI's tests) and `deploy/Dockerfile` (the
+image), and `scripts/check-tool-pins.sh` (part of `just check` and the CI's hygiene job) fails when they disagree. The
+rule: one LiveKit release everywhere, and one FFmpeg release for tests and production. The image builds that FFmpeg
+release from source with only what the media pipeline needs (`--disable-everything` plus an allow-list); the tests use
+BtbN's dated static build of the same release (`n<version>-<n>-g<commit>`, the release branch a few commits on), so a
+decoder or filter missing from the allow-list shows up in tavrn-web's nightly end-to-end run, which runs against the
+image's own ffmpeg. The organization's runner image (just-tavrn/.github, `runner/Dockerfile`) and tavrn-web's
+`just livekit-install` pin the same versions; bump them together.
+
 Tests: `just test` (SQLite) and `just test-pg` (PostgreSQL, and the cluster tests against Valkey) run the unit
 tests, the integration tests in `tests/` (one test binary, `tests/main.rs`), the protocol's test vectors from
 `protocol/testvectors/` and a comparison of the API specification generated from the routes with
@@ -175,6 +185,11 @@ of the build context instead. The token (secret `read_token`, or `TAVRN_WEB_TOKE
 needed while the repositories are private: cargo fetches `tavrn-crypto` with it and the web stage clones
 tavrn-web. It is never stored in the image. `just docker-build` wraps this (`just docker-build local`,
 `just docker-build git v0.1.0`).
+
+The Rust build is split in two layers with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef): the
+dependencies, compiled from a recipe of the manifests and `Cargo.lock`, and the node itself. A change of the code
+reuses the dependency layer (from the local build cache, and in the CI from the Actions cache, which stores layers but
+not BuildKit cache mounts); a change of `Cargo.toml` or `Cargo.lock` rebuilds both.
 
 A plain `docker build` builds for the host's own architecture. For another one, or both at once, use buildx
 with `--platform linux/amd64,linux/arm64`: the Rust and ffmpeg stages run on the build host and cross-compile
