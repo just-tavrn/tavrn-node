@@ -319,7 +319,7 @@ pub async fn purge_user(
             Ok(Json(PurgeUserResponse { dry_run: true, messages: count, confirm_token: Some(token) }))
         }
         Some(token) => {
-            let (_, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
+            let (claims, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
                 .map_err(|_| {
                     bad(
                         "moderation.confirm_invalid",
@@ -329,6 +329,7 @@ pub async fn purge_user(
             if extra.target != user_id {
                 return Err(bad("moderation.confirm_mismatch", "The target changed after the preview"));
             }
+            crate::routes::spend_confirmation(&state, &claims).await?;
             let deleted = crate::routes::messages::purge_with_blobs(&state, &filter).await?;
             store::rooms::audit(
                 &state.db,

@@ -515,6 +515,12 @@ impl Cluster {
         Ok(self.open(&key, &sealed).and_then(|plain| serde_json::from_slice(&plain).ok()))
     }
 
+    /// Marks `name` as used for `ttl`: `true` the first time, `false` for every later call (on any instance) until the
+    /// mark expires. For single-use tokens (the `jti` of a confirmation token, valid as long as the token).
+    pub async fn claim_once(&self, name: &str, ttl: Duration) -> CacheResult<bool> {
+        self.cache.lease(&self.key(&format!("used:{name}")), &crate::util::ulid(), ttl).await
+    }
+
     fn envelope(&self, msg: Message) -> String {
         serde_json::to_string(&Envelope { from: self.instance_id.clone(), msg }).unwrap_or_default()
     }
@@ -758,6 +764,17 @@ mod tests {
         assert_eq!(target_of("rediss://u:p@h.example"), "h.example");
         assert!(valid_instance_id("tavrn-1") && valid_instance_id("a.b_c"));
         assert!(!valid_instance_id("") && !valid_instance_id("a b") && !valid_instance_id(&"x".repeat(65)));
+    }
+
+    #[tokio::test]
+    async fn claims_hold_once_across_instances() {
+        let cache: Arc<dyn Cache> = Arc::new(memory::InProcess::default());
+        let a = Cluster::shared_with("x.test", "a", cache.clone(), &[1; 32], "");
+        let b = Cluster::shared_with("x.test", "b", cache, &[1; 32], "");
+        assert!(a.claim_once("jti-1", Duration::from_secs(60)).await.unwrap());
+        assert!(!a.claim_once("jti-1", Duration::from_secs(60)).await.unwrap(), "used");
+        assert!(!b.claim_once("jti-1", Duration::from_secs(60)).await.unwrap(), "used on another instance");
+        assert!(b.claim_once("jti-2", Duration::from_secs(60)).await.unwrap());
     }
 
     #[tokio::test]

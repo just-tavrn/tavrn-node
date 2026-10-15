@@ -383,3 +383,43 @@ async fn forgot_password_without_smtp_is_unavailable_in_production() {
     let j = common::body_json(resp).await;
     assert_eq!(j["code"], "mail.unavailable", "{j}");
 }
+
+/// An admin update is validated as a whole before anything is written: a refused request changes nothing (no
+/// account disabled, no session revoked, no admin right granted).
+#[tokio::test]
+async fn a_refused_user_update_changes_nothing() {
+    let node = test_node("t.local").await;
+    let admin = node.register("admin").await;
+    let bob = node.register("bob").await;
+    let path = format!("/api/v1/admin/users/{}", bob.user_id);
+    for body in [
+        json!({ "disabled": true, "node_admin": true, "room_creation_grant": 5000 }),
+        json!({ "disabled": true, "node_admin": true, "app_creation_grant": -1 }),
+    ] {
+        let (s, j) = node.patch(&path, &admin.token, body.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {j}");
+        let (_, users) = node.get_auth("/api/v1/admin/users?q=bob", &admin.token).await;
+        assert_eq!(
+            (users[0]["disabled"].clone(), users[0]["is_node_admin"].clone()),
+            (json!(false), json!(false)),
+            "{body}: {users}"
+        );
+        let (s, _) = node.get_auth("/api/v1/users/me", &bob.token).await;
+        assert_eq!(s, StatusCode::OK, "{body}: Bob's session is still live");
+    }
+}
+
+/// The confirmation token of a user purge deletes once.
+#[tokio::test]
+async fn a_user_purge_confirmation_is_single_use() {
+    let node = test_node("t.local").await;
+    let admin = node.register("admin").await;
+    let bob = node.register("bob").await;
+    let path = format!("/api/v1/admin/users/{}/purge", bob.user_id);
+    let (_, preview) = node.post(&path, &admin.token, json!({})).await;
+    let confirm = json!({ "confirm_token": preview["confirm_token"] });
+    let (s, j) = node.post(&path, &admin.token, confirm.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node.post(&path, &admin.token, confirm).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("moderation.confirm_invalid")), "{j}");
+}
