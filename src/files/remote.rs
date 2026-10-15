@@ -19,7 +19,7 @@ use reqwest::{Method, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
 
 use super::sigv4::{self, Signer};
-use crate::federation::client::{AddressForbidden, SystemLookup, VettingResolver, forbidden_ip};
+use crate::federation::client::{Precheck, SystemLookup, VettingResolver, forbidden_ip, is_address_forbidden};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// No byte for this long ends a transfer (large files may take long in total).
@@ -282,15 +282,16 @@ impl RemoteStore {
     /// The SSRF checks before every request: shape, then DNS (the resolver repeats it when connecting).
     async fn check_target(&self, url: &Url) -> Result<(), RemoteError> {
         check_url(url.as_str(), self.allow_private)?;
-        let host = url.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
-        if host.parse::<std::net::IpAddr>().is_ok() {
+        let host = url.host_str().unwrap_or("");
+        // IP literals passed the shape check above (`check_url`).
+        if host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok() {
             return Ok(());
         }
         let resolver = VettingResolver::new(Arc::new(SystemLookup), self.allow_private, HashSet::new());
-        match resolver.vetted(host).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.is::<AddressForbidden>() => Err(RemoteError::AddressForbidden),
-            Err(_) => Err(RemoteError::Unreachable),
+        match resolver.precheck(host).await {
+            Precheck::Allowed => Ok(()),
+            Precheck::Forbidden => Err(RemoteError::AddressForbidden),
+            Precheck::Unresolved => Err(RemoteError::Unreachable),
         }
     }
 
@@ -333,14 +334,7 @@ impl RemoteStore {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, RemoteError> {
         req.send().await.map_err(|e| {
             // The vetting resolver refused an address while connecting (DNS changed since the check).
-            let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
-            while let Some(s) = source {
-                if s.downcast_ref::<AddressForbidden>().is_some() {
-                    return RemoteError::AddressForbidden;
-                }
-                source = s.source();
-            }
-            RemoteError::Unreachable
+            if is_address_forbidden(&e) { RemoteError::AddressForbidden } else { RemoteError::Unreachable }
         })
     }
 

@@ -52,7 +52,7 @@ use crate::{
     cache::limiter::SharedLimiter,
     config::Config,
     error::ApiError,
-    federation::client::{AddressForbidden, Lookup, VettingResolver, forbidden_ip, user_agent},
+    federation::client::{Lookup, Precheck, VettingResolver, forbidden_ip, is_address_forbidden, user_agent},
     models::Message,
     store::{self, push::SubscriptionRow},
     util,
@@ -561,8 +561,7 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         if message.thread_id.is_some() && !direct && !followers.contains(&recipient.user_id) {
             continue;
         }
-        let Some(important) = settings.push_decision(room_id, &row.id, &now, direct, message.mentions_everyone)
-        else {
+        let Some(important) = settings.push_decision(room_id, &row.id, &now, direct, message.mentions_everyone) else {
             continue;
         };
         let kind = match (room_id, important) {
@@ -715,7 +714,13 @@ async fn deliver(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, t
 
 /// Sends one push and records a failure on the subscription and the outcome in the metrics; `true` when it was
 /// delivered (the caller records that, for many subscriptions at once).
-async fn deliver_one(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl: u32, topic: Option<&str>) -> bool {
+async fn deliver_one(
+    state: &AppState,
+    s: &SubscriptionRow,
+    payload: &PushPayload,
+    ttl: u32,
+    topic: Option<&str>,
+) -> bool {
     let outcome = send(state, s, payload, ttl, topic).await;
     let db = &state.db;
     let result = match outcome {
@@ -754,11 +759,10 @@ async fn send(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl:
     let Ok(url) = push.check_endpoint(&s.endpoint) else { return Outcome::Gone };
     let Some(host) = url.host_str() else { return Outcome::Gone };
     // Vet the addresses before connecting (the resolver of the client vets them again for the connection itself).
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if bare.parse::<std::net::IpAddr>().is_err()
-        && let Err(e) = push.resolver.vetted(bare).await
-    {
-        return if e.is::<AddressForbidden>() { Outcome::Failed } else { Outcome::Retry { retry_after: None } };
+    match push.resolver.precheck(host).await {
+        Precheck::Allowed => {}
+        Precheck::Forbidden => return Outcome::Failed,
+        Precheck::Unresolved => return Outcome::Retry { retry_after: None },
     }
     let plaintext = match serde_json::to_vec(&PushPayload { v: 1, ..payload.clone() }) {
         Ok(p) => p,
@@ -804,16 +808,8 @@ async fn send(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl:
                 }
             }
         }
-        Err(e) => {
-            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
-            while let Some(err) = source {
-                if err.downcast_ref::<AddressForbidden>().is_some() {
-                    return Outcome::Failed;
-                }
-                source = err.source();
-            }
-            Outcome::Retry { retry_after: None }
-        }
+        Err(e) if is_address_forbidden(&e) => Outcome::Failed,
+        Err(_) => Outcome::Retry { retry_after: None },
     }
 }
 
