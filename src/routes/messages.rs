@@ -363,10 +363,9 @@ fn validate_preview(preview: &Value) -> Result<(), ApiError> {
         )
     };
     let obj = preview.as_object().ok_or_else(invalid)?;
-    let text = |key: &str, max: usize| match obj.get(key) {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => s.chars().count() <= max,
-        Some(_) => false,
+    let text = |key: &str, max: usize| {
+        let rules = crate::validate::TextRules { min: 0, max, trim: false, controls: true };
+        crate::validate::json_text(obj.get(key), rules).is_ok()
     };
     let url = obj.get("url").and_then(Value::as_str).ok_or_else(invalid)?;
     let url_ok = url.len() <= 2048 && (url.starts_with("https://") || url.starts_with("http://"));
