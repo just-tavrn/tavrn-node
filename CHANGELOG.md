@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- Room auto-moderation rules are matched off the request threads within a fixed work budget per message, and the
+  matcher skips the starts of a term that cannot match, so crafted rules and messages no longer cost seconds of CPU
+  per message; a message that would need more work than the budget is refused with `403 automod.blocked`.
 - Auto-moderation `delete` and `timeout` rules act only on members ranked below the member who last saved the rules
   (the rank is recorded with them), so a low-ranked room manager can no longer time out or silence higher moderators
   through a rule.

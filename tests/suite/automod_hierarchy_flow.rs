@@ -4,7 +4,10 @@
 //! at once), its rules reach only members their author outranks, and matching stays cheap for crafted rules and text.
 use crate::common;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use common::{Session, TestNode, test_node};
@@ -162,4 +165,47 @@ async fn automod_rules_reach_only_members_their_author_outranks() {
     let (s, j) = node.send(&bob.token, &room_id, &channel, "hello again").await;
     assert_eq!(s, StatusCode::CREATED, "{j}");
     assert!(timeout_of(bob.user_id.clone()).await.is_some(), "the owner outranks bob");
+}
+
+/// Crafted room rules (20 × 500 two-literal wildcard terms) and a crafted 60 KB message of a custom type cost about
+/// as much as an ordinary message: the matcher never walks every start of a literal for every term.
+#[tokio::test]
+async fn crafted_rules_and_text_stay_cheap() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let mallory = node.register("mallory").await;
+    let (room_id, channel) = room_with(&node, &alice, &[&mallory]).await;
+    let alpha: Vec<char> = "bcdefghijklmnopqrstuvwxyz".chars().collect();
+    let mut pairs = Vec::new();
+    for x in &alpha {
+        for y in &alpha {
+            pairs.push(format!("{x}{y}"));
+        }
+    }
+    let terms: Vec<String> = pairs.iter().take(500).map(|p| format!("a*{p}")).collect();
+    let rules: Vec<Value> = (0..20)
+        .map(|i| json!({ "name": format!("r{i}"), "terms": terms, "whole_word": false, "action": "block" }))
+        .collect();
+    let (s, j) = node.put(&format!("/api/v1/rooms/{room_id}/automod"), &alice.token, json!({ "rules": rules })).await;
+    assert_eq!(s, StatusCode::OK, "{}", code(&j));
+    let url = format!("/api/v1/conversations/{channel}/messages");
+    let (s, j) = node.post(&url, &mallory.token, json!({ "content": { "type": "text", "body": "hi" } })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let head: String = pairs.iter().take(500).map(|p| format!("{p} ")).collect();
+    // One long run of the first literal; spaced-out runs of it.
+    let blobs =
+        [format!("{head}{}", "a".repeat(60_000 - head.len())), format!("{head}{}", "a ".repeat(30_000 - head.len() / 2))];
+    for blob in blobs {
+        let started = Instant::now();
+        let (s, j) = node.post(&url, &mallory.token, json!({ "content": { "type": "note", "x": blob } })).await;
+        let took = started.elapsed();
+        assert_eq!(s, StatusCode::CREATED, "{}", code(&j));
+        assert!(took < common::timeout(Duration::from_secs(2)), "a crafted message took {took:?}");
+    }
+    // Matching still works: a term in a long run of its first literal.
+    let blob = format!("{}xy{}", "a".repeat(30_000), "a".repeat(10));
+    let rules = json!({ "rules": [{ "name": "r", "terms": ["a*xy"], "action": "block" }] });
+    node.put(&format!("/api/v1/rooms/{room_id}/automod"), &alice.token, rules).await;
+    let (s, j) = node.post(&url, &mallory.token, json!({ "content": { "type": "note", "x": blob } })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "automod.blocked"), "{j}");
 }
