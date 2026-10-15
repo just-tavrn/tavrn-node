@@ -945,6 +945,33 @@ pub async fn shared_rooms(db: &Pool, a: &str, b: &str) -> Result<Vec<(String, St
     rows.iter().map(|r| Ok((r.try_get("id")?, r.try_get("name")?))).collect()
 }
 
+/// The rooms `a` shares with each of `others` (other user id → `(id, name)` ordered by name; users without a shared
+/// room are absent), with one query per [`super::IN_CHUNK`] users.
+pub async fn shared_rooms_with(
+    db: &Pool,
+    a: &str,
+    others: &[String],
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, ApiError> {
+    let mut out: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    for chunk in others.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT m2.user_id AS user_id, r.id AS id, r.name AS name FROM rooms r
+             JOIN room_members m1 ON m1.room_id = r.id AND m1.user_id = $1
+             JOIN room_members m2 ON m2.room_id = r.id AND m2.user_id IN ({})
+             ORDER BY r.name",
+            super::placeholders(2, chunk.len())
+        );
+        let mut q = sqlx::query(&sql).bind(a);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.entry(r.try_get::<String, _>("user_id")?).or_default().push((r.try_get("id")?, r.try_get("name")?));
+        }
+    }
+    Ok(out)
+}
+
 /// Rooms a user is a member of (ids).
 pub async fn room_ids_of_user(db: &Pool, user_id: &str) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query("SELECT room_id FROM room_members WHERE user_id = $1").bind(user_id).fetch_all(db).await?;

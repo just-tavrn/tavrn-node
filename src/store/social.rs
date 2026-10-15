@@ -495,6 +495,69 @@ pub async fn last_message_id(db: &Pool, conversation_id: &str) -> Result<Option<
     Ok(row.try_get::<Option<String>, _>("m")?)
 }
 
+/// A member of a conversation in [`members_of`]: user id and whether they have not accepted it yet.
+pub struct ConvMember {
+    pub user_id: String,
+    pub requested: bool,
+}
+
+/// The members of several conversations (conversation id → members in the order of [`member_ids`]), with one query
+/// per [`super::IN_CHUNK`] conversations.
+pub async fn members_of(
+    db: &Pool,
+    conversation_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<ConvMember>>, ApiError> {
+    let mut out: std::collections::HashMap<String, Vec<ConvMember>> = std::collections::HashMap::new();
+    for chunk in conversation_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT conversation_id, user_id, state FROM conversation_members WHERE conversation_id IN ({})
+             ORDER BY conversation_id, joined_at, user_id",
+            super::placeholders(1, chunk.len())
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            out.entry(r.try_get::<String, _>("conversation_id")?).or_default().push(ConvMember {
+                user_id: r.try_get("user_id")?,
+                requested: r.try_get::<String, _>("state")? == STATE_REQUESTED,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The newest (`newest`) or oldest message id of several conversations (conversation id → message id; conversations
+/// without messages are absent): one indexed lookup per conversation (`messages(conversation_id, id)`), one query
+/// per [`super::IN_CHUNK`] conversations.
+pub async fn edge_message_ids(
+    db: &Pool,
+    conversation_ids: &[String],
+    newest: bool,
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
+    let order = if newest { "DESC" } else { "ASC" };
+    let mut out = std::collections::HashMap::new();
+    for chunk in conversation_ids.chunks(super::IN_CHUNK) {
+        let sql = format!(
+            "SELECT c.id AS conversation_id,
+                    (SELECT m.id FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id {order} LIMIT 1) AS message_id
+             FROM conversations c WHERE c.id IN ({})",
+            super::placeholders(1, chunk.len())
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for r in q.fetch_all(db).await? {
+            if let Some(m) = r.try_get::<Option<String>, _>("message_id")? {
+                out.insert(r.try_get::<String, _>("conversation_id")?, m);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Users who share a DM or group DM with `user_id` (for `identity.changed`).
 pub async fn contact_ids(db: &Pool, user_id: &str) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(
