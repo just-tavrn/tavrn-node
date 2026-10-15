@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Routes of application commands (protocol/APPLICATIONS.md §5): definitions (owner and bot), the node
 //! approval (admins), per-room settings (`manage_applications`), the `/` palette, invocations, callbacks and
-//! follow-ups. The logic lives in `crate::commands` and `crate::interactions`.
+//! follow-ups, and the message components of §5.10 (component interactions, modal submits). The logic lives in
+//! `crate::commands`, `crate::components` and `crate::interactions`.
 
 use axum::{
     Json, Router,
@@ -24,7 +25,10 @@ use crate::{
     },
     error::{ApiError, ApiJson, ProblemDetails},
     installations,
-    interactions::{self, Callback, EphemeralReply, FollowUp, FollowUpResponse, InvokeRequest, InvokeResponse},
+    interactions::{
+        self, Callback, ComponentInvokeRequest, EphemeralReply, FollowUp, FollowUpResponse, InvokeRequest,
+        InvokeResponse, ModalSubmitRequest,
+    },
     routes::applications::{bot_context, owned, require_person},
     store,
 };
@@ -40,6 +44,14 @@ pub fn routes() -> Router<AppState> {
         .route("/conversations/{conversation_id}/interactions", post(invoke).layer(small()))
         .route("/interactions/{interaction_id}/callback", post(callback).layer(answer()))
         .route("/interactions/{interaction_id}/messages", post(follow_up).layer(answer()))
+        .route(
+            "/conversations/{conversation_id}/messages/{message_id}/interactions",
+            post(invoke_component).layer(small()),
+        )
+        .route(
+            "/interactions/{interaction_id}/submit",
+            post(submit_interaction).layer(DefaultBodyLimit::max(crate::components::MAX_SUBMIT_BYTES)),
+        )
         .route("/rooms/{room_id}/commands", get(room_commands))
         .route(
             "/rooms/{room_id}/commands/{command_ref}",
@@ -62,6 +74,8 @@ pub fn routes() -> Router<AppState> {
         invoke,
         callback,
         follow_up,
+        invoke_component,
+        submit_interaction,
         room_commands,
         put_room_command,
         reset_room_command,
@@ -80,6 +94,8 @@ pub fn routes() -> Router<AppState> {
         PaletteApplication,
         InvokeRequest,
         InvokeResponse,
+        ComponentInvokeRequest,
+        ModalSubmitRequest,
         EphemeralReply,
         Callback,
         FollowUp,
@@ -214,8 +230,49 @@ pub async fn invoke(
     Ok(Json(interactions::invoke(&state, &auth, &conv, req, language).await?))
 }
 
-/// The application's first response to an interaction (app token with the `commands` scope): `reply`,
-/// `defer` or `error`. Only the first response counts; after 3 seconds it is `410 interaction.expired`.
+/// Use a button or select menu of an application's message (APPLICATIONS.md §5.10.2; `use_components`); waits at
+/// most 3 seconds for the application's first response, which may open a modal.
+#[utoipa::path(post, path = "/api/v1/conversations/{conversation_id}/messages/{message_id}/interactions", security(("bearer" = [])),
+    params(("conversation_id" = String, Path), ("message_id" = String, Path)), request_body = ComponentInvokeRequest,
+    responses((status = 200, body = InvokeResponse), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 410, body = ProblemDetails),
+        (status = 429, body = ProblemDetails), (status = 503, body = ProblemDetails), (status = 504, body = ProblemDetails)))]
+pub async fn invoke_component(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<ComponentInvokeRequest>,
+) -> Result<Json<InvokeResponse>, ApiError> {
+    if auth.user.is_bot() || auth.app.is_some() {
+        return Err(apps::bot_forbidden());
+    }
+    let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
+    let language = headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok());
+    Ok(Json(interactions::invoke_component(&state, &auth, &conv, &message_id, req, language).await?))
+}
+
+/// Submit the modal an application answered an interaction with (APPLICATIONS.md §5.10.4; the invoker only, once);
+/// waits at most 3 seconds for the application's first response.
+#[utoipa::path(post, path = "/api/v1/interactions/{interaction_id}/submit", security(("bearer" = [])),
+    params(("interaction_id" = String, Path)), request_body = ModalSubmitRequest,
+    responses((status = 200, body = InvokeResponse), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails), (status = 409, body = ProblemDetails), (status = 410, body = ProblemDetails),
+        (status = 429, body = ProblemDetails), (status = 503, body = ProblemDetails), (status = 504, body = ProblemDetails)))]
+pub async fn submit_interaction(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<ModalSubmitRequest>,
+) -> Result<Json<InvokeResponse>, ApiError> {
+    let language = headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok());
+    Ok(Json(interactions::submit_modal(&state, &auth, &id, req, language).await?))
+}
+
+/// The application's first response to an interaction (app token with the `commands` scope): `reply`, `defer`,
+/// `error`, `update` (component interactions) or `modal`. Only the first response counts; after 3 seconds it is
+/// `410 interaction.expired`.
 #[utoipa::path(post, path = "/api/v1/interactions/{interaction_id}/callback", security(("bearer" = [])),
     params(("interaction_id" = String, Path)), request_body = Callback,
     responses((status = 200, body = InvokeResponse), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails),

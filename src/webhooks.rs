@@ -411,6 +411,8 @@ async fn check_payload(
     }
     let hosts = state.gifs.as_ref().map(|g| g.allowed_hosts()).unwrap_or(&[]);
     let v = crate::routes::messages::validate_content(hosts, false, &payload.content, &payload.mentions)?;
+    // Webhooks never carry components (APPLICATIONS.md §5.10.1): nothing could answer their interactions.
+    crate::components::refuse_unless_bot(&payload.content, false)?;
     let mentions = member_mentions(state, &webhook.room_id, &v.mentions).await?;
     if payload.mentions_everyone && webhook.allow_mentions_everyone == 0 {
         return Err(ApiError::Forbidden {

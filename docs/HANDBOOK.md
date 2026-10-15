@@ -430,6 +430,7 @@ Bot tokens are a single factor: rooms, categories and channels can be declared "
 | `TAVRN_APPS_FEDERATE` | `true` | This node's bots may obtain federation tokens for other nodes. |
 | `TAVRN_APP_ALLOW_PRIVATE_URLS` | `false` (`--dev`: `true`) | Application URLs (interactions URL, event subscriptions) on private or loopback addresses (intranets; turns the SSRF protection off for them). |
 | `TAVRN_APP_COMMANDS_REQUIRE_APPROVAL` | `false` | Node admins approve every application command definition before it is offered in this node's rooms (a changed definition is pending again). |
+| `TAVRN_COMPONENT_MAX_AGE_DAYS` | `30` | Buttons and select menus of application messages older than this many days answer `410 component.expired` (0 = no limit, at most 3650). |
 | `TAVRN_WEBHOOKS_ENABLED` | `true` | Incoming webhooks; `false` refuses creation and execution (`webhook.disabled`). |
 | `TAVRN_WEBHOOKS_PER_CHANNEL` | `10` | Webhooks per channel (1–50; a room has at most 50). |
 
@@ -1711,6 +1712,11 @@ a deferred command's follow-ups still arrive, and a callback within the 3 second
 The interactions URL (§6.3) is called by the owner itself and needs nothing of this. Without `TAVRN_CACHE_URL` the
 interactions stay in memory, and a restart loses them.
 
+Component interactions and modal submits (APPLICATIONS.md §5.10) are interactions of the same kind and travel the
+same way (`Invoke` carries the event name: `command.invoke`, `component.invoke` or `modal.submit`). A modal an
+application answers with is kept sealed next to its interaction (`interaction-modal:<id>`) and its one submit is a
+lease (`interaction-submitted:<id>`), so any instance takes the submit and a second one is refused everywhere.
+
 ### Audit of the in-memory state
 
 "Per instance" means each instance keeps its own copy and that is correct (or acceptable, with the reason);
@@ -1839,6 +1845,17 @@ What the operator decides:
   see [Mail languages and templates](#mail-languages-and-templates)).
 - **Command review**: `TAVRN_APP_COMMANDS_REQUIRE_APPROVAL=true` makes node admins approve every command definition
   (and every change of one) before it is offered in this node's rooms.
+- **Buttons, select menus and forms** (message components, `components.v1`): applications put them into their own
+  messages; clicking, choosing and submitting forms are interactions like commands (the same rate limit of 5 per 5
+  seconds and user, the same delivery to the bot). The node refuses components in plaintext messages of people and
+  webhooks, so nobody can fake an application's buttons, and accepts interactions only on messages of a bot whose
+  application is still installed. `TAVRN_COMPONENT_MAX_AGE_DAYS` (default 30, 0 = no limit) ends them on old
+  messages. Members need the permission *Use buttons and menus of apps* (`use_components`, bit 40, channel-scoped,
+  everyone by default; at the first start with this release granted once to every role holding *Send messages*,
+  marker `fixup.use_components`); it does not need *Send messages*, so announcement channels can carry sign-up
+  buttons. In encrypted channels the values people send are end-to-end encrypted to the bot; the node sees which
+  component of which message was used. Forms an application opens are kept with their interaction (15 minutes) and
+  never stored.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and
   `TAVRN_FEDERATION_REMOTE_BOTS` (other nodes' bots may act here), both on by default.
 - **Outbound requests**: the node calls applications' interactions URLs and event subscription endpoints. They must

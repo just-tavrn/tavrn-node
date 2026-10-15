@@ -9,6 +9,12 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 First public release of the node and its container image.
 
+- **Message components** (protocol APPLICATIONS.md §5.10, capability `components.v1`): buttons and select menus in
+  bots' messages (refused in plaintext from people and webhooks, `400 message.components_invalid` with `meta.path`),
+  `POST /conversations/{id}/messages/{message_id}/interactions` (permission `use_components`, bit 40, granted once
+  to every role with *Send messages*, marker `fixup.use_components`), the callback types `update` and `modal`,
+  `POST /interactions/{id}/submit`, events `component.invoke` and `modal.submit`, `message_id` on ephemeral replies,
+  and `TAVRN_COMPONENT_MAX_AGE_DAYS` (default 30, 0 = no limit).
 - **Performance and observability**: the database pool keeps 2 PostgreSQL connections open while idle, closes
   further idle ones after 30 minutes and pings a connection only after 30 seconds of idleness (the first requests
   after a quiet period no longer pay a new connection, and no request pays a ping); a role save is one statement

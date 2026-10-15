@@ -197,12 +197,15 @@ pub enum Message {
     Voice {
         effect: VoiceEffect,
     },
-    /// A command invocation for a receiving connection of `bot` on `instance` (APPLICATIONS.md §5.6); `data` is
-    /// the `command.invoke` event data. The sender owns the pending interaction.
+    /// An interaction for a receiving connection of `bot` on `instance` (APPLICATIONS.md §5.6, §5.10); `data` is
+    /// the data of the event `event` (`command.invoke`, `component.invoke` or `modal.submit`; empty from senders
+    /// before components: `command.invoke`). The sender owns the pending interaction.
     Invoke {
         instance: String,
         bot: String,
         data: String,
+        #[serde(default)]
+        event: String,
     },
 }
 
@@ -684,9 +687,9 @@ pub async fn dispatch(state: &AppState, payload: &str) {
                 state.app_connections.replace_local(&token, id);
             }
         }
-        Message::Invoke { instance, bot, data } => {
+        Message::Invoke { instance, bot, data, event } => {
             if instance == cluster.instance_id {
-                crate::interactions::deliver_from_bus(state, &bot, &data);
+                crate::interactions::deliver_from_bus(state, &bot, &event, &data);
             }
         }
         Message::Voice { effect } => {
@@ -791,7 +794,12 @@ mod tests {
             },
             Message::Wake { job: Job::Outbox },
             Message::PresenceConn { user: "u".into(), devices: HashMap::from([("d".into(), 2)]) },
-            Message::Invoke { instance: "i1".into(), bot: "b".into(), data: "{\"interaction_id\":\"x\"}".into() },
+            Message::Invoke {
+                instance: "i1".into(),
+                bot: "b".into(),
+                data: "{\"interaction_id\":\"x\"}".into(),
+                event: "component.invoke".into(),
+            },
         ];
         for m in msgs {
             let json = serde_json::to_string(&m).unwrap();
