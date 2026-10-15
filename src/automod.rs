@@ -904,12 +904,7 @@ pub async fn remove(
     );
     if let (Some(minutes), Some(room_id)) = (hit.timeout_minutes.filter(|_| hit.action == "timeout"), conv.room_id()) {
         let until = util::in_seconds(minutes * 60);
-        store::rooms::set_timeout(&state.db, room_id, &author.id, Some(&until)).await?;
-        let (room, user) = (room_id.to_string(), author.id.clone());
-        crate::voice::spawn_effect(
-            state,
-            move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await },
-        );
+        crate::routes::rooms::set_timeout_announced(state, room_id, &author.id, Some(&until)).await?;
     }
     alert(state, conv, author, hit, Some(message_id)).await;
     Ok(())

@@ -145,6 +145,8 @@ First public release of the node and its container image.
 
 ### Security
 
+- Auto-moderation timeouts (keyword rules and the flood limit) publish `member.update` like a moderator's timeout, so
+  clients learn them and ephemeral events and typing are refused at once.
 - Several instances: when events may have been lost on the cache bus, an instance drops its channel visibility
   snapshots and every WebSocket reloads the rooms it receives, so a membership whose `member.leave` was lost no longer
   receives the room's events.

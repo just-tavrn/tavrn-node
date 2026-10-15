@@ -982,18 +982,9 @@ pub async fn timeout_member(
     let target = moderation_target(&state, &access, &user_id).await?;
     let minutes = validate::range("minutes", req.minutes, 0, 60 * 24 * 28)?;
     let until = (minutes > 0).then(|| util::in_seconds(minutes * 60));
-    let member = store::rooms::member(&state.db, &room_id, &user_id)
+    let member = set_timeout_announced(&state, &room_id, &user_id, until.as_deref())
         .await?
         .ok_or_else(|| access::not_found("Member", "member.not_found"))?;
-    store::rooms::set_timeout(&state.db, &room_id, &user_id, until.as_deref()).await?;
-    if minutes > 0 {
-        // Members in timeout keep only `view_channel`: they leave voice too.
-        let (room, user) = (room_id.clone(), user_id.clone());
-        crate::voice::spawn_effect(
-            &state,
-            move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await },
-        );
-    }
     store::rooms::audit(
         &state.db,
         Some(&room_id),
@@ -1004,17 +995,35 @@ pub async fn timeout_member(
         serde_json::json!({ "minutes": minutes }),
     )
     .await?;
-    let member = to_member(&state, &room_id, &crate::models::MemberRow { timeout_until: until, ..member })
-        .await?
-        .ok_or_else(|| access::not_found("Member", "member.not_found"))?;
+    Ok(Json(member))
+}
+
+/// Sets (`Some`) or lifts (`None`) a member's timeout, whoever decides it (a moderator, auto-moderation), and
+/// announces it like every change of a member: `member.update`, which also drops the room's visibility snapshot,
+/// so ephemeral events and typing are refused at once. Members in timeout keep only `view_channel`: they leave
+/// voice too. `None` when the user is not a member.
+pub(crate) async fn set_timeout_announced(
+    state: &AppState,
+    room_id: &str,
+    user_id: &str,
+    until: Option<&str>,
+) -> Result<Option<Member>, ApiError> {
+    let Some(row) = store::rooms::member(&state.db, room_id, user_id).await? else { return Ok(None) };
+    store::rooms::set_timeout(&state.db, room_id, user_id, until).await?;
+    if until.is_some() {
+        let (room, user) = (room_id.to_string(), user_id.to_string());
+        crate::voice::spawn_effect(state, move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await });
+    }
+    let row = crate::models::MemberRow { timeout_until: until.map(String::from), ..row };
+    let Some(member) = to_member(state, room_id, &row).await? else { return Ok(None) };
     crate::subscriptions::room_event(
-        &state,
-        &room_id,
+        state,
+        room_id,
         "member.update",
         serde_json::json!({ "room_id": room_id, "member": member }),
     )
     .await;
-    Ok(Json(member))
+    Ok(Some(member))
 }
 
 // ---------------------------------------------------------------- Bans

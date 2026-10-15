@@ -19,6 +19,7 @@ mod suite {
     mod auth_flow;
     mod authz_audit;
     mod automod_content_flow;
+    mod automod_hierarchy_flow;
     mod backups_flow;
     mod blob_deletion_flow;
     mod bot_files_flow;

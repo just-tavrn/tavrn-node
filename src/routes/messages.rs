@@ -796,7 +796,9 @@ async fn automod_check(
     let deleted = purge_with_blobs(state, &filter).await?;
     let minutes = i64::from(state.config.automod_timeout_minutes);
     let until = (minutes > 0).then(|| util::in_seconds(minutes * 60));
-    store::rooms::set_timeout(&state.db, &access.room.id, &user.id, until.as_deref()).await?;
+    if until.is_some() {
+        crate::routes::rooms::set_timeout_announced(state, &access.room.id, &user.id, until.as_deref()).await?;
+    }
     store::rooms::audit(&state.db, Some(&access.room.id), None, "automod.spam", &user.address(), "Message flood", serde_json::json!({ "channel_id": channel.id, "deleted": deleted, "window_secs": AUTOMOD_WINDOW_SECS, "timeout_minutes": minutes })).await?;
     state.hub.room(&access.room.id, "message.purge", serde_json::json!({ "room_id": access.room.id, "conversation_ids": [channel.id], "author_id": user.id, "from": since, "to": Value::Null, "deleted": deleted }));
     let mut recipients = store::rooms::moderator_ids(&state.db, &access.room.id).await?;
