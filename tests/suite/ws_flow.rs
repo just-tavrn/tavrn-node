@@ -133,9 +133,13 @@ async fn events_flow_to_room_members_only() {
         ))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let marker = tavrn_node::store::messages::read_marker(&node.state.db, &channel_id, &bob.user_id).await.unwrap();
-    assert_eq!(marker.as_deref(), msg["id"].as_str());
+    // The connection handles the ack in its own task: wait for it instead of a fixed delay.
+    let read = msg["id"].as_str().unwrap().to_string();
+    common::wait_until(Duration::from_secs(5), "the ack sets the read marker", || async {
+        tavrn_node::store::messages::read_marker(&node.state.db, &channel_id, &bob.user_id).await.unwrap().as_deref()
+            == Some(read.as_str())
+    })
+    .await;
 }
 
 pub(crate) async fn hello(url: &str, token: &str) -> Socket {

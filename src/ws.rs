@@ -232,21 +232,14 @@ async fn run(state: AppState, mut socket: WebSocket) {
                         // metadata only to those it is listed to, and what they gained or lost (PROTOCOL.md §6).
                         if relevant && let Scope::Room(room_id) = &ev.scope {
                             let delivery = visible.deliver(&state, room_id, &ev.kind, &ev.data, &auth.user.id).await;
-                            let mut closed = false;
-                            for frame in delivery.before {
-                                if sink.send(WsMessage::Text(frame.into())).await.is_err() {
-                                    closed = true;
-                                    break;
-                                }
-                            }
-                            if closed {
+                            // Serialized once in `Hub::publish`; this clone only bumps a reference count.
+                            let event = delivery.event.then(|| ev.frame.clone());
+                            let frames = delivery.before.into_iter().map(Into::into).chain(event).chain(delivery.after.into_iter().map(Into::into));
+                            if send_all(&mut sink, frames).await.is_err() {
                                 break;
                             }
-                            if !delivery.event {
-                                continue;
-                            }
+                            continue;
                         }
-                        // Serialized once in `Hub::publish`; this clone only bumps a reference count.
                         if relevant && sink.send(WsMessage::Text(ev.frame.clone())).await.is_err() {
                             break;
                         }
@@ -284,6 +277,20 @@ async fn run(state: AppState, mut socket: WebSocket) {
             }
         }
     }
+}
+
+/// Sends the frames in order; fails when the connection is closed.
+async fn send_all<S>(
+    sink: &mut S,
+    frames: impl IntoIterator<Item = axum::extract::ws::Utf8Bytes>,
+) -> Result<(), S::Error>
+where
+    S: futures::Sink<WsMessage> + Unpin,
+{
+    for frame in frames {
+        sink.send(WsMessage::Text(frame)).await?;
+    }
+    Ok(())
 }
 
 /// `false` once a local user's device has no live session any more or the account is disabled (checked at every

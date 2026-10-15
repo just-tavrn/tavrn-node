@@ -1405,7 +1405,11 @@ async fn authz_losing_connect_ends_the_voice_session() {
     assert_eq!(v.join(&v.alice).await.0, StatusCode::OK);
     v.connected(&v.alice).await;
     v.override_everyone(&v.voice_id, &[], &[p::CONNECT]).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The voice watcher ends the session in the background: wait for it instead of a fixed delay.
+    common::wait_until(Duration::from_secs(5), "bob's session ends", || async {
+        v.participants(&v.alice).await.len() <= 1
+    })
+    .await;
     let left: Vec<Value> = v.participants(&v.alice).await;
     assert_eq!(left.len(), 1, "the owner stays: {left:?}");
     assert_eq!(left[0]["identity"], v.identity(&v.alice));
