@@ -764,12 +764,14 @@ impl Default for Config {
 }
 
 /// A URL as `check-config`, logs and error messages show it: the password of `user:password@` and the values of
-/// query parameters that carry secrets (`password=`, `…token=`, `…key=`, `…secret=`) become `***`. A password with
-/// an unencoded `@` is covered too (everything up to the last `@` is the user information).
+/// query parameters that carry secrets (`password=`, `…token=`, `…key=`, `…secret=`) become `***`. The user
+/// information ends at the last `@` before the path, query or fragment, so a password with an unencoded `@` is
+/// covered, and an `@` in a query value is not taken for one.
 pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let (userinfo, rest) = match rest.rsplit_once('@') {
-        Some((info, host)) => (Some(info), host),
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, rest) = match rest[..authority_end].rfind('@') {
+        Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
         None => (None, rest),
     };
     let (before_fragment, fragment) = match rest.split_once('#') {
@@ -982,7 +984,7 @@ impl Config {
         if let Some(url) = self.smtp_url.as_deref().map(str::trim).filter(|u| !u.is_empty())
             && crate::mail::SmtpSettings::parse(url).is_none()
         {
-            problems.push(format!("TAVRN_SMTP_URL='{url}' is invalid (smtp://, smtps:// or smtp+starttls://host:port, optionally user:pass@)"));
+            problems.push(format!("TAVRN_SMTP_URL='{}' is invalid (smtp://, smtps:// or smtp+starttls://host:port, optionally user:pass@)", redact_url(url)));
         }
         if let Some(from) = self.smtp_from.as_deref().map(str::trim).filter(|f| !f.is_empty())
             && from.parse::<lettre::message::Mailbox>().is_err()
@@ -3173,8 +3175,25 @@ mod tests {
             ("redis://:pw@valkey:6379/1", "redis://:***@valkey:6379/1"),
             ("sqlite://data-dev/tavrn.db?mode=rwc", "sqlite://data-dev/tavrn.db?mode=rwc"),
             ("sqlite::memory:", "sqlite::memory:"),
+            ("postgres://tavrn@db/tavrn?password=p@ssw0rd", "postgres://tavrn@db/tavrn?password=***"),
+            ("postgres://db?password=p@ss#x", "postgres://db?password=***#x"),
+            ("smtps://mailer:pw@mail.example.org:465", "smtps://mailer:***@mail.example.org:465"),
         ] {
             assert_eq!(redact_url(url), printed, "{url}");
         }
+    }
+
+    /// An unparsable `TAVRN_SMTP_URL` is named in the error without its password.
+    #[test]
+    fn invalid_smtp_url_is_reported_without_its_password() {
+        let config = Config {
+            domain: "chat.example.org".into(),
+            database_url: "postgres://tavrn:pw@db/tavrn".into(),
+            smtp_url: Some("smtp+tls://mailer:S3cretSmtpPw@mail.example.org:587".into()),
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("TAVRN_SMTP_URL"), "{err}");
+        assert!(!err.to_string().contains("S3cretSmtpPw"), "{err}");
     }
 }

@@ -145,6 +145,8 @@ First public release of the node and its container image.
 
 ### Security
 
+- Configuration printouts no longer show a password from a query parameter that contains `@`, and an invalid
+  `TAVRN_SMTP_URL` is named in the error without its password.
 - `POST /auth/login` refuses a username no account can have (`400 auth.username_invalid`) before it is looked up or
   counted; the anonymous sign-in routes take bodies of at most 16 KiB; rate limiters store long keys as hashes and
   keep a hard bound on their number of keys, also on single-instance nodes.
