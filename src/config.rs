@@ -198,7 +198,8 @@ pub struct Config {
     /// registrations and assertions and published as `webauthn.origins`. Empty: only the web origin.
     pub webauthn_app_origins: String,
 
-    /// `postgres://…`; in development mode also `sqlite://…`.
+    /// `postgres://…`; in development mode also `sqlite://…`. `check-config` prints it without the password.
+    #[serde(serialize_with = "redact_url_password_required")]
     pub database_url: String,
     /// `TAVRN_CACHE_URL`: optional Valkey/Redis (`redis://[user:pw@]host:port[/db]`, `rediss://` for TLS) shared by
     /// several instances of this node (docs/SCALING.md). Unset: one instance, everything in memory. The password
@@ -216,7 +217,8 @@ pub struct Config {
     pub registration: Registration,
     pub email: EmailMode,
     /// `smtp://host:port` (unencrypted, e.g. an internal relay), `smtps://host:port` (TLS),
-    /// `smtp+starttls://host:port`; optionally `user:pass@`.
+    /// `smtp+starttls://host:port`; optionally `user:pass@` (never printed by `check-config`).
+    #[serde(serialize_with = "redact_url_password")]
     pub smtp_url: Option<String>,
     /// Sender address; default `noreply@<domain>`.
     pub smtp_from: Option<String>,
@@ -226,6 +228,8 @@ pub struct Config {
     /// Optional captcha: `none` or `turnstile` (Cloudflare).
     pub captcha_provider: CaptchaProvider,
     pub turnstile_site_key: Option<String>,
+    /// Never printed by `check-config` (`***` when set).
+    #[serde(serialize_with = "redact_secret")]
     pub turnstile_secret_key: Option<String>,
     /// Require the captcha at registration (only with a provider).
     pub captcha_register: bool,
@@ -313,6 +317,8 @@ pub struct Config {
     pub files_external_private: Switch,
     /// GIF search: `none`, `giphy` or `tenor`; the key stays on the node.
     pub gif_provider: GifProvider,
+    /// Never printed by `check-config` (`***` when set).
+    #[serde(serialize_with = "redact_secret")]
     pub gif_api_key: Option<String>,
 
     pub voice_enabled: bool,
@@ -757,20 +763,71 @@ impl Default for Config {
     }
 }
 
-/// `check-config` prints the cache URL without its password.
+/// A URL as `check-config`, logs and error messages show it: the password of `user:password@` and the values of
+/// query parameters that carry secrets (`password=`, `…token=`, `…key=`, `…secret=`) become `***`. A password with
+/// an unencoded `@` is covered too (everything up to the last `@` is the user information).
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let (userinfo, rest) = match rest.rsplit_once('@') {
+        Some((info, host)) => (Some(info), host),
+        None => (None, rest),
+    };
+    let (before_fragment, fragment) = match rest.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (rest, None),
+    };
+    let mut out = format!("{scheme}://");
+    if let Some(info) = userinfo {
+        match info.split_once(':') {
+            Some((user, _)) => out.push_str(&format!("{user}:***@")),
+            None => out.push_str(&format!("{info}@")),
+        }
+    }
+    match before_fragment.split_once('?') {
+        Some((path, query)) => {
+            out.push_str(path);
+            out.push('?');
+            let params: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _)) if secret_param(name) => format!("{name}=***"),
+                    _ => pair.to_string(),
+                })
+                .collect();
+            out.push_str(&params.join("&"));
+        }
+        None => out.push_str(before_fragment),
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+fn secret_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["pass", "pwd", "secret", "token", "key"].iter().any(|w| name.contains(w))
+}
+
+/// `check-config` prints URLs without their passwords ([`redact_url`]).
 fn redact_url_password<S: serde::Serializer>(url: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
     match url.as_deref() {
         None => s.serialize_none(),
-        Some(u) => match u
-            .split_once("://")
-            .and_then(|(scheme, rest)| rest.rsplit_once('@').map(|(cred, host)| (scheme, cred, host)))
-        {
-            Some((scheme, cred, host)) => {
-                let user = cred.split_once(':').map(|(u, _)| u).unwrap_or(cred);
-                s.serialize_some(&format!("{scheme}://{user}:***@{host}"))
-            }
-            None => s.serialize_some(u),
-        },
+        Some(u) => s.serialize_some(&redact_url(u)),
+    }
+}
+
+fn redact_url_password_required<S: serde::Serializer>(url: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&redact_url(url))
+}
+
+/// `check-config` shows that a secret is set (`***`), never the secret itself.
+fn redact_secret<S: serde::Serializer>(secret: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match secret.as_deref() {
+        None => s.serialize_none(),
+        Some("") => s.serialize_some(""),
+        Some(_) => s.serialize_some("***"),
     }
 }
 
@@ -3051,5 +3108,73 @@ mod tests {
             assert!(Config::load(false).is_ok());
             Ok(())
         });
+    }
+
+    /// `check-config` prints the configuration (operators paste it into issues, the health check used to store it in the
+    /// container state): no password, key or token in it, wherever it was configured.
+    #[test]
+    fn printed_configuration_contains_no_secrets() {
+        let c = Config {
+            database_url: "postgres://tavrn:DbPass%40x@db:5432/tavrn?sslmode=require&password=QueryPass".into(),
+            cache_url: Some("rediss://user:CachePass@cache.example:6380/0".into()),
+            smtp_url: Some("smtps://mailer:SmtpPass@mail.example:465".into()),
+            turnstile_site_key: Some("public-site-key".into()),
+            turnstile_secret_key: Some("TurnstileSecret".into()),
+            gif_api_key: Some("GifApiKey".into()),
+            oidc_client_secret: Some("OidcSecret".into()),
+            metrics_token: Some("MetricsToken0123456789".into()),
+            ..prod()
+        };
+        let printed = serde_json::to_value(&c).unwrap();
+        let text = printed.to_string();
+        for secret in [
+            "DbPass",
+            "QueryPass",
+            "CachePass",
+            "SmtpPass",
+            "TurnstileSecret",
+            "GifApiKey",
+            "OidcSecret",
+            "MetricsToken",
+        ] {
+            assert!(!text.contains(secret), "{secret} printed: {text}");
+        }
+        // What is not secret stays readable: users, hosts, the public site key, that a secret is set.
+        assert_eq!(printed["database_url"], "postgres://tavrn:***@db:5432/tavrn?sslmode=require&password=***");
+        assert_eq!(printed["cache_url"], "rediss://user:***@cache.example:6380/0");
+        assert_eq!(printed["smtp_url"], "smtps://mailer:***@mail.example:465");
+        assert_eq!(printed["turnstile_site_key"], "public-site-key");
+        assert_eq!(printed["turnstile_secret_key"], "***");
+        assert_eq!(printed["gif_api_key"], "***");
+        // A new field named like a secret must be redacted as well (or be listed here as not secret).
+        let not_secret =
+            ["turnstile_site_key", "oidc_client_secret_file", "password_hash_concurrency", "app_token_max_days"];
+        for (name, value) in printed.as_object().unwrap() {
+            let named_secret = ["secret", "password", "token", "_key", "credential"].iter().any(|w| name.contains(w));
+            if named_secret && !not_secret.contains(&name.as_str()) {
+                assert!(value.is_null() || value == "***", "{name} printed as {value}");
+            }
+        }
+        let unset = serde_json::to_value(prod()).unwrap();
+        assert_eq!(
+            (unset["gif_api_key"].clone(), unset["smtp_url"].clone()),
+            (serde_json::Value::Null, serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn urls_are_printed_without_credentials() {
+        for (url, printed) in [
+            ("postgres://tavrn:secret@db/tavrn", "postgres://tavrn:***@db/tavrn"),
+            ("postgres://tavrn:p@ss@db/tavrn", "postgres://tavrn:***@db/tavrn"),
+            ("postgres://user@db/x", "postgres://user@db/x"),
+            ("postgres://db/x?user=u&password=secret", "postgres://db/x?user=u&password=***"),
+            ("postgres://db/x?PassWord=secret#frag", "postgres://db/x?PassWord=***#frag"),
+            ("redis://:pw@valkey:6379/1", "redis://:***@valkey:6379/1"),
+            ("sqlite://data-dev/tavrn.db?mode=rwc", "sqlite://data-dev/tavrn.db?mode=rwc"),
+            ("sqlite::memory:", "sqlite::memory:"),
+        ] {
+            assert_eq!(redact_url(url), printed, "{url}");
+        }
     }
 }

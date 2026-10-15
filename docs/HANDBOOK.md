@@ -119,7 +119,8 @@ The node reads, later sources overriding earlier ones:
 Every value is then validated, and **all** problems are printed together (`Configuration error:` with one line
 per problem and the name of the variable); the process exits with code 2. Check a configuration without starting
 the server: `docker compose exec tavrn tavrn-node check-config` (prints the effective configuration as JSON; the
-Valkey password, the OIDC client secret and the metrics token are never printed).
+passwords of the database, SMTP and Valkey URLs, the Turnstile secret, the GIF key, the OIDC client secret and the
+metrics token are never printed).
 
 On/off switches accept `true`/`false`; those documented as `on | off` accept `on`/`off` as well as
 `true`/`false`. Lists are comma-separated. Sizes are in bytes.
@@ -2298,7 +2299,8 @@ the configuration first and exits with code **2** on a configuration error. The 
 | Command | What it does | Exit codes |
 |---|---|---|
 | `serve` (default) | Starts the server. | `1` on an error, `3` when `TAVRN_CACHE_URL` is set but Valkey is unreachable at start. |
-| `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. Also the image's health check. | `0` ok, `2` problem. |
+| `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets: passwords in `TAVRN_DATABASE_URL`, `TAVRN_SMTP_URL` and `TAVRN_CACHE_URL`, secret query parameters, the Turnstile secret and the GIF key appear as `***`; the OIDC client secret and the metrics token not at all), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. | `0` ok, `2` problem. |
+| `health [--ready]` | Probes the server running in the same container or host: `GET /healthz` (with `--ready` `/readyz`) on the port of `TAVRN_LISTEN` (a wildcard address becomes loopback), 3-second timeout, nothing printed when healthy. The image's health check. | `0` healthy, `1` unhealthy or no answer. |
 | `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP nothing is sent and the log says so). | `0` sent, `1` failed. |
 | `doctor --peer <domain>` | Runs the [conformance checks](#conformance-checks-of-other-nodes) against another node with this node's configuration, keys and database and prints one line per check (`pass`, `warn`, `fail`, `skip` with a reason). The result is stored like an admin's check (a hard failure blocks the peer). Run it while the node is running: the other node claims the probe's keys from it. | `0` ok, `1` hard failure, `2` the check could not run. |
 | `rotate-storage-key` | [Rotates the storage key](#rotating-the-storage-key). Stop the node first; back up the new key file afterwards. Resumable. | `0` done, `1` failed. |
