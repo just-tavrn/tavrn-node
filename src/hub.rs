@@ -37,6 +37,28 @@ pub enum Scope {
     Connection(u64),
 }
 
+impl Scope {
+    /// The id lists sorted and without duplicates, so every connection finds itself by binary search
+    /// ([`Scope::listed`]) instead of scanning the list: a presence change or a whiteboard
+    /// stroke goes to many users, and every connection of the instance looks at it.
+    fn normalized(mut self) -> Self {
+        let tidy = |ids: &mut Vec<String>| {
+            ids.sort_unstable();
+            ids.dedup();
+        };
+        match &mut self {
+            Self::Users(ids) | Self::Devices(ids) | Self::UsersExceptDevice { users: ids, .. } => tidy(ids),
+            Self::Room(_) | Self::All | Self::Connection(_) => {}
+        }
+        self
+    }
+
+    /// Is `id` in the user or device list of a scope (lists normalized by the hub)?
+    pub fn listed(ids: &[String], id: &str) -> bool {
+        ids.binary_search_by(|x| x.as_str().cmp(id)).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub id: String,
@@ -66,7 +88,7 @@ impl Event {
         // Serializing a `Value` cannot fail (string keys only); fall back to a resync just in case.
         let frame = serde_json::to_string(&Frame { op: "event", id: &id, kind, data: &data })
             .unwrap_or_else(|_| String::from(r#"{"op":"resync"}"#));
-        Self { id, kind: kind.to_string(), data, scope, frame: frame.into() }
+        Self { id, kind: kind.to_string(), data, scope: scope.normalized(), frame: frame.into() }
     }
 }
 
@@ -194,6 +216,7 @@ impl Hub {
             data: Value,
         }
         let data = serde_json::from_str::<Data>(&frame).map(|d| d.data).unwrap_or(Value::Null);
+        let scope = scope.normalized();
         self.invalidate(&kind, &scope, &data);
         let _ = self.tx.send(Arc::new(Event { id, kind, data, scope, frame: frame.into() }));
     }
@@ -295,6 +318,19 @@ mod tests {
         let r = rx.recv().await.unwrap();
         assert_eq!((r.kind.as_str(), r.frame.as_str(), &r.scope), (RESYNC_KIND, r#"{"op":"resync"}"#, &Scope::All));
         assert!(bus.try_recv().is_err(), "the resync hint is local");
+    }
+
+    #[tokio::test]
+    async fn user_lists_are_sorted_once_for_binary_search() {
+        let hub = Hub::new();
+        let mut rx = hub.subscribe();
+        hub.users(vec!["c".into(), "a".into(), "b".into(), "a".into()], "presence.update", serde_json::json!({}));
+        let e = rx.recv().await.unwrap();
+        let Scope::Users(ids) = &e.scope else { unreachable!("users") };
+        assert_eq!(ids, &["a", "b", "c"]);
+        assert!(Scope::listed(ids, "b") && !Scope::listed(ids, "d"));
+        hub.inject("e".into(), "x".into(), Scope::Devices(vec!["z".into(), "y".into()]), "{}".into());
+        assert_eq!(rx.recv().await.unwrap().scope, Scope::Devices(vec!["y".into(), "z".into()]));
     }
 
     #[test]

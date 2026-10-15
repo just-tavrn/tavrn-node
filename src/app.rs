@@ -282,6 +282,10 @@ pub struct AppState {
     pub live_sessions: Arc<crate::sessions::LiveCache>,
     /// Heartbeat of WebSockets (`ws::PING_INTERVAL`; tests shorten it to watch the session re-check).
     pub ws_ping: Duration,
+    /// `TAVRN_TRUSTED_PROXIES`, parsed once (`auth::ClientIp` consults it for every request).
+    pub trusted_proxies: Arc<[ipnet::IpNet]>,
+    /// How long a WebSocket send may take before the connection ends (`ws::SEND_TIMEOUT`; tests shorten it).
+    pub ws_send_timeout: Duration,
     /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
     pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
@@ -453,6 +457,8 @@ impl AppState {
             access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             live_sessions: Arc::default(),
             ws_ping: crate::ws::PING_INTERVAL,
+            trusted_proxies: config.trusted_proxies().into(),
+            ws_send_timeout: crate::ws::SEND_TIMEOUT,
             password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
                 0 => crate::auth::default_hash_concurrency(),
                 n => n as usize,

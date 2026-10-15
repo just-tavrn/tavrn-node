@@ -510,3 +510,81 @@ async fn answer_pings(ws: &mut Socket, ms: u64) -> Option<u16> {
         }
     }
 }
+
+/// A client that stops reading (a frozen tab, a half-open link) is disconnected once a send takes longer than the
+/// send timeout: its task does not hang, and the user goes offline (so web push reaches them again).
+#[tokio::test]
+async fn a_client_that_stops_reading_is_disconnected() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let mut state = node.state.clone();
+    state.ws_send_timeout = Duration::from_millis(300);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = tavrn_node::app::router(state);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let ws = hello(&format!("ws://{addr}/api/v1/ws"), &alice.token).await;
+    assert!(node.state.hub.is_online(&alice.user_id));
+    // From now on the client reads nothing; the node keeps sending large events until the buffers are full.
+    let big = "x".repeat(256 * 1024);
+    let hub = node.state.hub.clone();
+    let user = alice.user_id.clone();
+    let flood = tokio::spawn(async move {
+        for _ in 0..400 {
+            hub.users(vec![user.clone()], "test.flood", json!({ "pad": big }));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    common::wait_until(Duration::from_secs(10), "the stalled client is disconnected", || async {
+        !node.state.hub.is_online(&alice.user_id)
+    })
+    .await;
+    flood.abort();
+    drop(ws);
+}
+
+/// The heartbeat checks the sessions of every connected device at once: one statement for all of them per
+/// interval, not two per socket and ping.
+#[tokio::test]
+async fn the_heartbeat_checks_every_connected_device_in_one_statement() {
+    let node = test_node("t.local").await;
+    let mut users = Vec::new();
+    for i in 0..12 {
+        users.push(node.register(&format!("user{i}")).await);
+    }
+    let guards: Vec<_> = users
+        .iter()
+        .map(|u| tavrn_node::sessions::watch(&node.state.live_sessions, &u.user_id, &u.device_id))
+        .collect();
+    let interval = Duration::from_secs(30);
+    let (live, statements) = common::logs::statements(async {
+        let mut live = 0;
+        for u in &users {
+            live += usize::from(tavrn_node::sessions::still_live(&node.state, &u.device_id, interval).await);
+        }
+        live
+    })
+    .await;
+    assert_eq!((live, statements), (12, 1), "12 pings, one check");
+    // A session that ends without the event is found at the next check.
+    tavrn_node::store::users::revoke_device_sessions(&node.state.db, &users[3].user_id, &users[3].device_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET disabled_at = $1 WHERE id = $2")
+        .bind(tavrn_node::util::now())
+        .bind(&users[5].user_id)
+        .execute(&node.state.db)
+        .await
+        .unwrap();
+    node.state.live_sessions.forget(std::slice::from_ref(&users[3].device_id));
+    let alive: Vec<bool> = {
+        let mut out = Vec::new();
+        for u in &users {
+            out.push(tavrn_node::sessions::still_live(&node.state, &u.device_id, interval).await);
+        }
+        out
+    };
+    assert_eq!(alive.iter().filter(|a| !**a).count(), 2, "{alive:?}");
+    assert!(!alive[3] && !alive[5]);
+    drop(guards);
+}
