@@ -232,3 +232,5 @@ First public release of the node and its container image.
 - Forwarded reports give evidence authors other than the reported user pseudonyms of that report only (never the
   reporter's) and leave out their message ids.
 - Files channels: a rename is classified like an upload (executable rule and upload categories).
+- Files channels: uploads in progress reserve their bytes, so parallel uploads cannot exceed the channel quota; an
+  upload whose request ends early (client gone, timeout) leaves no partial file, for attachments too.

@@ -651,3 +651,97 @@ async fn a_rename_is_classified_like_an_upload() {
         s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "parent_id": id(&folder) })).await;
     assert_eq!(st, StatusCode::OK, "{j}");
 }
+
+fn part_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(part_files(&path));
+        } else if path.extension().is_some_and(|e| e == "part") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// An upload request with a streamed body of unknown length: `first` now, `rest` once `release` fires.
+fn streamed_upload(
+    s: &Setup,
+    first: usize,
+    rest: Option<(usize, tokio::sync::oneshot::Receiver<()>)>,
+) -> axum::http::Request<axum::body::Body> {
+    use axum::body::Bytes;
+    let head = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; first]))]);
+    let tail: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> = match rest {
+        Some((len, wait)) => Box::pin(futures::stream::once(async move {
+            let _ = wait.await;
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'b'; len]))
+        })),
+        None => Box::pin(futures::stream::pending()),
+    };
+    axum::http::Request::post(format!("{}/upload", s.base()))
+        .header("authorization", format!("Bearer {}", s.bob.token))
+        .header("content-type", "text/plain")
+        .header("tavrn-file-name", format!("notes-{}.txt", tavrn_node::util::ulid()))
+        .body(axum::body::Body::from_stream(futures::StreamExt::chain(head, tail)))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn parallel_uploads_cannot_overrun_the_channel_quota() {
+    use tower::ServiceExt;
+    const QUOTA: u64 = 1024 * 1024;
+    const PARALLEL: usize = 6;
+    let s = setup_with(|c| c.files_channels_max_bytes = QUOTA).await;
+    let data_dir = std::path::PathBuf::from(&s.node.state.config.data_dir);
+    let mut releases = Vec::new();
+    let mut tasks = Vec::new();
+    for _ in 0..PARALLEL {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        releases.push(release);
+        let req = streamed_upload(&s, 64 * 1024, Some((600 * 1024 - 64 * 1024, wait)));
+        tasks.push(tokio::spawn(s.node.router.clone().oneshot(req)));
+        // Every upload starts writing before the next one checks the quota.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    common::wait_until(std::time::Duration::from_secs(10), "an upload is writing", || {
+        let n = part_files(&data_dir).len();
+        async move { n >= 1 }
+    })
+    .await;
+    for r in releases {
+        let _ = r.send(());
+    }
+    let mut created = 0;
+    for t in tasks {
+        let resp = t.await.unwrap().unwrap();
+        if resp.status() == StatusCode::CREATED {
+            created += 1;
+        } else {
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    let used = usage["used_bytes"].as_u64().unwrap();
+    assert!(created >= 1, "the first upload fits");
+    assert!(used <= QUOTA, "usage {used} stays within the quota {QUOTA} ({created} uploads accepted)");
+    assert!(part_files(&data_dir).is_empty(), "refused uploads leave nothing behind");
+}
+
+#[tokio::test]
+async fn an_aborted_upload_leaves_no_partial_file() {
+    use tower::ServiceExt;
+    let s = setup().await;
+    let data_dir = std::path::PathBuf::from(&s.node.state.config.data_dir);
+    let req = streamed_upload(&s, 512 * 1024, None);
+    // The client goes away mid-body (or a timeout drops the request): the handler is dropped while writing.
+    let dropped = tokio::time::timeout(std::time::Duration::from_secs(2), s.node.router.clone().oneshot(req)).await;
+    assert!(dropped.is_err(), "the upload was still running");
+    assert!(part_files(&data_dir).is_empty(), "the partial file is removed at once: {:?}", part_files(&data_dir));
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    assert_eq!(usage["used_bytes"], 0);
+    // The reservation of the dropped upload is released: a full-size upload still fits.
+    let (st, j) = s.up(&s.bob.token, "after.txt", None, "text/plain", b"fine").await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+}

@@ -896,13 +896,26 @@ pub async fn upload(
     if declared.is_some_and(|n| n > max) {
         return Err(too_large(max));
     }
-    let remaining = quota.map(|q| u64::try_from(q.saturating_sub(used)).unwrap_or(0));
-    if let (Some(q), Some(left)) = (quota, remaining)
-        && declared.unwrap_or(1) > left
-    {
-        return Err(quota_exceeded(q, used));
-    }
-    let limit = remaining.map_or(max, |r| r.min(max));
+    // The bytes this upload may write are reserved before the body arrives (a declared length exactly, otherwise as
+    // much as is left up to the upload limit): parallel uploads share what is left instead of each getting all of it.
+    // The reservation ends with this request, however it ends.
+    let reservation = match quota {
+        Some(q) => Some(
+            state
+                .storage
+                .reservations
+                .reserve(
+                    &format!("files:{}", conv.id),
+                    u64::try_from(q).unwrap_or(0),
+                    u64::try_from(used).unwrap_or(0),
+                    declared.unwrap_or(max),
+                    declared.is_some(),
+                )
+                .map_err(|_| quota_exceeded(q, used))?,
+        ),
+        None => None,
+    };
+    let limit = reservation.as_ref().map_or(max, |r| if declared.is_some() { max.min(r.bytes()) } else { r.bytes() });
     if matches!(storage, Storage::Remote { .. }) && declared.is_none() {
         return Err(bad("files.length_required", "Uploads to an external store need a Content-Length"));
     }
@@ -932,6 +945,7 @@ pub async fn upload(
     };
     // Client-chosen ids never name a stored file: the node picks the storage id (they share one namespace).
     let internal_id = if record.is_some() { store::files::new_id() } else { id.clone() };
+    let mut unrecorded = Unrecorded(None);
     let (storage_id, backend, encrypted) = match &storage {
         Storage::Internal => {
             if let Err(e) = state.storage.write_stream(&internal_id, stream).await {
@@ -941,6 +955,7 @@ pub async fn upload(
                 }
                 return Err(err);
             }
+            unrecorded.0 = Some((state.storage.clone(), internal_id.clone()));
             (Some(internal_id.clone()), "internal", false)
         }
         Storage::Remote { store, encrypt } => {
@@ -975,7 +990,18 @@ pub async fn upload(
         (m.len as i64, m.sha256())
     };
     let is_e2ee = record.is_some();
-    let inserted = store::files::insert(
+    // Another instance may have stored files meanwhile (reservations are per instance): the quota is checked against
+    // the stored usage once more before the entry counts.
+    let over_quota = match quota {
+        Some(q) => store::files::usage(&state.db, &conv.id).await.map(|(now, _, _)| now.saturating_add(size) > q),
+        None => Ok(false),
+    };
+    let over = matches!(over_quota, Ok(true));
+    let inserted = match over_quota {
+        Ok(true) => Ok(None),
+        Err(e) => Err(e),
+        Ok(false) => {
+            store::files::insert(
         &state.db,
         store::files::NewEntry {
             id: &id,
@@ -994,9 +1020,14 @@ pub async fn upload(
             record,
         },
     )
-    .await;
+    .await
+        }
+    };
     let row = match inserted {
-        Ok(Some(row)) => row,
+        Ok(Some(row)) => {
+            unrecorded.0 = None;
+            row
+        }
         other => {
             // Name or id taken meanwhile (or a database error): the stored bytes go again, unless an entry that
             // took the same client-chosen id owns the external object of that id.
@@ -1033,6 +1064,7 @@ pub async fn upload(
             }
             return Err(match other {
                 Err(e) => e,
+                _ if over => quota_exceeded(quota.unwrap_or(0), used),
                 _ if is_e2ee => id_taken(),
                 _ => name_taken(&name),
             });
@@ -1040,6 +1072,20 @@ pub async fn upload(
     };
     changed(&state, &conv, &[row.parent_id.as_deref()]);
     Ok((StatusCode::CREATED, Json(row.to_api())))
+}
+
+/// A file on the node's storage that has no entry yet: removed when dropped while still set (a request dropped
+/// between the write and the insert leaves no file outside every quota).
+struct Unrecorded(Option<(crate::storage::BlobStorage, String)>);
+
+impl Drop for Unrecorded {
+    fn drop(&mut self) {
+        if let Some((storage, id)) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move { storage.delete(&id).await });
+        }
+    }
 }
 
 /// The error of a failed upload stream: too large, quota, aborted by the client, or internal.
@@ -1572,12 +1618,22 @@ pub async fn put_thumbnail(
     }
     let size = bytes.len() as i64;
     let ent = Entitlements::load(&state, Some(&auth.user), Some(room_of(&conv))).await?;
-    if let Some(quota) = channel_quota(&ent, &storage_of(&state, &conv.id).await?) {
-        let (used, _, _) = store::files::usage(&state.db, &conv.id).await?;
-        if used.saturating_sub(entry.thumbnail_size).saturating_add(size) > quota {
-            return Err(quota_exceeded(quota, used));
+    // Reserved like an upload (uploads in flight count), held until the thumbnail is recorded.
+    let _reservation = match channel_quota(&ent, &storage_of(&state, &conv.id).await?) {
+        Some(quota) => {
+            let (used, _, _) = store::files::usage(&state.db, &conv.id).await?;
+            let others = u64::try_from(used.saturating_sub(entry.thumbnail_size)).unwrap_or(0);
+            let reserved = state.storage.reservations.reserve(
+                &format!("files:{}", conv.id),
+                u64::try_from(quota).unwrap_or(0),
+                others,
+                u64::try_from(size).unwrap_or(u64::MAX),
+                true,
+            );
+            Some(reserved.map_err(|_| quota_exceeded(quota, used))?)
         }
-    }
+        None => None,
+    };
     let storage_id = store::files::new_id();
     state.storage.write(&storage_id, &bytes).await.map_err(ApiError::Internal)?;
     match store::files::set_thumbnail(&state.db, &entry.id, &storage_id, size).await {
