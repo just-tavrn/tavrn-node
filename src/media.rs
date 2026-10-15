@@ -294,8 +294,20 @@ pub struct Processed {
 fn too_large(max: usize, code: &'static str, what: &str) -> ApiError {
     ApiError::PayloadTooLarge {
         code,
-        detail: format!("{what}: at most {} MB", max / (1024 * 1024)),
+        detail: format!("{what}: at most {}", size_text(max)),
         meta: serde_json::json!({ "max_bytes": max }),
+    }
+}
+
+/// A byte limit for people: MB from 1 MiB on, KB below (the emoji and preview limits are KiB).
+fn size_text(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MB", bytes / MIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
     }
 }
 
@@ -795,7 +807,7 @@ impl Job<'_> {
                 None => return Err(invalid("The file could not be converted")),
             }
         }
-        Err(too_large(max, "media.output_too_large", "Das Ergebnis bleibt zu groß"))
+        Err(too_large(max, "media.output_too_large", "The result stays too large"))
     }
 
     /// Animated WebP from `input`; `raw` = the input is a raw frame stream on stdin (animated WebP
@@ -842,7 +854,7 @@ impl Job<'_> {
                 None => return Err(invalid("The animation could not be converted")),
             }
         }
-        Err(too_large(max, "media.output_too_large", "Die Animation bleibt zu groß"))
+        Err(too_large(max, "media.output_too_large", "The animation stays too large"))
     }
 
     /// Animated WebP input: frames decoded with `image-webp`, resampled to a constant rate, piped raw.
@@ -1000,6 +1012,16 @@ mod tests {
         b.extend_from_slice(&h.to_be_bytes());
         b.extend_from_slice(&[8, 6, 0, 0, 0]);
         b
+    }
+
+    #[test]
+    fn limits_read_in_kb_below_one_mb() {
+        assert_eq!(size_text(256 * 1024), "256 KB");
+        assert_eq!(size_text(40 * 1024), "40 KB");
+        assert_eq!(size_text(8 * 1024 * 1024), "8 MB");
+        assert_eq!(size_text(1536 * 1024), "1.5 MB");
+        let e = too_large(256 * 1024, "media.output_too_large", "The result stays too large");
+        assert!(e.to_string().contains("at most 256 KB") || format!("{e:?}").contains("at most 256 KB"), "{e:?}");
     }
 
     #[test]
