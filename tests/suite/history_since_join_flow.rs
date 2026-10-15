@@ -219,3 +219,65 @@ async fn the_gap_since_the_join_counts_under_every_policy() {
         r.node.catch_up(&mut r.alice, &r.channel).await;
     }
 }
+
+/// Pins and reactions serve and act on messages like a page of messages does: an encrypted message from before the
+/// member's window is neither listed among the pins nor reachable through the reaction and pin routes.
+#[tokio::test]
+async fn pins_and_reactions_stay_inside_the_window() {
+    let r = room().await;
+    let (s, list) = r.node.get_auth(&format!("/api/v1/conversations/{}/messages", r.channel), r.alice.token()).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    let old =
+        list.as_array().unwrap().iter().find(|m| m["encrypted"] == true).unwrap()["id"].as_str().unwrap().to_string();
+    let (s, j) =
+        r.node.put(&format!("/api/v1/conversations/{}/pins/{old}", r.channel), r.alice.token(), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let bob = r.node.crypto_user("bob").await;
+    join_room(&r, &bob).await;
+    // Bob may pin in this channel: only the window keeps him out.
+    let (s, j) = r
+        .node
+        .put(
+            &format!("/api/v1/rooms/{}/overrides", r.room_id),
+            r.alice.token(),
+            json!({ "target_type": "channel", "target_id": r.channel, "subject_type": "member", "subject_id": bob.session.user_id, "allow": p::PIN_MESSAGES.to_string(), "deny": "0" }),
+        )
+        .await;
+    assert!(s.is_success(), "{j}");
+    let (s, j) = r.node.send_encrypted(&r.alice, &r.channel, "After Bob joined").await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let new = j["id"].as_str().unwrap().to_string();
+    let (s, j) =
+        r.node.put(&format!("/api/v1/conversations/{}/pins/{new}", r.channel), r.alice.token(), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+
+    for path in [
+        format!("/api/v1/conversations/{}/pins", r.channel),
+        format!("/api/v1/rooms/{}/channels/{}/pins", r.room_id, r.channel),
+    ] {
+        let (s, pins) = r.node.get_auth(&path, bob.token()).await;
+        assert_eq!(s, StatusCode::OK, "{pins}");
+        let ids: Vec<&str> = pins["messages"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        assert_eq!(ids, vec![new.as_str()], "{path}: only the pin inside Bob's window");
+        let (_, pins) = r.node.get_auth(&path, r.alice.token()).await;
+        assert_eq!(pins["messages"].as_array().unwrap().len(), 2, "Alice's window has both");
+    }
+    let base = format!("/api/v1/conversations/{}", r.channel);
+    for (method, path) in [
+        ("PUT", format!("{base}/messages/{old}/reactions/%F0%9F%91%8D")),
+        ("DELETE", format!("{base}/messages/{old}/reactions/%F0%9F%91%8D")),
+        ("PUT", format!("{base}/pins/{old}")),
+        ("DELETE", format!("{base}/pins/{old}")),
+    ] {
+        let (s, j) = match method {
+            "PUT" => r.node.put(&path, bob.token(), json!({})).await,
+            _ => r.node.delete(&path, bob.token()).await,
+        };
+        assert_eq!((s, j["code"].as_str()), (StatusCode::NOT_FOUND, Some("message.not_found")), "{method} {path}: {j}");
+    }
+    // Inside the window everything works as before.
+    let (s, j) = r.node.put(&format!("{base}/messages/{new}/reactions/%F0%9F%91%8D"), bob.token(), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = r.node.delete(&format!("{base}/pins/{new}"), bob.token()).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
