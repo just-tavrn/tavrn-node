@@ -319,6 +319,7 @@ fn forbidden_v6(ip: Ipv6Addr) -> bool {
         || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 (documentation)
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+        || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 (site-local, deprecated but still routed by some networks)
         || (s[0] & 0xff00) == 0xff00 // ff00::/8 (multicast)
 }
 

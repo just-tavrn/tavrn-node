@@ -1561,7 +1561,9 @@ All instances need the same configuration and reach the same database, data volu
 - **`TAVRN_TRUSTED_PROXIES`** must contain the reverse proxy and the instances' own network (relayed requests
   carry the client address in `X-Forwarded-For`); the default (private networks) covers the usual setups.
 - **`TAVRN_INSTANCE_URL`** (`http://tavrn-1:8080`): where the other instances reach this one; default: this host's
-  address towards Valkey with the `TAVRN_LISTEN` port. The instances must reach each other on that port.
+  address towards Valkey with the `TAVRN_LISTEN` port. The instances must reach each other on that port, over a
+  private network: the relay mark binds instance, method, path and time but not the body, so traffic between the
+  instances must not cross networks others can read (use `https` addresses otherwise).
 
 #### Load balancer
 

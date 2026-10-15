@@ -253,6 +253,8 @@ fn forbidden_address_ranges() {
         "fd12:3456::1",
         "fe80::1",
         "febf::1",
+        "fec0::1",
+        "feff::1",
         "ff02::1",
         "ff00::",
         // 6to4 relays (192.88.99.0/24), IPv4-compatible (::/96), 6to4 with an internal IPv4 address (2002::/16),
@@ -298,7 +300,6 @@ fn forbidden_address_ranges() {
         "::ffff:8.8.8.8",
         "64:ff9b::808:808",
         "2001:db9::1",
-        "fec0::1",
         // 6to4 with a public IPv4 address stays usable; other 2001:: blocks are not Teredo, 64:ff9b:2:: is no NAT64.
         "2002:808:808::1",
         "64:ff9b:2::1",

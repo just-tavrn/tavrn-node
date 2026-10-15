@@ -236,3 +236,5 @@ First public release of the node and its container image.
   upload whose request ends early (client gone, timeout) leaves no partial file, for attachments too.
 - `TAVRN_FILES_CHANNELS_MAX_BYTES` defaults to 10 GiB instead of unlimited: files channels on the node's own storage
   no longer leave the disk unbounded by default.
+- More file types count as executables (compiled help, click-once, web queries, search and library connectors and
+  others), and the address filter of outbound requests also refuses the deprecated site-local range `fec0::/10`.

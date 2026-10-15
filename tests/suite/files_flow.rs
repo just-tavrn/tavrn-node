@@ -754,3 +754,30 @@ async fn files_channels_on_the_node_storage_have_a_default_quota() {
     let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
     assert_eq!(usage["limit_bytes"].as_u64(), Some(default), "{usage}");
 }
+
+#[tokio::test]
+async fn entries_cannot_be_moved_into_another_channels_folder() {
+    let s = setup().await;
+    let (st, other) = s
+        .node
+        .post(
+            &format!("/api/v1/rooms/{}/channels", s.room_id),
+            &s.alice.token,
+            json!({ "kind": "files", "name": "Other Files", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{other}");
+    let other_base = format!("/api/v1/rooms/{}/channels/{}/files", s.room_id, id(&other));
+    let (st, foreign) =
+        s.node.post(&format!("{other_base}/folders"), &s.alice.token, json!({ "parent_id": null, "name": "F" })).await;
+    assert_eq!(st, StatusCode::CREATED, "{foreign}");
+    let (_, file) = s.up(&s.bob.token, "a.txt", None, "text/plain", b"a").await;
+    let (_, folder) = s.folder(&s.bob.token, None, "Mine").await;
+    for entry in [id(&file), id(&folder)] {
+        let (st, j) =
+            s.node.patch(&format!("{}/{entry}", s.base()), &s.alice.token, json!({ "parent_id": id(&foreign) })).await;
+        assert_eq!((st, j["code"].as_str()), (StatusCode::NOT_FOUND, Some("files.parent_not_found")), "{j}");
+    }
+    let (_, listing) = s.node.get_auth(&format!("{other_base}?parent={}", id(&foreign)), &s.alice.token).await;
+    assert_eq!(listing["entries"], json!([]), "nothing arrived in the other channel");
+}
