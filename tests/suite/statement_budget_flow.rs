@@ -98,8 +98,11 @@ async fn hot_routes_stay_within_their_statement_budgets() {
     let alice = node.register("alice").await;
     let (room, channel, members) = room_with(&node, &alice, 30, "member").await;
 
-    // GET /rooms/{id}/members: constant in the page size.
+    // GET /rooms/{id}/members: constant in the page size. The first request of a room may load the shared
+    // visibility snapshot (one statement more on PostgreSQL); the budget is for the steady state.
     let path = format!("/api/v1/rooms/{room}/members");
+    let (s, warm, _) = measure(&node, Method::GET, &format!("{path}?limit=1"), Some(&alice.token), None).await;
+    assert_eq!(s, StatusCode::OK, "{warm}");
     let (s, small, few) = measure(&node, Method::GET, &format!("{path}?limit=3"), Some(&alice.token), None).await;
     assert_eq!(s, StatusCode::OK, "{small}");
     let (s, page, many) = measure(&node, Method::GET, &path, Some(&alice.token), None).await;
