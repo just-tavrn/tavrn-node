@@ -426,6 +426,25 @@ mod tests {
         (name_of(c.category), c.executable)
     }
 
+    /// The protocol's reference cases (`testvectors/upload_categories.json`, PROTOCOL.md §7a), which clients run too.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn protocol_vectors() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../protocol/testvectors/upload_categories.json")).expect("vectors JSON");
+        let cases = doc["cases"].as_array().expect("cases");
+        assert!(cases.len() > 30);
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let head: Vec<u8> = match c["head_hex"].as_str() {
+                Some(h) => (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect(),
+                None => Vec::new(),
+            };
+            let got = class(&head, c["file_name"].as_str().unwrap(), c["mime"].as_str().unwrap());
+            assert_eq!(got, (c["category"].as_str().unwrap(), c["executable"].as_bool().unwrap()), "{name}");
+        }
+    }
+
     #[test]
     fn content_extension_and_type_classify() {
         assert_eq!(class(b"\x89PNG\r\n\x1a\nrest", "x.dat", "application/octet-stream"), ("images", false));
