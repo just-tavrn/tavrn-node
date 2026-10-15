@@ -28,6 +28,9 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const CLOSE_RESTART: u16 = 4000;
 pub const CLOSE_AUTH: u16 = 4001;
 pub const CLOSE_PROTOCOL: u16 = 4002;
+/// A temporary problem of the node (its database does not answer): the session is fine, the client reconnects with
+/// its usual backoff (RFC 6455 "Try Again Later"; PROTOCOL.md §6).
+pub const CLOSE_TRY_AGAIN: u16 = 1013;
 /// Largest client frame and message: the client's operations are small JSON objects; a larger frame is refused
 /// before it is buffered (also before the hello).
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -68,6 +71,16 @@ async fn close(mut socket: WebSocket, code: u16, reason: &str) {
     let _ = socket.send(WsMessage::Close(Some(axum::extract::ws::CloseFrame { code, reason: reason.into() }))).await;
 }
 
+/// Closes after an error that is not the client's (database unavailable, internal): `1013` with the error code
+/// (`db.unavailable`, `internal`) as the reason; the cause of an internal error is logged.
+async fn close_unavailable(socket: WebSocket, e: &ApiError) {
+    match e {
+        ApiError::Internal(cause) => tracing::error!(error = ?cause, "WebSocket hello failed"),
+        other => tracing::warn!(error = %other, "WebSocket hello failed"),
+    }
+    close(socket, CLOSE_TRY_AGAIN, e.code()).await
+}
+
 async fn run(state: AppState, mut socket: WebSocket) {
     // 1. Wait for the hello with the token.
     let hello = tokio::time::timeout(HELLO_TIMEOUT, socket.recv()).await;
@@ -77,11 +90,14 @@ async fn run(state: AppState, mut socket: WebSocket) {
     let Ok(ClientOp::Hello { token, capabilities, last_event_id }) = serde_json::from_str::<ClientOp>(&text) else {
         return close(socket, CLOSE_PROTOCOL, "hello expected").await;
     };
-    // The close reason carries the error code (`auth.token_expired`, …): clients refresh and reconnect.
+    // The close reason carries the error code (`auth.token_expired`, …): clients refresh and reconnect. Only a refused
+    // token or session is `4001` (clients end the session when it repeats); a failing database is not.
     let auth = match auth::authenticate(&state, &token).await {
         Ok(a) => a,
-        Err(ApiError::Unauthorized { code }) => return close(socket, CLOSE_AUTH, code).await,
-        Err(_) => return close(socket, CLOSE_AUTH, "auth.token_invalid").await,
+        Err(ApiError::Unauthorized { code } | ApiError::Forbidden { code, .. }) => {
+            return close(socket, CLOSE_AUTH, code).await;
+        }
+        Err(e) => return close_unavailable(socket, &e).await,
     };
     // The general per-user limit applies to connecting as to every other request (`TAVRN_RATE_USER_PER_MINUTE`).
     if let Some(limiter) = &state.user_api_limiter
@@ -99,12 +115,14 @@ async fn run(state: AppState, mut socket: WebSocket) {
         return close(socket, CLOSE_PROTOCOL, "age.status_required").await;
     }
     // Terms not accepted (`TAVRN_LEGAL_TERMS_MODE=require`): no events either; the client reconnects after accepting.
-    if crate::legal::documents::check_required(&state, &auth.user, None).await.is_err() {
-        return close(socket, CLOSE_PROTOCOL, "legal.terms_required").await;
+    match crate::legal::documents::check_required(&state, &auth.user, None).await {
+        Ok(()) => {}
+        Err(ApiError::ForbiddenMeta { code, .. }) => return close(socket, CLOSE_PROTOCOL, code).await,
+        Err(e) => return close_unavailable(socket, &e).await,
     }
     let mut rooms: HashSet<String> = match store::rooms::rooms_of_user(&state.db, &auth.user.id).await {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
-        Err(_) => return close(socket, CLOSE_RESTART, "datenbank").await,
+        Err(e) => return close_unavailable(socket, &e).await,
     };
     let mut visible = crate::visibility::Filter::default();
     let mut rx = state.hub.subscribe();
