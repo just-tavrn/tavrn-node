@@ -720,14 +720,28 @@ pub async fn devices(State(state): State<AppState>, auth: AuthUser) -> Result<Js
     ))
 }
 
-/// Development nodes only (not in the API description): every access token issued so far counts as expired, so the
-/// e2e tests can watch clients refresh (`auth.token_expired` on REST and `4001` on the WebSocket).
-pub async fn dev_expire_access_tokens(State(state): State<AppState>) -> StatusCode {
+#[derive(Deserialize)]
+pub struct DevExpireAccessTokens {
+    /// The local account whose access tokens end; the other accounts (tests running in parallel) keep theirs.
+    pub username: String,
+}
+
+/// Development nodes only (not in the API description): every access token of the account issued so far counts as
+/// expired, so the e2e tests can watch clients refresh (`auth.token_expired` on REST and `4001` on the WebSocket).
+pub async fn dev_expire_access_tokens(
+    State(state): State<AppState>,
+    Json(req): Json<DevExpireAccessTokens>,
+) -> Result<StatusCode, ApiError> {
     if !state.config.dev {
-        return StatusCode::NOT_FOUND;
+        return Ok(StatusCode::NOT_FOUND);
     }
-    state.access_not_before.store(crate::jwt::now_unix(), std::sync::atomic::Ordering::Relaxed);
-    StatusCode::NO_CONTENT
+    let user = store::users::by_username(&state.db, &req.username, &state.config.domain)
+        .await?
+        .ok_or_else(|| ApiError::NotFound { code: "user.not_found", what: "User".into() })?;
+    if let Ok(mut map) = state.access_not_before.lock() {
+        map.insert(user.id, crate::jwt::now_unix());
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

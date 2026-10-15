@@ -1752,7 +1752,7 @@ that holds them.
 | Typing throttle (per connection) | per instance | Bound to the WebSocket. |
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
 | Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives ([Command interactions](#command-interactions)). |
-| `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
+| `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens` with `{"username": …}`: one account's access tokens), never set in production. |
 | Session liveness of access tokens (`sessions.rs`) | per instance | Positive answers are reused for 5 seconds per device; a revocation clears the entries of the instance that handled it at once, the others follow within 5 seconds (WebSockets everywhere close at once through the event bus). |
 
 #### Rate limits
