@@ -86,6 +86,7 @@ mod suite {
     mod sessions_flow;
     mod signatures_flow;
     mod sso_flow;
+    mod statement_budget_flow;
     mod storage_encryption_flow;
     mod subscriptions_flow;
     mod test_databases_flow;

@@ -71,8 +71,10 @@ pub fn start() -> (Capture, Guard) {
             .with_ansi(false)
             // Dynamic: asked for every event (a `filter_fn` caches its first answer per callsite).
             .with_filter(dynamic_filter_fn(|_, _| CAPTURING.load(Ordering::SeqCst)));
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
-            .expect("no other global subscriber in the test process");
+        // The node's statement counter too, so a `slow request` line of a node with `log_slow_request_ms` carries
+        // `queries=` (the statement budget tests read it; it counts per request span, other tests do not add to it).
+        let registry = tracing_subscriber::registry().with(tavrn_node::telemetry::statement_counter()).with(layer);
+        tracing::subscriber::set_global_default(registry).expect("no other global subscriber in the test process");
     });
     let capture = Capture::default();
     *ACTIVE.lock().unwrap() = Some(capture.clone());
