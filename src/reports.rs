@@ -8,7 +8,8 @@
 //! Reporters are visible to moderators; the reported user never learns about a report. Action shortcuts run the
 //! existing moderation routes with the caller's own permissions inside [`ACTING_ON`], so the audit entries those
 //! routes write carry the report id. Reports about users of other nodes can be forwarded to their home node
-//! ([`forward`], MODERATION.md §1.6).
+//! ([`forward`], MODERATION.md §1.6). Moderation bots read the room's inbox, metadata only ([`AppReport`], §1.4a), and
+//! never write.
 
 pub mod forward;
 
@@ -199,6 +200,83 @@ pub struct ReportOrigin {
 pub struct ReportList {
     pub reports: Vec<ModerationReport>,
     /// Open reports of the list's scope (badges), whatever the filters.
+    pub open: i64,
+}
+
+/// A report as a moderation bot sees it (MODERATION.md §1.4a): metadata only, the reporter as a pseudonym.
+// Built field by field from a `ModerationReport` (`AppReport::for_app_token`), so a field added there never reaches
+// app tokens by accident.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AppReport {
+    pub id: String,
+    /// `user` or `automod`.
+    pub source: String,
+    /// Always `room`: bots see the room's reports only.
+    pub scope: String,
+    /// `message`, `user` or `room`.
+    pub kind: String,
+    pub room_id: Option<String>,
+    pub room_name: Option<String>,
+    pub conversation_id: Option<String>,
+    /// `channel` (null when unknown here).
+    pub conversation_kind: Option<String>,
+    /// The reported message (its content is not part of the report for bots).
+    pub message_id: Option<String>,
+    /// The reported message still exists on this node.
+    pub message_exists: bool,
+    /// The reported user (null for an address this node does not know).
+    pub target: Option<User>,
+    pub target_address: String,
+    /// A pseudonym of the reporter (MODERATION.md §1.6 format), stable per reporter, bot and room, never the address;
+    /// null for automod entries.
+    pub reporter: Option<String>,
+    pub category: String,
+    /// How many messages the reporter released (never the messages).
+    pub evidence_count: usize,
+    /// How many action shortcuts were taken.
+    pub action_count: usize,
+    /// `open`, `resolved` or `dismissed`.
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+}
+
+impl AppReport {
+    /// The reduced shape of `r` for the bot `bot`: no detail, snapshot, evidence, note, assignee, actions, forward or
+    /// origin; the reporter's address replaced by the keyed pseudonym of §1.6 towards the bot and the room.
+    pub fn for_app_token(state: &AppState, bot: &UserRow, r: ModerationReport) -> AppReport {
+        let receiver = format!("{}/{}", bot.address(), r.room_id.as_deref().unwrap_or_default());
+        AppReport {
+            reporter: r.reporter.as_ref().map(|u| forward::pseudonym(state, &receiver, &u.address)),
+            action_count: r.actions.len(),
+            id: r.id,
+            source: r.source,
+            scope: r.scope,
+            kind: r.kind,
+            room_id: r.room_id,
+            room_name: r.room_name,
+            conversation_id: r.conversation_id,
+            conversation_kind: r.conversation_kind,
+            message_id: r.message_id,
+            message_exists: r.message_exists,
+            target: r.target,
+            target_address: r.target_address,
+            category: r.category,
+            evidence_count: r.evidence_count,
+            status: r.status,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            resolved_at: r.resolved_at,
+        }
+    }
+}
+
+/// A page of the inbox for a moderation bot.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AppReportList {
+    pub reports: Vec<AppReport>,
+    /// Open reports of the room the bot may see (badges), whatever the filters.
     pub open: i64,
 }
 
@@ -475,9 +553,7 @@ pub async fn create(
     auth: &AuthUser,
     req: CreateReportRequest,
 ) -> Result<(ReportCreated, bool), ApiError> {
-    if auth.user.is_bot() {
-        return Err(ApiError::Forbidden { code: "report.bot_forbidden", detail: "Bots cannot report".into() });
-    }
+    refuse_bots(auth)?;
     if !CATEGORIES.contains(&req.category.as_str()) {
         return Err(bad("report.category_invalid", format!("category: one of {}", CATEGORIES.join(", "))));
     }
@@ -579,15 +655,28 @@ pub async fn automod_entry(
     Ok(())
 }
 
+/// Bots never report and never change a report (MODERATION.md §1, §1.4a); the route table keeps app tokens away from
+/// these routes as well.
+pub(crate) fn refuse_bots(auth: &AuthUser) -> Result<(), ApiError> {
+    if auth.user.is_bot() {
+        return Err(ApiError::Forbidden {
+            code: "report.bot_forbidden",
+            detail: "Bots cannot report or act on reports".into(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- visibility and events
 
 /// May `user` see the report? Node admins see every report; room moderators (`moderate_members`) the room's
-/// reports that are not about themselves.
+/// reports that are not about themselves. Bots count as moderators of a room by the same rule, with their
+/// permissions capped by their scopes (`moderation` unlocks `moderate_members`), and only ever read (§1.4a).
 pub async fn can_see(state: &AppState, user: &UserRow, row: &ReportRow) -> Result<bool, ApiError> {
-    if user.is_node_admin() {
+    if user.is_node_admin() && !user.is_bot() {
         return Ok(true);
     }
-    if row.scope != "room" || row.target_user_id.as_deref() == Some(user.id.as_str()) || user.is_bot() {
+    if row.scope != "room" || row.target_user_id.as_deref() == Some(user.id.as_str()) {
         return Ok(false);
     }
     let Some(room_id) = row.room_id.as_deref() else { return Ok(false) };
@@ -614,9 +703,10 @@ pub async fn visible(state: &AppState, user: &UserRow, id: &str) -> Result<Repor
     Ok(row)
 }
 
-/// Who gets the events of a report: node admins and, for room reports, the room's moderators; never the reporter
-/// or the reported user, never bots.
-async fn audience(state: &AppState, row: &ReportRow) -> Result<Vec<String>, ApiError> {
+/// Who gets the events of a report: node admins and, for room reports, the room's moderators, among them the bots
+/// that may see the report (§1.4a; their WebSocket filter also needs the scope `moderation`); never the reporter or
+/// the reported user. Returns `(people, bots)`: web pushes go to people only.
+async fn audience(state: &AppState, row: &ReportRow) -> Result<(Vec<String>, Vec<String>), ApiError> {
     let mut ids = store::reports::node_admin_ids(&state.db).await?;
     if row.scope == "room"
         && let Some(room_id) = &row.room_id
@@ -626,7 +716,15 @@ async fn audience(state: &AppState, row: &ReportRow) -> Result<Vec<String>, ApiE
     ids.sort();
     ids.dedup();
     ids.retain(|i| Some(i) != row.reporter_id.as_ref() && Some(i) != row.target_user_id.as_ref());
-    Ok(store::users::by_ids(&state.db, &ids).await?.into_iter().filter(|u| !u.is_bot()).map(|u| u.id).collect())
+    let (mut people, mut bots) = (Vec::new(), Vec::new());
+    for user in store::users::by_ids(&state.db, &ids).await? {
+        if !user.is_bot() {
+            people.push(user.id);
+        } else if row.scope == "room" && can_see(state, &user, row).await? {
+            bots.push(user.id);
+        }
+    }
+    Ok((people, bots))
 }
 
 /// `report.create` (MODERATION.md §1.5): no detail, no evidence.
@@ -636,15 +734,15 @@ pub(crate) async fn announce(state: &AppState, row: &ReportRow) {
         None => None,
     };
     match audience(state, row).await {
-        Ok(ids) => {
+        Ok((people, bots)) => {
             state.hub.users(
-                ids.clone(),
+                people.iter().chain(&bots).cloned().collect(),
                 "report.create",
                 json!({ "report": { "id": row.id, "scope": row.scope, "source": row.source, "kind": row.kind,
                     "room_id": row.room_id, "room_name": room_name, "conversation_id": row.conversation_id,
                     "category": row.category, "created_at": row.created_at } }),
             );
-            push_report(state, row, room_name, ids);
+            push_report(state, row, room_name, people);
         }
         Err(e) => tracing::warn!(error = %e, "report.create not sent"),
     }
@@ -681,9 +779,9 @@ fn push_report(state: &AppState, row: &ReportRow, room_name: Option<String>, aud
 /// `report.update` after a change, an action, a forward or a deletion.
 pub(crate) async fn changed(state: &AppState, row: &ReportRow, status: &str) {
     match audience(state, row).await {
-        Ok(ids) => {
+        Ok((people, bots)) => {
             state.hub.users(
-                ids,
+                people.into_iter().chain(bots).collect(),
                 "report.update",
                 json!({ "id": row.id, "scope": row.scope, "room_id": row.room_id, "status": status }),
             );
@@ -797,6 +895,23 @@ pub async fn page(state: &AppState, filter: ListFilter, limit: i64) -> Result<Re
     Ok(ReportList { reports: to_api(state, rows, false).await?, open })
 }
 
+/// [`page`] in the reduced shape for the bot `bot` (§1.4a).
+pub async fn app_page(
+    state: &AppState,
+    bot: &UserRow,
+    filter: ListFilter,
+    limit: i64,
+) -> Result<AppReportList, ApiError> {
+    let list = page(state, filter, limit).await?;
+    let reports = list.reports.into_iter().map(|r| AppReport::for_app_token(state, bot, r)).collect();
+    Ok(AppReportList { reports, open: list.open })
+}
+
+/// One report in the reduced shape for the bot `bot` (§1.4a); the evidence is not even loaded.
+pub async fn app_one(state: &AppState, bot: &UserRow, row: ReportRow) -> Result<AppReport, ApiError> {
+    Ok(AppReport::for_app_token(state, bot, one(state, row, false).await?))
+}
+
 // ---------------------------------------------------------------- triage
 
 /// `PATCH /reports/{id}`.
@@ -806,6 +921,7 @@ pub async fn update(
     id: &str,
     req: UpdateReportRequest,
 ) -> Result<ModerationReport, ApiError> {
+    refuse_bots(auth)?;
     let row = visible(state, &auth.user, id).await?;
     let status = match req.status.as_deref() {
         Some(s) if STATUSES.contains(&s) => s.to_string(),
@@ -817,7 +933,7 @@ pub async fn update(
         Some(None) => None,
         Some(Some(uid)) => {
             let ok = match store::users::by_id(&state.db, &uid).await? {
-                Some(u) => can_see(state, &u, &row).await?,
+                Some(u) => !u.is_bot() && can_see(state, &u, &row).await?,
                 None => false,
             };
             if !ok {
@@ -853,6 +969,7 @@ pub async fn update(
 
 /// `DELETE /reports/{id}`: node admins only, at any time.
 pub async fn delete(state: &AppState, auth: &AuthUser, id: &str) -> Result<(), ApiError> {
+    refuse_bots(auth)?;
     if !auth.user.is_node_admin() {
         return Err(ApiError::Forbidden { code: "auth.node_admin_required", detail: "Node admins only".into() });
     }
@@ -998,6 +1115,7 @@ pub async fn act(
     id: &str,
     req: ReportActionRequest,
 ) -> Result<ReportActionResult, ApiError> {
+    refuse_bots(auth)?;
     let row = visible(state, &auth.user, id).await?;
     if !ACTIONS.contains(&req.action.as_str()) {
         return Err(action_invalid(format!("action: one of {}", ACTIONS.join(", "))));

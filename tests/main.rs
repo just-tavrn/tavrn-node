@@ -72,6 +72,7 @@ mod suite {
     mod reactions_flow;
     mod reauth_flow;
     mod report_push_flow;
+    mod reports_bots_flow;
     mod reports_flow;
     mod reports_forward_flow;
     mod room_invites_flow;

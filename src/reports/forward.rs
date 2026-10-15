@@ -121,6 +121,7 @@ pub fn payload(report: &ModerationReport, reporter: &str, pseudo: impl Fn(&str) 
 /// `POST /reports/{id}/forward` (MODERATION.md §1.6): node admins, reports by users about a user of another node whose
 /// home node announces `reports.v2`; idempotent.
 pub async fn forward(state: &AppState, auth: &AuthUser, id: &str) -> Result<ModerationReport, ApiError> {
+    super::refuse_bots(auth)?;
     super::require_admin(auth)?;
     let row = super::visible(state, &auth.user, id).await?;
     if row.source != "user" || !matches!(row.kind.as_str(), "message" | "user") || row.reporter_id.is_none() {
