@@ -423,6 +423,32 @@ async fn acks_over_the_read_limit_are_dropped() {
     assert!(tavrn_node::store::messages::read_marker(db, &channel, &alice.user_id).await.unwrap().is_none());
 }
 
+/// Frames up to the 64 KiB limit still arrive whole although the read buffer of a connection is small (a few KiB,
+/// `ws::READ_BUFFER`): two of them back to back, then the socket keeps working.
+#[tokio::test]
+async fn frames_up_to_the_limit_arrive_through_the_small_read_buffer() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel_id = common::TestNode::text_channel(&room);
+    let url = serve(&node).await;
+    let mut ws = connect(&url).await;
+    ws.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["op"], "ready");
+    assert!(tavrn_node::ws::READ_BUFFER * 8 <= tavrn_node::ws::MAX_FRAME, "the test reads a frame in several parts");
+    // A pong padded to just under the limit (the node ignores the unknown field), twice in one write.
+    let pad = "x".repeat(tavrn_node::ws::MAX_FRAME - 64);
+    let big = json!({ "op": "pong", "pad": pad }).to_string();
+    assert!(big.len() > tavrn_node::ws::MAX_FRAME - 64 && big.len() <= tavrn_node::ws::MAX_FRAME);
+    ws.feed(Message::Text(big.clone().into())).await.unwrap();
+    ws.feed(Message::Text(big.into())).await.unwrap();
+    ws.flush().await.unwrap();
+    let (_, msg) = node.send(&alice.token, &room_id, &channel_id, "after the large frames").await;
+    let ev = next_json(&mut ws).await;
+    assert_eq!((ev["type"].as_str(), ev["data"]["id"].as_str()), (Some("message.create"), msg["id"].as_str()), "{ev}");
+}
+
 /// A frame header announcing more than 64 KiB is refused as soon as it is read, before the hello and before any
 /// payload is buffered (with only the message limit the node would wait for the payload until the hello timeout).
 #[tokio::test]
