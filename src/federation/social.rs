@@ -187,7 +187,7 @@ pub const MAX_SHARED_ROOMS: usize = 10;
 /// pushes of local members (`push.rs`, never blocks).
 pub async fn notify_members(state: &AppState, conv: &Conv, message: &Message, author_id: &str) {
     state.metrics.message(message.encrypted);
-    crate::push::message(state, message, author_id);
+    crate::push::message(state, message, author_id, matches!(conv.kind, ConvKind::Direct { .. }));
     if !state.config.federation_enabled {
         return;
     }
@@ -198,8 +198,7 @@ pub async fn notify_members(state: &AppState, conv: &Conv, message: &Message, au
 
 /// Does the message mention the user by address or by one of their roles (`role:<id>`)?
 fn direct_mention(message: &Message, user: &UserRow, role_ids: &[String]) -> bool {
-    message.mentions.contains(&user.address())
-        || role_ids.iter().any(|r| message.mentions.contains(&store::messages::role_mention(r)))
+    message.mentions_user(&user.address(), role_ids)
 }
 
 async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_id: &str) -> Result<(), ApiError> {

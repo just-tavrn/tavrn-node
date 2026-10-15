@@ -74,6 +74,17 @@ impl SharedLimiter {
         }
     }
 
+    /// [`SharedLimiter::check`] for many keys at once (one fan-out over many users): the cache round trips run
+    /// concurrently on its multiplexed connection. `true` for each key under its limit, in the order of `keys`.
+    pub async fn check_many(&self, keys: &[String]) -> Vec<bool> {
+        futures::future::join_all(keys.iter().map(|k| async move { self.check(k).await.is_ok() })).await
+    }
+
+    /// [`SharedLimiter::peek`] for many keys at once, like [`SharedLimiter::check_many`].
+    pub async fn peek_many(&self, keys: &[String]) -> Vec<bool> {
+        futures::future::join_all(keys.iter().map(|k| async move { self.peek(k).await.is_ok() })).await
+    }
+
     /// Counts every key in order and stops at the first one over its limit (like [`RateLimiter::check_all`]).
     pub async fn check_all(&self, keys: &[String]) -> Result<(), ApiError> {
         for k in keys {
@@ -102,6 +113,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(l.check("a").await.is_ok(), "next window");
         let err = l.check_all(&["a".into(), "a".into(), "a".into()]).await.unwrap_err();
+        let keys: Vec<String> = ["c", "d", "c", "c"].map(String::from).to_vec();
+        assert_eq!(l.peek_many(&keys).await, [true; 4]);
+        assert_eq!(l.check_many(&keys).await.iter().filter(|ok| **ok).count(), 3, "c twice, d once");
+        assert_eq!(l.peek_many(&keys).await, [false, true, false, false]);
         assert!(matches!(err, ApiError::RateLimited { .. }));
     }
 

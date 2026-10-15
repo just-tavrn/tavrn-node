@@ -1027,6 +1027,16 @@ pub struct MessageUpdate {
 }
 
 impl Message {
+    /// Does the message mention the user directly: their address (`username@domain`, compared without ASCII case;
+    /// stored mentions are lowercase) or one of their roles (`role_ids`, without @everyone)? `@everyone` is
+    /// [`Message::mentions_everyone`].
+    pub fn mentions_user(&self, address: &str, role_ids: &[String]) -> bool {
+        self.mentions.iter().any(|m| {
+            m.eq_ignore_ascii_case(address)
+                || m.strip_prefix("role:").is_some_and(|id| role_ids.iter().any(|r| r.eq_ignore_ascii_case(id)))
+        })
+    }
+
     /// The message as events carry it: events reach many viewers, so no per-viewer state (`reactions[].me` is
     /// `false`, PROTOCOL.md §6). HTTP responses keep the caller's view.
     pub fn for_broadcast(&self) -> Message {
@@ -1094,4 +1104,26 @@ pub struct AccountInvite {
     pub uses: i64,
     pub expires_at: Option<String>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn direct_mentions_by_address_or_role() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "m", "conversation_id": "c", "author": "a@n.test", "author_id": "a", "device_id": null,
+            "encrypted": false, "format": 1, "epoch": null, "content": {}, "reply_to_id": null, "thread_id": null,
+            "mentions": ["bob@n.test", "role:01JAAAAAAAAAAAAAAAAAAAAAAA"], "mentions_everyone": false,
+            "created_at": "2026-01-01T00:00:00.000Z", "edited_at": null,
+        }))
+        .unwrap();
+        assert!(message.mentions_user("bob@n.test", &[]));
+        assert!(message.mentions_user("Bob@N.test", &[]), "addresses compare without ASCII case");
+        assert!(!message.mentions_user("bobby@n.test", &[]));
+        assert!(message.mentions_user("carol@n.test", &["01jaaaaaaaaaaaaaaaaaaaaaaa".into()]));
+        assert!(!message.mentions_user("carol@n.test", &["01JBBBBBBBBBBBBBBBBBBBBBBB".into()]));
+    }
 }

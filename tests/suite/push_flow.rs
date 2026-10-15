@@ -785,3 +785,55 @@ async fn gated_channels_push_nothing_to_minors() {
     assert_eq!(st, StatusCode::CREATED, "{m}");
     fake.wait(&browser.path, 1).await;
 }
+
+/// One message to a channel with 20 offline subscribed members: the recipients, their settings, blocks and
+/// subscriptions are loaded in batches (not per member), the deliveries are recorded in one statement, and a
+/// coalesced repeat costs no per-member work at all.
+#[tokio::test]
+async fn a_channel_message_loads_its_push_recipients_in_batches() {
+    let s = setup().await;
+    let (_, invite) = s.node.post(&format!("/api/v1/rooms/{}/invites", s.room_id), &s.alice.token, json!({})).await;
+    let code = invite["code"].as_str().unwrap().to_string();
+    let mut browsers = Vec::new();
+    let mut members = Vec::new();
+    for i in 0..20 {
+        let m = s.node.register(&format!("member{i}")).await;
+        members.push(m.user_id.clone());
+        s.node.post(&format!("/api/v1/invites/{code}/join"), &m.token, json!({})).await;
+        let b = Browser::new(&s.fake, &format!("ok/member{i}"));
+        subscribe(&s.node, &m, &b).await;
+        browsers.push(b);
+    }
+    // One member blocked the author: no push for them.
+    store::social::block(&s.node.state.db, &members[0], &s.alice.user_id, "").await.unwrap();
+    let m = send(&s, &s.channel, text("round for everyone")).await;
+    for b in &browsers[1..] {
+        s.fake.wait(&b.path, 1).await;
+    }
+    s.fake.settle(&browsers[0].path, 0).await;
+    // The same message in a second channel nobody was pushed for yet, run directly and counted.
+    let other = plaintext_channel(&s, "second").await;
+    let mut message: tavrn_node::models::Message = serde_json::from_value(m).unwrap();
+    message.conversation_id = other.clone();
+    let job = || tavrn_node::push::Job::Message {
+        message: Box::new(message.clone()),
+        author_id: s.alice.user_id.clone(),
+        priority: false,
+    };
+    let (r, first) = common::logs::statements(tavrn_node::push::run(&s.node.state, job())).await;
+    r.unwrap();
+    for b in &browsers[1..] {
+        s.fake.wait(&b.path, 2).await;
+    }
+    // conversation, candidates, author, the recipients with settings, blocks and subscriptions, the deliveries
+    // (and the room's visibility snapshot when it was dropped since).
+    println!("push job statements for 20 recipients: {first}");
+    assert!(first <= 6 + 7, "statements for 20 recipients: {first}");
+    let (r, coalesced) = common::logs::statements(tavrn_node::push::run(&s.node.state, job())).await;
+    r.unwrap();
+    println!("push job statements when coalesced: {coalesced}");
+    assert!(coalesced <= 4, "a coalesced repeat: {coalesced}");
+    for b in &browsers[1..] {
+        s.fake.settle(&b.path, 2).await;
+    }
+}
