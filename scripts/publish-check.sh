@@ -8,11 +8,17 @@
 #
 # Private domains and addresses are not written into this script (it is public itself). They come from
 #   - PUBLISH_CHECK_PRIVATE (comma-separated literal strings; in the CI the secret of the same name),
-#   - the file .publish-check.private in the checked directory, in its parent directory or next to this
-#     script's repository (one string per line, gitignored, never committed).
+#   - the file .publish-check.private in the checked directory or in its parent directory (one string per
+#     line, gitignored, never committed).
+# Without any of them the check fails, unless PUBLISH_CHECK_ALLOW_UNCONFIGURED=1: then only the private-pattern
+# step is skipped, with a warning, and every other step still runs and still fails. The CI sets it for Dependabot's
+# pull requests alone (they see only Dependabot secrets); the push to main runs the full check with the patterns.
+# A finding names the file and the line, never the matching text (CI logs of public repositories are public).
+# The source of this script is scripts/publish-check.sh of the tavrn repository; every repository carries an
+# identical copy (apart from the SPDX line; tavrn-website's adds the default node host of its deployment and one
+# more local pattern list). Change the source first, then the copies.
 set -uo pipefail
 
-here="$(cd "$(dirname "$0")/.." && pwd)"
 dir="${1:-.}"
 cd "$dir" || exit 2
 problems=0
@@ -41,22 +47,23 @@ for f in "${files[@]}"; do
   esac
 done
 
-# 2. Private domains and addresses: the configured private patterns are refused everywhere, the deploy examples included
-#    (the default reference node tavrn.org is the project's public domain, not a private name).
+# 2. Private domains and addresses.
 patterns=()
 IFS=',' read -r -a env_patterns <<< "${PUBLISH_CHECK_PRIVATE:-}"
 for p in "${env_patterns[@]}"; do [ -n "${p// /}" ] && patterns+=("${p// /}"); done
-for list in ./.publish-check.private ../.publish-check.private "$here/.publish-check.private"; do
+for list in ./.publish-check.private ../.publish-check.private; do
   [ -f "$list" ] || continue
   while IFS= read -r p; do [ -n "$p" ] && [[ "$p" != \#* ]] && patterns+=("$p"); done < "$list"
 done
 [ "${#patterns[@]}" -gt 0 ] && mapfile -t patterns < <(printf '%s\n' "${patterns[@]}" | sort -u)
-if [ "${#patterns[@]}" -eq 0 ]; then
+if [ "${#patterns[@]}" -eq 0 ] && [ "${PUBLISH_CHECK_ALLOW_UNCONFIGURED:-}" = "1" ]; then
+  echo "publish-check: warning: private-pattern check skipped: no patterns configured and PUBLISH_CHECK_ALLOW_UNCONFIGURED=1 (the push to main runs it with the patterns)" >&2
+elif [ "${#patterns[@]}" -eq 0 ]; then
   report "no private domains or addresses configured (PUBLISH_CHECK_PRIVATE or .publish-check.private)"
 else
   for f in "${files[@]}"; do
     case "$f" in
-      */node_modules/* | *.lock | pnpm-lock.yaml) continue ;;
+      */node_modules/* | *.lock | pnpm-lock.yaml | package-lock.json) continue ;;
     esac
     [ -f "$f" ] || continue
     for p in "${patterns[@]}"; do
@@ -78,8 +85,8 @@ for f in "${files[@]}"; do
   [ -n "$hit" ] && report "possible secret in $f:${hit%%:*}"
 done
 
-# 4. gitleaks, if installed: only what would be published (the files above, not ignored build or test output such as
-#    build output or local data), plus the git history.
+# 4. gitleaks, if installed: only what would be published (the files above, not ignored build or test output or
+#    local data), plus the git history.
 if command -v gitleaks >/dev/null 2>&1; then
   tree="$(mktemp -d)"
   trap 'rm -rf "$tree"' EXIT
