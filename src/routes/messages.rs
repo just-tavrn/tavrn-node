@@ -759,11 +759,6 @@ pub(crate) async fn create_in(
         crate::automod::remove(state, conv, &auth.user, h, &id).await?;
         return Ok((StatusCode::CREATED, Json(message)));
     }
-    // Plaintext channel messages go into the node's search index (with their file names, bound above).
-    if !encrypted {
-        crate::search::index_message(state, &id).await;
-    }
-
     if let ConvKind::Channel { access, channel } = &conv.kind
         && let Some(alert) = automod_check(state, access, channel, &auth.user).await?
     {
@@ -774,6 +769,10 @@ pub(crate) async fn create_in(
     }
     conv.publish_recorded(state, "message.create", message.for_broadcast()).await;
     crate::federation::social::notify_members(state, conv, &message, &auth.user.id).await;
+    // Plaintext channel messages go into the node's search index (with their file names), after delivery.
+    if !conv.encrypted {
+        crate::search::index(state, &message, matches!(conv.kind, ConvKind::Channel { .. })).await;
+    }
     Ok((StatusCode::CREATED, Json(message)))
 }
 
@@ -1009,10 +1008,10 @@ pub(crate) async fn edit_in(
         crate::automod::remove(state, conv, &auth.user, h, message_id).await?;
         return Ok(Json(message));
     }
-    if !conv.encrypted {
-        crate::search::index_message(state, message_id).await;
-    }
     conv.publish_recorded(state, "message.update", message.for_broadcast()).await;
+    if !conv.encrypted {
+        crate::search::index(state, &message, matches!(conv.kind, ConvKind::Channel { .. })).await;
+    }
     Ok(Json(message))
 }
 

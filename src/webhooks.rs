@@ -355,7 +355,6 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
     )
     .await?;
     store::webhooks::touch(&state.db, &webhook.id).await?;
-    crate::search::index_message(state, &id).await;
     let message = crate::routes::messages::enrich_one(state, &webhook.user_id, &id).await?;
     if let Some(t) = &thread {
         // Like a member's reply (an archived thread reopens), without following: the pseudo user reads nothing.
@@ -366,6 +365,10 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
     let event_id = state.hub.room(&webhook.room_id, "message.create", &message);
     crate::subscriptions::record(state, &webhook.room_id, "message.create", &event_id, &message).await;
     crate::federation::social::notify_members(state, &conv, &message, &webhook.user_id).await;
+    // Plaintext channels only; sealed webhook messages are encrypted (`index` skips them).
+    if !conv.encrypted {
+        crate::search::index(state, &message, true).await;
+    }
     tracing::info!(webhook = webhook.id, message = id, "webhook executed");
     Ok(message)
 }

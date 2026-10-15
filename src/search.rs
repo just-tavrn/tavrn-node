@@ -130,7 +130,11 @@ pub fn fts5_query(terms: &[String]) -> String {
 /// descriptions, field names and values, and the attachment file names. `None` for anything else (system
 /// messages, encrypted content, unknown types).
 pub fn searchable_text(content: &str, files: &[String]) -> Option<String> {
-    let v: Value = serde_json::from_str(content).ok()?;
+    searchable_text_of(&serde_json::from_str(content).ok()?, files)
+}
+
+/// [`searchable_text`] of a parsed content object.
+pub fn searchable_text_of(v: &Value, files: &[String]) -> Option<String> {
     let kind = v.get("type").and_then(Value::as_str)?;
     if kind != "text" && kind != "action" {
         return None;
@@ -324,22 +328,37 @@ async fn apply(db: &Pool, candidates: &[Candidate]) -> Result<usize, ApiError> {
     Ok(written)
 }
 
-/// Indexes (or re-indexes after an edit) one message if it is searchable; removes it otherwise. Best
-/// effort: a failure is logged and never fails the request that wrote the message (the next start's
-/// backfill does not see it again, so this is logged as a warning).
-pub async fn index_message(state: &AppState, message_id: &str) {
+/// Indexes (or re-indexes after an edit) one message if it is searchable, from the message as it was just written
+/// or edited (no read back; `channel` = it is in a room channel), and removes it otherwise. The caller runs it after
+/// the broadcast, so the index never delays delivery, and only for unencrypted conversations. Best effort: a
+/// failure is logged and never fails the request that wrote the message (the next start's backfill does not see it
+/// again, so this is logged as a warning).
+pub async fn index(state: &AppState, message: &crate::models::Message, channel: bool) {
     if !state.config.search_enabled {
         return;
     }
-    let result = async {
-        let rows =
-            sqlx::query(&format!("{CANDIDATE_SQL} WHERE m.id = $1")).bind(message_id).fetch_all(&state.db).await?;
-        let candidates = rows.iter().map(candidate).collect::<Result<Vec<_>, _>>()?;
-        apply(&state.db, &candidates).await
-    }
-    .await;
+    let files: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
+    let text = (channel && !message.encrypted).then(|| searchable_text_of(&message.content, &files)).flatten();
+    let result = match text.map(|t| index_terms(&t)).filter(|t| !t.is_empty()) {
+        Some(terms) => sqlx::query(
+            "INSERT INTO message_search (message_id, conversation_id, author_id, terms) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (message_id) DO UPDATE SET terms = excluded.terms",
+        )
+        .bind(&message.id)
+        .bind(&message.conversation_id)
+        .bind(&message.author_id)
+        .bind(&terms)
+        .execute(&state.db)
+        .await
+        .map(|_| ()),
+        None => sqlx::query("DELETE FROM message_search WHERE message_id = $1")
+            .bind(&message.id)
+            .execute(&state.db)
+            .await
+            .map(|_| ()),
+    };
     if let Err(e) = result {
-        tracing::warn!(error = %e, message_id, "search index not updated");
+        tracing::warn!(error = %e, message_id = message.id, "search index not updated");
     }
 }
 
