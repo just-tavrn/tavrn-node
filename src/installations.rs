@@ -821,6 +821,9 @@ pub async fn handle_changed(
         apps::close_devices(state, devices);
         return Ok("handled");
     }
+    // Each change costs two fetches and an update to every room of the bot: limited per sender and bot like
+    // `profile.changed` (`429` before the message counts as received, the sender's retry brings it later).
+    state.profile_changed_limiter.check_all(&[format!("app|{iss}|{}", bot.id)]).await?;
     match crate::federation::profiles::fetch(state, &bot.username, &bot.domain).await {
         Ok(profile) => crate::federation::profiles::apply(state, &bot, &profile).await?,
         Err(e) => tracing::info!(domain = bot.domain, result = e.code(), "bot profile not refreshed after app.changed"),

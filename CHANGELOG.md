@@ -227,3 +227,5 @@ First public release of the node and its container image.
 - Incoming friend requests are limited per sending node and recipient (10 per hour, at most 20 pending from one
   node), and stubs created by inbound messages leave a tenth of `TAVRN_FEDERATION_MAX_REMOTE_USERS` for federated
   logins.
+- `app.changed` is limited per sender and bot like `profile.changed`; rate-limited inbox messages are not counted as
+  received, so the sender's retry is handled.
