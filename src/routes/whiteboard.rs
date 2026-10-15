@@ -20,7 +20,7 @@ use crate::{
     access::{self, Conv, ConvKind},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ProblemDetails},
     models::UserRow,
     permissions as p, store,
     validate::bad,
@@ -178,7 +178,7 @@ pub async fn post_ephemeral(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(conversation_id): Path<String>,
-    Json(req): Json<EphemeralRequest>,
+    ApiJson(req): ApiJson<EphemeralRequest>,
 ) -> Result<Json<EphemeralAccepted>, ApiError> {
     if !valid_type(&req.kind) {
         return Err(bad("ephemeral.type_invalid", "type must be `cursor` or `whiteboard.<name>`"));
@@ -457,7 +457,7 @@ pub async fn rename_scene(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(scene_id_raw): Path<String>,
-    Json(req): Json<RenameSceneRequest>,
+    ApiJson(req): ApiJson<RenameSceneRequest>,
 ) -> Result<Json<SceneInfo>, ApiError> {
     local_only(&state, &auth)?;
     scene_id(&scene_id_raw)?;

@@ -1058,7 +1058,7 @@ async fn run_action(
                 return Err(bad("validation.range", "minutes: between 1 and 40320"));
             }
             let body = rooms::TimeoutRequest { minutes, reason: req.reason.clone() };
-            let _ = rooms::timeout_member(s(), auth.clone(), Path((room_id()?, user_id()?)), Json(body)).await?;
+            let _ = rooms::timeout_member(s(), auth.clone(), Path((room_id()?, user_id()?)), ApiJson(body)).await?;
             Ok(None)
         }
         "kick" => {
@@ -1073,7 +1073,7 @@ async fn run_action(
             let subject = row.target_address.clone();
             if row.scope == "room" {
                 let body = rooms::BanRequest { subject, reason: req.reason.clone() };
-                let _ = rooms::ban(s(), auth.clone(), Path(room_id()?), Json(body)).await?;
+                let _ = rooms::ban(s(), auth.clone(), Path(room_id()?), ApiJson(body)).await?;
             } else {
                 require_admin(auth)?;
                 let body = admin::NodeBanRequest { subject, reason: req.reason.clone() };
@@ -1091,7 +1091,7 @@ async fn run_action(
                     to: None,
                     confirm_token: req.confirm_token.clone(),
                 };
-                let Json(r) = rooms::purge(s(), auth.clone(), Path(room_id()?), Json(body)).await?;
+                let Json(r) = rooms::purge(s(), auth.clone(), Path(room_id()?), ApiJson(body)).await?;
                 Ok(Some(r))
             } else {
                 require_admin(auth)?;

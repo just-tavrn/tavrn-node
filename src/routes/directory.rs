@@ -9,7 +9,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -20,7 +20,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     app::AppState,
     auth::{AuthUser, ClientIp, NodeAdmin},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     federation::{self, announce, discovery},
     store::{self, directory as dir},
     util,
@@ -458,7 +458,7 @@ async fn delist(state: &AppState, admin_id: &str, node: &str, room_id: &str) -> 
 pub async fn relist(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
-    Json(req): Json<RelistRequest>,
+    ApiJson(req): ApiJson<RelistRequest>,
 ) -> Result<StatusCode, ApiError> {
     let node = node_domain(&req.node)?;
     let room_id = req.room_id.as_deref().map(|r| validate::ulid("room_id", r)).transpose()?.unwrap_or_default();
@@ -589,7 +589,7 @@ fn to_report(r: dir::ReportRow) -> DirectoryReport {
 pub async fn report(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<ReportRequest>,
+    ApiJson(req): ApiJson<ReportRequest>,
 ) -> Result<(StatusCode, Json<DirectoryReport>), ApiError> {
     let (domain, application_ref) = match &req.subject {
         Some(subject) => {

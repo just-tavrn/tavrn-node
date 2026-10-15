@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     config::RoomCreation,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     jwt,
     models::{AuditEntry, Ban, Category, Channel, Invite, Member, PermissionOverride, Role, Room, UserRow},
     permissions as p, store,
@@ -149,7 +149,7 @@ async fn may_create_room(state: &AppState, user: &UserRow) -> Result<(), ApiErro
 pub async fn create_room(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<CreateRoomRequest>,
+    ApiJson(req): ApiJson<CreateRoomRequest>,
 ) -> Result<(StatusCode, Json<RoomDetail>), ApiError> {
     may_create_room(&state, &auth.user).await?;
     let name = validate::name("name", &req.name, 100)?;
@@ -317,7 +317,7 @@ pub async fn update_room(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<UpdateRoomRequest>,
+    ApiJson(req): ApiJson<UpdateRoomRequest>,
 ) -> Result<Json<RoomDetail>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROOM, "room.manage_forbidden", "Manage room")?;
@@ -801,7 +801,7 @@ pub async fn update_member(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, user_id)): Path<(String, String)>,
-    Json(req): Json<UpdateMemberRequest>,
+    ApiJson(req): ApiJson<UpdateMemberRequest>,
 ) -> Result<Json<Member>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     let target = store::rooms::member(&state.db, &room_id, &user_id)
@@ -975,7 +975,7 @@ pub async fn timeout_member(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, user_id)): Path<(String, String)>,
-    Json(req): Json<TimeoutRequest>,
+    ApiJson(req): ApiJson<TimeoutRequest>,
 ) -> Result<Json<Member>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MODERATE_MEMBERS, "member.timeout_forbidden", "Moderate members")?;
@@ -1033,7 +1033,7 @@ pub async fn ban(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<BanRequest>,
+    ApiJson(req): ApiJson<BanRequest>,
 ) -> Result<(StatusCode, Json<Ban>), ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::BAN_MEMBERS, "member.ban_forbidden", "Ban members")?;
@@ -1326,7 +1326,7 @@ pub async fn purge(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<PurgeRequest>,
+    ApiJson(req): ApiJson<PurgeRequest>,
 ) -> Result<Json<PurgeResponse>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
