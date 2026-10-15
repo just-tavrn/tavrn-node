@@ -161,17 +161,18 @@ async fn entry_in(state: &AppState, conv: &Conv, entry_id: &str) -> Result<Entry
     store::files::entry(&state.db, &conv.id, entry_id).await?.ok_or_else(entry_not_found)
 }
 
-/// Start of the requester's history window for entry records (RFC 3339; FILES.md §8.7), `None` = no limit.
-/// Only encrypted channels and room members (node admins who are not members cannot decrypt anyway).
+/// Start of the requester's history window for entry records (RFC 3339; FILES.md §8.7), `None` = no limit: the
+/// member's window of messages ([`crate::history::member_window`]: policy, `read_history` and, after a key reset
+/// without an approved restore, never before `key_reset_at`). Only encrypted channels and room members (node admins
+/// who are not members cannot decrypt anyway).
 fn record_cut(conv: &Conv) -> Option<String> {
     if !conv.encrypted {
         return None;
     }
     let ConvKind::Channel { access, channel } = &conv.kind else { return None };
     let member = access.member.as_ref()?;
-    let joined = util::parse_time(&member.joined_at)?;
     let policy = crate::history::Policy::of(channel.history_for_new_members.as_deref());
-    crate::history::cutoff(policy, p::has(conv.perms, p::READ_HISTORY), joined).map(util::format_time)
+    crate::history::member_window(policy, p::has(conv.perms, p::READ_HISTORY), member).map(util::format_time)
 }
 
 /// Checks an entry record like message content (FILES.md §8.4) and returns it as stored with the session's user
