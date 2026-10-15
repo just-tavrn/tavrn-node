@@ -166,27 +166,12 @@ pub struct NewHook<'a> {
     pub expires_at: &'a str,
 }
 
-/// Queues a delivery. With `cap` events already queued for the application the oldest are dropped (and
-/// counted in `dropped`) to make room. Returns the number dropped.
+/// Queues a delivery. Beyond `cap` queued events of the application the oldest are dropped (and counted in
+/// `dropped`). Returns the number dropped. The new event is inserted first and the queue then trimmed to the
+/// newest `cap` in the same transaction, so concurrent enqueues cannot leave more than `cap` behind, and no count
+/// of the whole queue runs per event.
 pub async fn enqueue(db: &Pool, h: NewHook<'_>, cap: i64) -> Result<i64, ApiError> {
-    let queued = queued(db, h.application_id).await?;
-    let mut dropped = 0;
-    if queued >= cap {
-        dropped = queued - cap + 1;
-        sqlx::query(
-            "DELETE FROM application_outbox WHERE id IN
-               (SELECT id FROM application_outbox WHERE application_id = $1 ORDER BY id LIMIT $2)",
-        )
-        .bind(h.application_id)
-        .bind(dropped)
-        .execute(db)
-        .await?;
-        sqlx::query("UPDATE application_subscriptions SET dropped = dropped + $1 WHERE application_id = $2")
-            .bind(dropped)
-            .bind(h.application_id)
-            .execute(db)
-            .await?;
-    }
+    let mut tx = db.begin().await?;
     sqlx::query(
         "INSERT INTO application_outbox (id, application_id, event_id, event_type, body, attempts, next_at, expires_at)
          VALUES ($1, $2, $3, $4, $5, 0, $6, $7)",
@@ -198,8 +183,26 @@ pub async fn enqueue(db: &Pool, h: NewHook<'_>, cap: i64) -> Result<i64, ApiErro
     .bind(h.body)
     .bind(h.next_at)
     .bind(h.expires_at)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    let dropped = sqlx::query(
+        "DELETE FROM application_outbox WHERE application_id = $1 AND id <=
+           (SELECT id FROM application_outbox WHERE application_id = $1 ORDER BY id DESC LIMIT 1 OFFSET $2)",
+    )
+    .bind(h.application_id)
+    .bind(cap)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let dropped = i64::try_from(dropped).unwrap_or(i64::MAX);
+    if dropped > 0 {
+        sqlx::query("UPDATE application_subscriptions SET dropped = dropped + $1 WHERE application_id = $2")
+            .bind(dropped)
+            .bind(h.application_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(dropped)
 }
 

@@ -153,13 +153,22 @@ async fn record_inner(
     };
     let at = util::now();
     let mut queued = false;
+    // Message events: whether each bot may read the channel, from the room's visibility snapshot (the evaluation of
+    // the REST routes, shared by the fan-out), instead of loading the room, roles and overrides per subscriber.
+    let view = match &channel {
+        Some(_) => match crate::visibility::room(state, room_id).await? {
+            Some(view) => Some(view),
+            None => return Ok(()),
+        },
+        None => None,
+    };
     for sub in subscribers {
         let events: Vec<String> = serde_json::from_str(&sub.events).unwrap_or_default();
         if !events.iter().any(|e| e == kind) {
             continue;
         }
         let Some(app) = store::applications::by_id(&state.db, &sub.application_id).await? else { continue };
-        let Some(mut bot) = store::users::by_id(&state.db, &sub.bot_user_id).await? else { continue };
+        let Some(bot) = store::users::by_id(&state.db, &sub.bot_user_id).await? else { continue };
         if crate::applications::disabled_reason(state, &app, &bot).await?.is_some() {
             continue;
         }
@@ -167,10 +176,11 @@ async fn record_inner(
         if !crate::applications::event_allowed(kind, &data, &scopes) {
             continue;
         }
-        if let Some(channel) = &channel {
-            bot.app_scopes = Some(scopes.clone());
-            let Ok(access) = crate::access::room_access(state, room_id, &bot).await else { continue };
-            let perms = crate::access::channel_perms(state, &access, channel, &bot.id).await?;
+        if let (Some(channel), Some(view)) = (&channel, &view) {
+            // The snapshot evaluates the bot with every scope; its application's scopes cap the result as they cap
+            // a request of the bot.
+            let Some(perms) = view.perms(&channel.id, &bot.id) else { continue };
+            let perms = p::cap_bot(perms, &bot.kind, channel.no_bots(), Some(&scopes));
             if !p::has(perms, p::VIEW_CHANNEL | p::READ_HISTORY) {
                 continue;
             }
