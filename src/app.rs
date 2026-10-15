@@ -161,8 +161,8 @@ pub struct AppState {
     pub direct_invite_limiter: Arc<RateLimiter>,
     /// Received `room.invite` notifications per sender and recipient (10 per hour, §5.2).
     pub room_invite_inbox_limiter: Arc<RateLimiter>,
-    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2).
-    pub notify_limiter: Arc<RateLimiter>,
+    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2), counted for the whole node.
+    pub notify_limiter: Arc<SharedLimiter>,
     /// Key cache refetches through `federation::keys::ensure` per remote user (1 per minute, §3.5).
     pub keys_fetch_limiter: Arc<RateLimiter>,
     /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
@@ -393,7 +393,7 @@ impl AppState {
             ),
             direct_invite_limiter: limiter(invites.1, 3600),
             room_invite_inbox_limiter: limiter(invites.2, 3600),
-            notify_limiter: limiter(1, 60),
+            notify_limiter: shared("fed-notify", 1, 60),
             keys_fetch_limiter: limiter(1, 60),
             profile_refresh_limiter: limiter(1, 60),
             profile_changed_limiter: shared(

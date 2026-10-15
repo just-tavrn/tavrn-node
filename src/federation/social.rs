@@ -238,11 +238,15 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
             (users, Some(access.room.id.clone()))
         }
     };
-    for (user, roles) in candidates {
-        if user.id == author_id || user.domain == *own || crate::presence::is_online(state, &user.id) {
-            continue;
-        }
-        if state.notify_limiter.check(&format!("{}|{}", user.id, conv.id)).is_err() {
+    let candidates: Vec<(UserRow, Vec<String>)> = candidates
+        .into_iter()
+        .filter(|(user, _)| user.id != author_id && user.domain != *own && !crate::presence::is_online(state, &user.id))
+        .collect();
+    let keys: Vec<String> = candidates.iter().map(|(user, _)| format!("{}|{}", user.id, conv.id)).collect();
+    let passed = state.notify_limiter.check_many(&keys).await;
+    let mut hints = Vec::new();
+    for ((user, roles), ok) in candidates.into_iter().zip(passed) {
+        if !ok {
             continue;
         }
         // `mention`: the user or one of their roles is mentioned, or @everyone; `everyone`: only @everyone
@@ -251,9 +255,10 @@ async fn notify_inner(state: &AppState, conv: &Conv, message: &Message, author_i
         let mention = direct || message.mentions_everyone;
         let everyone = message.mentions_everyone && !direct;
         let payload = json!({ "node": own, "conversation_id": conv.id, "room_id": room_id, "mention": mention, "everyone": everyone });
-        send(state, own, &user, "notify", payload).await?;
+        hints.push((user.domain.clone(), user.address(), payload));
     }
-    Ok(())
+    // One statement for all of them (an @everyone in a room with many remote members).
+    outbox::enqueue_many(state, "notify", own, hints).await
 }
 
 // ---------------------------------------------------------------- receiving

@@ -101,6 +101,39 @@ pub async fn enqueue(
     Ok(id)
 }
 
+/// [`enqueue`] for many notifications of one kind from `from`: `(target node, recipient address, payload)` each, in
+/// one statement per 500 and with one wake-up of the sender.
+pub async fn enqueue_many(
+    state: &AppState,
+    kind: &str,
+    from: &str,
+    items: Vec<(String, String, Value)>,
+) -> Result<(), ApiError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut built = Vec::with_capacity(items.len());
+    for (target, to, payload) in items {
+        let (id, at, body, expires_at) = envelope(kind, from, &to, payload)?;
+        built.push((target, id, at, body, expires_at));
+    }
+    let entries: Vec<store::federation::NewOutbox<'_>> = built
+        .iter()
+        .map(|(target, id, at, body, expires_at)| store::federation::NewOutbox {
+            id,
+            target,
+            kind,
+            body,
+            created_at: at,
+            expires_at,
+        })
+        .collect();
+    store::federation::enqueue_many(&state.db, &entries).await?;
+    tracing::debug!(kind, count = entries.len(), "federation notifications queued");
+    crate::cache::wake(state, crate::cache::Job::Outbox);
+    Ok(())
+}
+
 /// Queues a notification that replaces the queued ones of the same `kind` from `from` to `target` (at most one
 /// stays) and leaves at the earliest `delay_secs` from now, so a burst of changes becomes one message carrying
 /// the latest state (`profile.changed`, FEDERATION.md §5.2). A replaced entry's due time is kept.

@@ -886,6 +886,28 @@ pub async fn enqueue(db: &Pool, e: NewOutbox<'_>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// [`enqueue`] for many entries: one multi-row `INSERT` per 500 (a message's `notify` hints to many members).
+pub async fn enqueue_many(db: &Pool, entries: &[NewOutbox<'_>]) -> Result<(), ApiError> {
+    for chunk in entries.chunks(500) {
+        let rows: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let b = i * 6;
+                format!("(${}, ${}, ${}, ${}, 0, ${}, ${}, ${})", b + 1, b + 2, b + 3, b + 4, b + 5, b + 5, b + 6)
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO federation_outbox (id, target, type, body, attempts, next_at, created_at, expires_at) VALUES {}",
+            rows.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        for e in chunk {
+            q = q.bind(e.id).bind(e.target).bind(e.kind).bind(e.body).bind(e.created_at).bind(e.expires_at);
+        }
+        q.execute(db).await?;
+    }
+    Ok(())
+}
+
 /// Queues `e` in place of the entries of the same target and type that `from` sent and that are still queued
 /// (coalescing, FEDERATION.md §5.2 `profile.changed`): at most one such entry stays. The new entry is due at the
 /// earliest `next_at` of the replaced ones (a waiting or backed-off target keeps its schedule), else at `next_at`.
