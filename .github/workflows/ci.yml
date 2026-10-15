@@ -177,3 +177,9 @@ jobs:
     secrets:
       # Read access to tavrn-crypto (cargo) and tavrn-web (the web stage), passed as the build secret read_token.
       READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}
+
+  shared-scripts:
+    # The copies of the organization's shared scripts (SPDX check, publication check, labels, JS licenses) are the
+    # source in just-tavrn/.github apart from their SPDX line (its docs/GITHUB.md "Shared scripts").
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    uses: just-tavrn/.github/.github/workflows/shared-scripts.yml@main

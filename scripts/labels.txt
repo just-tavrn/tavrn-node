@@ -1,0 +1,10 @@
+# Labels of this repository on top of the common set of scripts/github-labels.sh (name|colour|description).
+federation|1d76db|Federation between nodes
+voice|5319e7|Voice, video and LiveKit
+e2ee|0e8a16|End-to-end encryption on the node (MLS delivery service, keys)
+database|c5def5|Migrations, SQLite and PostgreSQL
+deployment|0052cc|Container image, compose file, reverse proxy, operator documentation
+scaling|bfdadc|Several instances of one node (Valkey)
+performance|f9d0c4|Performance budgets and the load generator
+protocol|fbca04|Needs a change or clarification in tavrn-protocol
+ci|ededed|Workflows and build tooling
