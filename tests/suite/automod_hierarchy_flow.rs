@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use axum::http::StatusCode;
 use common::{Session, TestNode, test_node};
 use serde_json::{Value, json};
-use tavrn_node::hub::Event;
+use tavrn_node::{hub::Event, permissions as p};
 use tokio::sync::broadcast;
 
 const DOMAIN: &str = "t.local";
@@ -29,6 +29,18 @@ async fn room_with(node: &TestNode, owner: &Session, members: &[&Session]) -> (S
         assert_eq!(s, StatusCode::OK, "{j}");
     }
     (room_id, channel_id)
+}
+
+async fn role(node: &TestNode, owner: &str, room_id: &str, name: &str, bits: &[u64], position: i64) -> String {
+    let (s, role) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/roles"),
+            owner,
+            json!({ "name": name, "permissions": common::perms(bits), "position": position }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{role}");
+    role["id"].as_str().unwrap().to_string()
 }
 
 async fn member_update(rx: &mut broadcast::Receiver<Arc<Event>>, user_id: &str) -> Value {
@@ -90,4 +102,64 @@ async fn automod_flood_timeout_is_announced() {
     }
     let update = member_update(&mut rx, &bob.user_id).await;
     assert!(update["member"]["timeout_until"].is_string(), "{update}");
+}
+
+/// A `timeout` or `delete` rule written by a member reaches only members that member outranks: a low-ranked room
+/// manager cannot time out or silence a higher moderator through a rule (permissions.md "Hierarchy"). Members below
+/// the author are still caught.
+#[tokio::test]
+async fn automod_rules_reach_only_members_their_author_outranks() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await; // owner
+    let bob = node.register("bob").await; // high moderator
+    let carol = node.register("carol").await; // low room manager
+    let dave = node.register("dave").await; // plain member
+    let (room_id, channel) = room_with(&node, &alice, &[&bob, &carol, &dave]).await;
+    let low = role(&node, &alice.token, &room_id, "Settings", &[p::MANAGE_ROOM], 1).await;
+    let high = role(&node, &alice.token, &room_id, "Mod", &[p::MODERATE_MEMBERS, p::KICK_MEMBERS], 5).await;
+    for (u, r) in [(&carol.user_id, &low), (&bob.user_id, &high)] {
+        let (s, j) =
+            node.patch(&format!("/api/v1/rooms/{room_id}/members/{u}"), &alice.token, json!({ "roles": [r] })).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+    }
+    let rules = json!({ "rules": [
+        { "name": "trap", "terms": ["hello"], "action": "timeout", "timeout_minutes": 40320 },
+        { "name": "gone", "terms": ["vanish"], "action": "delete" },
+    ] });
+    let (s, j) = node.put(&format!("/api/v1/rooms/{room_id}/automod"), &carol.token, rules).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let timeout_of = |user_id: String| {
+        let db = node.state.db.clone();
+        let room_id = room_id.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT timeout_until FROM room_members WHERE room_id = $1 AND user_id = $2",
+            )
+            .bind(&room_id)
+            .bind(&user_id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (s, j) = node.send(&bob.token, &room_id, &channel, "hello all").await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert_eq!(timeout_of(bob.user_id.clone()).await, None, "the rule's author does not outrank bob");
+    let (s, kept) = node.send(&bob.token, &room_id, &channel, "vanish").await;
+    assert_eq!(s, StatusCode::CREATED, "{kept}");
+    let (_, list) = node.get_auth(&format!("/api/v1/conversations/{channel}/messages"), &alice.token).await;
+    assert!(list.as_array().unwrap().iter().any(|m| m["id"] == kept["id"]), "bob's message stays");
+
+    // dave ranks below carol: her rules apply to him.
+    let (s, j) = node.send(&dave.token, &room_id, &channel, "hello all").await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert!(timeout_of(dave.user_id.clone()).await.is_some(), "dave is timed out");
+
+    // Rules the owner writes reach everybody but the owner.
+    let rules = json!({ "rules": [{ "name": "trap", "terms": ["hello"], "action": "timeout", "timeout_minutes": 5 }] });
+    let (s, j) = node.put(&format!("/api/v1/rooms/{room_id}/automod"), &alice.token, rules).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, j) = node.send(&bob.token, &room_id, &channel, "hello again").await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    assert!(timeout_of(bob.user_id.clone()).await.is_some(), "the owner outranks bob");
 }

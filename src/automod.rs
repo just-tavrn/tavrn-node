@@ -438,11 +438,19 @@ struct Compiled {
     rule: AutomodRule,
     terms: Terms,
     links: Links,
+    /// The rank of the rules' author ([`Document`]): `delete` and `timeout` act only on members ranked below it.
+    author_rank: Option<i64>,
 }
 
 impl Compiled {
     fn new(rule: AutomodRule) -> Self {
-        Self { terms: Terms::new(&rule.terms, rule.whole_word), links: Links::parse(&rule.links), rule }
+        Self { terms: Terms::new(&rule.terms, rule.whole_word), links: Links::parse(&rule.links), rule, author_rank: None }
+    }
+
+    /// A `delete` or `timeout` rule acts on a member only when its author outranks them, as a moderator's own
+    /// action would (permissions.md "Hierarchy"); `block` rules filter everyone's messages.
+    fn reaches(&self, rank: i64) -> bool {
+        self.rule.action == "block" || self.author_rank.is_none_or(|author| author > rank)
     }
 }
 
@@ -560,7 +568,31 @@ pub async fn room_rules(state: &AppState, room_id: &str) -> Result<Vec<AutomodRu
 }
 
 fn parse_rules(raw: &str) -> Vec<AutomodRule> {
-    serde_json::from_str(raw).unwrap_or_default()
+    parse_document(raw).0
+}
+
+/// The stored document of a room's rules: `{"author_rank": …, "rules": […]}` (or a bare list, written before the
+/// rank was recorded).
+#[derive(Debug, Serialize, Deserialize)]
+struct Document {
+    /// The highest role position of the member who last wrote the rules (`i64::MAX` for the owner or a node admin).
+    #[serde(default)]
+    author_rank: Option<i64>,
+    #[serde(default)]
+    rules: Vec<AutomodRule>,
+}
+
+/// The rules and the rank of their author ([`Document`]); `None` for a list stored without it.
+fn parse_document(raw: &str) -> (Vec<AutomodRule>, Option<i64>) {
+    if let Ok(rules) = serde_json::from_str::<Vec<AutomodRule>>(raw) {
+        return (rules, None);
+    }
+    serde_json::from_str::<Document>(raw).map(|d| (d.rules, d.author_rank)).unwrap_or_default()
+}
+
+/// The document [`parse_document`] reads: the rules with the rank of the member who writes them (`top_position`).
+pub fn encode_rules(rules: &[AutomodRule], author_rank: i64) -> Result<String, ApiError> {
+    serde_json::to_string(&json!({ "author_rank": author_rank, "rules": rules })).map_err(|e| ApiError::Internal(e.into()))
 }
 
 /// The compiled rules of a room, shared between messages (parsing and compiling 20 rules × 500 terms per message
@@ -603,8 +635,10 @@ async fn compiled_rules(state: &AppState, room_id: &str) -> Result<Arc<Vec<Compi
         hit.checked = Instant::now();
         return Ok(hit.rules.clone());
     }
-    let rules: Arc<Vec<Compiled>> =
-        Arc::new(parse_rules(&raw).into_iter().filter(|r| r.enabled).map(Compiled::new).collect());
+    let (rules, author_rank) = parse_document(&raw);
+    let rules: Arc<Vec<Compiled>> = Arc::new(
+        rules.into_iter().filter(|r| r.enabled).map(|r| Compiled { author_rank, ..Compiled::new(r) }).collect(),
+    );
     let mut cache = rule_cache();
     if cache.len() >= MAX_CACHED_ROOMS {
         cache.clear();
@@ -853,6 +887,7 @@ pub async fn evaluate(
         let rule = &c.rule;
         if rule.exempt_channels.contains(&channel.id)
             || access.member_roles.iter().any(|r| rule.exempt_roles.contains(&r.id))
+            || !c.reaches(access.top_position())
         {
             continue;
         }

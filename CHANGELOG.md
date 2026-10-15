@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- Auto-moderation `delete` and `timeout` rules act only on members ranked below the member who last saved the rules
+  (the rank is recorded with them), so a low-ranked room manager can no longer time out or silence higher moderators
+  through a rule.
 - Auto-moderation timeouts (keyword rules and the flood limit) publish `member.update` like a moderator's timeout, so
   clients learn them and ephemeral events and typing are refused at once.
 - Several instances: when events may have been lost on the cache bus, an instance drops its channel visibility

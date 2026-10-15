@@ -370,7 +370,8 @@ pub async fn put_automod(
     let roles = store::rooms::roles(&state.db, &access.room.id).await?;
     let channels = store::rooms::channels(&state.db, &access.room.id).await?;
     let rules = automod::validate_rules(req.rules, &roles, &channels)?;
-    let encoded = serde_json::to_string(&rules).map_err(|e| ApiError::Internal(e.into()))?;
+    // The author's rank goes with the rules: `delete` and `timeout` act only on members the author outranks.
+    let encoded = automod::encode_rules(&rules, access.top_position())?;
     store::automod::set_rules(&state.db, &access.room.id, &encoded, &util::now()).await?;
     automod::rules_changed(&state, &access.room.id);
     store::rooms::audit(
