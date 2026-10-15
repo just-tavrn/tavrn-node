@@ -72,7 +72,8 @@ impl GifClient {
     pub async fn search(&self, query: Option<&str>, limit: u32) -> Result<Vec<Gif>, ApiError> {
         let limit = limit.clamp(1, 50).to_string();
         let unavailable = |e: reqwest::Error| {
-            tracing::warn!(error = %e, "GIF provider unreachable");
+            // Without the URL: it carries the node's API key and the user's search term.
+            tracing::warn!(error = %e.without_url(), "GIF provider unreachable");
             ApiError::Unavailable { code: "gif.unavailable", detail: "GIF service unreachable".into() }
         };
         match self.provider {
