@@ -297,7 +297,7 @@ pub struct Config {
     pub attachment_retention_days: u32,
     /// `files_channels.enabled`: files channels may be created (`on`/`off`).
     pub files_channels: Switch,
-    /// `files_channels.max_bytes`: storage per files channel.
+    /// `files_channels.max_bytes`: storage per files channel on the node's own storage (default 10 GiB; `0` = unlimited).
     pub files_channels_max_bytes: u64,
     /// Cached copies of other nodes' emojis and clips are evicted after this many days without use;
     /// 0 = never.
@@ -642,7 +642,7 @@ impl Default for Config {
             sounds_max_personal: 10,
             attachment_retention_days: 0,
             files_channels: Switch::On,
-            files_channels_max_bytes: 0,
+            files_channels_max_bytes: 10 * 1024 * 1024 * 1024,
             media_cache_unused_days: 365,
             media_cache_max_bytes: 2 * 1024 * 1024 * 1024,
             media_cache_max_bytes_per_host: 64 * 1024 * 1024,

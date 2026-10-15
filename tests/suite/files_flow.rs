@@ -745,3 +745,12 @@ async fn an_aborted_upload_leaves_no_partial_file() {
     let (st, j) = s.up(&s.bob.token, "after.txt", None, "text/plain", b"fine").await;
     assert_eq!(st, StatusCode::CREATED, "{j}");
 }
+
+#[tokio::test]
+async fn files_channels_on_the_node_storage_have_a_default_quota() {
+    let default = tavrn_node::config::Config::default().files_channels_max_bytes;
+    assert!(default > 0, "the node's own storage is never unlimited by default");
+    let s = setup().await;
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    assert_eq!(usage["limit_bytes"].as_u64(), Some(default), "{usage}");
+}

@@ -234,3 +234,5 @@ First public release of the node and its container image.
 - Files channels: a rename is classified like an upload (executable rule and upload categories).
 - Files channels: uploads in progress reserve their bytes, so parallel uploads cannot exceed the channel quota; an
   upload whose request ends early (client gone, timeout) leaves no partial file, for attachments too.
+- `TAVRN_FILES_CHANNELS_MAX_BYTES` defaults to 10 GiB instead of unlimited: files channels on the node's own storage
+  no longer leave the disk unbounded by default.
