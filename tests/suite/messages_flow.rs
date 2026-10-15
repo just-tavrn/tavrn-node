@@ -258,8 +258,9 @@ async fn message_ids_are_accepted_in_any_case() {
     assert_eq!(s, StatusCode::CREATED, "{m}");
     let id = m["id"].as_str().unwrap().to_string();
     let lower = id.to_lowercase();
-    let (s, j) =
-        node.patch(&format!("{path}/{lower}"), &bob.token, json!({ "content": { "type": "text", "body": "Edited" } })).await;
+    let (s, j) = node
+        .patch(&format!("{path}/{lower}"), &bob.token, json!({ "content": { "type": "text", "body": "Edited" } }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!((j["id"].as_str(), j["content"]["body"].as_str()), (Some(id.as_str()), Some("Edited")));
     let (s, j) = node

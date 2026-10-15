@@ -196,8 +196,9 @@ async fn discover_counts_members_and_limits_anonymous_callers() {
     for (name, joins) in [("Busy", true), ("Quiet", false)] {
         let room = node.create_room(&alice.token, name).await;
         let id = room["id"].as_str().unwrap().to_string();
-        let (s, j) =
-            node.patch(&format!("/api/v1/rooms/{id}"), &alice.token, json!({ "join_mode": "public", "discoverable": true })).await;
+        let (s, j) = node
+            .patch(&format!("/api/v1/rooms/{id}"), &alice.token, json!({ "join_mode": "public", "discoverable": true }))
+            .await;
         assert_eq!(s, StatusCode::OK, "{j}");
         if joins {
             let (s, j) = node.post(&format!("/api/v1/rooms/{id}/join"), &bob.token, json!({})).await;
@@ -206,7 +207,8 @@ async fn discover_counts_members_and_limits_anonymous_callers() {
     }
     let (s, list) = node.req(Method::GET, "/api/v1/rooms/discover", None, None).await;
     assert_eq!(s, StatusCode::OK, "{list}");
-    let count = |name: &str| list.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["member_count"].clone();
+    let count =
+        |name: &str| list.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["member_count"].clone();
     assert_eq!((count("Busy"), count("Quiet")), (json!(2), json!(1)));
 
     // The in-process router has no peer address: every anonymous request here comes from "unknown".

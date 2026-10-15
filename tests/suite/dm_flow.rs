@@ -345,7 +345,11 @@ async fn the_dm_list_can_be_paged() {
         let friend = node.register(&format!("friend{i}")).await;
         node.befriend(&alice, &friend).await;
         let (s, j) = node
-            .post("/api/v1/conversations", &alice.token, json!({ "kind": "dm", "members": [format!("{}@{DOMAIN}", friend.username)] }))
+            .post(
+                "/api/v1/conversations",
+                &alice.token,
+                json!({ "kind": "dm", "members": [format!("{}@{DOMAIN}", friend.username)] }),
+            )
             .await;
         assert_eq!(s, StatusCode::CREATED, "{j}");
         ids.push(j["id"].as_str().unwrap().to_string());
