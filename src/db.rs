@@ -188,6 +188,37 @@ mod tests {
         }
     }
 
+    /// Read states look up the newest message and the unread messages after a read marker as index ranges (migration
+    /// 0430 adds the partial index of the conversation's main messages), not as reads of the whole history.
+    #[tokio::test]
+    async fn read_states_use_the_main_message_index() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let plan = |sql: String, binds: usize| {
+            let pool = pool.clone();
+            async move {
+                let text = format!("EXPLAIN QUERY PLAN {sql}");
+                let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(&text);
+                for i in 0..binds {
+                    q = q.bind(format!("p{i}"));
+                }
+                q.fetch_all(&pool).await.unwrap().into_iter().map(|(.., detail)| detail).collect::<Vec<_>>()
+            }
+        };
+        // (SQLite may pick the partial index or `messages_conversation` on the same columns: both are ranges.)
+        let last = plan(crate::store::messages::last_ids_sql(2), 2).await;
+        assert!(
+            last.iter().any(|d| d.contains("INDEX messages_conversation") && d.contains("conversation_id=?")),
+            "newest message: {last:?}"
+        );
+        // One role pattern, two conversations with a marker, none without.
+        let counts = plan(crate::store::messages::unread_counts_sql(1, 2, 0), 5).await;
+        assert!(
+            counts.iter().any(|d| d.contains("INDEX messages_conversation") && d.contains("id>?")),
+            "unread after the marker: {counts:?}"
+        );
+        assert!(!counts.iter().any(|d| d.starts_with("SCAN m")), "no scan of the messages: {counts:?}");
+    }
+
     /// Binary columns (BYTEA) round-trip through the `Any` driver on SQLite (and PostgreSQL in test-pg).
     #[tokio::test]
     async fn binary_columns_roundtrip() {
