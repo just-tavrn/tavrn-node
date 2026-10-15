@@ -405,7 +405,7 @@ These settings decide whether and with whom the node federates and how it takes 
 | `TAVRN_FEDERATION_RATE_INBOX` | `300` | Inbox messages per remote domain and minute (> 0). |
 | `TAVRN_FEDERATION_RATE_API` | `3000` | API requests of all users of one remote domain per minute (> 0). |
 | `TAVRN_FEDERATION_RATE_CLAIMS` | `120` | KeyPackage claims per requesting node and minute (> 0). |
-| `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. |
+| `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. Users that only an incoming message names (the sender of a friend request) may fill it up to nine tenths; the rest stays for users who sign in. |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS_PER_DOMAIN` | `1000` | Remote users per home domain. |
 | `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` | `10` | How long a request to a peer waits for one of the peer's 4 connection slots and then one of the 64 node-wide slots before it fails (1–120). A slow peer only ever ties up its own slots. |
 | `TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS` | `1000` | Cached discovery documents of peers no signed request of which ever verified here (10–1000000). Beyond it, unsigned requests naming a new domain are refused (`503 federation.peer_limit`) before any fetch. Peers this node looked up itself, listed in its directory, or with users or sign-ins never count. Failed fetches are remembered for 60 seconds per domain, and peers unused for 30 days that nothing ties to the node are pruned. |
@@ -1127,6 +1127,8 @@ The operator decides which nodes this node federates with and how much load othe
   blocklist still wins.
 - Blocks and node bans of a domain stop the outgoing traffic too: queued notifications for it are dropped as
   undeliverable, and profiles, avatars and application documents are no longer fetched from it.
+- Incoming friend requests: at most 10 per hour from one node to one user, and at most 20 pending from one node per
+  user; further requests are dropped.
 - Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;
   quotas of remote users: `TAVRN_FEDERATION_MAX_REMOTE_USERS`, `…_PER_DOMAIN`.
 - Remote users with nothing left on this node are deleted after `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`.

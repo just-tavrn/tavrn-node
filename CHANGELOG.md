@@ -224,3 +224,6 @@ First public release of the node and its container image.
   avatars and application documents are no longer fetched from it.
 - The KeyPackage claim budget of a requesting node exempts only related requesters it can speak for (its own users,
   or users of this node signed in there); users of third nodes named by it count against its budget.
+- Incoming friend requests are limited per sending node and recipient (10 per hour, at most 20 pending from one
+  node), and stubs created by inbound messages leave a tenth of `TAVRN_FEDERATION_MAX_REMOTE_USERS` for federated
+  logins.

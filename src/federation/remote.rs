@@ -227,6 +227,23 @@ pub async fn ensure_remote_user(
     store::federation::create_remote_user(&state.db, username, domain, username, kind, owner_id).await
 }
 
+/// [`ensure_remote_user`] for a user that an inbound message names without signing in (a friend request's sender):
+/// such stubs may fill the node-wide quota only up to a reserve of a tenth (at least one row), which stays for users
+/// who sign in, so that requests in invented names cannot lock out other nodes' users. The per-domain quota applies
+/// as usual.
+pub async fn ensure_remote_stub(state: &AppState, username: &str, domain: &str) -> Result<UserRow, ApiError> {
+    if let Some(user) = store::federation::user_by_address(&state.db, username, domain).await? {
+        return Ok(user);
+    }
+    let max = i64::from(state.config.federation_max_remote_users);
+    let reserve = (max / 10).max(1);
+    if store::federation::count_remote_users(&state.db, &state.config.domain).await? >= max - reserve {
+        tracing::warn!(domain, "remote user quota for inbound messages reached");
+        return Err(remote_limit());
+    }
+    ensure_remote_user(state, username, domain, "user", None).await
+}
+
 fn user_not_found() -> ApiError {
     ApiError::NotFound { code: "user.not_found", what: "User".into() }
 }
