@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "tavrn-node"
-version = "0.4.0-rc.8"
+version = "0.4.0-rc.9"
 dependencies = [
  "aes-gcm 0.11.1",
  "aho-corasick",
@@ -5017,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "tavrn-perf-loadgen"
-version = "0.4.0-rc.8"
+version = "0.4.0-rc.9"
 dependencies = [
  "anyhow",
  "chrono",
