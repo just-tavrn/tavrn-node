@@ -682,15 +682,21 @@ pub fn redact_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The request span of the HTTP trace layer: method, the redacted path (never the query string) and version.
+/// The request span of the HTTP trace layer (level info, so that warnings and errors of a request carry it): method,
+/// route template, the `x-request-id` (the `request_id` of Problem Details), the redacted path (never the query
+/// string) and version.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RedactedSpan;
 
 impl<B> tower_http::trace::MakeSpan<B> for RedactedSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
-        tracing::debug_span!(
+        let route = request.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("-");
+        let request_id = request.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("-");
+        tracing::info_span!(
             "request",
             method = %request.method(),
+            route,
+            request_id,
             path = %redact_path(request.uri().path()),
             version = ?request.version(),
         )

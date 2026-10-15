@@ -11,6 +11,25 @@ use serde_json::Value;
 
 pub const ERROR_TYPE_BASE: &str = "https://tavrn.dev/errors/";
 
+tokio::task_local! {
+    /// The `x-request-id` of the request being handled ([`request_scope`]): Problem Details name it.
+    static REQUEST_ID: String;
+}
+
+/// Middleware (inside the layer that sets `x-request-id`): handles the request with its id in scope, so that every
+/// Problem Details answer carries it as `request_id` (PROTOCOL.md §4) and users can report it.
+pub async fn request_scope(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    match req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(String::from) {
+        Some(id) => REQUEST_ID.scope(id, next.run(req)).await,
+        None => next.run(req).await,
+    }
+}
+
+/// The id of the request being handled, if any.
+pub fn current_request_id() -> Option<String> {
+    REQUEST_ID.try_with(Clone::clone).ok()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{detail}")]
@@ -167,7 +186,7 @@ impl IntoResponse for ApiError {
             tracing::error!(error = ?e, "internal error");
         }
         let status = self.status();
-        let problem = self.to_problem(None);
+        let problem = self.to_problem(current_request_id());
         let body = serde_json::to_vec(&problem).unwrap_or_else(|_| b"{}".to_vec());
         let mut response = (status, body).into_response();
         response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/problem+json"));
