@@ -378,6 +378,8 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<AuthUser, Api
         {
             return Err(invalid("auth.token_invalid"));
         }
+        // The user's own share first: requests it refuses do not use up the budget of the whole domain.
+        state.federation_user_api_limiter.check_all(&[format!("user:{}", user.id)])?;
         state.federation_api_limiter.check_all(&[format!("domain:{}", user.domain)])?;
         let app = if user.is_bot() {
             Some(crate::applications::remote_principal(state, &mut user, &extra.dev).await?)

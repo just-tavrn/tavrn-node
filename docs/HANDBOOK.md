@@ -401,9 +401,10 @@ These settings decide whether and with whom the node federates and how it takes 
 | `TAVRN_FEDERATION_ALLOW_PRIVATE` | `false` | `true` allows peers on private or loopback addresses (development, tests, closed intranets). |
 | `TAVRN_FEDERATION_SRV_FALLBACK` | `true` | When a peer's identity domain serves no `/.well-known/tavrn` (404, or no HTTPS server at all), look up `_tavrn._tcp.<domain>` SRV and fetch the document from its target ([SRV record](#srv-record-instead-of-the-well-known-file)). |
 | `TAVRN_FEDERATION_REMOTE_BOTS` | `true` | Accept bots of other nodes. |
-| `TAVRN_FEDERATION_RATE_LOGINS` | `60` | Federated logins per remote domain and minute (> 0). |
+| `TAVRN_FEDERATION_RATE_LOGINS` | `60` | Federated logins per remote domain and minute (> 0). One account, and one client address on the network (not loopback), get a quarter of it (at least 1). |
 | `TAVRN_FEDERATION_RATE_INBOX` | `300` | Inbox messages per remote domain and minute (> 0). |
 | `TAVRN_FEDERATION_RATE_API` | `3000` | API requests of all users of one remote domain per minute (> 0). |
+| `TAVRN_FEDERATION_RATE_API_PER_USER` | `600` | API requests of one remote user per minute (> 0), counted before the domain's budget and at most that budget: requests it refuses do not use up the domain's budget, so one account cannot lock the other users of its domain out. Keep it well below `TAVRN_FEDERATION_RATE_API`. |
 | `TAVRN_FEDERATION_RATE_CLAIMS` | `120` | KeyPackage claims per requesting node and minute (> 0). |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS_PER_DOMAIN` | `1000` | Remote users per home domain. |
@@ -1127,7 +1128,8 @@ The operator decides which nodes this node federates with and how much load othe
   subdomains (a ban of `evil.example` refuses `a.evil.example`).
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
   blocklist still wins.
-- Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;
+- Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`, with
+  shares per remote user (`…_API_PER_USER`; a quarter of the logins per account and per client address);
   quotas of remote users: `TAVRN_FEDERATION_MAX_REMOTE_USERS`, `…_PER_DOMAIN`.
 - Remote users with nothing left on this node are deleted after `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`.
 - Bots: `TAVRN_FEDERATION_REMOTE_BOTS` (accept other nodes' bots), `TAVRN_APPS_FEDERATE` (this node's bots on other

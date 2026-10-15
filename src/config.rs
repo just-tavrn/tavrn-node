@@ -412,6 +412,9 @@ pub struct Config {
     pub federation_rate_inbox: u32,
     /// API requests of all users of one remote domain per minute (FEDERATION.md §3.2).
     pub federation_rate_api: u32,
+    /// API requests of one remote user per minute, counted before the domain's budget and capped by it, so one
+    /// account cannot use up the budget its whole domain shares.
+    pub federation_rate_api_per_user: u32,
     /// KeyPackage claims per requesting node and minute (served by this node as home node, §3.5).
     pub federation_rate_claims: u32,
     /// Remote users in total.
@@ -694,6 +697,7 @@ impl Default for Config {
             federation_rate_logins: 60,
             federation_rate_inbox: 300,
             federation_rate_api: 3000,
+            federation_rate_api_per_user: 600,
             federation_rate_claims: 120,
             federation_max_remote_users: 10_000,
             federation_max_remote_users_per_domain: 1000,
@@ -900,6 +904,8 @@ impl Config {
             c.app_allow_private_urls = true;
             // End-to-end tests submit many notices from one address.
             c.legal_notice_rate_per_hour = 1000;
+            // One test user may use a remote domain's whole API budget.
+            c.federation_rate_api_per_user = c.federation_rate_api;
         }
         c
     }
@@ -1502,6 +1508,9 @@ impl Config {
         }
         if self.federation_rate_api == 0 {
             problems.push("TAVRN_FEDERATION_RATE_API must be greater than 0".into());
+        }
+        if self.federation_rate_api_per_user == 0 {
+            problems.push("TAVRN_FEDERATION_RATE_API_PER_USER must be greater than 0".into());
         }
         if self.federation_rate_claims == 0 {
             problems.push("TAVRN_FEDERATION_RATE_CLAIMS must be greater than 0".into());
@@ -2706,11 +2715,12 @@ mod tests {
             federation_rate_logins: 0,
             federation_rate_inbox: 0,
             federation_rate_api: 0,
+            federation_rate_api_per_user: 0,
             federation_rate_claims: 0,
             ..prod()
         };
         let err = c.validate().unwrap_err();
-        for var in ["LOGINS", "INBOX", "API", "CLAIMS"] {
+        for var in ["LOGINS", "INBOX", "API", "API_PER_USER", "CLAIMS"] {
             assert!(err.problems.iter().any(|p| p.contains(&format!("TAVRN_FEDERATION_RATE_{var}"))), "{err}");
         }
     }

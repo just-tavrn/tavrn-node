@@ -106,10 +106,12 @@ async fn run(state: AppState, mut socket: WebSocket) {
     };
     // The close reason carries the error code (`auth.token_expired`, `app.disabled`, …): clients refresh and reconnect.
     // Only a refused token or session is `4001` (clients end the session when it repeats); a failing database (a 5xx
-    // error) is not.
+    // error) or a rate limit is not.
     let auth = match auth::authenticate(&state, &token).await {
         Ok(a) => a,
         Err(e) if e.status().is_server_error() => return close_unavailable(socket, &e).await,
+        // A rate limit is no refused session: the client tries again later (`4002 rate_limited`, as below).
+        Err(ApiError::RateLimited { .. }) => return close(socket, CLOSE_PROTOCOL, "rate_limited").await,
         Err(e) => return close(socket, CLOSE_AUTH, e.code()).await,
     };
     // The general per-user limit applies to connecting as to every other request (`TAVRN_RATE_USER_PER_MINUTE`).

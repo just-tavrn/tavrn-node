@@ -145,6 +145,10 @@ First public release of the node and its container image.
 
 ### Security
 
+- A remote user counts against their own limit (`TAVRN_FEDERATION_RATE_API_PER_USER`, default 600 per minute) before
+  the budget of their home domain, and federated logins against a share per account and per client address, so one
+  account can no longer lock the other users of its domain out; a rate-limited WebSocket hello closes with `4002
+  rate_limited` instead of `4001`.
 - `TAVRN_TRUSTED_PROXIES` defaults to loopback only (it listed every private network, so on a node reached directly
   from a private network every client could choose its rate-limit address with `X-Forwarded-For` and read `/metrics`).
   `deploy/docker-compose.yml` sets Docker's private ranges, where the reverse proxy connects through Docker's gateway;

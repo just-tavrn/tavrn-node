@@ -139,6 +139,9 @@ pub struct AppState {
     pub federation: Arc<crate::federation::client::FederationClient>,
     /// Federated logins per remote domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_LOGINS` per minute).
     pub federation_login_limiter: Arc<SharedLimiter>,
+    /// The share of one account (`user:<address>`) and of one client address (`domain:<domain>|ip:<address>`) of a
+    /// domain's federated logins: a quarter of `TAVRN_FEDERATION_RATE_LOGINS`, at least 1.
+    pub federation_login_share_limiter: Arc<SharedLimiter>,
     /// Inbox messages per remote domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_INBOX` per minute).
     pub federation_inbox_limiter: Arc<SharedLimiter>,
     /// Node-token requests (inbox, KeyPackage claims) per client address, before the signature check
@@ -148,6 +151,9 @@ pub struct AppState {
     pub federation_token_limiter: Arc<SharedLimiter>,
     /// API requests of remote users per home domain (`domain:<domain>`, `TAVRN_FEDERATION_RATE_API` per minute).
     pub federation_api_limiter: Arc<RateLimiter>,
+    /// API requests of one remote user (`user:<id>`, `TAVRN_FEDERATION_RATE_API_PER_USER` per minute, at most the
+    /// domain's budget), counted before [`AppState::federation_api_limiter`].
+    pub federation_user_api_limiter: Arc<RateLimiter>,
     /// S2S KeyPackage claims per requesting node (`domain:<domain>`, `TAVRN_FEDERATION_RATE_CLAIMS` per minute).
     pub federation_claim_limiter: Arc<RateLimiter>,
     /// S2S KeyPackage claims per requester and user (`<requester>|<user>`, 10 per hour, FEDERATION.md §3.5).
@@ -385,10 +391,15 @@ impl AppState {
         Ok(Self {
             federation,
             federation_login_limiter: shared("fed-login", config.federation_rate_logins, 60),
+            federation_login_share_limiter: shared("fed-login-share", (config.federation_rate_logins / 4).max(1), 60),
             federation_inbox_limiter: shared("fed-inbox", config.federation_rate_inbox, 60),
             federation_ip_limiter: shared("fed-ip", if config.dev { 10_000 } else { 600 }, 60),
             federation_token_limiter: shared("fed-token", token_max, 60),
             federation_api_limiter: limiter(config.federation_rate_api, 60),
+            federation_user_api_limiter: limiter(
+                config.federation_rate_api_per_user.min(config.federation_rate_api).max(1),
+                60,
+            ),
             federation_claim_limiter: limiter(config.federation_rate_claims, 60),
             claim_pair_limiter: shared("claim-pair", invites.0, 3600),
             claim_target_limiter: shared("claim-target", config.e2ee_claims_per_target_per_hour, 3600),
