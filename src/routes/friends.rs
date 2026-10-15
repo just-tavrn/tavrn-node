@@ -123,22 +123,33 @@ pub fn request_view(row: &store::social::FriendRequestRow, me: &str, other: &Use
 #[utoipa::path(get, path = "/api/v1/users/me/friends", security(("bearer" = [])), responses((status = 200, body = FriendList)))]
 pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<FriendList>, ApiError> {
     let me = &auth.user.id;
-    let mut friends = Vec::new();
-    for (id, since) in store::social::friends_of(&state.db, me).await? {
-        if let Some(u) = store::users::by_id(&state.db, &id).await? {
-            friends.push(Friend { user: u.to_public(), since });
-        }
-    }
+    // A constant number of statements: the users of all friends, requests and blocks in one lookup.
+    let friend_rows = store::social::friends_of(&state.db, me).await?;
+    let requests = store::social::requests_of(&state.db, me).await?;
+    let other = |r: &store::social::FriendRequestRow| {
+        if &r.to_user_id == me { r.from_user_id.clone() } else { r.to_user_id.clone() }
+    };
+    let blocked_ids = store::social::blocked_by(&state.db, me).await?;
+    let ids: Vec<String> = friend_rows
+        .iter()
+        .map(|(id, _)| id.clone())
+        .chain(requests.iter().map(&other))
+        .chain(blocked_ids.iter().cloned())
+        .collect();
+    let users: std::collections::HashMap<String, UserRow> =
+        store::users::by_ids(&state.db, &ids).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    let friends = friend_rows
+        .into_iter()
+        .filter_map(|(id, since)| Some(Friend { user: users.get(&id)?.to_public(), since }))
+        .collect();
     let (mut incoming, mut outgoing) = (Vec::new(), Vec::new());
-    for r in store::social::requests_of(&state.db, me).await? {
-        let other_id = if &r.to_user_id == me { &r.from_user_id } else { &r.to_user_id };
-        if let Some(other) = store::users::by_id(&state.db, other_id).await? {
-            let view = request_view(&r, me, &other);
+    for r in &requests {
+        if let Some(u) = users.get(&other(r)) {
+            let view = request_view(r, me, u);
             if view.direction == "incoming" { incoming.push(view) } else { outgoing.push(view) }
         }
     }
-    let blocked_ids = store::social::blocked_by(&state.db, me).await?;
-    let blocked = store::users::by_ids(&state.db, &blocked_ids).await?.iter().map(UserRow::to_public).collect();
+    let blocked = blocked_ids.iter().filter_map(|id| users.get(id)).map(UserRow::to_public).collect();
     Ok(Json(FriendList { friends, incoming, outgoing, blocked }))
 }
 
