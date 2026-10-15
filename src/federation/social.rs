@@ -685,7 +685,7 @@ pub async fn vouches(state: &AppState, iss: &str, address: &str) -> Result<bool,
 
 /// Is `address` a user of a third node, neither of the sending node `iss` nor of this one? `iss` can name such a
 /// user (a member of a group it hosts) but cannot vouch for them: their identity is unverified here.
-fn third_party(state: &AppState, iss: &str, address: &str) -> bool {
+pub(crate) fn third_party(state: &AppState, iss: &str, address: &str) -> bool {
     util::parse_address(address).is_none_or(|(_, domain)| domain != iss && domain != state.config.domain)
 }
 

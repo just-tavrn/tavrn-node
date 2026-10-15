@@ -91,6 +91,13 @@ pub async fn claim_budget(state: &AppState, source: &str, requester: &str, targe
     {
         return Ok(());
     }
+    claim_budget_unrelated(state, source, target).await
+}
+
+/// The budget of [`claim_budget`] without the exemption of related requesters: for claims whose requester the source
+/// cannot speak for (a user of a third node named by a federated request), so that naming someone else's contacts
+/// does not lift the limit.
+pub async fn claim_budget_unrelated(state: &AppState, source: &str, target: &UserRow) -> Result<(), ApiError> {
     state.claim_target_limiter.check_all(&[format!("{source}|{}", target.id)]).await?;
     state.claim_target_total_limiter.check_all(std::slice::from_ref(&target.id)).await
 }

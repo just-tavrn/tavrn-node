@@ -6,8 +6,26 @@
 
 
 use axum::http::StatusCode;
-use common::federation::{A, two_nodes};
-use serde_json::json;
+use common::federation::{A, FedNode, two_nodes};
+use serde_json::{Value, json};
+
+/// A node token request to `path` on `to_node`, signed by `from_node`.
+async fn s2s(from_node: &FedNode, to_node: &FedNode, path: &str, body: Value) -> (StatusCode, String) {
+    let body = body.to_string().into_bytes();
+    let n = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "iss": from_node.domain(), "sub": from_node.domain(), "aud": to_node.domain(), "iat": n, "exp": n + 300,
+        "jti": tavrn_node::util::ulid(), "typ": "s2s", "htm": "POST", "htu": path,
+        "body_sha256": tavrn_node::federation::tokens::body_sha256(&body),
+    });
+    let token = from_node.sign(&claims);
+    let (st, _, raw) =
+        to_node.raw(axum::http::Method::POST, path, &token, &[("content-type", "application/json")], body).await;
+    let code = serde_json::from_slice::<Value>(&raw).ok().and_then(|v| v["code"].as_str().map(String::from));
+    (st, code.unwrap_or_default())
+}
+
+const CLAIM: &str = "/api/v1/federation/key-packages/claim";
 
 // ---------------------------------------------------------------- outbound policy
 
@@ -52,4 +70,30 @@ async fn profiles_and_app_documents_are_not_fetched_from_a_blocked_peer() {
     assert_eq!(e.code(), "federation.peer_blocked");
     let e = tavrn_node::installations::fetch_document(&b.state, A, &tavrn_node::util::ulid()).await.unwrap_err();
     assert_eq!(e.code(), "federation.peer_blocked");
+}
+
+// ---------------------------------------------------------------- claim budget
+
+#[tokio::test]
+async fn claims_in_the_name_of_a_third_node_user_count_against_the_sending_node() {
+    let (a, b) = two_nodes().await;
+    let carol = b.register("carol").await;
+    while b.state.claim_target_limiter.check(&format!("a.test|{}", carol.user_id)).await.is_ok() {}
+    let (st, _) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "x1@a.test" })).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a.test's own budget is exhausted");
+    // dave@c.test is carol's friend here, but a.test cannot speak for him.
+    let dave =
+        tavrn_node::store::federation::create_remote_user(&b.state.db, "dave", "c.test", "dave", "user", None)
+            .await
+            .unwrap();
+    tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &dave.id).await.unwrap();
+    let (st, code) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "dave@c.test" })).await;
+    assert_eq!((st, code.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    // A related requester of the sending node itself keeps the exemption.
+    let erin = tavrn_node::store::federation::create_remote_user(&b.state.db, "erin", A, "erin", "user", None)
+        .await
+        .unwrap();
+    tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &erin.id).await.unwrap();
+    let (st, code) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "erin@a.test" })).await;
+    assert_eq!(st, StatusCode::OK, "{code}");
 }

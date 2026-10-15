@@ -108,7 +108,13 @@ pub async fn serve(state: &AppState, ip: &str, headers: &HeaderMap, body: Body) 
         });
     }
     state.claim_pair_limiter.check_all(&[format!("{}|{}", req.requester, req.user)]).await?;
-    crate::e2ee::claim_budget(state, &iss, &req.requester, &user).await?;
+    // Only requesters the sending node can speak for (its own users, or users of this node signed in there) are
+    // exempt as contacts of the target; a third node's user named by `iss` counts against `iss`'s budget.
+    if super::social::third_party(state, &iss, &req.requester) {
+        crate::e2ee::claim_budget_unrelated(state, &iss, &user).await?;
+    } else {
+        crate::e2ee::claim_budget(state, &iss, &req.requester, &user).await?;
+    }
     let packages = claim_local(state, &user).await?;
     tracing::info!(
         node = iss,

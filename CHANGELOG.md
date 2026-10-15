@@ -222,3 +222,5 @@ First public release of the node and its container image.
 - Outbound federation honours node bans of a domain and blocks of a peer (operator, automatic, key conflict) on every
   path: outbox entries for such a domain are dropped as undeliverable (also those queued before), and profiles,
   avatars and application documents are no longer fetched from it.
+- The KeyPackage claim budget of a requesting node exempts only related requesters it can speak for (its own users,
+  or users of this node signed in there); users of third nodes named by it count against its budget.
