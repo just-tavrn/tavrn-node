@@ -13,15 +13,19 @@ mod suite {
     mod age_flow;
     mod api_basics;
     mod app_install_flow;
+    mod app_install_index_flow;
     mod applications_flow;
+    mod attachment_quota_flow;
     mod attachment_retention_flow;
     mod attachments_flow;
     mod auth_flow;
     mod authz_audit;
     mod automod_content_flow;
+    mod automod_hierarchy_flow;
     mod backups_flow;
     mod blob_deletion_flow;
     mod bot_files_flow;
+    mod bot_owner_flow;
     mod bots_encrypted_flow;
     mod calls_flow;
     mod channel_visibility_flow;
@@ -33,6 +37,7 @@ mod suite {
     mod connect_flow;
     mod conversation_index_flow;
     mod delegation_flow;
+    mod device_limit_flow;
     mod directory_flow;
     mod dm_flow;
     mod dm_requests_flow;
@@ -43,6 +48,7 @@ mod suite {
     mod entitlements_flow;
     mod everyone_safety_flow;
     mod federation_flow;
+    mod federation_policy_flow;
     mod federation_rooms_flow;
     mod federation_social_flow;
     mod files_backends_flow;
@@ -55,7 +61,9 @@ mod suite {
     mod history_since_join_flow;
     mod housekeeping_flow;
     mod identity_rotation_flow;
+    mod interaction_checks_flow;
     mod legal_flow;
+    mod login_limits_flow;
     mod mail_locale_flow;
     mod message_retention_flow;
     mod messages_flow;
@@ -68,6 +76,7 @@ mod suite {
     mod polls_flow;
     mod presence_flow;
     mod profiles_flow;
+    mod push_deadline_flow;
     mod push_flow;
     mod rate_limits_flow;
     mod reactions_flow;
@@ -105,4 +114,5 @@ mod suite {
     mod welcome_flow;
     mod whiteboard_flow;
     mod ws_flow;
+    mod ws_resync_flow;
 }

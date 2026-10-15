@@ -115,6 +115,7 @@ pub fn parse(address: &str, body: &[u8]) -> Result<RemoteProfile, &'static str> 
 
 /// Fetches and validates the profile from the home node.
 pub async fn fetch(state: &AppState, username: &str, domain: &str) -> Result<RemoteProfile, ApiError> {
+    super::check_policy(state, domain).await?;
     let address = format!("{username}@{domain}");
     let path = format!("/api/v1/users/{username}/profile");
     match state.federation.get(domain, &path, Kind::Profile).await {
@@ -222,6 +223,10 @@ async fn fetch_variant(
     kind: Kind,
     animated: bool,
 ) -> Option<(Vec<u8>, String)> {
+    if let Err(e) = super::check_policy(state, &user.domain).await {
+        tracing::info!(domain = user.domain, result = e.code(), "remote image not fetched");
+        return None;
+    }
     let fetched = match state.federation.get(&user.domain, path, kind).await {
         Ok(f) => f,
         Err(e) => {

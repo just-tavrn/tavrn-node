@@ -84,10 +84,16 @@ async fn login_inner(
     client: &str,
 ) -> Result<FederatedLogin, ApiError> {
     super::check_policy(state, iss).await?;
-    // Before the signature check the domain's budget counts per address: a peer's own attempts (the conformance
-    // check's burst of invalid logins, §9) reach `429`, forged ones from elsewhere cannot use up its budget.
+    // Before the signature check the domain's budget counts per address (a quarter of it per address): a peer's own
+    // attempts (the conformance check's burst of invalid logins, §9) reach `429`, forged ones from elsewhere cannot
+    // use up its budget.
     if !state.config.misbehaves("no_rate_limit") {
-        state.federation_login_limiter.check_all(&[format!("domain:{iss}|ip:{ip}")]).await?;
+        // The share per address applies to clients on the network; loopback (development nodes, a proxy that does
+        // not forward the address) counts against the domain only.
+        let local = ip == "unknown" || ip.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback());
+        let key = format!("domain:{iss}|ip:{ip}");
+        let limiter = if local { &state.federation_login_limiter } else { &state.federation_login_share_limiter };
+        limiter.check_all(&[key]).await?;
     }
     let t = match tokens::verify_federation_token(state, token, iss).await {
         Ok(t) => t,
@@ -101,7 +107,9 @@ async fn login_inner(
     };
     // Per domain only after the signature check (the route limits per address before): forged tokens in a
     // peer's name must not use up its budget.
+    // The account's share first: attempts it refuses do not use up the domain's budget.
     if !state.config.misbehaves("no_rate_limit") {
+        state.federation_login_share_limiter.check_all(&[format!("user:{}", t.std.sub)]).await?;
         state.federation_login_limiter.check_all(&[format!("domain:{iss}")]).await?;
     }
     // After the signature check, so only real peers can start a conformance run; before the `jti` is
@@ -225,6 +233,23 @@ pub async fn ensure_remote_user(
         return Err(remote_limit());
     }
     store::federation::create_remote_user(&state.db, username, domain, username, kind, owner_id).await
+}
+
+/// [`ensure_remote_user`] for a user that an inbound message names without signing in (a friend request's sender):
+/// such stubs may fill the node-wide quota only up to a reserve of a tenth (at least one row), which stays for users
+/// who sign in, so that requests in invented names cannot lock out other nodes' users. The per-domain quota applies
+/// as usual.
+pub async fn ensure_remote_stub(state: &AppState, username: &str, domain: &str) -> Result<UserRow, ApiError> {
+    if let Some(user) = store::federation::user_by_address(&state.db, username, domain).await? {
+        return Ok(user);
+    }
+    let max = i64::from(state.config.federation_max_remote_users);
+    let reserve = (max / 10).max(1);
+    if store::federation::count_remote_users(&state.db, &state.config.domain).await? >= max - reserve {
+        tracing::warn!(domain, "remote user quota for inbound messages reached");
+        return Err(remote_limit());
+    }
+    ensure_remote_user(state, username, domain, "user", None).await
 }
 
 fn user_not_found() -> ApiError {

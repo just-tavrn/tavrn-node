@@ -571,7 +571,7 @@ pub async fn handle(
             Ok("stored")
         }
         Incoming::FriendRequest { request_id, message } => {
-            friend_request(state, from, to, at, &request_id, message.as_deref()).await
+            friend_request(state, iss, from, to, at, &request_id, message.as_deref()).await
         }
         Incoming::FriendAccept => friend_accept(state, from, to, at).await,
         Incoming::FriendRemove { request_id } => friend_remove(state, from, to, at, request_id.as_deref()).await,
@@ -685,7 +685,7 @@ pub async fn vouches(state: &AppState, iss: &str, address: &str) -> Result<bool,
 
 /// Is `address` a user of a third node, neither of the sending node `iss` nor of this one? `iss` can name such a
 /// user (a member of a group it hosts) but cannot vouch for them: their identity is unverified here.
-fn third_party(state: &AppState, iss: &str, address: &str) -> bool {
+pub(crate) fn third_party(state: &AppState, iss: &str, address: &str) -> bool {
     util::parse_address(address).is_none_or(|(_, domain)| domain != iss && domain != state.config.domain)
 }
 
@@ -726,7 +726,7 @@ async fn friend_sender(
 ) -> Result<Option<UserRow>, ApiError> {
     let Some((name, domain)) = util::parse_address(from) else { return Err(invalid("invalid from")) };
     let remote = if create {
-        super::remote::ensure_remote_user(state, name, domain, "user", None).await?
+        super::remote::ensure_remote_stub(state, name, domain).await?
     } else {
         match store::federation::user_by_address(&state.db, name, domain).await? {
             Some(u) => u,
@@ -744,14 +744,40 @@ fn friend_events(state: &AppState, local: &UserRow, remote: &UserRow, since: &st
     state.hub.users(vec![local.id.clone()], "friend.accept", json!({ "user": remote.to_public(), "since": since }));
 }
 
+/// Pending friend requests that users of one node may have open to one user of this node; further requests from
+/// that node are dropped (`limited`) until the user answers some.
+pub const MAX_PENDING_FRIEND_REQUESTS_PER_NODE: usize = 20;
+
+/// Is a new incoming friend request from `from` (a user of `iss`) to `to` within the budgets (§6.2): the per hour
+/// limit of the sending node per recipient (as for invitations) and the cap on pending requests from that node. A
+/// sender who already has a request or a friendship with the recipient is always handled (crossing requests, repeats).
+async fn friend_request_admitted(state: &AppState, iss: &str, from: &str, to: &UserRow) -> Result<bool, ApiError> {
+    if let Some(sender) = known(state, from).await?
+        && (store::social::request_between(&state.db, &sender.id, &to.id).await?.is_some()
+            || store::social::request_between(&state.db, &to.id, &sender.id).await?.is_some()
+            || store::social::are_friends(&state.db, &to.id, &sender.id).await?)
+    {
+        return Ok(true);
+    }
+    if state.room_invite_inbox_limiter.check(&format!("friend|{iss}|{}", to.id)).is_err() {
+        return Ok(false);
+    }
+    let pending = store::social::pending_requests_from_domain(&state.db, &to.id, iss).await?;
+    Ok(usize::try_from(pending).unwrap_or(usize::MAX) < MAX_PENDING_FRIEND_REQUESTS_PER_NODE)
+}
+
 async fn friend_request(
     state: &AppState,
+    iss: &str,
     from: &str,
     to: &UserRow,
     at: &str,
     request_id: &str,
     message: Option<&str>,
 ) -> Result<&'static str, ApiError> {
+    if !friend_request_admitted(state, iss, from, to).await? {
+        return Ok("rate_limited");
+    }
     let Some(remote) = friend_sender(state, from, to, at, true).await? else { return Ok("stale") };
     super::remote::refresh_profile(state, &remote, None).await?;
     if store::social::blocked_either(&state.db, &to.id, &remote.id).await? {

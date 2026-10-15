@@ -79,6 +79,8 @@ const NAME_CHARS: usize = 100;
 pub const MAX_ENDPOINT: usize = 2048;
 /// Timeout of one delivery.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// One push to one user ends within this time, however many of their subscriptions are slow.
+pub const USER_DEADLINE: Duration = Duration::from_secs(10);
 /// Lifetime of a push at the push service (`TTL`): messages and notices, call rings, test pushes.
 const TTL_MESSAGE: u32 = 6 * 3600;
 const TTL_CALL: u32 = 45;
@@ -197,6 +199,20 @@ pub struct Push {
     pub test_limiter: SharedLimiter,
     /// Subscription registrations per user (`push-sub:<user id>`, 30 per hour).
     pub register_limiter: SharedLimiter,
+    /// Users with a delivery in flight on this instance: one at a time per user ([`deliver_user`]).
+    busy: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// A user's place in [`Push::busy`] while a delivery to them runs.
+struct Busy {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    user_id: String,
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.user_id);
+    }
 }
 
 impl Push {
@@ -223,6 +239,7 @@ impl Push {
         let (priority_tx, priority_rx) = mpsc::channel(QUEUE);
         let shared = |name: &'static str, max: u32, window: Duration| SharedLimiter::new(name, max, window, cluster);
         Ok(Self {
+            busy: Arc::default(),
             enabled,
             vapid,
             contact: config.push_contact(),
@@ -428,9 +445,9 @@ pub async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
                 local: true,
                 ..PushPayload::default()
             };
-            for s in store::push::deliverable(&state.db, &user_id).await? {
-                deliver(state, &s, &payload, TTL_TEST, None).await;
-            }
+            let subscriptions = store::push::deliverable(&state.db, &user_id).await?;
+            let sent = deliver_user(state, &user_id, &subscriptions, &payload, TTL_TEST, None).await;
+            mark_used(state, &sent).await;
             Ok(())
         }
     }
@@ -599,23 +616,51 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         .map(|(recipient, payload)| {
             let topic = topic.as_str();
             async move {
-                let mut sent = Vec::new();
-                for s in &recipient.subscriptions {
-                    if deliver_one(state, s, &payload, TTL_MESSAGE, Some(topic)).await {
-                        sent.push(s.id.clone());
-                    }
-                }
-                sent
+                deliver_user(state, &recipient.user_id, &recipient.subscriptions, &payload, TTL_MESSAGE, Some(topic))
+                    .await
             }
         })
         .buffer_unordered(PARALLEL_USERS)
         .flat_map(futures::stream::iter)
         .collect()
         .await;
-    if let Err(e) = store::push::mark_used_many(&state.db, &sent).await {
+    mark_used(state, &sent).await;
+    Ok(())
+}
+
+/// Records successful deliveries ([`store::push::mark_used_many`]); a failure is logged.
+async fn mark_used(state: &AppState, sent: &[String]) {
+    if let Err(e) = store::push::mark_used_many(&state.db, sent).await {
         tracing::warn!(error = %e, "push subscription state not saved");
     }
-    Ok(())
+}
+
+/// Sends `payload` to the subscriptions of one user, all at once and within [`USER_DEADLINE`], so a user's silent
+/// endpoints hold a sender no longer than that; returns the ids delivered. While a delivery to the user is still
+/// running on this instance the push is skipped: their endpoints are slow, and a later push would only queue
+/// behind it.
+async fn deliver_user(
+    state: &AppState,
+    user_id: &str,
+    subscriptions: &[SubscriptionRow],
+    payload: &PushPayload,
+    ttl: u32,
+    topic: Option<&str>,
+) -> Vec<String> {
+    if subscriptions.is_empty() {
+        return Vec::new();
+    }
+    let busy = &state.push.busy;
+    if !busy.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.to_string()) {
+        tracing::debug!(user_id, "a push to this user is still being delivered, skipped");
+        return Vec::new();
+    }
+    let _busy = Busy { set: busy.clone(), user_id: user_id.to_string() };
+    let deadline = tokio::time::Instant::now() + USER_DEADLINE;
+    let sends = subscriptions
+        .iter()
+        .map(|s| async move { deliver_one(state, s, payload, ttl, topic, deadline).await.then(|| s.id.clone()) });
+    futures::future::join_all(sends).await.into_iter().flatten().collect()
 }
 
 async fn run_call(
@@ -678,9 +723,8 @@ async fn deliver_to_user(
     }
     let ttl = if ring { TTL_CALL } else { TTL_MESSAGE };
     let topic = conversation_id.map(topic);
-    for s in &subscriptions {
-        deliver(state, s, &payload, ttl, topic.as_deref()).await;
-    }
+    let sent = deliver_user(state, user_id, &subscriptions, &payload, ttl, topic.as_deref()).await;
+    mark_used(state, &sent).await;
     Ok(())
 }
 
@@ -703,15 +747,6 @@ pub enum Outcome {
     Failed,
 }
 
-/// Sends one push and records the outcome on the subscription and in the metrics.
-async fn deliver(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl: u32, topic: Option<&str>) {
-    if deliver_one(state, s, payload, ttl, topic).await
-        && let Err(e) = store::push::mark_used(&state.db, &s.id).await
-    {
-        tracing::warn!(error = %e, "push subscription state not saved");
-    }
-}
-
 /// Sends one push and records a failure on the subscription and the outcome in the metrics; `true` when it was
 /// delivered (the caller records that, for many subscriptions at once).
 async fn deliver_one(
@@ -720,8 +755,12 @@ async fn deliver_one(
     payload: &PushPayload,
     ttl: u32,
     topic: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> bool {
-    let outcome = send(state, s, payload, ttl, topic).await;
+    // An endpoint that does not answer by the deadline counts as a failure (held back, deleted when it repeats).
+    let outcome = tokio::time::timeout_at(deadline, send(state, s, payload, ttl, topic))
+        .await
+        .unwrap_or(Outcome::Retry { retry_after: None });
     let db = &state.db;
     let result = match outcome {
         Outcome::Sent => {

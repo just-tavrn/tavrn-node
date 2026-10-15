@@ -221,8 +221,10 @@ impl Hub {
         let _ = self.tx.send(Arc::new(Event { id, kind, data, scope, frame: frame.into() }));
     }
 
-    /// Tells every connection of this instance to reload its state (`{"op":"resync"}`): events may have been lost.
+    /// Tells every connection of this instance to reload its state (`{"op":"resync"}`): events may have been lost,
+    /// among them some that would have dropped a room's visibility snapshot, so every snapshot goes first.
     pub fn resync_all(&self) {
+        self.visibility.invalidate_all();
         let event = Event {
             id: ulid(),
             kind: RESYNC_KIND.into(),

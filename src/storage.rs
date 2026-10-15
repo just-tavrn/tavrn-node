@@ -586,8 +586,82 @@ pub struct EncryptReport {
     pub failed: u64,
 }
 
+/// Bytes promised to uploads that are still streaming, per quota key (`files:<channel id>`): a quota check counts
+/// them as used, so parallel uploads cannot each get the whole remainder. Kept in memory per instance; the upload
+/// checks the stored usage again before it records the file.
+#[derive(Clone, Default)]
+pub struct Reservations(Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>);
+
+/// Reserved bytes of one upload, released when dropped (completed, refused or aborted alike).
+pub struct Reservation {
+    owner: Reservations,
+    key: String,
+    bytes: u64,
+}
+
+impl Reservation {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut map = self.owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = map.get_mut(&self.key) {
+            *n = n.saturating_sub(self.bytes);
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl Reservations {
+    /// Reserves bytes of `key` next to `used` within `quota`: exactly `want` (`exact`, a declared length), or as much
+    /// of `want` as is left. `Err(left)` when that does not fit (nothing left, or less than an exact `want`).
+    pub fn reserve(&self, key: &str, quota: u64, used: u64, want: u64, exact: bool) -> Result<Reservation, u64> {
+        let mut map = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reserved = map.get(key).copied().unwrap_or(0);
+        let left = quota.saturating_sub(used).saturating_sub(reserved);
+        let bytes = if exact { want } else { want.min(left) };
+        if bytes > left || (bytes == 0 && want > 0) {
+            return Err(left);
+        }
+        if bytes > 0 {
+            *map.entry(key.to_string()).or_insert(0) += bytes;
+        }
+        Ok(Reservation { owner: self.clone(), key: key.to_string(), bytes })
+    }
+
+    /// Bytes reserved for `key` right now.
+    pub fn reserved(&self, key: &str) -> u64 {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).copied().unwrap_or(0)
+    }
+}
+
+/// Removes a temporary file when dropped unless disarmed: an upload whose future is dropped mid-write (client gone,
+/// request timeout) leaves nothing behind.
+struct PartFile(Option<PathBuf>);
+
+impl PartFile {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BlobStorage {
+    /// Quota reservations of uploads in flight.
+    pub reservations: Reservations,
     root: PathBuf,
     db: Pool,
     keys: Arc<Keyring>,
@@ -602,6 +676,7 @@ pub struct BlobStorage {
 impl BlobStorage {
     pub fn new(data_dir: &str, db: Pool, keys: Keyring, encrypt: bool) -> Self {
         Self {
+            reservations: Reservations::default(),
             root: Path::new(data_dir).join("blobs"),
             db,
             keys: Arc::new(keys),
@@ -703,7 +778,8 @@ impl BlobStorage {
 
     /// Writes a stream of unknown length (files channels): encrypted chunk by chunk with
     /// at most two chunks in memory, then the key row and the rename as in [`BlobStorage::write`]. Returns
-    /// the plaintext length. A failing stream (size limit, aborted upload) leaves nothing behind.
+    /// the plaintext length. A failing stream (size limit, aborted upload) leaves nothing behind, and neither does a
+    /// dropped future (the temporary file is removed at once).
     pub async fn write_stream<S>(&self, id: &str, mut stream: S) -> anyhow::Result<u64>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Unpin,
@@ -716,6 +792,7 @@ impl BlobStorage {
                 .with_context(|| format!("blob directory {} cannot be created", parent.display()))?;
         }
         let tmp = path.with_extension("part");
+        let mut part = PartFile(Some(tmp.clone()));
         let result: anyhow::Result<(u64, Option<keys_store::NewBlobKey>)> = async {
             let f = tokio::fs::File::create(&tmp).await.with_context(|| format!("{} not writable", tmp.display()))?;
             let mut out = tokio::io::BufWriter::with_capacity(CHUNK + TAG, f);
@@ -745,26 +822,18 @@ impl BlobStorage {
             Ok((len, row))
         }
         .await;
-        let (len, row) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(e);
-            }
-        };
-        if let Some(row) = &row
-            && let Err(e) = keys_store::put_blob_key(&self.db, id, row).await
-        {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e.into());
+        // Every early return below removes the temporary file through `part`.
+        let (len, row) = result?;
+        if let Some(row) = &row {
+            keys_store::put_blob_key(&self.db, id, row).await?;
         }
         if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
             if row.is_some() {
                 let _ = keys_store::delete_blob_key(&self.db, id).await;
             }
             return Err(e.into());
         }
+        part.disarm();
         Ok(len)
     }
 

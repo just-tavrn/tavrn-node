@@ -611,6 +611,12 @@ async fn cross_node_install_index_changes_and_deletion() {
     let (_, members) = b.get_auth(&format!("/api/v1/rooms/{room_id}/members"), &carol.token).await;
     let m = members.as_array().unwrap().iter().find(|m| m["user"]["kind"] == "bot").unwrap();
     assert_eq!(m["user"]["display_name"], "Wanderer");
+    // Changes are limited per sender and bot like profile changes: beyond the limit `429`, the sender retries later.
+    let (bot_id, bot_address) = (m["user"]["id"].as_str().unwrap(), m["user"]["address"].as_str().unwrap());
+    while b.state.profile_changed_limiter.check_all(&[format!("app|{}|{bot_id}", federation::A)]).await.is_ok() {}
+    let changed = json!({ "application_id": traveller.app_id });
+    let (s, c) = inbox(&a, &b, "app.changed", bot_address, federation::B, changed).await;
+    assert_eq!((s, c.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
 
     // Uninstall on B → app.uninstall → A drops the index entry.
     let (s, _) = b

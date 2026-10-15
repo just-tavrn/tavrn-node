@@ -264,6 +264,14 @@ pub async fn set_auto_preview(db: &Pool, user_id: &str, value: &str) -> Result<(
 
 // ---------------------------------------------------------------- Devices and sessions
 
+/// The devices of a user (every row, also those without a live session: their keys stay in the keys document).
+pub async fn device_count(db: &Pool, user_id: &str) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM devices WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(db)
+        .await?)
+}
+
 pub async fn create_device(db: &Pool, user_id: &str, name: &str, client: &str) -> Result<DeviceRow, ApiError> {
     let id = ulid();
     let ts = now();

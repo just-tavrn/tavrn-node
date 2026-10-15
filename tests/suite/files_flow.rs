@@ -598,3 +598,186 @@ async fn housekeeping_keeps_file_entries_out_of_retention_and_sweeps_orphans() {
     assert_eq!(s.down(&s.bob.token, &id(&f), None).await.2, b"keep me");
     assert!(s.node.state.storage.read(&stray).await.unwrap().is_none());
 }
+
+// ---------------------------------------------------------------- renames, quotas and aborted uploads
+
+#[tokio::test]
+async fn a_rename_is_classified_like_an_upload() {
+    let s = setup().await;
+    let script = b"@echo off\r\nstart calc.exe\r\n";
+    // The node refuses the script under its real name and accepts the same bytes as text.
+    let (st, j) = s.up(&s.bob.token, "run.bat", None, "text/plain", script).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload.type_forbidden")), "{j}");
+    let (st, j) = s.up(&s.bob.token, "run.txt", None, "text/plain", script).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let entry = id(&j);
+    // Renaming it to an executable name is refused like the upload.
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.bat" })).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload.type_forbidden")), "{j}");
+    assert_eq!(j["meta"]["executable"], true);
+    let (st, h, _) = s.down(&s.bob.token, &entry, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h["content-disposition"].to_str().unwrap().contains("run.txt"));
+    // A harmless new name passes.
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.md" })).await;
+    assert_eq!((st, j["name"].as_str()), (StatusCode::OK, Some("run.md")), "{j}");
+
+    // Role-restricted categories: a member who may upload documents only cannot rename into an archive.
+    let everyone = {
+        let (_, room) = s.node.get_auth(&format!("/api/v1/rooms/{}", s.room_id), &s.alice.token).await;
+        room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (st, j) = s
+        .node
+        .patch(
+            &format!("/api/v1/rooms/{}/roles/{everyone}", s.room_id),
+            &s.alice.token,
+            json!({ "allowed_upload_categories": ["documents"] }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (st, j) = s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "name": "run.zip" })).await;
+    assert_eq!(
+        (st, j["code"].as_str(), j["meta"]["category"].as_str()),
+        (StatusCode::FORBIDDEN, Some("upload.type_forbidden"), Some("archives")),
+        "{j}"
+    );
+    // Moving without a new name is no rename.
+    let (_, folder) = s.folder(&s.bob.token, None, "Docs").await;
+    let (st, j) =
+        s.node.patch(&format!("{}/{entry}", s.base()), &s.bob.token, json!({ "parent_id": id(&folder) })).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+}
+
+fn part_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(part_files(&path));
+        } else if path.extension().is_some_and(|e| e == "part") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// An upload request with a streamed body of unknown length: `first` now, `rest` once `release` fires.
+fn streamed_upload(
+    s: &Setup,
+    first: usize,
+    rest: Option<(usize, tokio::sync::oneshot::Receiver<()>)>,
+) -> axum::http::Request<axum::body::Body> {
+    use axum::body::Bytes;
+    let head = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; first]))]);
+    let tail: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> = match rest {
+        Some((len, wait)) => Box::pin(futures::stream::once(async move {
+            let _ = wait.await;
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'b'; len]))
+        })),
+        None => Box::pin(futures::stream::pending()),
+    };
+    axum::http::Request::post(format!("{}/upload", s.base()))
+        .header("authorization", format!("Bearer {}", s.bob.token))
+        .header("content-type", "text/plain")
+        .header("tavrn-file-name", format!("notes-{}.txt", tavrn_node::util::ulid()))
+        .body(axum::body::Body::from_stream(futures::StreamExt::chain(head, tail)))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn parallel_uploads_cannot_overrun_the_channel_quota() {
+    use tower::ServiceExt;
+    const QUOTA: u64 = 1024 * 1024;
+    const PARALLEL: usize = 6;
+    let s = setup_with(|c| c.files_channels_max_bytes = QUOTA).await;
+    let data_dir = std::path::PathBuf::from(&s.node.state.config.data_dir);
+    let mut releases = Vec::new();
+    let mut tasks = Vec::new();
+    for _ in 0..PARALLEL {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        releases.push(release);
+        let req = streamed_upload(&s, 64 * 1024, Some((600 * 1024 - 64 * 1024, wait)));
+        tasks.push(tokio::spawn(s.node.router.clone().oneshot(req)));
+        // Every upload starts writing before the next one checks the quota.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    common::wait_until(std::time::Duration::from_secs(10), "an upload is writing", || {
+        let n = part_files(&data_dir).len();
+        async move { n >= 1 }
+    })
+    .await;
+    for r in releases {
+        let _ = r.send(());
+    }
+    let mut created = 0;
+    for t in tasks {
+        let resp = t.await.unwrap().unwrap();
+        if resp.status() == StatusCode::CREATED {
+            created += 1;
+        } else {
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    let used = usage["used_bytes"].as_u64().unwrap();
+    assert!(created >= 1, "the first upload fits");
+    assert!(used <= QUOTA, "usage {used} stays within the quota {QUOTA} ({created} uploads accepted)");
+    assert!(part_files(&data_dir).is_empty(), "refused uploads leave nothing behind");
+}
+
+#[tokio::test]
+async fn an_aborted_upload_leaves_no_partial_file() {
+    use tower::ServiceExt;
+    let s = setup().await;
+    let data_dir = std::path::PathBuf::from(&s.node.state.config.data_dir);
+    let req = streamed_upload(&s, 512 * 1024, None);
+    // The client goes away mid-body (or a timeout drops the request): the handler is dropped while writing.
+    let dropped = tokio::time::timeout(std::time::Duration::from_secs(2), s.node.router.clone().oneshot(req)).await;
+    assert!(dropped.is_err(), "the upload was still running");
+    assert!(part_files(&data_dir).is_empty(), "the partial file is removed at once: {:?}", part_files(&data_dir));
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    assert_eq!(usage["used_bytes"], 0);
+    // The reservation of the dropped upload is released: a full-size upload still fits.
+    let (st, j) = s.up(&s.bob.token, "after.txt", None, "text/plain", b"fine").await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+}
+
+#[tokio::test]
+async fn files_channels_on_the_node_storage_have_a_default_quota() {
+    let default = tavrn_node::config::Config::default().files_channels_max_bytes;
+    assert!(default > 0, "the node's own storage is never unlimited by default");
+    let s = setup().await;
+    let (_, usage) = s.node.get_auth(&format!("{}/usage", s.base()), &s.bob.token).await;
+    assert_eq!(usage["limit_bytes"].as_u64(), Some(default), "{usage}");
+}
+
+#[tokio::test]
+async fn entries_cannot_be_moved_into_another_channels_folder() {
+    let s = setup().await;
+    let (st, other) = s
+        .node
+        .post(
+            &format!("/api/v1/rooms/{}/channels", s.room_id),
+            &s.alice.token,
+            json!({ "kind": "files", "name": "Other Files", "encrypted": false }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{other}");
+    let other_base = format!("/api/v1/rooms/{}/channels/{}/files", s.room_id, id(&other));
+    let (st, foreign) =
+        s.node.post(&format!("{other_base}/folders"), &s.alice.token, json!({ "parent_id": null, "name": "F" })).await;
+    assert_eq!(st, StatusCode::CREATED, "{foreign}");
+    let (_, file) = s.up(&s.bob.token, "a.txt", None, "text/plain", b"a").await;
+    let (_, folder) = s.folder(&s.bob.token, None, "Mine").await;
+    for entry in [id(&file), id(&folder)] {
+        let (st, j) =
+            s.node.patch(&format!("{}/{entry}", s.base()), &s.alice.token, json!({ "parent_id": id(&foreign) })).await;
+        assert_eq!((st, j["code"].as_str()), (StatusCode::NOT_FOUND, Some("files.parent_not_found")), "{j}");
+    }
+    let (_, listing) = s.node.get_auth(&format!("{other_base}?parent={}", id(&foreign)), &s.alice.token).await;
+    assert_eq!(listing["entries"], json!([]), "nothing arrived in the other channel");
+}

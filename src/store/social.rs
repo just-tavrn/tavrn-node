@@ -98,6 +98,18 @@ pub async fn request_between(db: &Pool, from: &str, to: &str) -> Result<Option<F
     .await?)
 }
 
+/// Pending requests to `to` from users of `domain` (incoming remote requests of one node).
+pub async fn pending_requests_from_domain(db: &Pool, to: &str, domain: &str) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM friend_requests r JOIN users u ON u.id = r.from_user_id
+         WHERE r.to_user_id = $1 AND u.domain = $2",
+    )
+    .bind(to)
+    .bind(domain)
+    .fetch_one(db)
+    .await?)
+}
+
 pub async fn request_by_id(db: &Pool, id: &str) -> Result<Option<FriendRequestRow>, ApiError> {
     Ok(sqlx::query_as(&format!("SELECT {REQUEST_COLS} FROM friend_requests WHERE id = $1"))
         .bind(id)

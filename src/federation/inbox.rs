@@ -331,9 +331,10 @@ async fn process(state: &AppState, iss: &str, envelope: &Envelope) -> Result<&'s
         return Ok("duplicate");
     }
     let result = handle(state, iss, envelope, recipient, action).await;
-    // A failure on this node's side (5xx) is retried by the sender: the retry must not count as a duplicate.
+    // A failure on this node's side (5xx) and a rate limit of the handler (`429`) are retried by the sender: the retry
+    // must not count as a duplicate.
     if let Err(e) = &result
-        && e.status().is_server_error()
+        && (e.status().is_server_error() || e.status() == axum::http::StatusCode::TOO_MANY_REQUESTS)
     {
         store::federation::unmark_seen(&state.db, iss, &envelope.id).await?;
     }

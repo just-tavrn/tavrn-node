@@ -143,7 +143,7 @@ These settings fix the node's identity domain, where it is served and which data
 | `TAVRN_NAME` | `tavrn` | Display name of the node (directory, discovery document). |
 | `TAVRN_DESCRIPTION` | empty | Short description of the node (directory). |
 | `TAVRN_LISTEN` | `0.0.0.0:8080` | Address and port of the plain-HTTP server. |
-| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. |
+| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. List your reverse proxy here when it does not connect over loopback (another host, a container network); the compose file sets Docker's private ranges, because there the proxy reaches the node through Docker's gateway address. Never list networks that clients reach the node from directly: every address listed may choose its rate-limit identity. |
 | `TAVRN_DATABASE_URL` | empty (compose: built from `POSTGRES_PASSWORD`) | `postgres://user:password@host:port/db` (or `postgresql://`). `sqlite:` only with `--dev`. |
 | `TAVRN_DATA_DIR` | `/data` (image) | Directory for `keys/`, `blobs/` (stored files) and the generated LiveKit configuration. |
 | `TAVRN_ADMIN_USERS` | empty | Comma-separated usernames with node admin rights (besides the first registered account). |
@@ -174,7 +174,7 @@ and sessions work and the minimum age.
 | `TAVRN_RATE_LIMIT_IPV6_PREFIX` | `64` | Per-address rate limits (login, registration, password reset, connect, directory, the emoji and sound proxy, …) count IPv6 clients by this prefix (32–128): one host usually holds a whole /64. IPv4 addresses count one by one. |
 | `TAVRN_PASSWORD_HASH_CONCURRENCY` | `0` (twice the CPU cores, at least 2) | Password hashes and checks (Argon2id, 64 MiB each) running at once, off the request threads; further logins wait for a slot. |
 | `TAVRN_WS_MAX_SOCKETS_PER_USER` | `20` | WebSocket connections one user may hold at once per instance (`0` = unlimited); beyond it the socket is closed with 4002 `too_many_connections`. App tokens keep their own limit of two. |
-| `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. |
+| `TAVRN_DEVICE_STALE_DAYS` | `180` | Devices unused this long are deleted by the hourly housekeeping (never a user's only device, never one with a live session); 0–36500, `0` = never. An account has at most 100 devices (clients refuse a keys document with more): a login that would create the 101st is refused with `403 auth.device_limit` until the user removes a device they no longer use (device settings of a signed-in device; logging out with "forget this device" removes it too) or the housekeeping deletes stale ones. |
 | `TAVRN_E2EE_CLAIMS_PER_TARGET_PER_HOUR` | `60` | KeyPackage claims for one user per hour from one source (this node, or one other node) by requesters who share no room, DM, group DM or friendship with the user (1–10000); ten times that per user over all sources. Requesters who share one of these, and a user's claims for their own devices, are not counted. Protects users from having their KeyPackages drained by claims in many names without locking out their contacts. |
 | `TAVRN_MINIMUM_AGE` | `16` | Minimum age for registration (13–99). Every registration path asks for the date of birth and refuses younger people; see [Age gates](#age-gates). |
 | `TAVRN_DM_POLICY` | `everyone` | Upper bound of every user's "Who can message me": `friends`, `everyone_shared` (friends and shared rooms) or `everyone` (`open` is the old name). Users choose within it (their default is `everyone_shared`); non-friends land in the recipient's message requests; blocks always apply. |
@@ -334,7 +334,7 @@ marked "entitlement" above are the node defaults; node admins extend them per us
 | `TAVRN_SOUNDS_MAX_PERSONAL` | `10` | `sounds.max_personal`, personal soundboard clips (0–100000). |
 | `TAVRN_ATTACHMENT_RETENTION_DAYS` | `0` | `attachments.retention_days`: attachments of channels and DMs are deleted this many days after the upload by the hourly housekeeping; messages keep listing them as "file expired". Pinned messages keep their files. Rooms may only shorten it. 0–36500, `0` = keep forever. |
 | `TAVRN_FILES_CHANNELS` | `on` | `files_channels.enabled`: files channels may be created (`on`/`off`). |
-| `TAVRN_FILES_CHANNELS_MAX_BYTES` | `0` | `files_channels.max_bytes`, storage per files channel on the node's own storage (never external stores, which have their own limit in the channel's storage settings). |
+| `TAVRN_FILES_CHANNELS_MAX_BYTES` | `10737418240` (10 GiB) | `files_channels.max_bytes`, storage per files channel on the node's own storage (never external stores, which have their own limit in the channel's storage settings). Every member with *Attach files* can fill it, and a room may have several files channels: size it to the disk. `0` = unlimited (only where the disk is guarded otherwise); grants and plans can raise it per room. |
 | `TAVRN_FILES_EXTERNAL` | `off` | Files channels on external WebDAV/S3 stores (protocol: FILES.md §5). |
 | `TAVRN_FILES_INTERNAL` | `on` | `files_channels.internal`: `off` = files channels on external stores only; the node keeps no files of files channels (needs `TAVRN_FILES_EXTERNAL=on`, see [Files channels on external stores](#files-channels-on-external-stores)). A plan or override of the room owner (or a room grant) with `files_channels.internal` `1` allows the node's own storage in that owner's rooms anyway, `0` takes it away on a node that is `on`. |
 | `TAVRN_FILES_EXTERNAL_PRIVATE` | `off` | `on` also allows external stores on private, loopback or link-local addresses and plain `http` (stores in the LAN); this disables the SSRF protection for them. |
@@ -401,11 +401,12 @@ These settings decide whether and with whom the node federates and how it takes 
 | `TAVRN_FEDERATION_ALLOW_PRIVATE` | `false` | `true` allows peers on private or loopback addresses (development, tests, closed intranets). |
 | `TAVRN_FEDERATION_SRV_FALLBACK` | `true` | When a peer's identity domain serves no `/.well-known/tavrn` (404, or no HTTPS server at all), look up `_tavrn._tcp.<domain>` SRV and fetch the document from its target ([SRV record](#srv-record-instead-of-the-well-known-file)). |
 | `TAVRN_FEDERATION_REMOTE_BOTS` | `true` | Accept bots of other nodes. |
-| `TAVRN_FEDERATION_RATE_LOGINS` | `60` | Federated logins per remote domain and minute (> 0). |
+| `TAVRN_FEDERATION_RATE_LOGINS` | `60` | Federated logins per remote domain and minute (> 0). One account, and one client address on the network (not loopback), get a quarter of it (at least 1). |
 | `TAVRN_FEDERATION_RATE_INBOX` | `300` | Inbox messages per remote domain and minute (> 0). |
 | `TAVRN_FEDERATION_RATE_API` | `3000` | API requests of all users of one remote domain per minute (> 0). |
+| `TAVRN_FEDERATION_RATE_API_PER_USER` | `600` | API requests of one remote user per minute (> 0), counted before the domain's budget and at most that budget: requests it refuses do not use up the domain's budget, so one account cannot lock the other users of its domain out. Keep it well below `TAVRN_FEDERATION_RATE_API`. |
 | `TAVRN_FEDERATION_RATE_CLAIMS` | `120` | KeyPackage claims per requesting node and minute (> 0). |
-| `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. |
+| `TAVRN_FEDERATION_MAX_REMOTE_USERS` | `10000` | Remote users in total. Users that only an incoming message names (the sender of a friend request) may fill it up to nine tenths; the rest stays for users who sign in. |
 | `TAVRN_FEDERATION_MAX_REMOTE_USERS_PER_DOMAIN` | `1000` | Remote users per home domain. |
 | `TAVRN_FEDERATION_PERMIT_TIMEOUT_SECS` | `10` | How long a request to a peer waits for one of the peer's 4 connection slots and then one of the 64 node-wide slots before it fails (1–120). A slow peer only ever ties up its own slots. |
 | `TAVRN_FEDERATION_MAX_UNVERIFIED_PEERS` | `1000` | Cached discovery documents of peers no signed request of which ever verified here (10–1000000). Beyond it, unsigned requests naming a new domain are refused (`503 federation.peer_limit`) before any fetch. Peers this node looked up itself, listed in its directory, or with users or sign-ins never count. Failed fetches are remembered for 60 seconds per domain, and peers unused for 30 days that nothing ties to the node are pruned. |
@@ -524,8 +525,10 @@ Whichever proxy you use, it has to pass WebSockets through, forward the client's
    under `/rtc` (`/rtc`, `/rtc/v1`; the HTTP checks `/rtc/validate` and `/rtc/v1/validate` are plain GETs). Use a
    long read timeout (an hour): both are long-lived connections.
 2. **Set `X-Forwarded-For`.** tavrn only trusts the header when the connection comes from an address in
-   `TAVRN_TRUSTED_PROXIES` (default: private networks and localhost). If your proxy lives elsewhere, add its
-   address, otherwise rate limits and bans apply to the proxy address instead of the client.
+   `TAVRN_TRUSTED_PROXIES` (default: loopback only; `deploy/docker-compose.yml` adds Docker's private ranges). If
+   your proxy connects from anywhere else, add its address, otherwise rate limits and bans apply to the proxy
+   address instead of the client. List only proxies: a client that connects from a listed address may name any
+   address in the header.
 3. **Allow large bodies**, at least as large as `TAVRN_UPLOAD_MAX_BYTES` (or `TAVRN_UPLOAD_MAX_BYTES_CEILING` when
    grants raise it).
 4. **Leave requests and CORS to the node**: pass `Authorization` and the `Tavrn-*` request headers through
@@ -1125,7 +1128,12 @@ The operator decides which nodes this node federates with and how much load othe
   subdomains (a ban of `evil.example` refuses `a.evil.example`).
 - `TAVRN_FEDERATION_ALLOWLIST`: if set, the node federates only with these domains (a closed federation); the
   blocklist still wins.
-- Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`;
+- Blocks and node bans of a domain stop the outgoing traffic too: queued notifications for it are dropped as
+  undeliverable, and profiles, avatars and application documents are no longer fetched from it.
+- Incoming friend requests: at most 10 per hour from one node to one user, and at most 20 pending from one node per
+  user; further requests are dropped.
+- Rate limits per remote domain and minute: `TAVRN_FEDERATION_RATE_LOGINS`, `…_INBOX`, `…_API`, `…_CLAIMS`, with
+  shares per remote user (`…_API_PER_USER`; a quarter of the logins per account and per client address);
   quotas of remote users: `TAVRN_FEDERATION_MAX_REMOTE_USERS`, `…_PER_DOMAIN`.
 - Remote users with nothing left on this node are deleted after `TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`.
 - Bots: `TAVRN_FEDERATION_REMOTE_BOTS` (accept other nodes' bots), `TAVRN_APPS_FEDERATE` (this node's bots on other
@@ -1408,7 +1416,10 @@ How it behaves:
   have a queue of their own, so a busy channel never delays or drops the pushes of DMs, mentions, calls and
   reports. A message's recipients are loaded together (a few statements per message, whatever the room's size),
   members who were pushed for the conversation within the last 30 seconds are skipped first, and the deliveries to
-  different users run in parallel.
+  different users run in parallel. A user's subscriptions are sent to at once and given 10 seconds together, and while a
+  push to a user is still under way the next one for them is skipped, so endpoints that never answer cannot hold
+  the senders. An endpoint that fails is held back (30 seconds, doubling up to 6 hours) and deleted after 30 failures
+  in a row; registering it again keeps its count.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
 - **Monitoring**: `tavrn_push_sent_total` and `tavrn_push_failed_total` ([Metrics and health](#metrics-and-health)).
@@ -1445,8 +1456,8 @@ Access:
 - `TAVRN_METRICS_TOKEN` empty: `/metrics` answers only to requests from loopback and from the addresses in
   `TAVRN_TRUSTED_PROXIES`: the TCP peer and every address in `X-Forwarded-For` must be one of them, so public
   requests through a reverse proxy on the same host are refused;
-  everything else gets the same `404` as an unknown path. The default `TAVRN_TRUSTED_PROXIES` contains all private
-  networks, so set a token when untrusted hosts share a private network with the node.
+  everything else gets the same `404` as an unknown path. Set a token when `TAVRN_TRUSTED_PROXIES` lists networks
+  that untrusted hosts share with the node (the compose file lists Docker's private ranges).
 - Block `/metrics` at the reverse proxy for the public anyway (nginx: `location = /metrics { return 404; }`) and
   scrape the instances directly, not through the public host name.
 
@@ -1555,9 +1566,11 @@ All instances need the same configuration and reach the same database, data volu
   clients and re-announce their presence; counters and pending codes start over. One Valkey database per logical
   node: tavrn prefixes its keys with `tavrn:<domain>:`, but LiveKit's keys are not prefixed. `rediss://` for TLS.
 - **`TAVRN_TRUSTED_PROXIES`** must contain the reverse proxy and the instances' own network (relayed requests
-  carry the client address in `X-Forwarded-For`); the default (private networks) covers the usual setups.
+  carry the client address in `X-Forwarded-For`); the default is loopback only, so list both explicitly.
 - **`TAVRN_INSTANCE_URL`** (`http://tavrn-1:8080`): where the other instances reach this one; default: this host's
-  address towards Valkey with the `TAVRN_LISTEN` port. The instances must reach each other on that port.
+  address towards Valkey with the `TAVRN_LISTEN` port. The instances must reach each other on that port, over a
+  private network: the relay mark binds instance, method, path and time but not the body, so traffic between the
+  instances must not cross networks others can read (use `https` addresses otherwise).
 
 #### Load balancer
 
@@ -2196,8 +2209,8 @@ members" in the room (give it a role with that permission) lists the room's repo
 for example to post a summary in a moderators' channel or to escalate after several reports about one user. Bots
 see metadata only: kind, category, the reported user, status, counts, times and the id of the reported message, never
 the reporter's text, the snapshot, released plaintext, your notes or actions, and the reporter only as a pseudonym
-(the same for the same reporter in that room, never the address). Bots never see reports about themselves or about
-the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
+(the same for the same reporter in that room, never the address). Bots never see reports about themselves, their
+owner, their owner's other bots or the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
 (MODERATION.md §1.4a). Take the permission away to close the inbox for the bot.
 
 #### Forwarding reports to another node
@@ -2229,7 +2242,10 @@ erased account's forwarded reports lose their target but keep the origin. Both d
 
 Content rules only work where the node can read: unencrypted channels (never ciphertext). Rooms define their own
 rules (room settings → Auto-moderation: word lists with `*` wildcards, link allow and block lists, exempt roles and
-channels; actions block, delete or timeout), checked on send and edit, including attachment file names. As operator
+channels; actions block, delete or timeout), checked on send and edit, including attachment file names and bots'
+interaction replies. Delete and timeout rules act only on members ranked below whoever last saved the rules (as that
+member's own moderation would), and a timeout is shown to the room like a moderator's. Matching runs off the request
+threads with a fixed amount of work per message; a message that would need more is refused. As operator
 you can add node-wide lists that block in every unencrypted conversation: `TAVRN_AUTOMOD_WORDS_FILE=/data/automod/words.txt`
 (one term per line, whole words, `#` comments) and `TAVRN_AUTOMOD_LINKS=/data/automod/domains.txt` (one domain per
 line, subdomains included; `off` by default). Both files are read at start (at most 1 MiB and 10000 entries;

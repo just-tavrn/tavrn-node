@@ -113,8 +113,13 @@ pub async fn create_group(
     if !store::e2ee::create_group(&state.db, &conv.id, &gi, &ds_state).await? {
         return Err(exists());
     }
-    conv.publish(&state.hub, "mls.commit", json!({ "conversation_id": conv.id, "epoch": 0 }));
-    crate::bot_channels::after_group_created(&state, &conv, &auth.user).await;
+    // Stored: the event and the security log entry follow even when the client goes away meanwhile (see post_commit).
+    let (effects_state, creator) = (state.clone(), auth.user.clone());
+    crate::util::detached(async move {
+        conv.publish(&effects_state.hub, "mls.commit", json!({ "conversation_id": conv.id, "epoch": 0 }));
+        crate::bot_channels::after_group_created(&effects_state, &conv, &creator).await;
+    })
+    .await;
     Ok((StatusCode::CREATED, Json(EpochResponse { epoch: 0 })))
 }
 
@@ -205,23 +210,38 @@ pub async fn post_commit(
         let current = store::e2ee::group_epoch(&state.db, &conv.id).await?.unwrap_or(group.epoch);
         return Err(epoch_conflict(current));
     }
-    // Removed leaves are no longer pending (ENCRYPTION.md §4.7).
-    if !summary.removed.is_empty()
-        && let Err(e) = store::pending_removals::clear(&state.db, &conv.id, &summary.removed).await
-    {
-        tracing::warn!(error = %e, conversation = conv.id, "pending MLS removals not cleared");
-    }
     let new_epoch = group.epoch + 1;
-    conv.publish(&state.hub, "mls.commit", json!({ "conversation_id": conv.id, "epoch": new_epoch }));
-    if !welcome_devices.is_empty() {
-        state.hub.devices(welcome_devices, "mls.welcome", json!({ "conversation_id": conv.id, "epoch": new_epoch }));
-    }
-    // New members of a channel whose policy gives them history wait for keys (ENCRYPTION.md §7b).
-    crate::history::after_commit(&state, &conv, &auth.user, &summary, &group.ds_state).await;
-    // Bots joining or leaving an encrypted channel's group go to the room's security log.
-    if let Ok(roster) = ds.roster() {
-        crate::bot_channels::after_commit(&state, &conv, &auth.user, &summary, &group.ds_state, &roster).await;
-    }
+    // The commit is stored: what follows from it runs to its end even when the client goes away meanwhile (a tab
+    // closed or navigated right after committing). Dropped with the request, the security log missed a bot's removal
+    // and the pending removal stayed listed.
+    let roster = ds.roster().ok();
+    let committer = auth.user.clone();
+    let ds_state_before = group.ds_state;
+    let effects_state = state.clone();
+    crate::util::detached(async move {
+        let state = effects_state;
+        // Removed leaves are no longer pending (ENCRYPTION.md §4.7).
+        if !summary.removed.is_empty()
+            && let Err(e) = store::pending_removals::clear(&state.db, &conv.id, &summary.removed).await
+        {
+            tracing::warn!(error = %e, conversation = conv.id, "pending MLS removals not cleared");
+        }
+        conv.publish(&state.hub, "mls.commit", json!({ "conversation_id": conv.id, "epoch": new_epoch }));
+        if !welcome_devices.is_empty() {
+            state.hub.devices(
+                welcome_devices,
+                "mls.welcome",
+                json!({ "conversation_id": conv.id, "epoch": new_epoch }),
+            );
+        }
+        // New members of a channel whose policy gives them history wait for keys (ENCRYPTION.md §7b).
+        crate::history::after_commit(&state, &conv, &committer, &summary, &ds_state_before).await;
+        // Bots joining or leaving an encrypted channel's group go to the room's security log.
+        if let Some(roster) = roster {
+            crate::bot_channels::after_commit(&state, &conv, &committer, &summary, &ds_state_before, &roster).await;
+        }
+    })
+    .await;
     Ok((StatusCode::CREATED, Json(EpochResponse { epoch: new_epoch })))
 }
 

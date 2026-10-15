@@ -256,6 +256,31 @@ pub async fn index_nodes(db: &Pool, application_id: &str, own_domain: &str) -> R
     rows.iter().map(|r| r.try_get("node").map_err(ApiError::from)).collect()
 }
 
+/// Entries of `node` in the application's index.
+pub async fn index_count_of_node(db: &Pool, application_id: &str, node: &str) -> Result<i64, ApiError> {
+    let row = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM application_install_index WHERE application_id = $1 AND node = $2",
+    )
+    .bind(application_id)
+    .bind(node)
+    .fetch_one(db)
+    .await?;
+    Ok(row.try_get("n")?)
+}
+
+/// Does the index hold this room of `node`?
+pub async fn index_has(db: &Pool, application_id: &str, node: &str, room_id: &str) -> Result<bool, ApiError> {
+    let row = sqlx::query(
+        "SELECT 1 AS one FROM application_install_index WHERE application_id = $1 AND node = $2 AND room_id = $3",
+    )
+    .bind(application_id)
+    .bind(node)
+    .bind(room_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub async fn index_count(db: &Pool, application_id: &str) -> Result<i64, ApiError> {
     let row =
         sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM application_install_index WHERE application_id = $1")

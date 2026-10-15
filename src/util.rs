@@ -142,6 +142,19 @@ pub fn percent_decode_strict(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Runs `work` to completion even if the caller is dropped, and waits for it. Axum drops a handler's future when the
+/// client disconnects: side effects that must follow a stored change (events, the room's security log, cleared
+/// pending removals) go through here, so a closed tab never leaves the change without them. A panic in `work` is
+/// logged (as it would have ended the request).
+pub async fn detached<F>(work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tokio::spawn(work).await {
+        tracing::error!(error = %e, "detached work did not finish");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +228,23 @@ mod tests {
         assert_ne!(random_token(32), random_token(32));
         assert_eq!(sha256_b64("x"), sha256_b64("x"));
         assert_ne!(sha256_b64("x"), sha256_b64("y"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn detached_work_finishes_when_the_caller_is_dropped() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        // The caller (a request handler) waits for the work and is dropped while it runs (the client went away).
+        let caller = tokio::spawn(detached(async move {
+            let _ = started_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send("written");
+        }));
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(rx.await.unwrap(), "written", "the work ran to its end");
     }
 
     #[test]

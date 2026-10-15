@@ -23,6 +23,8 @@ use crate::{
 pub const ROTATION_SKEW_SECS: i64 = 300;
 /// At most one rotation per user in this interval.
 pub const ROTATION_INTERVAL_SECS: i64 = 3600;
+/// Continuity statements in a keys document (the clients' limit): no rotation beyond it.
+pub const MAX_CONTINUITY: i64 = 100;
 /// Upper bound of the attestation list (the device limit of the key cache, `federation::keys::MAX_DEVICES`).
 pub const MAX_ROTATION_ATTESTATIONS: usize = 100;
 /// Body limit of the rotation request (100 attestations of about 150 bytes plus the statement).
@@ -116,7 +118,15 @@ pub async fn rotate(
     let Some(current) = auth.user.identity_pubkey.clone() else {
         return Err(ApiError::conflict("e2ee.identity_missing", "Upload the account's security key first"));
     };
-    if let Some(last) = store::e2ee::current_rotation(&state.db, &auth.user.id).await?
+    let last = store::e2ee::current_rotation(&state.db, &auth.user.id).await?;
+    // Clients refuse a keys document with more than `MAX_CONTINUITY` statements: the chain never grows beyond it.
+    if last.as_ref().is_some_and(|l| l.generation >= MAX_CONTINUITY) {
+        return Err(ApiError::conflict(
+            "e2ee.rotation_limit",
+            "The account's security key was rotated as often as a keys document allows; reset it instead",
+        ));
+    }
+    if let Some(last) = last
         && let Some(at) = util::parse_time(&last.created_at)
     {
         let elapsed = (Utc::now() - at).num_seconds();
