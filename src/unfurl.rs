@@ -148,21 +148,26 @@ pub struct Unfurler {
 
 impl Unfurler {
     /// The production client (system DNS, nothing exempt); `None` when `TAVRN_UNFURL=off`.
+    /// Fails closed: when the HTTP client cannot be built, link previews stay off (with an error in the log).
     pub fn from_config(config: &Config) -> Option<Self> {
-        (config.unfurl == UnfurlSetting::On).then(|| {
-            let per_minute = if config.dev { 1000 } else { 30 };
-            Self::new(&config.domain, Arc::new(SystemLookup), HashSet::new(), TOTAL_TIMEOUT, per_minute)
-        })
+        if config.unfurl != UnfurlSetting::On {
+            return None;
+        }
+        let per_minute = if config.dev { 1000 } else { 30 };
+        Self::new(&config.domain, Arc::new(SystemLookup), HashSet::new(), TOTAL_TIMEOUT, per_minute)
+            .inspect_err(|e| tracing::error!(error = %e, "link previews are off: the HTTP client cannot be built"))
+            .ok()
     }
 
-    /// A client with its own DNS lookup, exempt hosts and timeout (tests).
+    /// A client with its own DNS lookup, exempt hosts and timeout (tests). Fails when the HTTP client cannot be
+    /// built: there is no fallback without the vetting resolver and the per-hop redirect checks.
     pub fn new(
         domain: &str,
         lookup: Arc<dyn Lookup>,
         exempt: HashSet<String>,
         total: Duration,
         per_minute: u32,
-    ) -> Self {
+    ) -> Result<Self, reqwest::Error> {
         let resolver = VettingResolver::new(lookup, false, exempt.clone());
         let http = reqwest::Client::builder()
             .user_agent(format!(
@@ -174,9 +179,8 @@ impl Unfurler {
             .connect_timeout(total)
             .timeout(total)
             .no_proxy()
-            .build()
-            .unwrap_or_default();
-        Self {
+            .build()?;
+        Ok(Self {
             http,
             resolver,
             exempt: Arc::new(exempt),
@@ -184,7 +188,7 @@ impl Unfurler {
             cache: Mutex::new((HashMap::new(), 0)),
             limiter: RateLimiter::new(per_minute, Duration::from_secs(60)),
             slots: Semaphore::new(CONCURRENT_FETCHES),
-        }
+        })
     }
 
     /// Unfurls `raw` for `user_id`: rate limit, cache, fetch, image conversion with `media`.
@@ -678,7 +682,7 @@ mod tests {
             ("mixed.test".to_string(), vec!["93.184.216.34".parse().unwrap(), "192.168.1.1".parse().unwrap()]),
         ]));
         let exempt = HashSet::from(["public.test".to_string(), "other.test".to_string()]);
-        let unfurler = Unfurler::new("node.test", Arc::new(dns), exempt, Duration::from_millis(1500), 1000);
+        let unfurler = Unfurler::new("node.test", Arc::new(dns), exempt, Duration::from_millis(1500), 1000).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config =
             Config { media_ffmpeg: "off".into(), data_dir: dir.path().to_string_lossy().into(), ..Config::default() };
@@ -789,7 +793,8 @@ mod tests {
             HashSet::from(["public.test".to_string()]),
             Duration::from_secs(2),
             3,
-        );
+        )
+        .unwrap();
         let url = format!("http://public.test:{port}/page");
         u.unfurl("u1", &url, &p).await.unwrap();
         assert_eq!(u.cache_len(), 1);

@@ -124,10 +124,11 @@ impl RemoteError {
     }
 }
 
-/// One HTTP client per private switch (vetting resolver, no redirects, no proxy).
-fn client(allow_private: bool) -> &'static reqwest::Client {
-    static PUBLIC: OnceLock<reqwest::Client> = OnceLock::new();
-    static PRIVATE: OnceLock<reqwest::Client> = OnceLock::new();
+/// One HTTP client per private switch (vetting resolver, no redirects, no proxy). Fails closed: when the client
+/// cannot be built, no request goes out (a default client would connect without the vetting resolver).
+fn client(allow_private: bool) -> Result<&'static reqwest::Client, RemoteError> {
+    static PUBLIC: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    static PRIVATE: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     let cell = if allow_private { &PRIVATE } else { &PUBLIC };
     cell.get_or_init(|| {
         let resolver = VettingResolver::new(Arc::new(SystemLookup), allow_private, HashSet::new());
@@ -139,8 +140,11 @@ fn client(allow_private: bool) -> &'static reqwest::Client {
             .read_timeout(READ_TIMEOUT)
             .no_proxy()
             .build()
-            .unwrap_or_default()
+            .inspect_err(|e| tracing::error!(error = %e, "HTTP client for external file stores cannot be built"))
+            .ok()
     })
+    .as_ref()
+    .ok_or(RemoteError::Unreachable)
 }
 
 fn valid_prefix(prefix: &str) -> bool {
@@ -295,8 +299,13 @@ impl RemoteStore {
     }
 
     /// Builds a request with the store's authentication.
-    fn request(&self, method: Method, url: Url, extra: &[(&str, String)]) -> reqwest::RequestBuilder {
-        let http = client(self.allow_private);
+    fn request(
+        &self,
+        method: Method,
+        url: Url,
+        extra: &[(&str, String)],
+    ) -> Result<reqwest::RequestBuilder, RemoteError> {
+        let http = client(self.allow_private)?;
         let mut req = http.request(method.clone(), url.clone());
         for (k, v) in extra {
             req = req.header(*k, v);
@@ -306,7 +315,7 @@ impl RemoteStore {
                 if !self.config.username.is_empty() || !self.config.password.is_empty() {
                     req = req.basic_auth(&self.config.username, Some(&self.config.password));
                 }
-                req
+                Ok(req)
             }
             Kind::S3 => {
                 let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -322,16 +331,17 @@ impl RemoteStore {
                     service: "s3",
                 };
                 let auth = signer.authorization(method.as_str(), &url, &headers, sigv4::UNSIGNED_PAYLOAD, &amz_date);
-                req.header("x-amz-content-sha256", sigv4::UNSIGNED_PAYLOAD)
+                Ok(req
+                    .header("x-amz-content-sha256", sigv4::UNSIGNED_PAYLOAD)
                     .header("x-amz-date", amz_date)
-                    .header(header::AUTHORIZATION, auth)
+                    .header(header::AUTHORIZATION, auth))
             }
-            Kind::Internal => req,
+            Kind::Internal => Ok(req),
         }
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, RemoteError> {
-        req.send().await.map_err(|e| {
+    async fn send(&self, req: Result<reqwest::RequestBuilder, RemoteError>) -> Result<reqwest::Response, RemoteError> {
+        req?.send().await.map_err(|e| {
             // The vetting resolver refused an address while connecting (DNS changed since the check).
             let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
             while let Some(s) = source {
@@ -373,8 +383,7 @@ impl RemoteStore {
         self.check_target(&url).await?;
         let req = self
             .request(Method::PUT, url, &[(header::CONTENT_LENGTH.as_str(), len.to_string())])
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(body);
+            .map(|r| r.header(header::CONTENT_TYPE, "application/octet-stream").body(body));
         let resp = self.send(req).await?;
         if resp.status().is_success() { Ok(()) } else { Err(RemoteError::Status(resp.status().as_u16())) }
     }
