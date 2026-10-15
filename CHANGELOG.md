@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- A bot's interaction replies and follow-ups pass the checks of an ordinary message: role mentions, the room's and the
+  node's content rules, slowmode, blocks and the channel kind; they are indexed for search like the bot's own
+  messages.
 - Room auto-moderation rules are matched off the request threads within a fixed work budget per message, and the
   matcher skips the starts of a term that cannot match, so crafted rules and messages no longer cost seconds of CPU
   per message; a message that would need more work than the budget is refused with `403 automod.blocked`.

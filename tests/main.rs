@@ -56,6 +56,7 @@ mod suite {
     mod history_since_join_flow;
     mod housekeeping_flow;
     mod identity_rotation_flow;
+    mod interaction_checks_flow;
     mod legal_flow;
     mod login_limits_flow;
     mod mail_locale_flow;
