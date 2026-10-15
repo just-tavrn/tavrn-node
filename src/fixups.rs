@@ -329,8 +329,14 @@ async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
 
 /// Adds `manage_threads` to every role holding `manage_messages`, once per node (see the module docs).
 async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
-    grant_to_roles(db, MANAGE_THREADS_MARKER, permissions::MANAGE_MESSAGES, permissions::MANAGE_THREADS, Everyone::Excluded)
-        .await
+    grant_to_roles(
+        db,
+        MANAGE_THREADS_MARKER,
+        permissions::MANAGE_MESSAGES,
+        permissions::MANAGE_THREADS,
+        Everyone::Excluded,
+    )
+    .await
 }
 
 async fn grant_voice_status(db: &Pool) -> anyhow::Result<u64> {
@@ -395,10 +401,7 @@ async fn grant_to_roles(db: &Pool, marker: &str, have: u64, add: u64, everyone: 
     } else {
         "SELECT id, permissions FROM roles WHERE is_everyone = 0 AND (permissions & $1) <> 0"
     };
-    let roles = sqlx::query(sql)
-        .bind(have as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+    let roles = sqlx::query(sql).bind(have as i64).fetch_all(&mut *tx).await?;
     let mut changed = 0;
     for row in roles {
         let (id, perms): (String, i64) = (row.try_get("id")?, row.try_get("permissions")?);

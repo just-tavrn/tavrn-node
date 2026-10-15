@@ -7,12 +7,17 @@
 
 use crate::common;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
+    extract::State,
     http::{Method, Request, StatusCode, header},
+    routing::post,
 };
 use common::{Session, TestNode, body_bytes, test_node, test_node_with};
 use serde_json::{Value, json};
@@ -25,7 +30,7 @@ use tavrn_node::{
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
-const D: &str = "c.local";
+const D: &str = common::e2ee::DOMAIN;
 
 fn code(j: &Value) -> &str {
     j["code"].as_str().unwrap_or("")
@@ -72,9 +77,8 @@ async fn bot(node: &TestNode, owner: &Session, name: &str) -> Bot {
     let (s, app) = node.post("/api/v1/applications", &owner.token, body).await;
     assert_eq!(s, StatusCode::CREATED, "{app}");
     let app_id = app["id"].as_str().unwrap().to_string();
-    let (s, t) = node
-        .post(&format!("/api/v1/applications/{app_id}/tokens"), &owner.token, json!({ "name": "main" }))
-        .await;
+    let (s, t) =
+        node.post(&format!("/api/v1/applications/{app_id}/tokens"), &owner.token, json!({ "name": "main" })).await;
     assert_eq!(s, StatusCode::CREATED, "{t}");
     let (_, commands) = node
         .put(
@@ -120,6 +124,8 @@ struct World {
     bot: Bot,
     room_id: String,
     channel: String,
+    /// The `@everyone` role of the room.
+    everyone: Value,
 }
 
 async fn world_with(node: TestNode) -> World {
@@ -131,9 +137,10 @@ async fn world_with(node: TestNode) -> World {
     let room = node.plaintext_room(&carol.token, "Guild").await;
     let room_id = room["id"].as_str().unwrap().to_string();
     let channel = TestNode::text_channel(&room);
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap().clone();
     member(&node, &carol, &room_id, &bob).await;
     install(&node, &carol.token, &room_id, &b).await;
-    World { node, alice, carol, bob, bot: b, room_id, channel }
+    World { node, alice, carol, bob, bot: b, room_id, channel, everyone }
 }
 
 async fn world() -> World {
@@ -248,7 +255,8 @@ async fn components_travel_on_bots_messages_only() {
     assert_eq!((s, code(&j), path_of(&j)), (StatusCode::BAD_REQUEST, "message.components_invalid", "components"));
     let (s, j) = post_as(node, &bob.token, &w.channel, json!({ "type": "text", "body": "x", "components": [] })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.components_invalid"), "an empty array too");
-    let (s, _) = post_as(node, &bob.token, &w.channel, json!({ "type": "text", "body": "x", "components": null })).await;
+    let (s, _) =
+        post_as(node, &bob.token, &w.channel, json!({ "type": "text", "body": "x", "components": null })).await;
     assert_eq!(s, StatusCode::CREATED, "null is absent");
     // The bot may; the body may be empty with components.
     let (s, m) = post_as(node, &w.bot.secret, &w.channel, card()).await;
@@ -271,7 +279,7 @@ async fn components_travel_on_bots_messages_only() {
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.components_invalid"));
     // Values content objects never travel as messages.
     for t in ["component.values", "modal.values"] {
-        let (s, j) = post_as(node, &w.bot.secret, &w.channel, json!({ "type": t, "body": "x" })).await;
+        let (s, j) = post_as(node, &bob.token, &w.channel, json!({ "type": t, "body": "x" })).await;
         assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "message.type_reserved"), "{t}");
     }
     // Edits: a person cannot add components; the bot can change them.
@@ -317,13 +325,23 @@ async fn buttons_selects_updates_and_modals() {
         (data["message_id"].as_str(), data["custom_id"].as_str(), data["values"].clone()),
         (Some(message.as_str()), Some("signup"), Value::Null)
     );
-    assert_eq!((data["user"].as_str(), data["device_id"].as_str()), (Some(format!("bob@{D}").as_str()), Some(bob.device_id.as_str())));
+    assert_eq!(
+        (data["user"].as_str(), data["device_id"].as_str()),
+        (Some(format!("bob@{D}").as_str()), Some(bob.device_id.as_str()))
+    );
     assert_eq!((data["encrypted"].as_bool(), data["locale"].as_str()), (Some(false), Some("de")));
-    assert_eq!((data["channel_id"].as_str(), data["application_id"].as_str()), (Some(w.channel.as_str()), Some(w.bot.app_id.as_str())));
+    assert_eq!(
+        (data["channel_id"].as_str(), data["application_id"].as_str()),
+        (Some(w.channel.as_str()), Some(w.bot.app_id.as_str()))
+    );
     assert!(data["permissions"].as_str().unwrap().parse::<u64>().unwrap() & p::USE_COMPONENTS != 0);
     let id = data["interaction_id"].as_str().unwrap().to_string();
     let (s, j) = node
-        .post(&callback(&id), &w.bot.secret, json!({ "type": "reply", "content": { "type": "text", "body": "Signed up" } }))
+        .post(
+            &callback(&id),
+            &w.bot.secret,
+            json!({ "type": "reply", "content": { "type": "text", "body": "Signed up" } }),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     let (s, res) = task.await.unwrap();
@@ -337,7 +355,8 @@ async fn buttons_selects_updates_and_modals() {
 
     // A select → an ephemeral reply under the message, also to bob's other connections.
     let mut events = node.state.hub.subscribe();
-    let task = spawn_post(node, path.clone(), &bob.token, json!({ "custom_id": "class", "values": ["healer", "tank"] }));
+    let task =
+        spawn_post(node, path.clone(), &bob.token, json!({ "custom_id": "class", "values": ["healer", "tank"] }));
     let data = r.event("component.invoke").await;
     assert_eq!(data["values"], json!(["healer", "tank"]));
     let id = data["interaction_id"].as_str().unwrap().to_string();
@@ -407,7 +426,11 @@ async fn buttons_selects_updates_and_modals() {
         );
     }
     let (s, j) = node
-        .post(&submit(&parent), &bob.token, json!({ "values": { "name": "Thrall" }, "values_ciphertext": "AAAA", "epoch": 1 }))
+        .post(
+            &submit(&parent),
+            &bob.token,
+            json!({ "values": { "name": "Thrall" }, "values_ciphertext": "AAAA", "epoch": 1 }),
+        )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "interaction.encryption_mismatch"));
     let task = spawn_post(node, submit(&parent), &bob.token, json!({ "values": { "name": "Thrall", "note": "late" } }));
@@ -423,7 +446,11 @@ async fn buttons_selects_updates_and_modals() {
     let (s, j) = node.post(&callback(&id), &w.bot.secret, json!({ "type": "modal", "modal": note_modal() })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "interaction.modal_nested"));
     let (s, j) = node
-        .post(&callback(&id), &w.bot.secret, json!({ "type": "reply", "content": { "type": "text", "body": "Noted, Thrall" } }))
+        .post(
+            &callback(&id),
+            &w.bot.secret,
+            json!({ "type": "reply", "content": { "type": "text", "body": "Noted, Thrall" } }),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, res) = task.await.unwrap();
@@ -503,10 +530,7 @@ async fn invocation_checks_run_in_order() {
     assert!(s == StatusCode::NOT_FOUND || s == StatusCode::FORBIDDEN, "{s}");
 
     // 1. use_components, deniable per channel.
-    let everyone = {
-        let (_, room) = node.get_auth(&format!("/api/v1/rooms/{}", w.room_id), &carol.token).await;
-        room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"].as_str().unwrap().to_string()
-    };
+    let everyone = w.everyone["id"].as_str().unwrap().to_string();
     let override_path = format!("/api/v1/rooms/{}/overrides", w.room_id);
     let deny = json!({ "target_type": "channel", "target_id": w.channel, "subject_type": "role", "subject_id": everyone,
                        "allow": "0", "deny": p::USE_COMPONENTS.to_string() });
@@ -549,13 +573,10 @@ async fn invocation_checks_run_in_order() {
         (json!({ "custom_id": "class", "values": [1] }), "values[0]"),
     ] {
         let (s, j) = node.post(&path, &bob.token, body.clone()).await;
-        assert_eq!(
-            (s, code(&j), path_of(&j)),
-            (StatusCode::BAD_REQUEST, "component.values_invalid", field),
-            "{body}"
-        );
+        assert_eq!((s, code(&j), path_of(&j)), (StatusCode::BAD_REQUEST, "component.values_invalid", field), "{body}");
     }
-    let (s, j) = node.post(&path, &bob.token, json!({ "custom_id": "signup", "values_ciphertext": "AAAA", "epoch": 1 })).await;
+    let (s, j) =
+        node.post(&path, &bob.token, json!({ "custom_id": "signup", "values_ciphertext": "AAAA", "epoch": 1 })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "interaction.encryption_mismatch"));
     let (s, _) = node.post(&path, &bob.token, json!({ "custom_id": "signup", "thread_id": util::ulid() })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "the thread is the message's");
@@ -572,7 +593,10 @@ async fn invocation_checks_run_in_order() {
 
     // A removed application: its messages lose their components.
     let (s, j) = node
-        .delete(&format!("/api/v1/rooms/{}/applications/{}", w.room_id, w.bot.reference().replace('/', "%2F")), &carol.token)
+        .delete(
+            &format!("/api/v1/rooms/{}/applications/{}", w.room_id, w.bot.reference().replace('/', "%2F")),
+            &carol.token,
+        )
         .await;
     assert!(s.is_success(), "{j}");
     let (s, j) = node.post(&path, &carol.token, ok).await;
@@ -672,9 +696,17 @@ async fn encrypted_conversations_pass_ciphertext_values() {
 
     // Passed through unread; any custom_id is accepted since the node cannot know the components.
     let mut r = receiver(&node, &b);
-    let task = spawn_post(&node, path.clone(), carol.token(), json!({ "custom_id": "class", "values_ciphertext": vct, "epoch": vepoch }));
+    let task = spawn_post(
+        &node,
+        path.clone(),
+        carol.token(),
+        json!({ "custom_id": "class", "values_ciphertext": vct, "epoch": vepoch }),
+    );
     let data = r.event("component.invoke").await;
-    assert_eq!((data["encrypted"].as_bool(), data["values"].clone(), data["epoch"].as_i64()), (Some(true), Value::Null, Some(vepoch)));
+    assert_eq!(
+        (data["encrypted"].as_bool(), data["values"].clone(), data["epoch"].as_i64()),
+        (Some(true), Value::Null, Some(vepoch))
+    );
     let plain = bot_dev
         .client
         .decrypt_content(
@@ -708,7 +740,11 @@ async fn encrypted_conversations_pass_ciphertext_values() {
     next["body"] = json!("Thrall signed up");
     let nct = bot_dev.client.encrypt_content(&q, &next.to_string()).unwrap();
     let (s, j) = node
-        .post(&callback(&sub), &b.secret, json!({ "type": "update", "content": nct, "epoch": bot_dev.client.current_epoch(&q).unwrap() }))
+        .post(
+            &callback(&sub),
+            &b.secret,
+            json!({ "type": "update", "content": nct, "epoch": bot_dev.client.current_epoch(&q).unwrap() }),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, res) = task.await.unwrap();
@@ -717,7 +753,11 @@ async fn encrypted_conversations_pass_ciphertext_values() {
     // A member's ciphertext may carry components, but nobody can click them: the node knows the author.
     let mine = carol.client.encrypt_content(&q, &card().to_string()).unwrap();
     let (s, m) = node
-        .post(&format!("/api/v1/conversations/{channel}/messages"), carol.token(), json!({ "content": mine, "epoch": vepoch }))
+        .post(
+            &format!("/api/v1/conversations/{channel}/messages"),
+            carol.token(),
+            json!({ "content": mine, "epoch": vepoch }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{m}");
     let (s, j) = node
@@ -728,7 +768,7 @@ async fn encrypted_conversations_pass_ciphertext_values() {
         )
         .await;
     assert_eq!((s, code(&j)), (StatusCode::NOT_FOUND, "component.not_found"));
-    let _ = b.address();
+    assert_eq!(b.address(), format!("{}@{D}", b.username));
 }
 
 // ---------------------------------------------------------------- permission and fixup
@@ -737,8 +777,7 @@ async fn encrypted_conversations_pass_ciphertext_values() {
 async fn use_components_defaults_and_the_one_time_fixup() {
     let w = world().await;
     let (node, carol) = (&w.node, &w.carol);
-    let (_, room) = node.get_auth(&format!("/api/v1/rooms/{}", w.room_id), &carol.token).await;
-    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap().clone();
+    let everyone = w.everyone.clone();
     assert!(p::has(everyone["permissions"].as_str().unwrap().parse::<u64>().unwrap(), p::USE_COMPONENTS), "a default");
     let (s, readers) = node
         .post(
@@ -772,8 +811,11 @@ async fn use_components_defaults_and_the_one_time_fixup() {
     let bits = |id: &str| {
         let (db, id) = (node.state.db.clone(), id.to_string());
         async move {
-            let v: i64 =
-                sqlx::query_scalar("SELECT permissions FROM roles WHERE id = $1").bind(id).fetch_one(&db).await.unwrap();
+            let v: i64 = sqlx::query_scalar("SELECT permissions FROM roles WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
             v as u64
         }
     };
@@ -785,4 +827,63 @@ async fn use_components_defaults_and_the_one_time_fixup() {
     // The node announces the capability.
     let (_, info) = node.get_auth("/api/v1/node", &carol.token).await;
     assert!(info.to_string().contains("components.v1"), "{info}");
+}
+
+// ---------------------------------------------------------------- interactions URL
+
+/// An interactions URL that answers the ping and then the queued answers in order.
+#[derive(Clone, Default)]
+struct UrlBot {
+    got: Arc<Mutex<Vec<Value>>>,
+    answers: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn url_receive(State(r): State<UrlBot>, body: Bytes) -> axum::Json<Value> {
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    r.got.lock().unwrap().push(parsed.clone());
+    if parsed["type"] == "ping" {
+        return axum::Json(json!({ "challenge": parsed["challenge"] }));
+    }
+    let mut answers = r.answers.lock().unwrap();
+    axum::Json(if answers.is_empty() { json!({ "type": "defer" }) } else { answers.remove(0) })
+}
+
+#[tokio::test]
+async fn the_interactions_url_gets_components_and_modal_submits() {
+    let w = world().await;
+    let node = &w.node;
+    let message = bot_card(&w).await;
+    let url_bot = UrlBot::default();
+    let app = Router::new().route("/i", post(url_receive)).with_state(url_bot.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (s, j) = node
+        .patch(
+            &format!("/api/v1/applications/{}", w.bot.app_id),
+            &w.alice.token,
+            json!({ "interactions_url": format!("http://127.0.0.1:{port}/i") }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    url_bot.answers.lock().unwrap().push(json!({ "type": "modal", "modal": note_modal() }));
+    let (s, res) = node.post(&invoke_path(&w.channel, &message), &w.bob.token, json!({ "custom_id": "signup" })).await;
+    assert_eq!((s, res["outcome"].as_str()), (StatusCode::OK, Some("modal")), "{res}");
+    let parent = res["interaction_id"].as_str().unwrap().to_string();
+    let request = url_bot.got.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (request["type"].as_str(), request["data"]["custom_id"].as_str()),
+        (Some("component.invoke"), Some("signup"))
+    );
+    let mut updated = card();
+    updated["body"] = json!("Thrall signed up");
+    url_bot.answers.lock().unwrap().push(json!({ "type": "update", "device_id": w.bot.device_id, "content": updated }));
+    let (s, res) = node.post(&submit(&parent), &w.bob.token, json!({ "values": { "name": "Thrall" } })).await;
+    assert_eq!((s, res["outcome"].as_str()), (StatusCode::OK, Some("update")), "{res}");
+    assert_eq!(res["message"]["content"]["body"], "Thrall signed up");
+    let request = url_bot.got.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (request["type"].as_str(), request["data"]["values"]["name"].as_str()),
+        (Some("modal.submit"), Some("Thrall"))
+    );
 }

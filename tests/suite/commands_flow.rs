@@ -653,7 +653,7 @@ async fn replies_ephemeral_defer_errors_and_follow_ups() {
     assert_eq!(m["device_id"], w.bot.device_id.as_str());
     assert_eq!(
         m["interaction"],
-        json!({ "id": id, "command": "weather", "application": w.bot.reference(), "user": format!("bob@{D}") })
+        json!({ "id": id, "kind": "command", "command": "weather", "message_id": null, "application": w.bot.reference(), "user": format!("bob@{D}") })
     );
     let (_, list) = node.get_auth(&format!("/api/v1/conversations/{}/messages", w.channel), &bob.token).await;
     assert_eq!(list[0]["interaction"]["id"], id.as_str());

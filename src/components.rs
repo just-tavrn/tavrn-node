@@ -43,7 +43,8 @@ const BUTTON_KEYS: &[&str] = &["type", "style", "label", "emoji", "custom_id", "
 const SELECT_KEYS: &[&str] = &["type", "custom_id", "placeholder", "options", "min", "max", "disabled"];
 const OPTION_KEYS: &[&str] = &["label", "value", "description", "emoji", "default"];
 const MODAL_KEYS: &[&str] = &["custom_id", "title", "inputs"];
-const INPUT_KEYS: &[&str] = &["custom_id", "label", "style", "placeholder", "min_length", "max_length", "required", "value"];
+const INPUT_KEYS: &[&str] =
+    &["custom_id", "label", "style", "placeholder", "min_length", "max_length", "required", "value"];
 
 // ---------------------------------------------------------------- errors
 
@@ -407,8 +408,11 @@ pub fn validate_modal_values(modal: &Value, values: Option<&Value>) -> Result<Va
     let obj = values
         .and_then(Value::as_object)
         .ok_or_else(|| modal_values_invalid("values", "values: an object of input custom_id to text"))?;
-    let inputs: Vec<&Map<String, Value>> =
-        modal.get("inputs").and_then(Value::as_array).map(|l| l.iter().filter_map(Value::as_object).collect()).unwrap_or_default();
+    let inputs: Vec<&Map<String, Value>> = modal
+        .get("inputs")
+        .and_then(Value::as_array)
+        .map(|l| l.iter().filter_map(Value::as_object).collect())
+        .unwrap_or_default();
     let id_of = |i: &Map<String, Value>| i.get("custom_id").and_then(Value::as_str).unwrap_or("").to_string();
     for (key, value) in obj {
         if !value.is_string() || !inputs.iter().any(|i| id_of(i) == *key) {
@@ -417,8 +421,10 @@ pub fn validate_modal_values(modal: &Value, values: Option<&Value>) -> Result<Va
     }
     for input in &inputs {
         let id = id_of(input);
-        let n = obj.get(&id).and_then(Value::as_str).map_or(0, |s| s.chars().count() as u64);
-        if n == 0 {
+        let text = obj.get(&id).and_then(Value::as_str).unwrap_or("");
+        let n = text.chars().count() as u64;
+        // Whitespace only counts as empty: a required input needs real text (the clients check the same).
+        if text.trim().is_empty() {
             if input.get("required").and_then(Value::as_bool).unwrap_or(true) {
                 return Err(modal_values_invalid(format!("values.{id}"), "This input is required"));
             }
@@ -503,6 +509,8 @@ mod tests {
         assert_eq!(validate_modal_values(&modal, None).err().map(|e| path(&e)).as_deref(), Some("values"));
         assert_eq!(p(json!({})).as_deref(), Some("values.name"));
         assert_eq!(p(json!({ "name": "A" })).as_deref(), Some("values.name"));
+        assert_eq!(p(json!({ "name": "   " })).as_deref(), Some("values.name"), "whitespace is empty");
+        assert_eq!(p(json!({ "name": "Al", "note": "  " })), None, "an optional input may be blank");
         assert_eq!(p(json!({ "name": "Al", "note": "x".repeat(11) })).as_deref(), Some("values.note"));
         assert_eq!(p(json!({ "name": "Al", "extra": "x" })).as_deref(), Some("values.extra"));
         assert_eq!(p(json!({ "name": 5 })).as_deref(), Some("values.name"));

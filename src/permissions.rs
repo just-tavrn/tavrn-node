@@ -629,7 +629,7 @@ mod tests {
         for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
             assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
         }
-        assert_eq!(names(CHANNEL_SCOPED).len(), 28);
+        assert_eq!(names(CHANNEL_SCOPED).len(), 29);
     }
 
     #[test]

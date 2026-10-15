@@ -805,6 +805,21 @@ impl Interactions {
         Ok((info, modal))
     }
 
+    /// The modal of interaction `id` was submitted already (`409 interaction.already_submitted`); read-only, the
+    /// submit itself is recorded with [`Interactions::mark_submitted`].
+    pub async fn check_not_submitted(&self, id: &str) -> Result<(), ApiError> {
+        let done = match &self.cluster {
+            Some(cluster) => cluster
+                .cache()
+                .get(&cluster.key(&submitted_key(id)))
+                .await
+                .map_err(crate::cache::unavailable)?
+                .is_some(),
+            None => self.entries().get(id).is_some_and(|e| e.submitted),
+        };
+        if done { Err(already_submitted()) } else { Ok(()) }
+    }
+
     /// Records the one submit of a modal (`409 interaction.already_submitted`).
     pub async fn mark_submitted(&self, id: &str) -> Result<(), ApiError> {
         if let Some(cluster) = &self.cluster {
@@ -1110,10 +1125,7 @@ pub const MODAL_EVENT: &str = "modal.submit";
 
 /// The application id of `data`: the local application, else the last segment of the reference.
 fn application_id(offer: &Offer) -> String {
-    offer
-        .local
-        .as_ref()
-        .map_or_else(|| offer.reference.rsplit('/').next().unwrap_or("").to_string(), |a| a.id.clone())
+    offer.local.as_ref().map_or_else(|| offer.reference.rsplit('/').next().unwrap_or("").to_string(), |a| a.id.clone())
 }
 
 fn room_and_channel(conv: &Conv) -> (Option<String>, Option<String>) {
@@ -1295,8 +1307,7 @@ pub async fn invoke_component(
     let offer = installed_offer(state, conv, &auth.user.id, &message.author_id).await?;
     let now = state.interactions.clock().now();
     let max_days = i64::from(state.config.component_max_age_days);
-    if max_days > 0
-        && util::parse_time(&message.created_at).is_some_and(|t| now - t > chrono::Duration::days(max_days))
+    if max_days > 0 && util::parse_time(&message.created_at).is_some_and(|t| now - t > chrono::Duration::days(max_days))
     {
         return Err(component_expired());
     }
@@ -1381,6 +1392,7 @@ pub async fn submit_modal(
         return Err(apps::bot_forbidden());
     }
     let (parent, modal) = state.interactions.modal_for_submit(id, &auth.user.id).await?;
+    state.interactions.check_not_submitted(id).await?;
     // The origin is still usable: the conversation, the permission and the application.
     let conv = access::conversation(state, &parent.conversation_id, &auth.user).await?;
     match parent.kind {
@@ -1431,9 +1443,11 @@ pub async fn submit_modal(
         ack_deadline: now + chrono::Duration::seconds(ACK_TIMEOUT_SECS),
         expires_at: now + chrono::Duration::seconds(LIFETIME_SECS),
     };
-    let command = (!parent.command_id.is_empty())
-        .then(|| json!({ "id": parent.command_id, "name": parent.command_name }))
-        .unwrap_or(Value::Null);
+    let command = if parent.command_id.is_empty() {
+        Value::Null
+    } else {
+        json!({ "id": parent.command_id, "name": parent.command_name })
+    };
     let data = json!({
         "interaction_id": info.id,
         "application_id": application_id(&offer),
