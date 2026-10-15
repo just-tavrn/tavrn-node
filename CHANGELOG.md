@@ -145,6 +145,10 @@ First public release of the node and its container image.
 
 ### Security
 
+- `TAVRN_TRUSTED_PROXIES` defaults to loopback only (it listed every private network, so on a node reached directly
+  from a private network every client could choose its rate-limit address with `X-Forwarded-For` and read `/metrics`).
+  `deploy/docker-compose.yml` sets Docker's private ranges, where the reverse proxy connects through Docker's gateway;
+  other setups list their proxy (docs/HANDBOOK.md).
 - Configuration printouts no longer show a password from a query parameter that contains `@`, and an invalid
   `TAVRN_SMTP_URL` is named in the error without its password.
 - `POST /auth/login` refuses a username no account can have (`400 auth.username_invalid`) before it is looked up or

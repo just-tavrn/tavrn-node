@@ -143,7 +143,7 @@ These settings fix the node's identity domain, where it is served and which data
 | `TAVRN_NAME` | `tavrn` | Display name of the node (directory, discovery document). |
 | `TAVRN_DESCRIPTION` | empty | Short description of the node (directory). |
 | `TAVRN_LISTEN` | `0.0.0.0:8080` | Address and port of the plain-HTTP server. |
-| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. |
+| `TAVRN_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | IPs or CIDRs whose `X-Forwarded-For` is trusted. For connections from elsewhere the connection's own address counts (rate limits, captcha), not the header. Also decides who may read `/metrics` without a token. List your reverse proxy here when it does not connect over loopback (another host, a container network); the compose file sets Docker's private ranges, because there the proxy reaches the node through Docker's gateway address. Never list networks that clients reach the node from directly: every address listed may choose its rate-limit identity. |
 | `TAVRN_DATABASE_URL` | empty (compose: built from `POSTGRES_PASSWORD`) | `postgres://user:password@host:port/db` (or `postgresql://`). `sqlite:` only with `--dev`. |
 | `TAVRN_DATA_DIR` | `/data` (image) | Directory for `keys/`, `blobs/` (stored files) and the generated LiveKit configuration. |
 | `TAVRN_ADMIN_USERS` | empty | Comma-separated usernames with node admin rights (besides the first registered account). |
@@ -524,8 +524,10 @@ Whichever proxy you use, it has to pass WebSockets through, forward the client's
    under `/rtc` (`/rtc`, `/rtc/v1`; the HTTP checks `/rtc/validate` and `/rtc/v1/validate` are plain GETs). Use a
    long read timeout (an hour): both are long-lived connections.
 2. **Set `X-Forwarded-For`.** tavrn only trusts the header when the connection comes from an address in
-   `TAVRN_TRUSTED_PROXIES` (default: private networks and localhost). If your proxy lives elsewhere, add its
-   address, otherwise rate limits and bans apply to the proxy address instead of the client.
+   `TAVRN_TRUSTED_PROXIES` (default: loopback only; `deploy/docker-compose.yml` adds Docker's private ranges). If
+   your proxy connects from anywhere else, add its address, otherwise rate limits and bans apply to the proxy
+   address instead of the client. List only proxies: a client that connects from a listed address may name any
+   address in the header.
 3. **Allow large bodies**, at least as large as `TAVRN_UPLOAD_MAX_BYTES` (or `TAVRN_UPLOAD_MAX_BYTES_CEILING` when
    grants raise it).
 4. **Leave requests and CORS to the node**: pass `Authorization` and the `Tavrn-*` request headers through
@@ -1445,8 +1447,8 @@ Access:
 - `TAVRN_METRICS_TOKEN` empty: `/metrics` answers only to requests from loopback and from the addresses in
   `TAVRN_TRUSTED_PROXIES`: the TCP peer and every address in `X-Forwarded-For` must be one of them, so public
   requests through a reverse proxy on the same host are refused;
-  everything else gets the same `404` as an unknown path. The default `TAVRN_TRUSTED_PROXIES` contains all private
-  networks, so set a token when untrusted hosts share a private network with the node.
+  everything else gets the same `404` as an unknown path. Set a token when `TAVRN_TRUSTED_PROXIES` lists networks
+  that untrusted hosts share with the node (the compose file lists Docker's private ranges).
 - Block `/metrics` at the reverse proxy for the public anyway (nginx: `location = /metrics { return 404; }`) and
   scrape the instances directly, not through the public host name.
 
@@ -1555,7 +1557,7 @@ All instances need the same configuration and reach the same database, data volu
   clients and re-announce their presence; counters and pending codes start over. One Valkey database per logical
   node: tavrn prefixes its keys with `tavrn:<domain>:`, but LiveKit's keys are not prefixed. `rediss://` for TLS.
 - **`TAVRN_TRUSTED_PROXIES`** must contain the reverse proxy and the instances' own network (relayed requests
-  carry the client address in `X-Forwarded-For`); the default (private networks) covers the usual setups.
+  carry the client address in `X-Forwarded-For`); the default is loopback only, so list both explicitly.
 - **`TAVRN_INSTANCE_URL`** (`http://tavrn-1:8080`): where the other instances reach this one; default: this host's
   address towards Valkey with the `TAVRN_LISTEN` port. The instances must reach each other on that port.
 

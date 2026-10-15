@@ -661,9 +661,11 @@ mod tests {
 
     #[test]
     fn client_ip_resolution_resists_spoofing() {
+        // The proxies of a Docker setup (the compose file lists Docker's private ranges).
         let config = crate::config::Config {
             domain: "x".into(),
             database_url: "postgres://x".into(),
+            trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12".into(),
             ..crate::config::Config::default()
         };
         let ip = |s: &str| s.parse::<std::net::IpAddr>().ok();

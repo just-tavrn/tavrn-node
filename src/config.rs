@@ -594,7 +594,9 @@ impl Default for Config {
             name: "tavrn".into(),
             description: String::new(),
             listen: "0.0.0.0:8080".into(),
-            trusted_proxies: "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7".into(),
+            // Loopback only: every listed address may choose its rate-limit identity with `X-Forwarded-For`; operators
+            // list their proxies (the compose file adds Docker's private ranges).
+            trusted_proxies: "127.0.0.0/8,::1/128".into(),
             public_url: None,
             webauthn_origin: None,
             webauthn_rp_id: None,
@@ -2024,7 +2026,8 @@ mod tests {
     #[test]
     fn trusted_proxies_are_parsed_and_validated() {
         let c = prod();
-        assert!(c.is_trusted_proxy("172.18.0.2".parse().unwrap()), "the Docker network is trusted by default");
+        assert!(c.is_trusted_proxy("127.0.0.1".parse().unwrap()) && c.is_trusted_proxy("::1".parse().unwrap()));
+        assert!(!c.is_trusted_proxy("172.18.0.2".parse().unwrap()), "only loopback by default (compose lists Docker)");
         assert!(!c.is_trusted_proxy("203.0.113.5".parse().unwrap()));
         let c = Config { trusted_proxies: "203.0.113.5, 2001:db8::/32".into(), ..prod() };
         c.validate().unwrap();
@@ -3195,5 +3198,18 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("TAVRN_SMTP_URL"), "{err}");
         assert!(!err.to_string().contains("S3cretSmtpPw"), "{err}");
+    }
+
+    /// Only loopback is a trusted proxy by default: on a node reached directly from a private network, clients
+    /// must not choose their rate-limit identity with `X-Forwarded-For`.
+    #[test]
+    fn only_loopback_is_a_trusted_proxy_by_default() {
+        let c = Config::default();
+        let ip = |peer: &str, xff: &str| crate::auth::resolve_client_ip(&c, Some(peer.parse().unwrap()), Some(xff));
+        assert_eq!(ip("127.0.0.1", "203.0.113.7"), "203.0.113.7");
+        assert_eq!(ip("::1", "203.0.113.7"), "203.0.113.7");
+        for lan in ["10.1.2.3", "172.17.0.1", "192.168.1.20", "fd00::5"] {
+            assert_eq!(ip(lan, "203.0.113.7"), lan, "{lan} is not trusted by default");
+        }
     }
 }
