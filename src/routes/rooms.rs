@@ -1012,7 +1012,10 @@ pub(crate) async fn set_timeout_announced(
     store::rooms::set_timeout(&state.db, room_id, user_id, until).await?;
     if until.is_some() {
         let (room, user) = (room_id.to_string(), user_id.to_string());
-        crate::voice::spawn_effect(state, move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await });
+        crate::voice::spawn_effect(
+            state,
+            move |s| async move { crate::voice::disconnect_user(&s, &room, &user).await },
+        );
     }
     let row = crate::models::MemberRow { timeout_until: until.map(String::from), ..row };
     let Some(member) = to_member(state, room_id, &row).await? else { return Ok(None) };

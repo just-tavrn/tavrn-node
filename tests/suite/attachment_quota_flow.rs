@@ -11,8 +11,8 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use common::{TestNode, body_bytes, test_node_with};
-use serde_json::Value;
 use futures::channel::mpsc;
+use serde_json::Value;
 use tower::ServiceExt;
 
 type Chunk = Result<Vec<u8>, std::io::Error>;

@@ -193,8 +193,10 @@ async fn crafted_rules_and_text_stay_cheap() {
     assert_eq!(s, StatusCode::CREATED, "{j}");
     let head: String = pairs.iter().take(500).map(|p| format!("{p} ")).collect();
     // One long run of the first literal; spaced-out runs of it.
-    let blobs =
-        [format!("{head}{}", "a".repeat(60_000 - head.len())), format!("{head}{}", "a ".repeat(30_000 - head.len() / 2))];
+    let blobs = [
+        format!("{head}{}", "a".repeat(60_000 - head.len())),
+        format!("{head}{}", "a ".repeat(30_000 - head.len() / 2)),
+    ];
     for blob in blobs {
         let started = Instant::now();
         let (s, j) = node.post(&url, &mallory.token, json!({ "content": { "type": "note", "x": blob } })).await;

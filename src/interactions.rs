@@ -1737,7 +1737,8 @@ async fn answer(state: &AppState, auth: &AuthUser, info: &Info, a: Answer<'_>) -
         .map_err(as_interaction_error)?;
     msgs::check_role_mentions(&conv, &v.mentions)?;
     // Content rules of unencrypted conversations (MODERATION.md §2.2), as for the bot's own messages.
-    let hit = if conv.encrypted || ephemeral { None } else { crate::automod::evaluate(state, &conv, &content, &[]).await? };
+    let hit =
+        if conv.encrypted || ephemeral { None } else { crate::automod::evaluate(state, &conv, &content, &[]).await? };
     if let Some(h) = hit.as_ref().filter(|h| h.blocks()) {
         return Err(crate::automod::blocked(state, &conv, &auth.user, h).await);
     }

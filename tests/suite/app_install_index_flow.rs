@@ -27,18 +27,20 @@ async fn one_node_cannot_fill_a_bots_install_index() {
     };
     let share = installations::MAX_INDEX_ENTRIES_PER_NODE;
     for i in 0..share {
-        let r = installations::handle_for_bot(&node.state, "evil.test", &bot, install(format!("fake {i}"), "m@evil.test"))
-            .await
-            .unwrap();
+        let r =
+            installations::handle_for_bot(&node.state, "evil.test", &bot, install(format!("fake {i}"), "m@evil.test"))
+                .await
+                .unwrap();
         assert_eq!(r, "handled");
     }
     let r = installations::handle_for_bot(&node.state, "evil.test", &bot, install("one more".into(), "m@evil.test"))
         .await
         .unwrap();
     assert_eq!(r, "ignored", "the node used up its share");
-    let r = installations::handle_for_bot(&node.state, "good.test", &bot, install("Real room".into(), "carol@good.test"))
-        .await
-        .unwrap();
+    let r =
+        installations::handle_for_bot(&node.state, "good.test", &bot, install("Real room".into(), "carol@good.test"))
+            .await
+            .unwrap();
     assert_eq!(r, "handled", "another node's genuine installation is indexed");
     let n = store::installations::index_count(&node.state.db, app["id"].as_str().unwrap()).await.unwrap();
     assert_eq!(n, share + 1);

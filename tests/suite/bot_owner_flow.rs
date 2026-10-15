@@ -69,11 +69,13 @@ async fn banning_a_bot_owner_respects_the_bots_rank() {
     assert_eq!(s, StatusCode::CREATED, "{j}");
     let mods = role(&node, &alice.token, &room_id, "Mod", &[p::KICK_MEMBERS, p::BAN_MEMBERS], 1).await;
     let high = role(&node, &alice.token, &room_id, "Guard", &[p::VIEW_CHANNEL], 5).await;
-    let (s, j) =
-        node.patch(&format!("/api/v1/rooms/{room_id}/members/{}", carol.user_id), &alice.token, json!({ "roles": [mods] })).await;
+    let (s, j) = node
+        .patch(&format!("/api/v1/rooms/{room_id}/members/{}", carol.user_id), &alice.token, json!({ "roles": [mods] }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{j}");
-    let (s, j) =
-        node.patch(&format!("/api/v1/rooms/{room_id}/members/{bot_id}"), &alice.token, json!({ "roles": [high] })).await;
+    let (s, j) = node
+        .patch(&format!("/api/v1/rooms/{room_id}/members/{bot_id}"), &alice.token, json!({ "roles": [high] }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{j}");
 
     // Control: carol may not kick the bot (it outranks her).
@@ -81,7 +83,8 @@ async fn banning_a_bot_owner_respects_the_bots_rank() {
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.hierarchy"), "{j}");
     // Nor ban it by its own address.
     let bot_address = format!("{}@{DOMAIN}", app["bot"]["username"].as_str().unwrap());
-    let (s, j) = node.post(&format!("/api/v1/rooms/{room_id}/bans"), &carol.token, json!({ "subject": bot_address })).await;
+    let (s, j) =
+        node.post(&format!("/api/v1/rooms/{room_id}/bans"), &carol.token, json!({ "subject": bot_address })).await;
     assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "member.hierarchy"), "{j}");
 
     // Nor through its owner's address (not a member, nothing to outrank of their own).

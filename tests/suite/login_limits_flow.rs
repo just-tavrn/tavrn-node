@@ -23,12 +23,22 @@ async fn login_refuses_oversized_usernames_before_counting_them() {
     let _admin = node.register("admin").await;
     let long = "a".repeat(4 * 1024);
     let (s, j) = node
-        .req(Method::POST, "/api/v1/auth/login", None, Some(json!({ "username": long, "password": "wrong-password-1" })))
+        .req(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "username": long, "password": "wrong-password-1" })),
+        )
         .await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("auth.username_invalid")), "{j}");
     let huge = "a".repeat(1024 * 1024);
     let (s, j) = node
-        .req(Method::POST, "/api/v1/auth/login", None, Some(json!({ "username": huge, "password": "wrong-password-1" })))
+        .req(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "username": huge, "password": "wrong-password-1" })),
+        )
         .await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{j}");
     // Real accounts still sign in, by name and by full address.

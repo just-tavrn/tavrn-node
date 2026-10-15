@@ -539,7 +539,12 @@ struct Compiled {
 
 impl Compiled {
     fn new(rule: AutomodRule) -> Self {
-        Self { terms: Terms::new(&rule.terms, rule.whole_word), links: Links::parse(&rule.links), rule, author_rank: None }
+        Self {
+            terms: Terms::new(&rule.terms, rule.whole_word),
+            links: Links::parse(&rule.links),
+            rule,
+            author_rank: None,
+        }
     }
 
     /// A `delete` or `timeout` rule acts on a member only when its author outranks them, as a moderator's own
@@ -687,7 +692,8 @@ fn parse_document(raw: &str) -> (Vec<AutomodRule>, Option<i64>) {
 
 /// The document [`parse_document`] reads: the rules with the rank of the member who writes them (`top_position`).
 pub fn encode_rules(rules: &[AutomodRule], author_rank: i64) -> Result<String, ApiError> {
-    serde_json::to_string(&json!({ "author_rank": author_rank, "rules": rules })).map_err(|e| ApiError::Internal(e.into()))
+    serde_json::to_string(&json!({ "author_rank": author_rank, "rules": rules }))
+        .map_err(|e| ApiError::Internal(e.into()))
 }
 
 /// The compiled rules of a room, shared between messages (parsing and compiling 20 rules × 500 terms per message
@@ -1009,7 +1015,13 @@ enum RoomMatch {
 
 /// The first of a room's rules that matches `texts` for a member with `role_ids` and the highest role position
 /// `rank` in `channel_id`, within [`MATCH_BUDGET`].
-fn match_room_rules(rules: &[Compiled], texts: &[String], channel_id: &str, role_ids: &[String], rank: i64) -> RoomMatch {
+fn match_room_rules(
+    rules: &[Compiled],
+    texts: &[String],
+    channel_id: &str,
+    role_ids: &[String],
+    rank: i64,
+) -> RoomMatch {
     let budget = Budget::new(MATCH_BUDGET);
     for c in rules {
         let rule = &c.rule;
@@ -1188,7 +1200,11 @@ mod tests {
             }
             let parts = parts(&term);
             for whole in [false, true] {
-                assert_eq!(term_matches(&text, &parts, whole), brute(&text, &parts, whole), "{term:?} in {text:?} ({whole})");
+                assert_eq!(
+                    term_matches(&text, &parts, whole),
+                    brute(&text, &parts, whole),
+                    "{term:?} in {text:?} ({whole})"
+                );
             }
         }
     }

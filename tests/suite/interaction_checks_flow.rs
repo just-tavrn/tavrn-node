@@ -108,8 +108,12 @@ async fn interaction_answers_pass_the_checks_of_a_message() {
         .post(&format!("/api/v1/rooms/{room_id}/roles"), &carol.token, json!({ "name": "Staff", "mentionable": false }))
         .await;
     let role_id = role["id"].as_str().unwrap().to_string();
-    node.patch(&format!("/api/v1/rooms/{room_id}/members/{}", bob.user_id), &carol.token, json!({ "roles": [role_id] }))
-        .await;
+    node.patch(
+        &format!("/api/v1/rooms/{room_id}/members/{}", bob.user_id),
+        &carol.token,
+        json!({ "roles": [role_id] }),
+    )
+    .await;
     let rule = json!({ "name": "nope", "terms": ["forbiddenword"], "whole_word": false, "links": "off", "domains": [],
                        "exempt_roles": [], "exempt_channels": [], "action": "block" });
     let (s, j) = node.put(&format!("/api/v1/rooms/{room_id}/automod"), &carol.token, json!({ "rules": [rule] })).await;
@@ -139,8 +143,9 @@ async fn interaction_answers_pass_the_checks_of_a_message() {
     let (s, j) = node.post(&callback, &b.secret, blocked).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("automod.blocked")), "{j}");
     // A clean reply is still possible after the refusals.
-    let (s, j) =
-        node.post(&callback, &b.secret, json!({ "type": "reply", "content": { "type": "text", "body": "On it" } })).await;
+    let (s, j) = node
+        .post(&callback, &b.secret, json!({ "type": "reply", "content": { "type": "text", "body": "On it" } }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{j}");
     let (_, res) = task.await.unwrap();
     assert_eq!(res["message"]["content"]["body"], "On it", "{res}");
