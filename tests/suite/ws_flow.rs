@@ -510,3 +510,39 @@ async fn answer_pings(ws: &mut Socket, ms: u64) -> Option<u16> {
         }
     }
 }
+
+/// Leaving a room tells the user's other devices too (as kick and ban do): their room list must not keep the room.
+#[tokio::test]
+async fn leaving_a_room_reaches_the_users_other_devices() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    let (st, j) =
+        node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    assert!(st.is_success(), "{j}");
+    let other_device = node.login("bob").await;
+    let url = serve(&node).await;
+    let mut bob_ws = hello(&url, &other_device.token).await;
+    let mut alice_ws = hello(&url, &alice.token).await;
+
+    let (st, j) = node.post(&format!("/api/v1/rooms/{room_id}/leave"), &bob.token, json!({})).await;
+    assert_eq!(st, axum::http::StatusCode::NO_CONTENT, "{j}");
+    for ws in [&mut bob_ws, &mut alice_ws] {
+        loop {
+            let ev = next_json(ws).await;
+            assert_eq!(ev["op"], "event", "{ev}");
+            if ev["type"] == "member.leave" {
+                assert_eq!(
+                    (ev["data"]["room_id"].as_str(), ev["data"]["user_id"].as_str()),
+                    (Some(room_id.as_str()), Some(bob.user_id.as_str()))
+                );
+                break;
+            }
+        }
+    }
+    // Exactly once on the leaving user's device.
+    assert!(silent(&mut bob_ws, 300).await);
+}

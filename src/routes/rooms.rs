@@ -694,21 +694,43 @@ pub async fn leave_room(
             detail: "The owner cannot leave the room, only delete it".into(),
         });
     }
-    if store::rooms::remove_member(&state.db, &room_id, &auth.user.id).await? {
-        crate::subscriptions::room_event(
-            &state,
-            &room_id,
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": auth.user.id }),
-        )
-        .await;
-        crate::welcome::membership_ended(&state, &access.room, &auth.user, access.member.as_ref(), LeaveKind::Leave)
-            .await;
-        crate::e2ee::user_left_room(&state, &room_id, &auth.user).await?;
-        // A bot leaving uninstalls itself (APPLICATIONS.md §4.3).
-        crate::installations::uninstalled(&state, &access.room, &auth.user, "left", Some(&auth.user.id)).await?;
-    }
+    end_membership(&state, &access.room, &auth.user, access.member.as_ref(), LeaveKind::Leave, &auth.user.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends `target`'s membership of `room`, the one sequence of leaving, kicking and banning (the domain ban once per
+/// member): the welcome channel's entry, `member.leave` to the room (and its event subscriptions) and to the
+/// target's own devices, whose connections drop the room with the room event (`ws.rs`), the MLS removals and, for a
+/// bot, its installation (APPLICATIONS.md §4.3). `false` when `target` was no member (nothing happens).
+async fn end_membership(
+    state: &AppState,
+    room: &Room,
+    target: &UserRow,
+    member: Option<&crate::models::MemberRow>,
+    kind: LeaveKind,
+    actor_id: &str,
+) -> Result<bool, ApiError> {
+    if !store::rooms::remove_member(&state.db, &room.id, &target.id).await? {
+        return Ok(false);
+    }
+    crate::welcome::membership_ended(state, room, target, member, kind).await;
+    let mut data = serde_json::json!({ "room_id": room.id, "user_id": target.id });
+    let reason = match kind {
+        LeaveKind::Leave => "left",
+        LeaveKind::Kick => {
+            data["kicked"] = true.into();
+            "kicked"
+        }
+        LeaveKind::Ban => {
+            data["banned"] = true.into();
+            "banned"
+        }
+    };
+    crate::subscriptions::room_event(state, &room.id, "member.leave", &data).await;
+    state.hub.users(vec![target.id.clone()], "member.leave", &data);
+    crate::e2ee::user_left_room(state, &room.id, target).await?;
+    crate::installations::uninstalled(state, room, target, reason, Some(actor_id)).await?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------- Members
@@ -926,8 +948,7 @@ pub async fn kick_member(
     let target = moderation_target(&state, &access, &user_id).await?;
     let reason = body.map(|b| b.0.reason).unwrap_or_default();
     let member = store::rooms::member(&state.db, &room_id, &user_id).await?;
-    if store::rooms::remove_member(&state.db, &room_id, &user_id).await? {
-        crate::welcome::membership_ended(&state, &access.room, &target, member.as_ref(), LeaveKind::Kick).await;
+    if end_membership(&state, &access.room, &target, member.as_ref(), LeaveKind::Kick, &auth.user.id).await? {
         store::rooms::audit(
             &state.db,
             Some(&room_id),
@@ -938,20 +959,6 @@ pub async fn kick_member(
             serde_json::json!({}),
         )
         .await?;
-        crate::subscriptions::room_event(
-            &state,
-            &room_id,
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": user_id, "kicked": true }),
-        )
-        .await;
-        state.hub.users(
-            vec![user_id.clone()],
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": user_id, "kicked": true }),
-        );
-        crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-        crate::installations::uninstalled(&state, &access.room, &target, "kicked", Some(&auth.user.id)).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1038,23 +1045,9 @@ pub async fn ban(
         if let Some(target) = store::users::by_username(&state.db, username, domain).await? {
             if let Some(member) = store::rooms::member(&state.db, &room_id, &target.id).await? {
                 moderation_target(&state, &access, &target.id).await?;
-                store::rooms::remove_member(&state.db, &room_id, &target.id).await?;
-                crate::welcome::membership_ended(&state, &access.room, &target, Some(&member), LeaveKind::Ban).await;
-                crate::subscriptions::room_event(
-                    &state,
-                    &room_id,
-                    "member.leave",
-                    serde_json::json!({ "room_id": room_id, "user_id": target.id, "banned": true }),
-                )
-                .await;
-                state.hub.users(
-                    vec![target.id.clone()],
-                    "member.leave",
-                    serde_json::json!({ "room_id": room_id, "user_id": target.id, "banned": true }),
-                );
-                crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-                crate::installations::uninstalled(&state, &access.room, &target, "banned", Some(&auth.user.id)).await?;
-                crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
+                if end_membership(&state, &access.room, &target, Some(&member), LeaveKind::Ban, &auth.user.id).await? {
+                    crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
+                }
             } else if target.id == access.room.owner_id {
                 return Err(ApiError::Forbidden {
                     code: "member.is_owner",
@@ -1076,16 +1069,9 @@ pub async fn ban(
         for user_id in &members {
             moderation_target(&state, &access, user_id).await?;
         }
-        for user_id in members {
-            let Some(target) = store::users::by_id(&state.db, &user_id).await? else { continue };
-            let member = store::rooms::member(&state.db, &room_id, &user_id).await?;
-            if store::rooms::remove_member(&state.db, &room_id, &user_id).await? {
-                crate::welcome::membership_ended(&state, &access.room, &target, member.as_ref(), LeaveKind::Ban).await;
-                let data = serde_json::json!({ "room_id": room_id, "user_id": user_id, "banned": true });
-                crate::subscriptions::room_event(&state, &room_id, "member.leave", &data).await;
-                state.hub.users(vec![user_id.clone()], "member.leave", &data);
-                crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-                crate::installations::uninstalled(&state, &access.room, &target, "banned", Some(&auth.user.id)).await?;
+        for target in store::users::by_ids(&state.db, &members).await? {
+            let member = store::rooms::member(&state.db, &room_id, &target.id).await?;
+            if end_membership(&state, &access.room, &target, member.as_ref(), LeaveKind::Ban, &auth.user.id).await? {
                 crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
             }
         }
