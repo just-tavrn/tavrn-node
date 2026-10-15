@@ -38,7 +38,8 @@ pub struct Policies {
     /// Largest image (bytes) clients load as a preview without a click (`TAVRN_PREVIEW_AUTO_MAX_BYTES`).
     pub preview_auto_max_bytes: u64,
     /// Files channels may keep their files on the node (`TAVRN_FILES_INTERNAL`); `false`: a files channel takes
-    /// uploads only once it has an external store (FILES.md §5).
+    /// uploads only once it has an external store (FILES.md §5). The node default; the entitlement
+    /// `files_channels.internal` may decide otherwise per room.
     pub files_internal: bool,
 }
 

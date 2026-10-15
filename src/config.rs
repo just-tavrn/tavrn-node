@@ -306,6 +306,7 @@ pub struct Config {
     pub files_external: Switch,
     /// Files channels may keep their files on the node's own storage (`TAVRN_FILES_INTERNAL`, default on). `off`:
     /// a files channel takes uploads only once it has an external store (FILES.md §5); needs `files_external`.
+    /// The node default of the entitlement `files_channels.internal` (per-room exceptions through plans/grants).
     pub files_internal: Switch,
     /// External stores may be on private, loopback or link-local addresses and use plain http
     /// (`TAVRN_FILES_EXTERNAL_PRIVATE`, default off: SSRF protection).

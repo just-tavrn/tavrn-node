@@ -39,7 +39,8 @@ pub struct NodeInfo {
     /// can only shorten it.
     pub message_retention_days: u32,
     /// Files channels may keep their files on this node (`TAVRN_FILES_INTERNAL`, FILES.md §5); `false`: a files
-    /// channel takes uploads only once it has an external store.
+    /// channel takes uploads only once it has an external store. The node default: the entitlement
+    /// `files_channels.internal` may decide otherwise per room (`internal_allowed` in a channel's files usage).
     pub files_internal: bool,
     /// Legal pages and the notice form (protocol/LEGAL.md).
     pub legal: crate::legal::LegalInfo,

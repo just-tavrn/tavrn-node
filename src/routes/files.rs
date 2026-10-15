@@ -317,24 +317,31 @@ fn external_disabled() -> ApiError {
 fn internal_disabled() -> ApiError {
     ApiError::Forbidden {
         code: "files.internal_disabled",
-        detail: "This node keeps no files of files channels: choose an external store first (TAVRN_FILES_INTERNAL)"
+        detail: "The node keeps no files of this room's files channels: choose an external store first \
+                 (TAVRN_FILES_INTERNAL, files_channels.internal)"
             .into(),
     }
 }
 
-/// The kind of the channel's store as clients see it: `internal`, `webdav`, `s3`, or `none` on a node without
-/// internal storage (`TAVRN_FILES_INTERNAL=off`) while the channel has no external store (FILES.md §5).
-fn backend_kind(state: &AppState, row: Option<&store::files::BackendRow>) -> String {
+/// The node's own storage may hold the room's files channels: `files_channels.internal` of the room (its owner's
+/// and the room's grants over the node default `TAVRN_FILES_INTERNAL`, FILES.md §5).
+fn internal_allowed(ent: &Entitlements) -> bool {
+    ent.get(entitlements::FILES_CHANNELS_INTERNAL) != 0
+}
+
+/// The kind of the channel's store as clients see it: `internal`, `webdav`, `s3`, or `none` while the room may not
+/// use the node's own storage (`internal` = false) and the channel has no external store (FILES.md §5).
+fn backend_kind(internal: bool, row: Option<&store::files::BackendRow>) -> String {
     match row.filter(|r| r.kind != "internal") {
         Some(r) => r.kind.clone(),
-        None if !state.config.files_internal.on() => "none".into(),
+        None if !internal => "none".into(),
         None => "internal".into(),
     }
 }
 
-/// New entries (uploads, folders) need a store: on a node without internal storage, an external one.
-async fn require_store(state: &AppState, channel_id: &str) -> Result<(), ApiError> {
-    if state.config.files_internal.on() {
+/// New entries (uploads, folders) need a store: where the room may not use the node's storage, an external one.
+async fn require_store(state: &AppState, channel_id: &str, internal: bool) -> Result<(), ApiError> {
+    if internal {
         return Ok(());
     }
     match store::files::backend(&state.db, channel_id).await? {
@@ -707,10 +714,11 @@ pub async fn create_folder(
 ) -> Result<(StatusCode, Json<FileEntry>), ApiError> {
     let conv = files_channel(&state, &room_id, &channel_id, &auth).await?;
     conv.require(p::ATTACH_FILES, "files.upload_forbidden", "attach files")?;
-    if !enabled_for(&state, room_of(&conv)).await? {
+    let ent = Entitlements::for_room(&state, room_of(&conv)).await?;
+    if ent.get(entitlements::FILES_CHANNELS_ENABLED) == 0 {
         return Err(disabled());
     }
-    require_store(&state, &conv.id).await?;
+    require_store(&state, &conv.id, internal_allowed(&ent)).await?;
     let author = auth.user.address();
     let (id, name, record) = if conv.encrypted {
         if req.name.is_some() {
@@ -826,7 +834,7 @@ pub async fn upload(
     if ent.get(entitlements::FILES_CHANNELS_ENABLED) == 0 {
         return Err(disabled());
     }
-    require_store(&state, &conv.id).await?;
+    require_store(&state, &conv.id, internal_allowed(&ent)).await?;
     let max = ent.upload_max_bytes(&state.config);
     let storage = storage_of(&state, &conv.id).await?;
     let quota = channel_quota(&ent, &storage);
@@ -1313,9 +1321,12 @@ pub struct FilesInfo {
     pub folders: i64,
     /// Largest upload for the requester.
     pub max_upload_bytes: u64,
-    /// `internal`, `webdav` or `s3`; `none` on a node without internal storage (`TAVRN_FILES_INTERNAL=off`) while
-    /// the channel has no external store: no uploads or folders until one is set (FILES.md §5).
+    /// `internal`, `webdav` or `s3`; `none` while the room may not use the node's own storage (`internal_allowed`
+    /// false) and the channel has no external store: no uploads or folders until one is set (FILES.md §5).
     pub backend: String,
+    /// The node's own storage may hold this channel's files: the room's `files_channels.internal` (the room owner's
+    /// plan or override, or a room grant, over the node default `TAVRN_FILES_INTERNAL`, FILES.md §5).
+    pub internal_allowed: bool,
     /// External store with encryption (files unreadable outside tavrn).
     pub encrypt_files: bool,
     /// The channel is end-to-end encrypted (FILES.md §8).
@@ -1351,7 +1362,8 @@ pub async fn usage(
     let (used, files_n, folders_n) = store::files::usage(&state.db, &conv.id).await?;
     let backend = store::files::backend(&state.db, &conv.id).await?;
     let allowed = access::upload_categories(&state, &conv, &auth.user.id).await?;
-    let kind = backend_kind(&state, backend.as_ref());
+    let internal = internal_allowed(&ent);
+    let kind = backend_kind(internal, backend.as_ref());
     let can_upload = enabled && state.config.uploads_enabled && p::has(conv.perms, p::ATTACH_FILES) && kind != "none";
     // Where the files are, for those who may delete the channel (never the credentials).
     let location = if p::has(conv.perms, p::MANAGE_CHANNELS) {
@@ -1369,6 +1381,7 @@ pub async fn usage(
         folders: folders_n,
         max_upload_bytes: ent.upload_max_bytes(&state.config),
         backend: kind,
+        internal_allowed: internal,
         encrypt_files: backend.as_ref().is_some_and(|b| b.encrypt_files != 0),
         encrypted: conv.encrypted,
         backend_host: location.as_ref().map(|l| l.0.clone()),
@@ -1615,7 +1628,8 @@ pub struct BackendInfo {
     pub max_bytes: u64,
     /// External stores are allowed on this node (`TAVRN_FILES_EXTERNAL`).
     pub external_allowed: bool,
-    /// The node's own storage may be chosen (`TAVRN_FILES_INTERNAL`); `false`: only external stores.
+    /// The node's own storage may be chosen: the room's `files_channels.internal` (node default
+    /// `TAVRN_FILES_INTERNAL`); `false`: only external stores.
     pub internal_allowed: bool,
     /// Private addresses and plain http are allowed (`TAVRN_FILES_EXTERNAL_PRIVATE`).
     pub private_allowed: bool,
@@ -1688,8 +1702,9 @@ pub async fn get_backend(
     let row = store::files::backend(&state.db, &conv.id).await?;
     let c = stored_config(&state, &conv.id, row.as_ref())?;
     let (_, files_n, _) = store::files::usage(&state.db, &conv.id).await?;
+    let internal = internal_allowed(&Entitlements::for_room(&state, room_of(&conv)).await?);
     Ok(Json(BackendInfo {
-        kind: backend_kind(&state, row.as_ref()),
+        kind: backend_kind(internal, row.as_ref()),
         url: c.url,
         username: c.username,
         password_set: !c.password.is_empty(),
@@ -1701,7 +1716,7 @@ pub async fn get_backend(
         max_bytes: c.max_bytes,
         encrypt_files: row.as_ref().is_some_and(|r| r.encrypt_files != 0),
         external_allowed: state.config.files_external.on(),
-        internal_allowed: state.config.files_internal.on(),
+        internal_allowed: internal,
         private_allowed: state.config.files_external_private.on(),
         has_files: files_n > 0,
         updated_at: row.map(|r| r.updated_at),
@@ -1709,15 +1724,17 @@ pub async fn get_backend(
 }
 
 /// The requested configuration, validated, with stored secrets kept where the request leaves them empty.
+/// `internal`: the room may use the node's own storage (`files_channels.internal`).
 fn requested_config(
     state: &AppState,
     conv: &Conv,
     req: BackendRequest,
     row: Option<&store::files::BackendRow>,
+    internal: bool,
 ) -> Result<(Kind, RemoteConfig, bool), ApiError> {
     let kind = Kind::parse(req.kind.trim()).ok_or_else(|| bad("validation.enum", "kind: internal, webdav or s3"))?;
     if kind == Kind::Internal {
-        if !state.config.files_internal.on() {
+        if !internal {
             return Err(internal_disabled());
         }
         if req.max_bytes.unwrap_or(0) != 0 {
@@ -1779,7 +1796,8 @@ pub async fn put_backend(
     let conv = backend_access(&state, &room_id, &channel_id, &auth).await?;
     backend_limiter().check_all(&[format!("files-backend:{}", auth.user.id)])?;
     let row = store::files::backend(&state.db, &conv.id).await?;
-    let (kind, config, encrypt) = requested_config(&state, &conv, req, row.as_ref())?;
+    let internal = internal_allowed(&Entitlements::for_room(&state, room_of(&conv)).await?);
+    let (kind, config, encrypt) = requested_config(&state, &conv, req, row.as_ref(), internal)?;
     if conv.encrypted && encrypt {
         return Err(bad(
             "files.backend_invalid",
@@ -1853,9 +1871,10 @@ pub async fn test_backend(
     let conv = backend_access(&state, &room_id, &channel_id, &auth).await?;
     backend_limiter().check_all(&[format!("files-backend:{}", auth.user.id)])?;
     let row = store::files::backend(&state.db, &conv.id).await?;
+    let internal = internal_allowed(&Entitlements::for_room(&state, room_of(&conv)).await?);
     let (kind, config) = if body.iter().all(u8::is_ascii_whitespace) {
         let kind = row.as_ref().and_then(|r| Kind::parse(&r.kind)).unwrap_or(Kind::Internal);
-        if kind == Kind::Internal && !state.config.files_internal.on() {
+        if kind == Kind::Internal && !internal {
             return Err(internal_disabled());
         }
         if kind != Kind::Internal && !state.config.files_external.on() {
@@ -1865,7 +1884,7 @@ pub async fn test_backend(
     } else {
         let req: BackendRequest =
             serde_json::from_slice(&body).map_err(|e| bad("validation.json", format!("Invalid request: {e}")))?;
-        let (kind, config, _) = requested_config(&state, &conv, req, row.as_ref())?;
+        let (kind, config, _) = requested_config(&state, &conv, req, row.as_ref(), internal)?;
         (kind, config)
     };
     if kind != Kind::Internal {
