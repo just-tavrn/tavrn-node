@@ -492,18 +492,14 @@ async fn ids(state: &AppState, sql: &str, user_id: &str) -> Result<Vec<String>, 
 /// Presences of the online users the viewer may see (`GET /presence`).
 pub async fn visible_to(state: &AppState, viewer_id: &str) -> Result<Vec<Presence>, ApiError> {
     let online: std::collections::HashSet<String> = state.presence.online_ids().into_iter().collect();
-    let mut out = Vec::new();
-    for id in ids(state, VISIBLE, viewer_id).await? {
-        if !online.contains(&id) {
-            continue;
-        }
-        if let Some(user) = store::users::by_id(&state.db, &id).await? {
-            let p = view(state, &user, false);
-            if p.status != "offline" {
-                out.push(p);
-            }
-        }
-    }
+    let visible: Vec<String> =
+        ids(state, VISIBLE, viewer_id).await?.into_iter().filter(|id| online.contains(id)).collect();
+    let mut out: Vec<Presence> = store::users::by_ids(&state.db, &visible)
+        .await?
+        .iter()
+        .map(|user| view(state, user, false))
+        .filter(|p| p.status != "offline")
+        .collect();
     out.sort_by(|a, b| a.user.cmp(&b.user));
     Ok(out)
 }
