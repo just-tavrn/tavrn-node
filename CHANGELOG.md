@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- Web push: a user's subscriptions are sent to at once within one 10-second deadline, a push for a user whose previous
+  one is still under way is skipped, and registering an endpoint again keeps its failure count, so endpoints that
+  never answer can no longer hold the node's push senders.
 - Banning a bot's owner from a room needs the rank over each of the owner's bots in the room, as banning the bot
   itself does.
 - A moderation bot never sees reports about its owner or the owner's other bots, in lists, single reads and events, as

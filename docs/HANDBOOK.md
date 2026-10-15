@@ -1412,7 +1412,10 @@ How it behaves:
   have a queue of their own, so a busy channel never delays or drops the pushes of DMs, mentions, calls and
   reports. A message's recipients are loaded together (a few statements per message, whatever the room's size),
   members who were pushed for the conversation within the last 30 seconds are skipped first, and the deliveries to
-  different users run in parallel.
+  different users run in parallel. A user's subscriptions are sent to at once and given 10 seconds together, and while a
+  push to a user is still under way the next one for them is skipped, so endpoints that never answer cannot hold
+  the senders. An endpoint that fails is held back (30 seconds, doubling up to 6 hours) and deleted after 30 failures
+  in a row; registering it again keeps its count.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
 - **Monitoring**: `tavrn_push_sent_total` and `tavrn_push_failed_total` ([Metrics and health](#metrics-and-health)).

@@ -73,6 +73,7 @@ mod suite {
     mod polls_flow;
     mod presence_flow;
     mod profiles_flow;
+    mod push_deadline_flow;
     mod push_flow;
     mod rate_limits_flow;
     mod reactions_flow;
