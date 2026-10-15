@@ -718,9 +718,12 @@ pub(crate) async fn create_in(
     let epoch =
         if encrypted { Some(check_ciphertext(state, auth, &conv.id, &v.content, req.epoch).await?) } else { None };
     let id = util::ulid();
-    store::messages::insert(
-        &state.db,
-        NewMessage {
+    // The message, its attachments, spoilers and poll close time are written together or not at all: a failure
+    // halfway would leave a message nobody was told about. The transaction rolls back when dropped.
+    let mut tx = state.db.begin().await?;
+    store::messages::insert_on(
+        &mut tx,
+        &NewMessage {
             id: &id,
             conversation_id: &conv.id,
             author_id: &auth.user.id,
@@ -738,21 +741,22 @@ pub(crate) async fn create_in(
     )
     .await?;
     if !req.attachments.is_empty() {
-        let bound = store::blobs::bind_to_message(&state.db, &req.attachments, &id, &auth.user.id, &conv.id).await?;
+        let bound = store::blobs::bind_to_message_on(&mut tx, &req.attachments, &id, &auth.user.id, &conv.id).await?;
         if bound.len() != req.attachments.len() {
-            store::messages::delete(&state.db, &id).await?;
+            tx.rollback().await?;
             return Err(bad(
                 "message.attachment_invalid",
                 "An attachment does not belong to you or to this channel, or was already used",
             ));
         }
         if !req.spoilers.is_empty() {
-            store::blobs::mark_spoilers(&state.db, &id, &req.spoilers).await?;
+            store::blobs::mark_spoilers_on(&mut tx, &id, &req.spoilers).await?;
         }
     }
     if let Some(closes_at) = &closes_at {
-        store::polls::set_closes_at(&state.db, &id, closes_at).await?;
+        store::polls::set_closes_at_on(&mut tx, &id, closes_at).await?;
     }
+    tx.commit().await?;
     let message = enrich_one(state, &auth.user.id, &id).await?;
     // `delete` and `timeout` rules: accepted, but never shown to anyone else.
     if let Some(h) = &hit {

@@ -149,6 +149,9 @@ pub async fn update_user(
     if target.is_bot() && (req.node_admin == Some(true) || req.app_creation_grant.is_some()) {
         return Err(bad("app.bot_forbidden", "Bots cannot be node admins or create applications"));
     }
+    // Everything is validated before the first write: a refused request changes nothing.
+    let room_grant = req.room_creation_grant.map(|n| validate::range("room_creation_grant", n, 0, 1000)).transpose()?;
+    let app_grant = req.app_creation_grant.map(|n| validate::range("app_creation_grant", n, 0, 100)).transpose()?;
     if let Some(d) = req.disabled {
         store::admin::set_disabled(&state.db, &user_id, d).await?;
         if d {
@@ -181,8 +184,7 @@ pub async fn update_user(
         )
         .await?;
     }
-    if let Some(n) = req.room_creation_grant {
-        let n = validate::range("room_creation_grant", n, 0, 1000)?;
+    if let Some(n) = room_grant {
         store::users::upsert_room_creation_grant(&state.db, &user_id, &admin.user.id, n).await?;
         store::rooms::audit(
             &state.db,
@@ -195,8 +197,7 @@ pub async fn update_user(
         )
         .await?;
     }
-    if let Some(n) = req.app_creation_grant {
-        let n = validate::range("app_creation_grant", n, 0, 100)?;
+    if let Some(n) = app_grant {
         store::applications::set_creation_grant(&state.db, &user_id, n).await?;
         store::rooms::audit(
             &state.db,

@@ -55,6 +55,12 @@ pub async fn insert_webhook(db: &Pool, m: NewMessage<'_>, webhook: WebhookAuthor
 }
 
 pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError> {
+    insert_on(&mut *db.acquire().await?, &m).await?;
+    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+}
+
+/// [`insert`] on one connection (a transaction), without reading the row back.
+pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
@@ -74,9 +80,9 @@ pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError
     .bind(m.mentions_everyone as i64)
     .bind(now())
     .bind(m.signature)
-    .execute(db)
+    .execute(&mut *conn)
     .await?;
-    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+    Ok(())
 }
 
 /// Sets the envelope field `interaction` of a message an application posted as the answer to a command
