@@ -222,7 +222,7 @@ RUN set -eu; CROSS=; FFMPEG_CROSS=; ELF_MACHINE=; . /cross.env; \
 # ---- LiveKit binary ---------------------------------------------------------
 # Pinned; keep in sync with livekit_version in the justfile and LIVEKIT_VERSION in .github/workflows/ci.yml.
 # The digest is the multi-architecture index: the stage resolves to the target's image (amd64 or arm64).
-FROM livekit/livekit-server:v1.13.8@sha256:ad961c9b4b064298cc08d618d772671f7c783e036001388079fa813929cc357e AS livekit
+FROM livekit/livekit-server:v1.13.9@sha256:d0c04791bf63ca8dcea123571827d56ba9504bd57c8d5de60ee03b5408cc3154 AS livekit
 
 # ---- Runtime image ---------------------------------------------------------
 # The only stage of the target architecture that runs commands (emulated in a cross build): keep it small.
