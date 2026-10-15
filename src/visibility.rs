@@ -399,16 +399,18 @@ pub struct Filter {
 }
 
 /// What a connection sends for one room event: first `before` (frames the connection makes itself: channels and
-/// categories the user gained or lost), then the event when `event`.
+/// categories the user gained or lost), then the event when `event`, then `after` (the channels gained in the
+/// category a `category.create` creates, which must follow it).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Delivery {
     pub before: Vec<String>,
     pub event: bool,
+    pub after: Vec<String>,
 }
 
 impl Delivery {
     fn event(event: bool) -> Self {
-        Self { before: Vec::new(), event }
+        Self { before: Vec::new(), event, after: Vec::new() }
     }
 }
 
@@ -442,8 +444,9 @@ fn frame(kind: &str, data: Value) -> String {
 /// The frames that tell a member what they gained and lost between `old` and `new` (`skip`: the channel or
 /// category the event itself creates or deletes): `category.create` before the first channel of a category the
 /// member did not know, `channel.create` in channel order, then `channel.delete` and `category.delete` with
-/// `hidden: true`.
-fn changes(view: &RoomView, old: &Known, new: &Known, skip: Option<&str>) -> Vec<String> {
+/// `hidden: true`. The channels gained in the skipped category come second: they follow the event that creates
+/// it (a lagging connection already sees them when it delivers the `category.create`).
+fn changes(view: &RoomView, old: &Known, new: &Known, skip: Option<&str>) -> (Vec<String>, Vec<String>) {
     let room_id = view.room.id.as_str();
     let not_skipped = |id: &&String| skip != Some(id.as_str());
     let mut gained_categories: Vec<&String> = new.categories.difference(&old.categories).filter(not_skipped).collect();
@@ -461,11 +464,17 @@ fn changes(view: &RoomView, old: &Known, new: &Known, skip: Option<&str>) -> Vec
             frames.push(frame("category.create", serde_json::to_value(category).unwrap_or_default()));
         }
     };
+    let mut after = Vec::new();
     for channel in gained {
-        if let Some(id) = channel.category_id.as_deref() {
-            category(id, &mut frames);
+        let created = frame("channel.create", serde_json::to_value(channel.to_api()).unwrap_or_default());
+        match channel.category_id.as_deref() {
+            Some(id) if skip == Some(id) => after.push(created),
+            Some(id) => {
+                category(id, &mut frames);
+                frames.push(created);
+            }
+            None => frames.push(created),
         }
-        frames.push(frame("channel.create", serde_json::to_value(channel.to_api()).unwrap_or_default()));
     }
     for id in &gained_categories {
         category(id, &mut frames);
@@ -480,7 +489,7 @@ fn changes(view: &RoomView, old: &Known, new: &Known, skip: Option<&str>) -> Vec
     for id in lost {
         frames.push(frame("category.delete", serde_json::json!({ "room_id": room_id, "id": id, "hidden": true })));
     }
-    frames
+    (frames, after)
 }
 
 impl Filter {
@@ -561,14 +570,22 @@ impl Filter {
             None => (None, !internal),
             Some(Target::Channel(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.channels.contains(id))),
             Some(Target::Category(id)) if deleted => (Some(id), old.as_ref().is_none_or(|o| o.categories.contains(id))),
-            Some(Target::Channel(id)) => (kind.ends_with(".create").then_some(id), new.channels.contains(id)),
-            Some(Target::Category(id)) => (kind.ends_with(".create").then_some(id), new.categories.contains(id)),
+            // A creation the user already knows of (told as gained by an earlier event of a lagging connection,
+            // or in its starting snapshot) is not sent again, as a deletion they no longer know of is not.
+            Some(Target::Channel(id)) if kind.ends_with(".create") => {
+                (Some(id), new.channels.contains(id) && old.as_ref().is_none_or(|o| !o.channels.contains(id)))
+            }
+            Some(Target::Category(id)) if kind.ends_with(".create") => {
+                (Some(id), new.categories.contains(id) && old.as_ref().is_none_or(|o| !o.categories.contains(id)))
+            }
+            Some(Target::Channel(id)) => (None, new.channels.contains(id)),
+            Some(Target::Category(id)) => (None, new.categories.contains(id)),
         };
-        let before = match &old {
+        let (before, after) = match &old {
             Some(old) if *old != new => changes(&view, old, &new, skip),
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         };
-        Delivery { before, event }
+        Delivery { before, event, after }
     }
 
     /// Forgets a room the connection left.
