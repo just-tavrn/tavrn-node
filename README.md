@@ -138,6 +138,16 @@ Voice needs `livekit-server` next to the node (`just livekit-install`; without i
 `TAVRN_VOICE_ENABLED=false`), the media pipeline `ffmpeg` with libwebp (`just ffmpeg-install`). Tests that need
 them skip themselves with a message when they are missing; the CI installs both.
 
+Tool versions: livekit-server and ffmpeg are pinned in three places of this repository, the `justfile`
+(`livekit_version`, `just ffmpeg-install`), `.github/workflows/ci.yml` (the CI's tests) and `deploy/Dockerfile` (the
+image), and `scripts/check-tool-pins.sh` (part of `just check` and the CI's hygiene job) fails when they disagree. The
+rule: one LiveKit release everywhere, and one FFmpeg release for tests and production. The image builds that FFmpeg
+release from source with only what the media pipeline needs (`--disable-everything` plus an allow-list); the tests use
+BtbN's dated static build of the same release (`n<version>-<n>-g<commit>`, the release branch a few commits on), so a
+decoder or filter missing from the allow-list shows up in tavrn-web's nightly end-to-end run, which runs against the
+image's own ffmpeg. The organization's runner image (just-tavrn/.github, `runner/Dockerfile`) and tavrn-web's
+`just livekit-install` pin the same versions; bump them together.
+
 Tests: `just test` (SQLite) and `just test-pg` (PostgreSQL, and the cluster tests against Valkey) run the unit
 tests, the integration tests in `tests/` (one test binary, `tests/main.rs`), the protocol's test vectors from
 `protocol/testvectors/` and a comparison of the API specification generated from the routes with

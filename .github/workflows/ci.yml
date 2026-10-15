@@ -116,6 +116,8 @@ jobs:
           node-version: 24
       - name: SPDX headers
         run: scripts/check-spdx.sh
+      - name: Tool pins (livekit-server, ffmpeg) agree between justfile, ci.yml and deploy/Dockerfile
+        run: scripts/check-tool-pins.sh
       - name: No private files, domains or secrets
         env:
           # Comma-separated private domains, hosts and addresses (repository or organization secret).

@@ -6,7 +6,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # credentials (for example `gh auth setup-git`), see README.md "Building".
 export CARGO_NET_GIT_FETCH_WITH_CLI := "true"
 
-# LiveKit version the node is tested with (also pinned in deploy/Dockerfile and .github/workflows/ci.yml)
+# LiveKit version the node is tested with (also pinned in deploy/Dockerfile and .github/workflows/ci.yml; `just tool-pins`)
 livekit_version := "1.13.8"
 
 # Test containers of `just test-pg` (start them with `just test-services`)
@@ -20,13 +20,17 @@ default:
 dev-server: protocol
     cargo run -p tavrn-node -- --dev
 
-# Every check of the CI: licenses, format, lints (node and load generator), tests on SQLite and on PostgreSQL
-check: license-check fmt-check clippy clippy-loadgen test test-pg test-perf-report
+# Every check of the CI: licenses, tool pins, format, lints (node and load generator), tests on SQLite and on PostgreSQL
+check: license-check tool-pins fmt-check clippy clippy-loadgen test test-pg test-perf-report
 
 # SPDX headers and the licenses of the Rust dependencies (deny.toml; all of cargo deny: `just deny`)
 license-check:
     scripts/check-spdx.sh
     if command -v cargo-deny >/dev/null; then cargo deny --log-level error check licenses; else echo "cargo-deny not installed (cargo install cargo-deny --locked): Rust licenses not checked"; fi
+
+# livekit-server and ffmpeg pinned alike in this justfile, .github/workflows/ci.yml and deploy/Dockerfile (README.md, Tool versions)
+tool-pins:
+    scripts/check-tool-pins.sh
 
 # Licenses, advisories, bans and sources of the Rust dependencies (deny.toml)
 deny:
@@ -134,7 +138,8 @@ ffmpeg-install:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v ffmpeg >/dev/null && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libwebp_anim; then ffmpeg -hide_banner -version | head -1; exit 0; fi
-    # A dated BtbN build (the month-end builds stay available) checked against its SHA-256; the same as ci.yml.
+    # A dated BtbN build (the month-end builds stay available) checked against its SHA-256; the same as ci.yml, of the
+    # FFmpeg release deploy/Dockerfile builds (`just tool-pins`, README.md "Tool versions").
     release=autobuild-2026-09-30-13-08
     case "$(uname -m)" in
       x86_64) file=ffmpeg-n8.1.3-9-g29e619e767-linux64-gpl-8.1.tar.xz sum=97ce978979194b5cf7e06a5e68020dbdaa7a4f3294c5452b6a1bc347100dbb79 ;;

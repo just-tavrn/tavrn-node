@@ -121,14 +121,15 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
 # ---- Static ffmpeg for the media pipeline (src/media.rs) ------------------------------
 # Only what the pipeline needs: image and short-video decoders, WebP encoding, file/pipe I/O. No network
 # protocols, no devices, no other muxers: a small static binary instead of Debian's ffmpeg with its
-# ~100 shared libraries. Keep the versions in sync with `just ffmpeg-install` (tests, development).
+# ~100 shared libraries. The version rule (README.md "Tool versions"): the same FFmpeg release as the tests use
+# (`just ffmpeg-install` and ci.yml take BtbN's dated build of that release); bump them together.
 # Runs on the build machine; for another target architecture libwebp and ffmpeg are cross-compiled with Debian's
 # cross gcc against the target's zlib (dpkg multiarch), and the result is checked with `file` instead of being run.
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
 ARG BUILDARCH
 ARG TARGETARCH
-ARG FFMPEG_VERSION=8.0
-ARG FFMPEG_SHA256=b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e
+ARG FFMPEG_VERSION=8.1.3
+ARG FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
 ARG LIBWEBP_VERSION=1.6.0
 ARG LIBWEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 # /cross.env: empty for a native build; the cross prefix and configure flags otherwise.
