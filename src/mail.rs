@@ -3,6 +3,7 @@
 //! production nodes only note that a mail was not sent (never its body, which may carry a token). The texts are localized
 //! templates (`mail_templates.rs`).
 
+use crate::util::percent_decode;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -63,30 +64,6 @@ impl SmtpSettings {
         }
         Some(Self { host: host.to_string(), port, security, credentials })
     }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let decoded = (bytes[i] == b'%')
-            .then(|| bytes.get(i + 1..i + 3))
-            .flatten()
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match decoded {
-            Some(v) => {
-                out.push(v);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Clone)]

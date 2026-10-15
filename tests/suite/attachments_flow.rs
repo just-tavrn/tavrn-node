@@ -335,3 +335,83 @@ async fn page_enrichment_matches_single_messages() {
     assert_eq!(&pins[0], m(3));
     assert_eq!(&pins[1], m(1));
 }
+
+/// Files below `dir` whose name ends in `.part` (a blob being written).
+fn part_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(part_files(&path));
+        } else if path.extension().is_some_and(|e| e == "part") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Uploads stream into storage as the bytes arrive (memory stays bounded by the chunk size, not the file size), and
+/// a body over the limit is cut off at the limit: the node stops reading and answers 413.
+#[tokio::test]
+async fn uploads_stream_to_storage_and_stop_at_the_limit() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    const CHUNK: usize = 64 * 1024;
+    let node = test_node_with("t.local", |c| c.upload_max_bytes = 1024 * 1024).await;
+    let (_alice, bob, room_id, channel_id) = setup(&node).await;
+    let path = format!("/api/v1/rooms/{room_id}/channels/{channel_id}/uploads");
+    let request = |body: Body| {
+        Request::post(&path)
+            .header(header::AUTHORIZATION, format!("Bearer {}", bob.token))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header("tavrn-file-name", "notes.txt")
+            .body(body)
+            .unwrap()
+    };
+    // 512 KiB, then the client pauses: the file is already being written before the body is complete.
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let first =
+        futures::stream::iter((0..8).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'a'; CHUNK]))));
+    let rest = futures::stream::once(async move {
+        let _ = wait.await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'b'; CHUNK]))
+    });
+    let router = node.router.clone();
+    let upload = tokio::spawn(router.oneshot(request(Body::from_stream(futures::StreamExt::chain(first, rest)))));
+    let data_dir = std::path::PathBuf::from(&node.state.config.data_dir);
+    common::wait_until(std::time::Duration::from_secs(5), "the blob is written while the body arrives", || {
+        let found = !part_files(&data_dir).is_empty();
+        async move { found }
+    })
+    .await;
+    release.send(()).unwrap();
+    let resp = upload.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let blob = common::body_json(resp).await;
+    assert_eq!(blob["size"], 9 * CHUNK);
+    assert!(part_files(&data_dir).is_empty(), "the finished blob is renamed");
+    let (st, _, bytes) = node
+        .raw(Method::GET, &format!("/api/v1/blobs/{}", blob["id"].as_str().unwrap()), &bob.token, &[], vec![])
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bytes.len(), 9 * CHUNK);
+    assert_eq!((bytes[0], bytes[9 * CHUNK - 1]), (b'a', b'b'));
+
+    // Endless body without a Content-Length: read up to the limit, then 413; nothing stays behind.
+    let pulled = Arc::new(AtomicU64::new(0));
+    let counter = pulled.clone();
+    let endless = futures::stream::repeat_with(move || {
+        counter.fetch_add(CHUNK as u64, Ordering::Relaxed);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; CHUNK]))
+    });
+    let resp = node.router.clone().oneshot(request(Body::from_stream(endless))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(common::body_json(resp).await["code"], "upload.too_large");
+    let read = pulled.load(Ordering::Relaxed);
+    assert!(read <= 1024 * 1024 + 2 * CHUNK as u64, "read {read} bytes of an endless body");
+    assert!(part_files(&data_dir).is_empty(), "the cut upload leaves no file");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs").fetch_one(&node.state.db).await.unwrap();
+    assert_eq!(count, 1, "no row for the cut upload");
+}
