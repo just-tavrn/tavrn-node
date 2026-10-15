@@ -1002,25 +1002,25 @@ pub async fn upload(
         Err(e) => Err(e),
         Ok(false) => {
             store::files::insert(
-        &state.db,
-        store::files::NewEntry {
-            id: &id,
-            room_id: &room.id,
-            channel_id: &conv.id,
-            parent_id: parent_id.as_deref(),
-            kind: "file",
-            name: &name,
-            storage_id: storage_id.as_deref(),
-            backend,
-            encrypted,
-            mime: &mime,
-            size,
-            sha256: &sha256,
-            created_by: &auth.user.id,
-            record,
-        },
-    )
-    .await
+                &state.db,
+                store::files::NewEntry {
+                    id: &id,
+                    room_id: &room.id,
+                    channel_id: &conv.id,
+                    parent_id: parent_id.as_deref(),
+                    kind: "file",
+                    name: &name,
+                    storage_id: storage_id.as_deref(),
+                    backend,
+                    encrypted,
+                    mime: &mime,
+                    size,
+                    sha256: &sha256,
+                    created_by: &auth.user.id,
+                    record,
+                },
+            )
+            .await
         }
     };
     let row = match inserted {

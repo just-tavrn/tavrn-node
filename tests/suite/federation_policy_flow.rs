@@ -101,17 +101,15 @@ async fn claims_in_the_name_of_a_third_node_user_count_against_the_sending_node(
     let (st, _) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "x1@a.test" })).await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "a.test's own budget is exhausted");
     // dave@c.test is carol's friend here, but a.test cannot speak for him.
-    let dave =
-        tavrn_node::store::federation::create_remote_user(&b.state.db, "dave", "c.test", "dave", "user", None)
-            .await
-            .unwrap();
+    let dave = tavrn_node::store::federation::create_remote_user(&b.state.db, "dave", "c.test", "dave", "user", None)
+        .await
+        .unwrap();
     tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &dave.id).await.unwrap();
     let (st, code) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "dave@c.test" })).await;
     assert_eq!((st, code.as_str()), (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     // A related requester of the sending node itself keeps the exemption.
-    let erin = tavrn_node::store::federation::create_remote_user(&b.state.db, "erin", A, "erin", "user", None)
-        .await
-        .unwrap();
+    let erin =
+        tavrn_node::store::federation::create_remote_user(&b.state.db, "erin", A, "erin", "user", None).await.unwrap();
     tavrn_node::store::social::add_friendship(&b.state.db, &carol.user_id, &erin.id).await.unwrap();
     let (st, code) = s2s(&a, &b, CLAIM, json!({ "user": "carol@b.test", "requester": "erin@a.test" })).await;
     assert_eq!(st, StatusCode::OK, "{code}");
