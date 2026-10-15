@@ -55,17 +55,22 @@ fn forward_invalid() -> ApiError {
     bad("report.forward_invalid", "Only reports by users about a user can be forwarded")
 }
 
-/// The payload of `report.forward` for `report` (MODERATION.md §1.6): the reporter and every author other than the
-/// reported user replaced by `pseudo`, their device ids left out; the oldest context entries of the evidence left out
-/// while the message would exceed the inbox limit (never the reported message).
+/// The payload of `report.forward` for `report` (MODERATION.md §1.6): the reporter replaced by `pseudo`; every other
+/// author than the reported user by a pseudonym of their own for this report only (never the reporter's, so the
+/// reporter's own context entries cannot be told apart from other people's), their message and device ids left out
+/// (an id would let a member of the conversation look the author up); the oldest context entries of the evidence left
+/// out while the message would exceed the inbox limit (never the reported message).
 pub fn payload(report: &ModerationReport, reporter: &str, pseudo: impl Fn(&str) -> String) -> Value {
     let target = report.target_address.as_str();
+    // Keyed by the report as well: stable within this report, unlinkable to `reporter` and to other reports.
+    let context = |author: &str| pseudo(&format!("{}\n{}", report.id, author.to_lowercase()));
     let mut evidence: Option<Vec<EvidenceEntry>> = report.evidence.clone().map(|entries| {
         entries
             .into_iter()
             .map(|mut e| {
                 if !e.author.eq_ignore_ascii_case(target) {
-                    e.author = pseudo(&e.author);
+                    e.author = context(&e.author);
+                    e.message_id = None;
                     e.device_id = None;
                 }
                 e
@@ -74,7 +79,7 @@ pub fn payload(report: &ModerationReport, reporter: &str, pseudo: impl Fn(&str) 
     });
     let snapshot: Option<MessageSnapshot> = report.snapshot.clone().map(|mut s| {
         if !s.author.eq_ignore_ascii_case(target) {
-            s.author = pseudo(&s.author);
+            s.author = context(&s.author);
         }
         s
     });
@@ -394,8 +399,11 @@ mod tests {
         }
     }
 
+    /// A readable stand-in for the keyed hash: the local part, prefixed with the report id when one is given.
     fn pseudo(a: &str) -> String {
-        format!("anon-{}", a.split('@').next().unwrap())
+        let (scope, address) = a.split_once('\n').map_or(("", a), |(r, a)| (r, a));
+        let name = address.split('@').next().unwrap();
+        if scope.is_empty() { format!("anon-{name}") } else { format!("anon-{}-{name}", &scope[scope.len() - 4..]) }
     }
 
     #[test]
@@ -404,13 +412,21 @@ mod tests {
             entry("01J00000000000000000000002", "alice@a.example", 1, "hi"),
             entry("01J00000000000000000000003", "dave@c.example", 2, "hello"),
             entry(REPORTED, "Mallory@b.example", 3, "I know where you live"),
+            entry("01J00000000000000000000004", "Alice@a.example", 4, "stop it"),
         ]));
         let p = payload(&r, "alice@a.example", pseudo);
         assert_eq!(p["reporter"], "anon-alice");
-        assert_eq!(p["evidence"][0]["author"], "anon-alice", "the reporter's own entries carry the pseudonym");
-        assert_eq!(p["evidence"][0]["device_id"], Value::Null);
-        assert_eq!(p["evidence"][1]["author"], "anon-dave");
+        let reporters_entry = &p["evidence"][0];
+        assert_ne!(reporters_entry["author"], p["reporter"], "context authors never carry the reporter pseudonym");
+        assert_eq!(reporters_entry["author"], p["evidence"][3]["author"], "one pseudonym per author within a report");
+        assert_ne!(reporters_entry["author"], p["evidence"][1]["author"]);
+        for i in [0, 1, 3] {
+            let e = &p["evidence"][i];
+            assert_eq!((&e["message_id"], &e["device_id"]), (&Value::Null, &Value::Null), "no ids of others: {e}");
+        }
+        assert_eq!(p["evidence"][1]["author"], "anon-0009-dave");
         assert_eq!(p["evidence"][2]["author"], "Mallory@b.example");
+        assert_eq!(p["evidence"][2]["message_id"], REPORTED, "the reported message keeps its id");
         assert_eq!(p["evidence"][2]["device_id"], "dev", "the reported user's entries keep their device");
         assert_eq!((p["report_id"].as_str(), p["message_id"].as_str()), (Some(r.id.as_str()), Some(REPORTED)));
         let text = p.to_string();
@@ -435,10 +451,10 @@ mod tests {
         let size = serde_json::to_vec(&p).unwrap().len() + ENVELOPE_RESERVE;
         assert!(size <= crate::federation::inbox::MAX_BODY_BYTES, "{size}");
         let kept: Vec<&str> =
-            p["evidence"].as_array().unwrap().iter().map(|e| e["message_id"].as_str().unwrap()).collect();
-        assert!(kept.contains(&REPORTED), "the reported message stays");
-        assert!(!kept.contains(&id(0).as_str()), "the oldest went first: {kept:?}");
-        assert!(kept.contains(&id(9).as_str()), "the newest context stays: {kept:?}");
+            p["evidence"].as_array().unwrap().iter().map(|e| e["created_at"].as_str().unwrap()).collect();
+        assert!(kept.contains(&"2026-10-01T10:30:00Z"), "the reported message stays");
+        assert!(!kept.contains(&"2026-10-01T10:00:00Z"), "the oldest went first: {kept:?}");
+        assert!(kept.contains(&"2026-10-01T10:09:00Z"), "the newest context stays: {kept:?}");
         assert!(parse(&p).is_ok());
     }
 

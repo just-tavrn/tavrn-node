@@ -229,3 +229,5 @@ First public release of the node and its container image.
   logins.
 - `app.changed` is limited per sender and bot like `profile.changed`; rate-limited inbox messages are not counted as
   received, so the sender's retry is handled.
+- Forwarded reports give evidence authors other than the reported user pseudonyms of that report only (never the
+  reporter's) and leave out their message ids.
