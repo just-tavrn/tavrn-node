@@ -999,8 +999,43 @@ pub struct Attachment {
 pub struct Reaction {
     pub emoji: String,
     pub count: i64,
-    /// Did the requester react with it?
+    /// Did the requester react with it? Always `false` in events (PROTOCOL.md §6): only responses carry the
+    /// caller's view.
     pub me: bool,
+}
+
+/// The reaction change a `message.update` names (PROTOCOL.md §6): absent on every other cause of the event.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReactionChange {
+    pub emoji: String,
+    /// The reactor, `username@domain`.
+    pub user: String,
+    /// The reactor's id on the hosting node.
+    pub user_id: String,
+    /// `false` for a removal.
+    pub added: bool,
+}
+
+/// The `data` of a `message.update` event: the message without per-viewer state and, for a reaction change, the
+/// change.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct MessageUpdate {
+    #[serde(flatten)]
+    pub message: Message,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<ReactionChange>,
+}
+
+impl Message {
+    /// The message as events carry it: events reach many viewers, so no per-viewer state (`reactions[].me` is
+    /// `false`, PROTOCOL.md §6). HTTP responses keep the caller's view.
+    pub fn for_broadcast(&self) -> Message {
+        let mut m = self.clone();
+        for r in &mut m.reactions {
+            r.me = false;
+        }
+        m
+    }
 }
 
 // ---------------------------------------------------------------- Emojis

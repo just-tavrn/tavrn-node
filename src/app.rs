@@ -782,7 +782,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/conversations/{conversation_id}/messages/{message_id}/reactions/{emoji}",
             put(routes::attachments::add_conversation_reaction)
-                .delete(routes::attachments::remove_conversation_reaction),
+                .delete(routes::attachments::remove_conversation_reaction)
+                .get(routes::attachments::list_reactors),
         )
         // Poll vote records (PROTOCOL.md §7g): one per member and poll.
         .route(

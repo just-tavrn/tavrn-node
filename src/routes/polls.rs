@@ -18,7 +18,7 @@ use crate::{
     auth::AuthUser,
     error::{ApiError, ProblemDetails},
     models::MessageRow,
-    permissions as p, polls, store,
+    polls, store,
     store::polls::VoteRow,
     validate::bad,
 };
@@ -98,18 +98,7 @@ async fn poll_message(
     conv: &Conv,
     message_id: &str,
 ) -> Result<MessageRow, ApiError> {
-    conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
-    let message = store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
-    if message.encrypted != 0
-        && let Some(cut) = crate::history::list_cutoff(state, conv, &auth.user).await?
-        && message.id.as_str() < cut.as_str()
-    {
-        return Err(access::not_found("Message", "message.not_found"));
-    }
-    Ok(message)
+    crate::routes::messages::readable(state, auth, conv, message_id).await
 }
 
 /// Checks for changing a vote: member (room channels), DM rules, no timeout, an open poll, the rate limit.
