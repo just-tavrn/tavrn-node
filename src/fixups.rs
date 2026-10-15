@@ -166,7 +166,7 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
     report.use_components_roles = grant_to_roles(
         db,
         USE_COMPONENTS_MARKER,
-        permissions::SEND_MESSAGES,
+        Some(permissions::SEND_MESSAGES),
         permissions::USE_COMPONENTS,
         Everyone::Included,
     )
@@ -179,38 +179,8 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
 
 /// Adds bits 31/32 to every `@everyone` role lacking them, once per node (see the module docs).
 async fn grant_external_emojis(db: &Pool) -> anyhow::Result<u64> {
-    let done = sqlx::query("SELECT value FROM node_settings WHERE key = $1")
-        .bind(EXTERNAL_EMOJI_MARKER)
-        .fetch_optional(db)
-        .await?
-        .is_some();
-    if done {
-        return Ok(0);
-    }
     let bits = permissions::USE_EXTERNAL_EMOJIS | permissions::USE_EXTERNAL_SOUNDS;
-    let mut tx = db.begin().await?;
-    let roles = sqlx::query("SELECT id, permissions FROM roles WHERE is_everyone = 1").fetch_all(&mut *tx).await?;
-    let mut changed = 0;
-    for row in roles {
-        let (id, perms): (String, i64) = (row.try_get("id")?, row.try_get("permissions")?);
-        if perms as u64 & bits == bits {
-            continue;
-        }
-        sqlx::query("UPDATE roles SET permissions = $1 WHERE id = $2")
-            .bind((perms as u64 | bits) as i64)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        changed += 1;
-    }
-    sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
-        .bind(EXTERNAL_EMOJI_MARKER)
-        .bind("done")
-        .bind(util::now())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(changed)
+    grant_to_roles(db, EXTERNAL_EMOJI_MARKER, None, bits, Everyone::Only).await
 }
 
 async fn audit_strip(db: &Pool, room_id: &str, target: &str, removed: u64, kind: &str) -> anyhow::Result<()> {
@@ -277,38 +247,7 @@ async fn strip_unscoped_overrides(db: &Pool) -> anyhow::Result<u64> {
 
 /// Adds `read_history` to every `@everyone` role lacking it, once per node (see the module docs).
 async fn grant_read_history(db: &Pool) -> anyhow::Result<u64> {
-    let done = sqlx::query("SELECT value FROM node_settings WHERE key = $1")
-        .bind(READ_HISTORY_MARKER)
-        .fetch_optional(db)
-        .await?
-        .is_some();
-    if done {
-        return Ok(0);
-    }
-    let bit = permissions::READ_HISTORY;
-    let mut tx = db.begin().await?;
-    let roles = sqlx::query("SELECT id, permissions FROM roles WHERE is_everyone = 1").fetch_all(&mut *tx).await?;
-    let mut changed = 0;
-    for row in roles {
-        let (id, perms): (String, i64) = (row.try_get("id")?, row.try_get("permissions")?);
-        if perms as u64 & bit == bit {
-            continue;
-        }
-        sqlx::query("UPDATE roles SET permissions = $1 WHERE id = $2")
-            .bind((perms as u64 | bit) as i64)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        changed += 1;
-    }
-    sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
-        .bind(READ_HISTORY_MARKER)
-        .bind("done")
-        .bind(util::now())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(changed)
+    grant_to_roles(db, READ_HISTORY_MARKER, None, permissions::READ_HISTORY, Everyone::Only).await
 }
 
 async fn marker_set(db: &Pool, key: &str) -> anyhow::Result<bool> {
@@ -320,7 +259,7 @@ async fn grant_manage_applications(db: &Pool) -> anyhow::Result<u64> {
     grant_to_roles(
         db,
         MANAGE_APPLICATIONS_MARKER,
-        permissions::MANAGE_ROOM,
+        Some(permissions::MANAGE_ROOM),
         permissions::MANAGE_APPLICATIONS,
         Everyone::Excluded,
     )
@@ -332,7 +271,7 @@ async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
     grant_to_roles(
         db,
         MANAGE_THREADS_MARKER,
-        permissions::MANAGE_MESSAGES,
+        Some(permissions::MANAGE_MESSAGES),
         permissions::MANAGE_THREADS,
         Everyone::Excluded,
     )
@@ -340,8 +279,14 @@ async fn grant_manage_threads(db: &Pool) -> anyhow::Result<u64> {
 }
 
 async fn grant_voice_status(db: &Pool) -> anyhow::Result<u64> {
-    grant_to_roles(db, VOICE_STATUS_MARKER, permissions::MANAGE_CHANNELS, permissions::VOICE_STATUS, Everyone::Excluded)
-        .await
+    grant_to_roles(
+        db,
+        VOICE_STATUS_MARKER,
+        Some(permissions::MANAGE_CHANNELS),
+        permissions::VOICE_STATUS,
+        Everyone::Excluded,
+    )
+    .await
 }
 
 /// Adds `create_polls` to every role holding `send_messages` (`@everyone` included) and to every override allowing it,
@@ -352,32 +297,9 @@ async fn grant_create_polls(db: &Pool) -> anyhow::Result<u64> {
     }
     let (have, add) = (permissions::SEND_MESSAGES, permissions::CREATE_POLLS);
     let mut tx = db.begin().await?;
-    let mut changed = 0;
-    for (select, update) in [
-        (
-            "SELECT id, permissions AS bits FROM roles WHERE (permissions & $1) <> 0",
-            "UPDATE roles SET permissions = $1 WHERE id = $2",
-        ),
-        (
-            "SELECT id, allow AS bits FROM permission_overrides WHERE (allow & $1) <> 0",
-            "UPDATE permission_overrides SET allow = $1 WHERE id = $2",
-        ),
-    ] {
-        for row in sqlx::query(select).bind(have as i64).fetch_all(&mut *tx).await? {
-            let (id, bits): (String, i64) = (row.try_get("id")?, row.try_get("bits")?);
-            if bits as u64 & add == add {
-                continue;
-            }
-            sqlx::query(update).bind((bits as u64 | add) as i64).bind(&id).execute(&mut *tx).await?;
-            changed += 1;
-        }
-    }
-    sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
-        .bind(CREATE_POLLS_MARKER)
-        .bind("done")
-        .bind(util::now())
-        .execute(&mut *tx)
-        .await?;
+    let mut changed = add_bits(&mut tx, "roles", "permissions", Some(have), add, "").await?;
+    changed += add_bits(&mut tx, "permission_overrides", "allow", Some(have), add, "").await?;
+    set_marker(&mut tx, CREATE_POLLS_MARKER).await?;
     tx.commit().await?;
     Ok(changed)
 }
@@ -387,42 +309,61 @@ async fn grant_create_polls(db: &Pool) -> anyhow::Result<u64> {
 enum Everyone {
     Included,
     Excluded,
+    /// Only the `@everyone` roles.
+    Only,
 }
 
-/// Adds `add` to every role holding `have` (`@everyone` only when `everyone` says so), once per node (`marker` in
-/// `node_settings`).
-async fn grant_to_roles(db: &Pool, marker: &str, have: u64, add: u64, everyone: Everyone) -> anyhow::Result<u64> {
+/// Adds `add` to every role holding `have` (every role for `None`; `@everyone` as `everyone` says), once per node
+/// (`marker` in `node_settings`).
+async fn grant_to_roles(
+    db: &Pool,
+    marker: &str,
+    have: Option<u64>,
+    add: u64,
+    everyone: Everyone,
+) -> anyhow::Result<u64> {
     if marker_set(db, marker).await? {
         return Ok(0);
     }
     let mut tx = db.begin().await?;
-    let sql = if everyone == Everyone::Included {
-        "SELECT id, permissions FROM roles WHERE (permissions & $1) <> 0"
-    } else {
-        "SELECT id, permissions FROM roles WHERE is_everyone = 0 AND (permissions & $1) <> 0"
+    let which = match everyone {
+        Everyone::Included => "",
+        Everyone::Excluded => " AND is_everyone = 0",
+        Everyone::Only => " AND is_everyone = 1",
     };
-    let roles = sqlx::query(sql).bind(have as i64).fetch_all(&mut *tx).await?;
-    let mut changed = 0;
-    for row in roles {
-        let (id, perms): (String, i64) = (row.try_get("id")?, row.try_get("permissions")?);
-        if perms as u64 & add == add {
-            continue;
-        }
-        sqlx::query("UPDATE roles SET permissions = $1 WHERE id = $2")
-            .bind((perms as u64 | add) as i64)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        changed += 1;
+    let changed = add_bits(&mut tx, "roles", "permissions", have, add, which).await?;
+    set_marker(&mut tx, marker).await?;
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Sets the bits `add` in `column` of every row of `table` that lacks one of them (and holds one of `have`), in one
+/// statement; `condition` narrows the rows further. Returns the rows changed.
+async fn add_bits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    table: &str,
+    column: &str,
+    have: Option<u64>,
+    add: u64,
+    condition: &str,
+) -> anyhow::Result<u64> {
+    let holding = if have.is_some() { format!(" AND ({column} & $2) <> 0") } else { String::new() };
+    let sql = format!("UPDATE {table} SET {column} = {column} | $1 WHERE ({column} & $1) <> $1{holding}{condition}");
+    let mut q = sqlx::query(&sql).bind(add as i64);
+    if let Some(have) = have {
+        q = q.bind(have as i64);
     }
+    Ok(q.execute(&mut **tx).await?.rows_affected())
+}
+
+async fn set_marker(tx: &mut sqlx::Transaction<'_, sqlx::Any>, marker: &str) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)")
         .bind(marker)
         .bind("done")
         .bind(util::now())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    tx.commit().await?;
-    Ok(changed)
+    Ok(())
 }
 
 /// Records once that the rooms existing when `bots_in_encrypted_channels` was introduced keep `allowed`.
