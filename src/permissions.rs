@@ -379,24 +379,63 @@ pub fn room_level(is_owner: bool, everyone_permissions: Perms, member_roles: &[(
 /// category's overrides, then the channel's own on top, a neutral bit inheriting from the layer below. For bots the result is
 /// capped afterwards ([`cap_bot`]): administrator and owner expand to all bits first, then the scope mask.
 pub fn compute(input: &Input) -> Perms {
+    compute_ref(&InputRef {
+        user_id: &input.user_id,
+        is_owner: input.is_owner,
+        everyone_role_id: &input.everyone_role_id,
+        everyone_permissions: input.everyone_permissions,
+        member_roles: &input.member_roles,
+        category_overrides: &input.category_overrides,
+        channel_overrides: &input.channel_overrides,
+        timed_out: input.timed_out,
+        kind: &input.kind,
+        no_bots: input.no_bots,
+        scopes: input.scopes.as_deref(),
+        system_channel: input.system_channel,
+        moved: input.moved,
+    })
+}
+
+/// [`Input`] borrowed from data that is already loaded: the channel visibility snapshot evaluates every member in
+/// every channel of a room without copying ids, roles or overrides per pair. [`compute`] evaluates through it, so
+/// the protocol's test vectors cover both.
+#[derive(Debug, Clone, Copy)]
+pub struct InputRef<'a> {
+    pub user_id: &'a str,
+    pub is_owner: bool,
+    pub everyone_role_id: &'a str,
+    pub everyone_permissions: Perms,
+    pub member_roles: &'a [(String, Perms)],
+    pub category_overrides: &'a [Override],
+    pub channel_overrides: &'a [Override],
+    pub timed_out: bool,
+    pub kind: &'a str,
+    pub no_bots: bool,
+    pub scopes: Option<&'a [String]>,
+    pub system_channel: bool,
+    pub moved: bool,
+}
+
+/// [`compute`] over borrowed input.
+pub fn compute_ref(input: &InputRef<'_>) -> Perms {
     let mut perms = compute_member(input);
     if input.system_channel {
         perms = (perms | SYSTEM_CHANNEL_FORCED) & !SYSTEM_CHANNEL_DENIED;
     }
-    let capped = cap_bot(perms, &input.kind, input.no_bots, input.scopes.as_deref());
+    let capped = cap_bot(perms, input.kind, input.no_bots, input.scopes);
     if has(capped, VIEW_CHANNEL) { capped } else { 0 }
 }
 
-fn compute_member(input: &Input) -> Perms {
+fn compute_member(input: &InputRef<'_>) -> Perms {
     if input.is_owner {
         return ALL;
     }
-    let base = room_level(false, input.everyone_permissions, &input.member_roles);
+    let base = room_level(false, input.everyone_permissions, input.member_roles);
     if has(base, ADMINISTRATOR) {
         return ALL;
     }
-    let category = apply_overrides(base, &input.category_overrides, input);
-    let mut perms = apply_overrides(category, &input.channel_overrides, input);
+    let category = apply_overrides(base, input.category_overrides, input);
+    let mut perms = apply_overrides(category, input.channel_overrides, input);
     // No override can hide a system channel: as if view_channel and read_history were never denied.
     if input.system_channel {
         perms |= SYSTEM_CHANNEL_FORCED;
@@ -415,7 +454,7 @@ fn compute_member(input: &Input) -> Perms {
 
 /// One layer (the category's or the channel's overrides) on top of `perms`. Only [`CHANNEL_SCOPED`] bits of an
 /// override take part; bits it neither allows nor denies keep the value of the layer below.
-fn apply_overrides(mut perms: Perms, overrides: &[Override], input: &Input) -> Perms {
+fn apply_overrides(mut perms: Perms, overrides: &[Override], input: &InputRef<'_>) -> Perms {
     let apply = |perms: Perms, allow: Perms, deny: Perms| (perms & !(deny & CHANNEL_SCOPED)) | (allow & CHANNEL_SCOPED);
     // 1. @everyone override
     if let Some(o) =

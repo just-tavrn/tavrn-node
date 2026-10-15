@@ -129,7 +129,8 @@ impl Hub {
     }
 
     /// A room event that changes roles, overrides, channels or membership drops the room's visibility snapshot
-    /// before any connection receives it: the events after it are checked against the new state. An announcement of
+    /// before any connection receives it: the events after it are checked against the new state. Updates that
+    /// change nothing the evaluation reads (a nickname, a topic) keep it (`visibility::Cache::unchanged_by`). An announcement of
     /// the room's moved voice participations is taken first and drops the snapshot when the set changed.
     fn invalidate(&self, kind: &str, scope: &Scope, data: &Value) {
         let Scope::Room(room_id) = scope else { return };
@@ -137,7 +138,7 @@ impl Hub {
             if self.moved.apply(room_id, data) {
                 self.visibility.invalidate(room_id);
             }
-        } else if crate::visibility::changes_visibility(kind) {
+        } else if crate::visibility::changes_visibility(kind) && !self.visibility.unchanged_by(room_id, kind, data) {
             self.visibility.invalidate(room_id);
         }
     }

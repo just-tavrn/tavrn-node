@@ -134,12 +134,23 @@ pub fn member_access(
         roles.iter().filter(|r| r.is_everyone == 0 && role_ids.contains(&r.id)).cloned().collect();
     let is_owner = room.owner_id == user.id;
     let eval_roles: Vec<(String, Perms)> = member_roles.iter().map(|r| (r.id.clone(), r.perms())).collect();
-    let mut room_perms = permissions::room_level(is_owner || is_node_admin, everyone.perms(), &eval_roles);
-    if member.as_ref().is_some_and(MemberRow::is_timed_out) && !is_owner && !is_node_admin {
-        room_perms &= permissions::TIMEOUT_KEEPS;
-    }
-    // Bots (APPLICATIONS.md §2.4, §3.5): capped by the token's scopes, nothing in a "no bots" room.
-    room_perms = permissions::cap_bot(room_perms, &user.kind, room.no_bots != 0, user.app_scopes.as_deref());
+    let timed_out = member.as_ref().is_some_and(MemberRow::is_timed_out);
+    let room_perms = room_perms_of(
+        &Subject {
+            user_id: &user.id,
+            is_owner,
+            is_node_admin,
+            everyone_role_id: &everyone.id,
+            everyone_permissions: everyone.perms(),
+            member_roles: &eval_roles,
+            timed_out,
+            kind: &user.kind,
+            scopes: user.app_scopes.as_deref(),
+            adult,
+            moved_channel: None,
+        },
+        room.no_bots != 0,
+    );
     Ok(RoomAccess {
         room,
         member,
@@ -153,6 +164,17 @@ pub fn member_access(
         adult,
         moved_channel,
     })
+}
+
+/// Room-level permissions of a member (no channel): their roles, a timeout, and for bots the scopes and the room's
+/// "no bots" flag (APPLICATIONS.md §2.4, §3.5).
+pub fn room_perms_of(subject: &Subject<'_>, room_no_bots: bool) -> Perms {
+    let privileged = subject.is_owner || subject.is_node_admin;
+    let mut room_perms = permissions::room_level(privileged, subject.everyone_permissions, subject.member_roles);
+    if subject.timed_out && !privileged {
+        room_perms &= permissions::TIMEOUT_KEEPS;
+    }
+    permissions::cap_bot(room_perms, subject.kind, room_no_bots, subject.scopes)
 }
 
 /// Does the user of `access` pass the channel's effective age gate?
@@ -200,39 +222,88 @@ pub fn channel_perms_with(
     overrides: &[OverrideRow],
     user_id: &str,
 ) -> Perms {
-    // Age gates (PROTOCOL.md §5e) come before everything: below the gate nothing, owners and admins included.
-    if !age_passes(access, channel) {
-        return 0;
-    }
-    let bot = |p: Perms| permissions::cap_bot(p, &access.kind, channel.no_bots(), access.scopes.as_deref());
-    let system = channel.kind == "system";
-    let restrict = |p: Perms| bot(if system { p & !SYSTEM_CHANNEL_DENIED } else { p });
-    if access.is_owner || access.is_node_admin {
-        return restrict(permissions::ALL);
-    }
-    let of = |target_type: &str, target_id: Option<&str>| {
+    let of = |target_type: &str, target_id: Option<&str>| -> Vec<permissions::Override> {
         overrides
             .iter()
             .filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id)
             .map(|o| o.to_eval())
             .collect()
     };
-    let input = permissions::Input {
-        user_id: user_id.to_string(),
+    let member_roles = access.member_roles_eval();
+    let subject = Subject {
+        user_id,
         is_owner: access.is_owner,
-        everyone_role_id: access.everyone.id.clone(),
+        is_node_admin: access.is_node_admin,
+        everyone_role_id: &access.everyone.id,
         everyone_permissions: access.everyone.perms(),
-        member_roles: access.member_roles_eval(),
-        category_overrides: of("category", channel.category_id.as_deref()),
-        channel_overrides: of("channel", Some(&channel.id)),
+        member_roles: &member_roles,
         timed_out: access.member.as_ref().is_some_and(MemberRow::is_timed_out),
-        kind: access.kind.clone(),
-        no_bots: channel.no_bots(),
-        scopes: access.scopes.clone(),
-        system_channel: system,
-        moved: channel.kind == "voice" && access.moved_channel.as_deref() == Some(channel.id.as_str()),
+        kind: &access.kind,
+        scopes: access.scopes.as_deref(),
+        adult: access.adult,
+        moved_channel: access.moved_channel.as_deref(),
     };
-    permissions::compute(&input)
+    channel_perms_of(
+        &subject,
+        channel,
+        &of("category", channel.category_id.as_deref()),
+        &of("channel", Some(&channel.id)),
+    )
+}
+
+/// What the evaluation of a channel needs of a member, borrowed (the visibility snapshot keeps it per member and
+/// evaluates every channel of a room with it).
+#[derive(Debug, Clone, Copy)]
+pub struct Subject<'a> {
+    pub user_id: &'a str,
+    pub is_owner: bool,
+    pub is_node_admin: bool,
+    pub everyone_role_id: &'a str,
+    pub everyone_permissions: Perms,
+    /// The member's roles without @everyone.
+    pub member_roles: &'a [(String, Perms)],
+    pub timed_out: bool,
+    pub kind: &'a str,
+    pub scopes: Option<&'a [String]>,
+    /// Passes `adults_only` gates (PROTOCOL.md §5e).
+    pub adult: bool,
+    pub moved_channel: Option<&'a str>,
+}
+
+/// The single evaluation of a member's permissions in a channel ([`channel_perms_with`] and the visibility snapshot):
+/// `category_overrides` and `channel_overrides` are exactly the overrides of the channel's category and of the
+/// channel.
+pub fn channel_perms_of(
+    subject: &Subject<'_>,
+    channel: &ChannelRow,
+    category_overrides: &[permissions::Override],
+    channel_overrides: &[permissions::Override],
+) -> Perms {
+    // Age gates (PROTOCOL.md §5e) come before everything: below the gate nothing, owners and admins included.
+    if !(subject.adult || !channel.adults_only()) {
+        return 0;
+    }
+    let bot = |p: Perms| permissions::cap_bot(p, subject.kind, channel.no_bots(), subject.scopes);
+    let system = channel.kind == "system";
+    let restrict = |p: Perms| bot(if system { p & !SYSTEM_CHANNEL_DENIED } else { p });
+    if subject.is_owner || subject.is_node_admin {
+        return restrict(permissions::ALL);
+    }
+    permissions::compute_ref(&permissions::InputRef {
+        user_id: subject.user_id,
+        is_owner: subject.is_owner,
+        everyone_role_id: subject.everyone_role_id,
+        everyone_permissions: subject.everyone_permissions,
+        member_roles: subject.member_roles,
+        category_overrides,
+        channel_overrides,
+        timed_out: subject.timed_out,
+        kind: subject.kind,
+        no_bots: channel.no_bots(),
+        scopes: subject.scopes,
+        system_channel: system,
+        moved: channel.kind == "voice" && subject.moved_channel == Some(channel.id.as_str()),
+    })
 }
 
 /// Upload categories (`uploads.rs`) of the member in a channel: the highest role with a setting (else
