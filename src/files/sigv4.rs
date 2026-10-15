@@ -5,6 +5,7 @@
 //! are not hashed (`UNSIGNED-PAYLOAD`, streams of unknown content); everything else follows the AWS
 //! specification and is tested against the examples of the AWS documentation.
 
+use crate::util::percent_decode;
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
@@ -103,10 +104,6 @@ pub fn host_header(url: &Url) -> String {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     }
-}
-
-fn percent_decode(s: &str) -> String {
-    crate::routes::attachments::percent_decode(s)
 }
 
 #[cfg(test)]

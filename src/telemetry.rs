@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{Event, Subscriber, span};
 use tracing_subscriber::{
-    EnvFilter, Layer, Registry, filter::Targets, fmt, layer::Context, prelude::*, registry::LookupSpan,
+    EnvFilter, Layer, Registry, filter::filter_fn, fmt, layer::Context, prelude::*, registry::LookupSpan,
 };
 
 use crate::config::{Config, LogFormat};
@@ -31,16 +31,17 @@ pub fn init(config: &Config) {
     let _ = result;
 }
 
-/// The statement counting layer with its own filter: request spans and sqlx's statement events only.
+/// The statement counting layer with its own filter: sqlx's statement events and the node's own spans. The node's
+/// spans inside a request (the HTTP trace layer's span, handler spans) must be enabled for it too: SQLite runs a
+/// statement on its worker thread inside the innermost span of the caller only (sqlx enters that one there), and the
+/// layer finds the request span through that span's parents.
 pub fn statement_counter<S>() -> impl Layer<S>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    StatementCounter.with_filter(
-        Targets::new()
-            .with_target(REQUEST_SPAN, tracing::Level::TRACE)
-            .with_target(SQLX_STATEMENTS, tracing::Level::TRACE),
-    )
+    StatementCounter.with_filter(filter_fn(|meta| {
+        meta.target() == SQLX_STATEMENTS || (meta.is_span() && meta.target().starts_with("tavrn_node"))
+    }))
 }
 
 /// Counts sqlx's statement events in the nearest enclosing request span.
@@ -120,5 +121,27 @@ mod tests {
         // Without the counting layer the span is disabled: no count.
         let span = tracing::trace_span!(target: REQUEST_SPAN, "request");
         assert_eq!(statements(&span), None);
+    }
+
+    /// SQLite's worker thread enters only the caller's innermost span (here the HTTP trace layer's), not the request
+    /// span around it: the statements still count towards the request.
+    #[test]
+    fn statements_on_another_thread_in_an_inner_span_count() {
+        let subscriber = tracing_subscriber::registry().with(statement_counter());
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::trace_span!(target: REQUEST_SPAN, "request");
+            let inner = request.in_scope(|| tracing::debug_span!(target: "tavrn_node::webhooks", "request"));
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let _entered = inner.enter();
+                    tracing::debug!(target: "sqlx::query", "SELECT 1");
+                    tracing::debug!(target: "sqlx::query", "SELECT 2");
+                });
+            })
+            .join()
+            .unwrap();
+            assert_eq!(statements(&request), Some(2));
+        });
     }
 }

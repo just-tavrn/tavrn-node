@@ -134,13 +134,24 @@ async fn expired_access_tokens_are_refused_with_token_expired() {
     let node = test_node("t.local").await;
     let alice = node.register("alice").await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (s, _) = node.req(Method::POST, "/api/v1/dev/expire-access-tokens", None, None).await;
+    let bob = node.register("bob").await;
+    let (s, _) =
+        node.req(Method::POST, "/api/v1/dev/expire-access-tokens", None, Some(json!({ "username": "alice" }))).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (s, j) = node.get_auth("/api/v1/users/me", &alice.token).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("auth.token_expired")));
+    // Only the named account: tests running in parallel on the same node keep their sessions.
+    let (s, _) = node.get_auth("/api/v1/users/me", &bob.token).await;
+    assert_eq!(s, StatusCode::OK, "another account's token is untouched");
     let (_, pair) = refresh(&node, &alice.refresh).await;
     let (s, _) = node.get_auth("/api/v1/users/me", pair["access_token"].as_str().unwrap()).await;
     assert_eq!(s, StatusCode::OK, "the refreshed token works");
+    // The account is required.
+    let (s, _) = node.req(Method::POST, "/api/v1/dev/expire-access-tokens", None, None).await;
+    assert!(s.is_client_error(), "{s}");
+    let (s, _) =
+        node.req(Method::POST, "/api/v1/dev/expire-access-tokens", None, Some(json!({ "username": "nobody" }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

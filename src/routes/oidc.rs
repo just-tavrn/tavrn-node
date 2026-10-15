@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -18,7 +18,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::{
     app::AppState,
     auth::{self, AuthUser, ClientIp, NodeAdmin},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     oidc::{self, Oidc, Purpose, account, groups},
     routes::auth::{AuthResponse, client_header, device_name},
     store,

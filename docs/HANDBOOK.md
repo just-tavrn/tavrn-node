@@ -119,7 +119,8 @@ The node reads, later sources overriding earlier ones:
 Every value is then validated, and **all** problems are printed together (`Configuration error:` with one line
 per problem and the name of the variable); the process exits with code 2. Check a configuration without starting
 the server: `docker compose exec tavrn tavrn-node check-config` (prints the effective configuration as JSON; the
-Valkey password, the OIDC client secret and the metrics token are never printed).
+passwords of the database, SMTP and Valkey URLs, the Turnstile secret, the GIF key, the OIDC client secret and the
+metrics token are never printed).
 
 On/off switches accept `true`/`false`; those documented as `on | off` accept `on`/`off` as well as
 `true`/`false`. Lists are comma-separated. Sizes are in bytes.
@@ -348,7 +349,7 @@ plaintext channels.
 | `TAVRN_MEDIA_FFMPEG` | `auto` | Media pipeline for avatars, profile headers, room icons and video backgrounds: `auto` (ffmpeg from `PATH`; the image ships one), `off` (only static PNG/JPEG/WebP, no animations or video input) or an absolute path to ffmpeg. |
 | `TAVRN_MEDIA_WORKERS` | `1` | Concurrent conversions (1–8); a few more uploads wait, the rest get `503 media.busy`. |
 | `TAVRN_WHITEBOARD_MAX_SCENES` | `50` | Whiteboard scenes per user in the encrypted library (1–1000, at most 5 MB each). |
-| `TAVRN_GIF_PROVIDER` | `none` | GIF search: `none`, `giphy` or `tenor`. The API key stays on the node; clients only ask the node. |
+| `TAVRN_GIF_PROVIDER` | `none` | GIF search: `none`, `giphy` or `tenor`. The API key stays on the node; clients only ask the node. Answers are cached (trending 5 minutes, searches 10 minutes) and each user may search 30 times a minute, so a few users cannot use up the key's quota; a provider error answers `503 gif.unavailable`. |
 | `TAVRN_GIF_API_KEY` | unset | Required with a GIF provider. |
 | `TAVRN_UNFURL` | `on` | Link previews: the sender's client asks this node to load a linked page (public addresses only, 5 s, 1 MiB of HTML, image downscaled to a 40 KiB WebP) and puts the preview into the message. The node sees the URLs its users preview; readers never fetch anything. `off`: no previews from this node (`404 unfurl.disabled`). |
 | `TAVRN_SEARCH_ENABLED` | `true` | Node-side message search over **unencrypted** channels (protocol: SEARCH.md); `false` removes the route (`404 search.disabled`) and stops indexing. Encrypted conversations are only searched in the clients' local encrypted index. |
@@ -537,6 +538,11 @@ clients depend on it: web clients of other nodes that act on this node for their
 pages have their own origin, so every request it sends is cross-origin, including the uploads with their `Tavrn-*`
 headers. A proxy that answers preflights itself with a fixed header list breaks those clients ("network error")
 while the node's own web client, which is same-origin, keeps working.
+
+Compression is not needed in the proxy: the node sends the web client's files compressed itself (gzip, or a
+`.br`/`.gz` copy shipped with the build, whichever the browser accepts) with an `ETag`, and API answers are better
+left uncompressed (they can carry secrets next to attacker-chosen text, the BREACH pattern). If you enable it
+anyway, limit it to the static files.
 
 Also recommended: redirect HTTP to HTTPS, send HSTS, and block `/metrics` for the public
 ([Metrics and health](#metrics-and-health)). Route `/rtc` only to tavrn, never to LiveKit's port 7880 (which is
@@ -1398,6 +1404,11 @@ How it behaves:
   and room only, at most one per room every 30 seconds); each of them can turn it off ("Reports" in the notification
   settings).
 - **Several instances**: any instance sends; the rate counters live in Valkey.
+- **Load**: pushes are queued and sent in the background, never on the request path. Ordinary channel messages
+  have a queue of their own, so a busy channel never delays or drops the pushes of DMs, mentions, calls and
+  reports. A message's recipients are loaded together (a few statements per message, whatever the room's size),
+  members who were pushed for the conversation within the last 30 seconds are skipped first, and the deliveries to
+  different users run in parallel.
 - **iPhone and iPad**: users have to add the web app to the home screen (install it as a PWA) before Safari
   allows push.
 - **Monitoring**: `tavrn_push_sent_total` and `tavrn_push_failed_total` ([Metrics and health](#metrics-and-health)).
@@ -1417,9 +1428,11 @@ Two endpoints tell whether the node is alive and whether it is ready to serve.
 | `GET /healthz` | Always `200` while the process serves requests: `{"status":"ok","voice":"running"}`. `voice` is the state of the supervised LiveKit process (`disabled`, `stopped`, `starting`, `running`, `restarting`); `voice_problem` appears when the operator has to fix something in the voice setup (e.g. none of the announced hostnames resolves). | Liveness. |
 | `GET /readyz` | `200` or `503` with `{"ready":…,"database":…,"livekit":…,"cache":…}`. `ready` requires the database and, with voice on, LiveKit answering on its local port (`livekit` is `null` with voice off). `cache` reports Valkey and the cache bus (`null` without `TAVRN_CACHE_URL`) but is **not** part of `ready`. | Readiness, load balancer health checks, external monitoring. |
 
-The image's Docker `HEALTHCHECK` runs `tavrn-node check-config` every 30 seconds: the container turns unhealthy
-when the configuration, the LiveKit binary or (with SSO) the provider check fails. It does not replace a
-`/readyz` check.
+The image's Docker `HEALTHCHECK` runs `tavrn-node health` every 30 seconds: one request to `/healthz` on the listen
+port inside the container with a 3-second timeout, nothing printed while healthy. The container turns unhealthy when
+the server stops answering (hung, crashed, the listener gone); a database or LiveKit outage does not restart it
+(`tavrn-node health --ready` probes `/readyz` instead, for a setup that wants that). It does not replace a `/readyz`
+check from outside, and it never contacts the identity provider (`check-config` does, run it by hand).
 
 ### Prometheus metrics
 
@@ -1670,7 +1683,7 @@ hashes, a pub/sub bus) with two implementations, `InProcess` (the default, one p
 | **Security rate limits** | One counter per key in the cache: `INCR` + `PEXPIRE … NX` + `PTTL` in one `MULTI`, a fixed window like the in-memory limiter. If the cache fails the instance counts locally (logged), so a cache outage never disables a limit. |
 | **Single-use values** | Connect codes and the OIDC `state` and one-time codes are stored in the cache with their TTL, encrypted with AES-256-GCM under a key derived from `secrets.key` (the cache never sees PKCE verifiers, nonces or identity claims), the key name bound as associated data, and taken with `GETDEL` (exactly one instance gets them). |
 | **Leader** | One lease `tavrn:<domain>:leader` (`SET NX PX`, renewed by its holder every third of its 15 s lifetime). The leader runs every singleton job and holds the voice, call and whiteboard state. Leadership is time-bound (it ends when the lease would have expired, even if the renewing task died); a failed renewal ends it at once; a graceful stop releases it. |
-| **Relay to the leader** | Requests whose state the leader holds (voice channels, calls, soundboard play, whiteboard sessions and ephemeral events, the LiveKit webhook) are forwarded by the other instances to the leader's `TAVRN_INSTANCE_URL` with the original method, headers and body, `X-Forwarded-For` extended and `Tavrn-Relayed` set (no second hop). A leader that does not answer gives `503 node.leader_unavailable` with `Retry-After: 2`. |
+| **Relay to the leader** | Requests whose state the leader holds (voice channels, calls, soundboard play, whiteboard sessions and ephemeral events, the LiveKit webhook) are forwarded by the other instances to the leader's `TAVRN_INSTANCE_URL` with the original method, headers and body, `X-Forwarded-For` extended and `Tavrn-Relayed` set (no second hop). The `Tavrn-Relayed` value is an HMAC over instance id, method, path and time keyed from `secrets.key` (shared by the instances) and holds for 60 seconds: a value a client sets itself does not verify, is removed and the request is relayed like any other (the instances' clocks must agree within that minute, NTP). A leader that does not answer gives `503 node.leader_unavailable` with `Retry-After: 2`. |
 | **Wakeups and side effects** | "New outbox item" and "new subscription event" wake the leader's workers over the bus; voice side effects of kicks, bans, timeouts and deletions (`disconnect_user`, `close_channel`, `close_room`) are handed to the leader. |
 | **Startup** | Migrations, the startup fixups and the storage key setup run under a startup lease: instances starting together go one after another. |
 
@@ -1739,7 +1752,7 @@ that holds them.
 | Typing throttle (per connection) | per instance | Bound to the WebSocket. |
 | App token connections (≤ 2 per token, APPLICATIONS.md §2.6) | **shared** | Hash `appconn:<token>` in the cache (field `<instance>/<id>`); beyond two the oldest connection is closed wherever it is (bus message to its instance). |
 | Command receivers and pending interactions (`interactions.rs`, APPLICATIONS.md §5.6) | **shared** | Receivers in the hash `cmdrecv:<bot user id>`; pending interactions sealed in the cache (`interaction-state:<id>`, the claim lease and the follow-up counter); the invoker's waiting request stays on the instance that took the invocation, `interaction:<id>` names it and callbacks and follow-ups are relayed there while it lives ([Command interactions](#command-interactions)). |
-| `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens`), never set in production. |
+| `access_not_before` | per instance | Development test hook (`POST /dev/expire-access-tokens` with `{"username": …}`: one account's access tokens), never set in production. |
 | Session liveness of access tokens (`sessions.rs`) | per instance | Positive answers are reused for 5 seconds per device; a revocation clears the entries of the instance that handled it at once, the others follow within 5 seconds (WebSockets everywhere close at once through the event bus). |
 
 #### Rate limits
@@ -1856,6 +1869,13 @@ What the operator decides:
   buttons. In encrypted channels the values people send are end-to-end encrypted to the bot; the node sees which
   component of which message was used. Forms an application opens are kept with their interaction (15 minutes) and
   never stored.
+- **Files channels**: bots browse and download with the scope `messages:read` and create folders, upload and delete
+  their own entries with `messages:write` (the channel's *Attach files*, upload categories and the bot account's
+  upload size apply as for people; others' entries need *Manage files*, which only the scope `rooms:manage`
+  unlocks). The storage settings of a files channel (store URL and credentials) stay closed to bots whatever their
+  scopes and roles. In encrypted files channels a bot that may read the channel is a member of its encryption group
+  and encrypts names and contents itself, so the node learns no more than from people's uploads; "no bots" and the
+  channel setting *Bots allowed* decide as for text channels.
 - **Federation**: `TAVRN_APPS_FEDERATE` (this node's bots may act on other nodes) and
   `TAVRN_FEDERATION_REMOTE_BOTS` (other nodes' bots may act here), both on by default.
 - **Outbound requests**: the node calls applications' interactions URLs and event subscription endpoints. They must
@@ -2171,6 +2191,15 @@ deletes resolved and dismissed reports with their evidence; admins can delete a 
 announced in the client (bell and toast) and, to moderators and admins who are not connected, by a web push that names
 only the report's kind and room (each user can turn it off: "Reports" in the notification settings).
 
+Moderation bots can read a room's reports: a bot whose token has the scope `moderation` and that holds "Moderate
+members" in the room (give it a role with that permission) lists the room's reports and receives new ones and changes,
+for example to post a summary in a moderators' channel or to escalate after several reports about one user. Bots
+see metadata only: kind, category, the reported user, status, counts, times and the id of the reported message, never
+the reporter's text, the snapshot, released plaintext, your notes or actions, and the reporter only as a pseudonym
+(the same for the same reporter in that room, never the address). Bots never see reports about themselves or about
+the room's owner, and they cannot report, change, act on, forward or delete reports: acting stays with people
+(MODERATION.md §1.4a). Take the permission away to close the inbox for the bot.
+
 #### Forwarding reports to another node
 
 A report about a user of another node (a member from elsewhere in one of your rooms, or the author of a direct
@@ -2298,7 +2327,8 @@ the configuration first and exits with code **2** on a configuration error. The 
 | Command | What it does | Exit codes |
 |---|---|---|
 | `serve` (default) | Starts the server. | `1` on an error, `3` when `TAVRN_CACHE_URL` is set but Valkey is unreachable at start. |
-| `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. Also the image's health check. | `0` ok, `2` problem. |
+| `check-config` | Loads, validates and prints the effective configuration as JSON (no secrets: passwords in `TAVRN_DATABASE_URL`, `TAVRN_SMTP_URL` and `TAVRN_CACHE_URL`, secret query parameters, the Turnstile secret and the GIF key appear as `***`; the OIDC client secret and the metrics token not at all), checks that the LiveKit binary is there (with voice on) and, with SSO, fetches the provider's discovery document and keys and prints the redirect URI to register. | `0` ok, `2` problem. |
+| `health [--ready]` | Probes the server running in the same container or host: `GET /healthz` (with `--ready` `/readyz`) on the port of `TAVRN_LISTEN` (a wildcard address becomes loopback), 3-second timeout, nothing printed when healthy. The image's health check. | `0` healthy, `1` unhealthy or no answer. |
 | `send-test-mail <to>` | Sends a test mail through `TAVRN_SMTP_URL` (without SMTP nothing is sent and the log says so). | `0` sent, `1` failed. |
 | `doctor --peer <domain>` | Runs the [conformance checks](#conformance-checks-of-other-nodes) against another node with this node's configuration, keys and database and prints one line per check (`pass`, `warn`, `fail`, `skip` with a reason). The result is stored like an admin's check (a hard failure blocks the peer). Run it while the node is running: the other node claims the probe's keys from it. | `0` ok, `1` hard failure, `2` the check could not run. |
 | `rotate-storage-key` | [Rotates the storage key](#rotating-the-storage-key). Stop the node first; back up the new key file afterwards. Resumable. | `0` done, `1` failed. |
@@ -2349,6 +2379,15 @@ find the exceptions.
   looking.
 - **Slow statements.** `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000) logs a warning with the statement text for
   every statement at or above the threshold; lower it (e.g. `100`) to find the statements behind slow requests.
+- **The web client** is served from memory without a copy per request, compressed (about 70 % smaller for scripts
+  and WebAssembly) and with an `ETag`, so a revalidation of `index.html` answers `304`.
+- **Stalled clients.** A WebSocket client that stops reading (a frozen tab, a broken mobile link) is disconnected
+  once a send has waited 15 seconds; the user then counts as offline (and gets web pushes again) instead of staying
+  "online" until the kernel gives up on the connection. The heartbeat re-checks the sessions of all connected
+  devices of an instance together, a few statements per 30 seconds instead of two per connection.
+- **Background workers** (federation outbox, housekeeping, event subscriptions, voice sweeps, directory, whiteboard
+  sweeper) start again after a panic; the log shows `background worker panicked, starting it again` with the
+  worker's name, and the panic itself as a `panic` line with its location.
 
 ### Common problems
 

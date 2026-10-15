@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# RustSec advisories of the Rust dependencies (`cargo-deny check advisories`, deny.toml) through the organization's
+# reusable rust-advisories.yml: daily and when Cargo.lock or deny.toml change. ci.yml checks bans, licenses and
+# sources on every pull request; an advisory published today concerns every branch at once, so it is checked here and
+# a scheduled failure opens the issue "RustSec advisories" instead of turning unrelated pull requests red.
+# Gated by CI_ENABLED (docs/GITHUB.md). `just deny` runs the full check locally.
+name: Advisories
+
+on:
+  schedule:
+    - cron: "47 5 * * *"
+  pull_request:
+    paths:
+      - Cargo.lock
+      - deny.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  advisories:
+    if: ${{ vars.CI_ENABLED == 'true' }}
+    uses: just-tavrn/.github/.github/workflows/rust-advisories.yml@main
+    with:
+      manifests: |
+        .
+      submodules: "false"
+    secrets:
+      # The private git dependencies (cargo metadata reads them) until the repositories go public.
+      READ_TOKEN: ${{ secrets.TAVRN_READ_PAT }}

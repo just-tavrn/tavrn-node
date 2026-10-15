@@ -6,7 +6,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -19,7 +19,7 @@ use crate::{
     access::{self, RoomAccess},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     media::MediaKind,
     models::{ChannelRow, Message},
     permissions as p, profile, store,

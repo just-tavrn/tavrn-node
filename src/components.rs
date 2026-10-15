@@ -8,7 +8,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::error::ApiError;
+use crate::{error::ApiError, validate::unknown_key};
 
 pub const CAPABILITY: &str = "components.v1";
 pub const MAX_ROWS: usize = 5;
@@ -76,20 +76,19 @@ fn absent(v: Option<&Value>) -> bool {
     v.is_none_or(Value::is_null)
 }
 
-/// A string of `min`–`max` characters (Unicode scalar values) without control characters.
+/// The rules of the component texts: `min`–`max` characters (Unicode scalar values) without control characters.
+fn rules(min: usize, max: usize) -> crate::validate::TextRules {
+    crate::validate::TextRules { min, max, trim: false, controls: false }
+}
+
+/// A string of `min`–`max` characters without control characters.
 fn text(v: Option<&Value>, min: usize, max: usize) -> bool {
-    match v {
-        Some(Value::String(s)) => {
-            let n = s.chars().count();
-            n >= min && n <= max && !s.chars().any(char::is_control)
-        }
-        _ => false,
-    }
+    matches!(crate::validate::json_text(v, rules(min, max)), Ok(Some(_)))
 }
 
 /// `custom_id`: 1–100 characters without control characters.
 pub fn valid_custom_id(s: &str) -> bool {
-    text(Some(&Value::String(s.to_string())), 1, MAX_CUSTOM_ID)
+    crate::validate::text_of(s, rules(1, MAX_CUSTOM_ID)).is_ok()
 }
 
 /// One Unicode emoji (1–16 characters without whitespace, control characters, `:`, `<`, `>`) or `:name:` (name 2–30
@@ -125,10 +124,6 @@ fn int_or(v: Option<&Value>, default: u64, min: u64, max: u64) -> Option<u64> {
         None | Some(Value::Null) => Some(default),
         Some(n) => n.as_u64().filter(|n| *n >= min && *n <= max),
     }
-}
-
-fn unknown_key<'a>(obj: &'a Map<String, Value>, allowed: &[&str]) -> Option<&'a str> {
-    obj.keys().map(String::as_str).find(|k| !allowed.contains(k))
 }
 
 // ---------------------------------------------------------------- components (§5.10.1)

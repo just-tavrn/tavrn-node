@@ -29,16 +29,11 @@ fn invalid(detail: impl Into<String>) -> ApiError {
 
 /// An optional string of at most `max` characters; returns its length in characters.
 fn text(obj: &serde_json::Map<String, Value>, key: &str, max: usize) -> Result<usize, ApiError> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(0),
-        Some(Value::String(s)) => {
-            let n = s.chars().count();
-            if n > max {
-                return Err(invalid(format!("embeds: {key} has at most {max} characters")));
-            }
-            Ok(n)
-        }
-        Some(_) => Err(invalid(format!("embeds: {key} must be a string"))),
+    let rules = crate::validate::TextRules { min: 0, max, trim: false, controls: true };
+    match crate::validate::json_text(obj.get(key), rules) {
+        Ok(s) => Ok(s.map_or(0, |s| s.chars().count())),
+        Err(crate::validate::TextError::NotText) => Err(invalid(format!("embeds: {key} must be a string"))),
+        Err(_) => Err(invalid(format!("embeds: {key} has at most {max} characters"))),
     }
 }
 

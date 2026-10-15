@@ -55,6 +55,12 @@ pub async fn insert_webhook(db: &Pool, m: NewMessage<'_>, webhook: WebhookAuthor
 }
 
 pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError> {
+    insert_on(&mut *db.acquire().await?, &m).await?;
+    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+}
+
+/// [`insert`] on one connection (a transaction), without reading the row back.
+pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
@@ -74,9 +80,9 @@ pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError
     .bind(m.mentions_everyone as i64)
     .bind(now())
     .bind(m.signature)
-    .execute(db)
+    .execute(&mut *conn)
     .await?;
-    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+    Ok(())
 }
 
 /// Sets the envelope field `interaction` of a message an application posted as the answer to a command
@@ -381,8 +387,63 @@ pub fn mention_pattern(address: &str) -> String {
     out
 }
 
-/// Read states of `conversation_ids` for `user_id` with three queries in total: newest message ids,
-/// markers, and one grouped count. Without a marker, messages count from the user's join: the
+/// The newest message id (outside threads) of each of `n` conversations bound from `$1`: one indexed lookup per
+/// conversation through the partial index `messages_conversation_main` (no scan of the history).
+pub(crate) fn last_ids_sql(n: usize) -> String {
+    format!(
+        "SELECT c.id AS conversation_id,
+                (SELECT m.id FROM messages m WHERE m.conversation_id = c.id AND m.thread_id IS NULL
+                 ORDER BY m.id DESC LIMIT 1) AS last_id
+         FROM conversations c WHERE c.id IN ({})",
+        super::placeholders(1, n)
+    )
+}
+
+/// The unread counts (`unread`, `direct`, `everyone` per `conversation_id`) of `marked` conversations with a read
+/// marker and `unmarked` ones without. Parameters: `$1` user id, `$2` the user's mention pattern, then `roles` role
+/// mention patterns, the marked and the unmarked conversation ids and, with unmarked ones, last the join time for
+/// rooms (PostgreSQL refuses parameters a statement does not use). With a marker the count is driven from it, so only
+/// the messages after the marker are read (`messages_conversation_main`, `id > marker`); without one it counts from
+/// the user's join (the conversation membership, else the join time).
+pub(crate) fn unread_counts_sql(roles: usize, marked: usize, unmarked: usize) -> String {
+    let direct = std::iter::once("m.mentions LIKE $2 ESCAPE '\\'".to_string())
+        .chain((0..roles).map(|i| format!("m.mentions LIKE ${} ESCAPE '\\'", i + 3)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let counts = format!(
+        "m.conversation_id AS conversation_id,
+         CAST(COUNT(*) AS BIGINT) AS unread,
+         CAST(SUM(CASE WHEN {direct} THEN 1 ELSE 0 END) AS BIGINT) AS direct,
+         CAST(SUM(CASE WHEN m.mentions_everyone <> 0 AND NOT ({direct}) THEN 1 ELSE 0 END) AS BIGINT) AS everyone"
+    );
+    let first = 3 + roles;
+    let mut parts = Vec::new();
+    if marked > 0 {
+        parts.push(format!(
+            "SELECT {counts} FROM read_markers r
+             JOIN messages m ON m.conversation_id = r.conversation_id AND m.id > r.last_read_message_id
+             WHERE r.user_id = $1 AND r.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
+             GROUP BY m.conversation_id",
+            super::placeholders(first, marked)
+        ));
+    }
+    if unmarked > 0 {
+        parts.push(format!(
+            "SELECT {counts} FROM messages m
+             WHERE m.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
+               AND m.created_at > COALESCE(
+                     (SELECT cm.joined_at FROM conversation_members cm WHERE cm.conversation_id = m.conversation_id AND cm.user_id = $1),
+                     ${})
+             GROUP BY m.conversation_id",
+            super::placeholders(first + marked, unmarked),
+            first + marked + unmarked
+        ));
+    }
+    parts.join(" UNION ALL ")
+}
+
+/// Read states of `conversation_ids` for `user_id` with three queries in total (plus the followed threads): newest
+/// message ids, markers, and one grouped count. Without a marker, messages count from the user's join: the
 /// conversation membership (DMs, group DMs) or `joined_since` (room channels).
 pub async fn read_states(
     db: &Pool,
@@ -399,72 +460,43 @@ pub async fn read_states(
         conversation_ids.iter().map(|id| ReadState { conversation_id: id.clone(), ..Default::default() }).collect();
     let index: std::collections::HashMap<String, usize> =
         conversation_ids.iter().enumerate().map(|(i, id)| (id.clone(), i)).collect();
-    // `IN (…)` placeholders after `leading` other parameters.
-    let ids = |leading: usize| {
-        (0..conversation_ids.len()).map(|i| format!("${}", i + leading + 1)).collect::<Vec<_>>().join(", ")
-    };
-    let query = |sql: String, leading: Vec<String>| {
-        (sql, leading.into_iter().chain(conversation_ids.iter().cloned()).collect::<Vec<String>>())
-    };
-    let pattern = mention_pattern(address);
-    let role_patterns: Vec<String> = ctx.role_ids.iter().take(100).map(|r| mention_pattern(&role_mention(r))).collect();
-    let direct = std::iter::once("m.mentions LIKE $2 ESCAPE '\\'".to_string())
-        .chain((0..role_patterns.len()).map(|i| format!("m.mentions LIKE ${} ESCAPE '\\'", i + 4)))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let (last_sql, last_binds) = query(
-        format!(
-            "SELECT conversation_id, MAX(id) AS last_id FROM messages WHERE conversation_id IN ({}) AND thread_id IS NULL GROUP BY conversation_id",
-            ids(0)
-        ),
-        vec![],
-    );
-    let (marker_sql, marker_binds) = query(
-        format!(
-            "SELECT conversation_id, last_read_message_id FROM read_markers WHERE user_id = $1 AND conversation_id IN ({})",
-            ids(1)
-        ),
-        vec![user_id.to_string()],
-    );
-    let (count_sql, count_binds) = query(
-        format!(
-            "SELECT m.conversation_id AS conversation_id,
-                    CAST(COUNT(*) AS BIGINT) AS unread,
-                    CAST(SUM(CASE WHEN {direct} THEN 1 ELSE 0 END) AS BIGINT) AS direct,
-                    CAST(SUM(CASE WHEN m.mentions_everyone <> 0 AND NOT ({direct}) THEN 1 ELSE 0 END) AS BIGINT) AS everyone
-             FROM messages m
-             LEFT JOIN read_markers r ON r.conversation_id = m.conversation_id AND r.user_id = $1
-             WHERE m.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
-               AND (m.id > r.last_read_message_id
-                    OR (r.last_read_message_id IS NULL AND m.created_at > COALESCE(
-                          (SELECT cm.joined_at FROM conversation_members cm WHERE cm.conversation_id = m.conversation_id AND cm.user_id = $1),
-                          $3)))
-             GROUP BY m.conversation_id",
-            ids(3 + role_patterns.len())
-        ),
-        [user_id.to_string(), pattern, joined_since.to_string()].into_iter().chain(role_patterns.iter().cloned()).collect(),
-    );
-    let fetch = |sql: String, binds: Vec<String>| async move {
+    async fn fetch(db: &Pool, sql: String, binds: Vec<&str>) -> Result<Vec<sqlx::any::AnyRow>, sqlx::Error> {
         let mut q = sqlx::query(&sql);
         for b in binds {
-            q = q.bind(b);
+            q = q.bind(b.to_string());
         }
         q.fetch_all(db).await
-    };
-    for row in fetch(last_sql, last_binds).await? {
+    }
+    let ids: Vec<&str> = conversation_ids.iter().map(String::as_str).collect();
+    for row in fetch(db, last_ids_sql(ids.len()), ids.clone()).await? {
         if let Some(&i) = index.get(&row.try_get::<String, _>("conversation_id")?) {
             states[i].last_message_id = row.try_get::<Option<String>, _>("last_id")?;
         }
     }
-    for row in fetch(marker_sql, marker_binds).await? {
+    let marker_sql = format!(
+        "SELECT conversation_id, last_read_message_id FROM read_markers WHERE user_id = $1 AND conversation_id IN ({})",
+        super::placeholders(2, ids.len())
+    );
+    for row in fetch(db, marker_sql, std::iter::once(user_id).chain(ids.iter().copied()).collect()).await? {
         if let Some(&i) = index.get(&row.try_get::<String, _>("conversation_id")?) {
             states[i].last_read_message_id = Some(row.try_get::<String, _>("last_read_message_id")?);
         }
     }
+    let pattern = mention_pattern(address);
+    let role_patterns: Vec<String> = ctx.role_ids.iter().take(100).map(|r| mention_pattern(&role_mention(r))).collect();
+    let (marked, unmarked): (Vec<&ReadState>, Vec<&ReadState>) =
+        states.iter().partition(|s| s.last_read_message_id.is_some());
+    let count_binds: Vec<&str> = [user_id, pattern.as_str()]
+        .into_iter()
+        .chain(role_patterns.iter().map(String::as_str))
+        .chain(marked.iter().chain(unmarked.iter()).map(|s| s.conversation_id.as_str()))
+        .chain((!unmarked.is_empty()).then_some(joined_since))
+        .collect();
+    let count_sql = unread_counts_sql(role_patterns.len(), marked.len(), unmarked.len());
     let now = crate::util::now();
     // (unread, direct mentions, @everyone mentions) per conversation: the channel's own messages …
     let mut raw: std::collections::HashMap<usize, (i64, i64, i64)> = std::collections::HashMap::new();
-    for row in fetch(count_sql, count_binds).await? {
+    for row in fetch(db, count_sql, count_binds).await? {
         if let Some(&i) = index.get(&row.try_get::<String, _>("conversation_id")?) {
             raw.insert(
                 i,

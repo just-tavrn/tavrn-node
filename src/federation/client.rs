@@ -428,6 +428,49 @@ impl VettingResolver {
     }
 }
 
+/// How long the early address check of a request may wait for DNS ([`VettingResolver::precheck`]).
+pub const PRECHECK_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The answer of [`VettingResolver::precheck`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precheck {
+    Allowed,
+    /// An address is not public (an IP literal, or a name resolving to one).
+    Forbidden,
+    /// The name does not resolve (or not within [`PRECHECK_DNS_TIMEOUT`]).
+    Unresolved,
+}
+
+impl VettingResolver {
+    /// The early SSRF check of a host before a request (web push, application hooks, files channel stores, link
+    /// previews): an IP literal must be public, a name must resolve to public addresses only, within
+    /// [`PRECHECK_DNS_TIMEOUT`] (a slow resolver cannot stall the caller). The connection itself is vetted again by
+    /// the resolver of the client ([`is_address_forbidden`] finds that refusal in the error).
+    pub async fn precheck(&self, host: &str) -> Precheck {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            return if !self.allow_private && forbidden_ip(ip) { Precheck::Forbidden } else { Precheck::Allowed };
+        }
+        match tokio::time::timeout(PRECHECK_DNS_TIMEOUT, self.vetted(bare)).await {
+            Ok(Ok(_)) => Precheck::Allowed,
+            Ok(Err(e)) if e.is::<AddressForbidden>() => Precheck::Forbidden,
+            Ok(Err(_)) | Err(_) => Precheck::Unresolved,
+        }
+    }
+}
+
+/// Did the vetting resolver refuse an address while connecting (anywhere in the error's source chain)?
+pub fn is_address_forbidden(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if err.downcast_ref::<AddressForbidden>().is_some() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 impl Resolve for VettingResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
@@ -530,6 +573,8 @@ pub struct FederationClient {
     unverified_discovery: Arc<Semaphore>,
     /// Recent failed or invalid discovery fetches per domain, with the error to answer (§1.4).
     discovery_failures: Mutex<HashMap<String, (Instant, &'static str, String)>>,
+    /// One discovery at a time per domain ([`FederationClient::single_flight`]).
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl FederationClient {
@@ -562,6 +607,7 @@ impl FederationClient {
             stale_documents: Mutex::new(HashSet::new()),
             permit_timeout: Duration::from_secs(u64::from(config.federation_permit_timeout_secs.max(1))),
             discovery_failures: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             unverified_discovery: Arc::new(Semaphore::new(config.federation_discovery_slots.max(1) as usize)),
         })
     }
@@ -680,7 +726,24 @@ impl FederationClient {
         if let Some(d) = self.cached_delegation(domain) {
             return Ok(d);
         }
+        // Requests that miss the cache together resolve once: the others wait and find the fresh entry.
+        let flight = self.single_flight(&format!("delegation|{domain}"));
+        let _one = flight.lock().await;
+        if let Some(d) = self.cached_delegation(domain) {
+            return Ok(d);
+        }
         self.resolve(domain).await
+    }
+
+    /// The lock that lets one task at a time do the work named `key` (a discovery fetch of a domain), so concurrent
+    /// cache misses wait for the first fetch instead of fetching the same document again each. Unused locks are
+    /// dropped once more than 1 000 are held.
+    pub fn single_flight(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 1000 {
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        map.entry(key.to_string()).or_default().clone()
     }
 
     /// Resolves `domain` without looking at the cache and caches the result.
@@ -1254,14 +1317,9 @@ fn success(domain: &str, response: reqwest::Response) -> Result<reqwest::Respons
 }
 
 fn classify(domain: &str, e: &reqwest::Error) -> FetchError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = source {
-        if err.downcast_ref::<AddressForbidden>().is_some() {
-            return FetchError::AddressForbidden(domain.to_string());
-        }
-        source = err.source();
-    }
-    if e.is_redirect() {
+    if is_address_forbidden(e) {
+        FetchError::AddressForbidden(domain.to_string())
+    } else if e.is_redirect() {
         FetchError::Redirect(domain.to_string())
     } else if e.is_timeout() {
         FetchError::Timeout(domain.to_string())

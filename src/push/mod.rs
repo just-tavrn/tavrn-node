@@ -22,17 +22,22 @@
 //!
 //! Limits: at most one push per conversation and user every [`COALESCE`] (call rings excepted), at most
 //! `TAVRN_PUSH_MAX_PER_MINUTE` per user; with several instances both counters live in the cache. Work is queued
-//! (bounded, [`QUEUE`]) and done by a background task, never on the request path; a full queue drops pushes.
+//! (bounded, [`QUEUE`]) and done by background tasks, never on the request path; a full queue drops pushes. Channel
+//! messages without mentions have a queue of their own, so a busy channel never pushes out a DM, a mention, a ring
+//! or a notice. A message job loads its recipients in batches (members, settings, blocks and subscriptions in one
+//! statement per 500 users) and skips the members already coalesced before loading anything about them.
 //! Delivery: `404`/`410` delete the subscription, `429`/`5xx`/network errors hold it back (exponential backoff,
 //! `Retry-After` honored) and delete it after `store::push::MAX_FAILURES` failures in a row.
 
 pub mod crypto;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+use futures::StreamExt;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Url, header};
@@ -47,8 +52,8 @@ use crate::{
     cache::limiter::SharedLimiter,
     config::Config,
     error::ApiError,
-    federation::client::{AddressForbidden, Lookup, VettingResolver, forbidden_ip, user_agent},
-    models::{Message, UserRow},
+    federation::client::{Lookup, Precheck, VettingResolver, forbidden_ip, is_address_forbidden, user_agent},
+    models::Message,
     store::{self, push::SubscriptionRow},
     util,
 };
@@ -61,8 +66,11 @@ pub const CAPABILITY: &str = "push.webpush";
 pub const COALESCE: Duration = Duration::from_secs(30);
 /// Jobs waiting for the sender; more are dropped (logged).
 pub const QUEUE: usize = 1024;
-/// Jobs worked on at once.
+/// Jobs worked on at once: channel messages without mentions, everything else.
 const PARALLEL: usize = 16;
+const PARALLEL_PRIORITY: usize = 8;
+/// Users one job delivers to at once (each user's subscriptions one after another).
+const PARALLEL_USERS: usize = 8;
 /// Characters of a message preview (unencrypted conversations with `push_text` only).
 pub const PREVIEW_CHARS: usize = 120;
 /// Names in a payload are cut to this many characters.
@@ -146,8 +154,9 @@ pub struct PushPayload {
 /// A job of the sender.
 #[derive(Debug, Clone)]
 pub enum Job {
-    /// A new message in a conversation hosted here.
-    Message { message: Box<Message>, author_id: String },
+    /// A new message in a conversation hosted here; `priority`: a DM, group DM or a message with mentions (the
+    /// priority queue).
+    Message { message: Box<Message>, author_id: String, priority: bool },
     /// A call in a DM or group DM hosted here rings `user_id`.
     Call { conversation_id: String, user_id: String, caller_id: String, group: bool },
     /// A received `notify` hint for a conversation on `node` (already filtered by the user's settings).
@@ -173,8 +182,11 @@ pub struct Push {
     vapid: Option<VapidKey>,
     contact: String,
     domain: String,
+    /// Channel messages without mentions.
     tx: mpsc::Sender<Job>,
-    rx: Mutex<Option<mpsc::Receiver<Job>>>,
+    /// Everything else (DMs, mentions, rings, hints, notices, test pushes).
+    priority_tx: mpsc::Sender<Job>,
+    rx: Mutex<Option<(mpsc::Receiver<Job>, mpsc::Receiver<Job>)>>,
     http: reqwest::Client,
     resolver: VettingResolver,
     allow_private: bool,
@@ -208,6 +220,7 @@ impl Push {
             .no_proxy()
             .build()?;
         let (tx, rx) = mpsc::channel(QUEUE);
+        let (priority_tx, priority_rx) = mpsc::channel(QUEUE);
         let shared = |name: &'static str, max: u32, window: Duration| SharedLimiter::new(name, max, window, cluster);
         Ok(Self {
             enabled,
@@ -215,7 +228,8 @@ impl Push {
             contact: config.push_contact(),
             domain: config.domain.clone(),
             tx,
-            rx: Mutex::new(Some(rx)),
+            priority_tx,
+            rx: Mutex::new(Some((rx, priority_rx))),
             http,
             resolver,
             allow_private,
@@ -241,8 +255,10 @@ impl Push {
         if !self.enabled {
             return;
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(job) {
-            tracing::warn!("web push queue full, a push was dropped");
+        let priority = !matches!(job, Job::Message { priority: false, .. });
+        let tx = if priority { &self.priority_tx } else { &self.tx };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(job) {
+            tracing::warn!(priority, "web push queue full, a push was dropped");
         }
     }
 
@@ -274,9 +290,13 @@ impl Push {
 // ---------------------------------------------------------------- entry points (never block)
 
 /// A new message in a conversation hosted here (every message path calls this through
-/// `federation::social::notify_members`).
-pub fn message(state: &AppState, message: &Message, author_id: &str) {
-    state.push.queue(Job::Message { message: Box::new(message.clone()), author_id: author_id.to_string() });
+/// `federation::social::notify_members`); `direct`: a DM or group DM.
+pub fn message(state: &AppState, message: &Message, author_id: &str, direct: bool) {
+    if !state.push.enabled {
+        return;
+    }
+    let priority = direct || !message.mentions.is_empty();
+    state.push.queue(Job::Message { message: Box::new(message.clone()), author_id: author_id.to_string(), priority });
 }
 
 /// A call in a DM or group DM hosted here rings the local user `user_id`.
@@ -336,15 +356,20 @@ pub fn report(state: &AppState, user_id: &str, room_id: Option<&str>, room: Opti
 
 // ---------------------------------------------------------------- the sender
 
-/// Starts the sender task (once per state; [`crate::app::AppState::init`] calls it).
+/// Starts the sender tasks, one per queue (once per state; [`crate::app::AppState::init`] calls it).
 pub fn start(state: &AppState) {
-    let Some(mut rx) = state.push.rx.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some((rx, priority_rx)) = state.push.rx.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
     if !state.push.enabled {
         return;
     }
+    sender(state, rx, PARALLEL);
+    sender(state, priority_rx, PARALLEL_PRIORITY);
+}
+
+fn sender(state: &AppState, mut rx: mpsc::Receiver<Job>, parallel: usize) {
     let state = state.clone();
     tokio::spawn(async move {
-        let permits = Arc::new(Semaphore::new(PARALLEL));
+        let permits = Arc::new(Semaphore::new(parallel));
         while let Some(job) = rx.recv().await {
             let Ok(permit) = permits.clone().acquire_owned().await else { break };
             let state = state.clone();
@@ -358,9 +383,10 @@ pub fn start(state: &AppState) {
     });
 }
 
-async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
+/// Works on one job now (the senders' work; tests measure it).
+pub async fn run(state: &AppState, job: Job) -> Result<(), ApiError> {
     match job {
-        Job::Message { message, author_id } => run_message(state, &message, &author_id).await,
+        Job::Message { message, author_id, .. } => run_message(state, &message, &author_id).await,
         Job::Call { conversation_id, user_id, caller_id, group } => {
             run_call(state, &conversation_id, &user_id, &caller_id, group).await
         }
@@ -430,16 +456,16 @@ fn preview_text(message: &Message) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Does the message mention the user directly (address or one of their roles)?
-fn direct_mention(message: &Message, user: &UserRow, role_ids: &[String]) -> bool {
-    let address = user.address().to_lowercase();
-    message.mentions.iter().any(|m| m.to_lowercase() == address)
-        || role_ids.iter().any(|r| message.mentions.contains(&store::messages::role_mention(r)))
+/// A member the message may push to: role ids (channels) and the conversation's name (channels, group DMs).
+struct Target {
+    role_ids: Vec<String>,
+    conversation: Option<String>,
 }
 
 async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Result<(), ApiError> {
     let Some(row) = store::social::conversation(&state.db, &message.conversation_id).await? else { return Ok(()) };
-    // Candidates: the members with a subscription (rooms can be large; most members have none).
+    // Candidates: the members with a subscription (rooms can be large; most members have none), without a
+    // connection.
     let candidates = match (row.kind.as_str(), &row.room_id) {
         ("channel", Some(room_id)) => store::push::room_members_with_subscriptions(&state.db, room_id).await?,
         ("dm" | "group", _) => {
@@ -448,9 +474,12 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         }
         _ => return Ok(()),
     };
+    let candidates: Vec<String> =
+        candidates.into_iter().filter(|u| u != author_id && !crate::presence::is_online(state, u)).collect();
     if candidates.is_empty() {
         return Ok(());
     }
+    let domain = &state.config.domain;
     // Room channels: who may view the channel now (the WebSocket fan-out's check, PROTOCOL.md §6).
     let view = match (row.kind.as_str(), &row.room_id) {
         ("channel", Some(room_id)) => match crate::visibility::room(state, room_id).await? {
@@ -459,6 +488,53 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         },
         _ => None,
     };
+    let mut targets: HashMap<String, Target> = HashMap::new();
+    match &view {
+        // Room channels: membership and `view_channel` from the room's visibility snapshot.
+        Some(view) => {
+            let Some(channel) = view.channel(&row.id) else { return Ok(()) };
+            // Welcome and system channels never notify.
+            if channel.kind == "system" {
+                return Ok(());
+            }
+            for user_id in candidates {
+                if let Some(member) = view.member(&user_id).filter(|_| view.can_view(&row.id, &user_id)) {
+                    let target = Target { role_ids: member.role_ids.clone(), conversation: Some(channel.name.clone()) };
+                    targets.insert(user_id, target);
+                }
+            }
+        }
+        // DMs and group DMs (a few members): the user's own view of the conversation (membership, message requests).
+        None => {
+            for user_id in candidates {
+                let Some(user) = store::users::by_id(&state.db, &user_id).await? else { continue };
+                if user.domain != *domain || user.disabled_at.is_some() {
+                    continue;
+                }
+                let conv = match access::conversation(state, &row.id, &user).await {
+                    Ok(c) => c,
+                    Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+                if !conv.entitled() || conv.is_request_for(&user.id) {
+                    continue;
+                }
+                if let ConvKind::Direct { row, .. } = &conv.kind {
+                    targets.insert(user_id, Target { role_ids: Vec::new(), conversation: row.name.clone() });
+                }
+            }
+        }
+    }
+    // Members this conversation pushed to within the coalescing window get nothing: skip them before anything
+    // else is loaded (peeking counts nothing; the counting check follows the decision below).
+    let ids: Vec<String> = targets.keys().cloned().collect();
+    let keys: Vec<String> = ids.iter().map(|u| format!("{u}|{}", row.id)).collect();
+    let open = state.push.conversation_limiter.peek_many(&keys).await;
+    let mut ids: Vec<String> = ids.into_iter().zip(open).filter_map(|(u, ok)| ok.then_some(u)).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    ids.sort_unstable();
     let author = store::users::by_id(&state.db, author_id).await?;
     let sender = message
         .author_room_profile
@@ -471,83 +547,73 @@ async fn run_message(state: &AppState, message: &Message, author_id: &str) -> Re
         Some(thread_id) => store::threads::follower_ids(&state.db, thread_id).await?.into_iter().collect(),
         None => HashSet::new(),
     };
-    for user_id in candidates {
-        if user_id == author_id || crate::presence::is_online(state, &user_id) {
+    let room = view.as_ref().map(|v| (v.room.id.clone(), cut(&v.room.name, NAME_CHARS)));
+    let room_id = room.as_ref().map(|(id, _)| id.as_str());
+    let mut out = Vec::new();
+    for recipient in store::push::recipients(&state.db, &ids, author_id, domain).await? {
+        let Some(target) = targets.get(&recipient.user_id) else { continue };
+        if recipient.blocked && author.is_some() {
             continue;
         }
-        let Some(user) = store::users::by_id(&state.db, &user_id).await? else { continue };
-        if user.domain != state.config.domain || user.disabled_at.is_some() {
+        let settings = crate::notifications::parse(recipient.settings.as_deref());
+        let address = format!("{}@{domain}", recipient.username);
+        let direct = message.mentions_user(&address, &target.role_ids);
+        if message.thread_id.is_some() && !direct && !followers.contains(&recipient.user_id) {
             continue;
         }
-        let (room_id, role_ids, room_name, channel_name) = match &view {
-            // Room channels: membership and `view_channel` from the room's visibility snapshot.
-            Some(view) => {
-                let Some(channel) = view.channel(&row.id) else { return Ok(()) };
-                // Welcome and system channels never notify.
-                if channel.kind == "system" {
-                    return Ok(());
-                }
-                let Some(member) = view.member(&user.id).filter(|_| view.can_view(&row.id, &user.id)) else {
-                    continue;
-                };
-                (
-                    Some(view.room.id.clone()),
-                    member.role_ids.clone(),
-                    Some(view.room.name.clone()),
-                    Some(channel.name.clone()),
-                )
-            }
-            // DMs and group DMs: the user's own view of the conversation (membership, message requests).
-            None => {
-                let conv = match access::conversation(state, &row.id, &user).await {
-                    Ok(c) => c,
-                    Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. }) => continue,
-                    Err(e) => return Err(e),
-                };
-                if !conv.entitled() || conv.is_request_for(&user.id) {
-                    continue;
-                }
-                match &conv.kind {
-                    ConvKind::Direct { row, .. } => (None, Vec::new(), None, row.name.clone()),
-                    ConvKind::Channel { .. } => continue,
-                }
-            }
-        };
-        if let Some(author) = &author
-            && store::social::blocked_either(&state.db, &user.id, &author.id).await?
-        {
-            continue;
-        }
-        let settings = crate::notifications::load(&state.db, &user.id).await?;
-        let direct = direct_mention(message, &user, &role_ids);
-        if message.thread_id.is_some() && !direct && !followers.contains(&user.id) {
-            continue;
-        }
-        let Some(important) =
-            settings.push_decision(room_id.as_deref(), &row.id, &now, direct, message.mentions_everyone)
-        else {
+        let Some(important) = settings.push_decision(room_id, &row.id, &now, direct, message.mentions_everyone) else {
             continue;
         };
-        let kind = match (&room_id, important) {
+        let kind = match (room_id, important) {
             (None, _) => Kind::Dm,
             (Some(_), true) => Kind::Mention,
             (Some(_), false) => Kind::Message,
         };
         let payload = PushPayload {
             kind: Some(kind),
-            node: state.config.domain.clone(),
+            node: domain.clone(),
             local: true,
             conversation_id: Some(row.id.clone()),
-            room_id: room_id.clone(),
+            room_id: room_id.map(String::from),
             conversation_kind: Some(row.kind.clone()),
-            room: room_name.map(|n| cut(&n, NAME_CHARS)),
-            conversation: channel_name.map(|n| cut(&n, NAME_CHARS)),
+            room: room.as_ref().map(|(_, name)| name.clone()),
+            conversation: target.conversation.as_deref().map(|n| cut(n, NAME_CHARS)),
             sender: sender.as_deref().map(|n| cut(n, NAME_CHARS)),
             text: if settings.global.push_text { preview_text(message) } else { None },
             encrypted: message.encrypted,
             ..PushPayload::default()
         };
-        deliver_to_user(state, &user.id, Some(&row.id), false, payload).await?;
+        out.push((recipient, payload));
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    // The limits for every recipient at once: coalescing, then the limit per minute of those left.
+    let keys: Vec<String> = out.iter().map(|(r, _)| format!("{}|{}", r.user_id, row.id)).collect();
+    let passed = state.push.conversation_limiter.check_many(&keys).await;
+    let out: Vec<_> = out.into_iter().zip(passed).filter_map(|(o, ok)| ok.then_some(o)).collect();
+    let users: Vec<String> = out.iter().map(|(r, _)| r.user_id.clone()).collect();
+    let passed = state.push.user_limiter.check_many(&users).await;
+    let topic = topic(&row.id);
+    let sent: Vec<String> = futures::stream::iter(out.into_iter().zip(passed).filter_map(|(o, ok)| ok.then_some(o)))
+        .map(|(recipient, payload)| {
+            let topic = topic.as_str();
+            async move {
+                let mut sent = Vec::new();
+                for s in &recipient.subscriptions {
+                    if deliver_one(state, s, &payload, TTL_MESSAGE, Some(topic)).await {
+                        sent.push(s.id.clone());
+                    }
+                }
+                sent
+            }
+        })
+        .buffer_unordered(PARALLEL_USERS)
+        .flat_map(futures::stream::iter)
+        .collect()
+        .await;
+    if let Err(e) = store::push::mark_used_many(&state.db, &sent).await {
+        tracing::warn!(error = %e, "push subscription state not saved");
     }
     Ok(())
 }
@@ -639,12 +705,28 @@ pub enum Outcome {
 
 /// Sends one push and records the outcome on the subscription and in the metrics.
 async fn deliver(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl: u32, topic: Option<&str>) {
+    if deliver_one(state, s, payload, ttl, topic).await
+        && let Err(e) = store::push::mark_used(&state.db, &s.id).await
+    {
+        tracing::warn!(error = %e, "push subscription state not saved");
+    }
+}
+
+/// Sends one push and records a failure on the subscription and the outcome in the metrics; `true` when it was
+/// delivered (the caller records that, for many subscriptions at once).
+async fn deliver_one(
+    state: &AppState,
+    s: &SubscriptionRow,
+    payload: &PushPayload,
+    ttl: u32,
+    topic: Option<&str>,
+) -> bool {
     let outcome = send(state, s, payload, ttl, topic).await;
     let db = &state.db;
     let result = match outcome {
         Outcome::Sent => {
             state.metrics.push_sent.inc();
-            store::push::mark_used(db, &s.id).await
+            return true;
         }
         Outcome::Gone => {
             state.metrics.push_failed.inc();
@@ -656,6 +738,7 @@ async fn deliver(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, t
     if let Err(e) = result {
         tracing::warn!(error = %e, "push subscription state not saved");
     }
+    false
 }
 
 /// A failed delivery: exponential backoff from 30 seconds up to 6 hours, or the service's `Retry-After`.
@@ -676,11 +759,10 @@ async fn send(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl:
     let Ok(url) = push.check_endpoint(&s.endpoint) else { return Outcome::Gone };
     let Some(host) = url.host_str() else { return Outcome::Gone };
     // Vet the addresses before connecting (the resolver of the client vets them again for the connection itself).
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if bare.parse::<std::net::IpAddr>().is_err()
-        && let Err(e) = push.resolver.vetted(bare).await
-    {
-        return if e.is::<AddressForbidden>() { Outcome::Failed } else { Outcome::Retry { retry_after: None } };
+    match push.resolver.precheck(host).await {
+        Precheck::Allowed => {}
+        Precheck::Forbidden => return Outcome::Failed,
+        Precheck::Unresolved => return Outcome::Retry { retry_after: None },
     }
     let plaintext = match serde_json::to_vec(&PushPayload { v: 1, ..payload.clone() }) {
         Ok(p) => p,
@@ -726,16 +808,8 @@ async fn send(state: &AppState, s: &SubscriptionRow, payload: &PushPayload, ttl:
                 }
             }
         }
-        Err(e) => {
-            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
-            while let Some(err) = source {
-                if err.downcast_ref::<AddressForbidden>().is_some() {
-                    return Outcome::Failed;
-                }
-                source = err.source();
-            }
-            Outcome::Retry { retry_after: None }
-        }
+        Err(e) if is_address_forbidden(&e) => Outcome::Failed,
+        Err(_) => Outcome::Retry { retry_after: None },
     }
 }
 

@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     config::RoomCreation,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     jwt,
     models::{AuditEntry, Ban, Category, Channel, Invite, Member, PermissionOverride, Role, Room, UserRow},
     permissions as p, store,
@@ -51,7 +51,8 @@ pub struct RoomDetail {
     pub read_states: Vec<crate::store::messages::ReadState>,
 }
 
-pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<RoomDetail, ApiError> {
+/// The room as `user` (whose access `access` is) sees it.
+pub(crate) async fn detail(state: &AppState, access: &RoomAccess, user: &UserRow) -> Result<RoomDetail, ApiError> {
     let db = &state.db;
     let id = &access.room.id;
     let mut channels = store::rooms::channels(db, id).await?;
@@ -74,9 +75,6 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
     let read_states = match &access.member {
         Some(member) => {
             let system: Vec<String> = channels.iter().filter(|c| c.kind == "system").map(|c| c.id.clone()).collect();
-            let user = store::users::by_id(db, &member.user_id)
-                .await?
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("member without user")))?;
             let settings = if user.domain == state.config.domain {
                 Some(crate::notifications::load(db, &user.id).await?)
             } else {
@@ -107,7 +105,7 @@ pub(crate) async fn detail(state: &AppState, access: &RoomAccess) -> Result<Room
         member_count: store::rooms::member_count(db, id).await?,
         categories,
         channels: channels.iter().map(|c| c.to_api()).collect(),
-        roles: store::rooms::roles(db, id).await?.iter().map(|r| r.to_api()).collect(),
+        roles: access.roles.iter().map(|r| r.to_api()).collect(),
         overrides,
         my_roles: access.member_roles.iter().map(|r| r.id.clone()).collect(),
         my_permissions: access.room_perms.to_string(),
@@ -151,7 +149,7 @@ async fn may_create_room(state: &AppState, user: &UserRow) -> Result<(), ApiErro
 pub async fn create_room(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<CreateRoomRequest>,
+    ApiJson(req): ApiJson<CreateRoomRequest>,
 ) -> Result<(StatusCode, Json<RoomDetail>), ApiError> {
     may_create_room(&state, &auth.user).await?;
     let name = validate::name("name", &req.name, 100)?;
@@ -191,7 +189,7 @@ pub async fn create_room(
     .await;
     crate::welcome::joined(&state, &room, &auth.user).await;
     let access = access::room_access(&state, &room.id, &auth.user).await?;
-    Ok((StatusCode::CREATED, Json(detail(&state, &access).await?)))
+    Ok((StatusCode::CREATED, Json(detail(&state, &access, &auth.user).await?)))
 }
 
 /// Rooms I am a member of.
@@ -233,19 +231,44 @@ impl PublicRoom {
 }
 
 /// Public rooms of this node ("Discover"). Rooms with an age gate are listed only when the request carries the
-/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e).
-#[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>)))]
+/// session of an adult (the `Authorization` header is optional here; PROTOCOL.md §5e). Anonymous requests are
+/// rate-limited per client address.
+#[utoipa::path(get, path = "/api/v1/rooms/discover", responses((status = 200, body = Vec<PublicRoom>), (status = 429, body = ProblemDetails)))]
 pub async fn discover_rooms(
     State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<PublicRoom>>, ApiError> {
-    let adult = crate::age::requester_is_adult(&state, &headers).await;
-    let mut out = Vec::new();
-    for r in store::rooms::public_rooms(&state.db, 100, adult).await? {
-        let member_count = store::rooms::member_count(&state.db, &r.id).await?;
-        out.push(PublicRoom::of(r, member_count));
-    }
-    Ok(Json(out))
+    let requester = match crate::auth::bearer(&headers) {
+        Some(token) => crate::auth::authenticate(&state, token).await.ok(),
+        None => None,
+    };
+    // Anonymous callers are limited per address like the other public directory reads, signed-in users by the
+    // general per-user request limit.
+    let adult = match &requester {
+        Some(auth) => {
+            if let Some(limiter) = &state.user_api_limiter {
+                limiter.check_all(&[format!("user:{}", auth.user.id)])?;
+            }
+            crate::age::is_adult(&state, &auth.user).await.unwrap_or(false)
+        }
+        None => {
+            state.directory_limiter.check_all(&[format!("discover-ip:{ip}")])?;
+            false
+        }
+    };
+    let rooms = store::rooms::public_rooms(&state.db, 100, adult).await?;
+    let ids: Vec<String> = rooms.iter().map(|r| r.id.clone()).collect();
+    let counts = store::rooms::member_counts(&state.db, &ids).await?;
+    Ok(Json(
+        rooms
+            .into_iter()
+            .map(|r| {
+                let n = counts.get(&r.id).copied().unwrap_or(0);
+                PublicRoom::of(r, n)
+            })
+            .collect(),
+    ))
 }
 
 /// Room with categories, channels, roles and own permissions.
@@ -256,7 +279,7 @@ pub async fn get_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomDetail>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    Ok(Json(detail(&state, &access).await?))
+    Ok(Json(detail(&state, &access, &auth.user).await?))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -294,7 +317,7 @@ pub async fn update_room(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<UpdateRoomRequest>,
+    ApiJson(req): ApiJson<UpdateRoomRequest>,
 ) -> Result<Json<RoomDetail>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MANAGE_ROOM, "room.manage_forbidden", "Manage room")?;
@@ -401,7 +424,7 @@ pub async fn update_room(
         _ => access,
     };
     state.hub.room(&room_id, "room.update", &access.room);
-    Ok(Json(detail(&state, &access).await?))
+    Ok(Json(detail(&state, &access, &auth.user).await?))
 }
 
 /// Sets the room's age gate (PROTOCOL.md §5e): audited, every channel changes its effective gate (`channel.update`),
@@ -563,7 +586,7 @@ async fn join(state: &AppState, user: &UserRow, room: &Room, accept_rules: bool)
         crate::welcome::joined(state, room, user).await;
     }
     let access = access::room_access(state, &room.id, user).await?;
-    detail(state, &access).await
+    detail(state, &access, user).await
 }
 
 /// Join a public room.
@@ -669,21 +692,43 @@ pub async fn leave_room(
             detail: "The owner cannot leave the room, only delete it".into(),
         });
     }
-    if store::rooms::remove_member(&state.db, &room_id, &auth.user.id).await? {
-        crate::subscriptions::room_event(
-            &state,
-            &room_id,
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": auth.user.id }),
-        )
-        .await;
-        crate::welcome::membership_ended(&state, &access.room, &auth.user, access.member.as_ref(), LeaveKind::Leave)
-            .await;
-        crate::e2ee::user_left_room(&state, &room_id, &auth.user).await?;
-        // A bot leaving uninstalls itself (APPLICATIONS.md §4.3).
-        crate::installations::uninstalled(&state, &access.room, &auth.user, "left", Some(&auth.user.id)).await?;
-    }
+    end_membership(&state, &access.room, &auth.user, access.member.as_ref(), LeaveKind::Leave, &auth.user.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends `target`'s membership of `room`, the one sequence of leaving, kicking and banning (the domain ban once per
+/// member): the welcome channel's entry, `member.leave` to the room (and its event subscriptions) and to the
+/// target's own devices, whose connections drop the room with the room event (`ws.rs`), the MLS removals and, for a
+/// bot, its installation (APPLICATIONS.md §4.3). `false` when `target` was no member (nothing happens).
+async fn end_membership(
+    state: &AppState,
+    room: &Room,
+    target: &UserRow,
+    member: Option<&crate::models::MemberRow>,
+    kind: LeaveKind,
+    actor_id: &str,
+) -> Result<bool, ApiError> {
+    if !store::rooms::remove_member(&state.db, &room.id, &target.id).await? {
+        return Ok(false);
+    }
+    crate::welcome::membership_ended(state, room, target, member, kind).await;
+    let mut data = serde_json::json!({ "room_id": room.id, "user_id": target.id });
+    let reason = match kind {
+        LeaveKind::Leave => "left",
+        LeaveKind::Kick => {
+            data["kicked"] = true.into();
+            "kicked"
+        }
+        LeaveKind::Ban => {
+            data["banned"] = true.into();
+            "banned"
+        }
+    };
+    crate::subscriptions::room_event(state, &room.id, "member.leave", &data).await;
+    state.hub.users(vec![target.id.clone()], "member.leave", &data);
+    crate::e2ee::user_left_room(state, &room.id, target).await?;
+    crate::installations::uninstalled(state, room, target, reason, Some(actor_id)).await?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------- Members
@@ -700,19 +745,24 @@ pub(crate) async fn to_member(
     m: &crate::models::MemberRow,
 ) -> Result<Option<Member>, ApiError> {
     let Some(user) = store::users::by_id(&state.db, &m.user_id).await? else { return Ok(None) };
+    Ok(Some(member_of(m, &user, store::rooms::member_role_ids(&state.db, room_id, &m.user_id).await?)))
+}
+
+/// The `Member` of a membership row from the loaded user and role ids.
+fn member_of(m: &crate::models::MemberRow, user: &UserRow, roles: Vec<String>) -> Member {
     let avatar = m.avatar_media_id.as_deref();
-    Ok(Some(Member {
+    Member {
         user: user.to_public(),
         nickname: m.nickname.clone(),
         joined_at: m.joined_at.clone(),
-        roles: store::rooms::member_role_ids(&state.db, room_id, &m.user_id).await?,
+        roles,
         timeout_until: m.timeout_until.clone().filter(|t| t.as_str() > now().as_str()),
         nick: m.nickname.clone(),
         room_avatar: crate::models::media_url(avatar, m.avatar_animated != 0),
         room_avatar_still: crate::models::media_url(avatar, false),
         room_avatar_animated: avatar.is_some() && m.avatar_animated != 0,
         room_bio: Some(m.bio.clone()).filter(|b| !b.is_empty()),
-    }))
+    }
 }
 
 /// Members (paginated via `after` = last user ID).
@@ -726,13 +776,16 @@ pub async fn list_members(
     access::room_access(&state, &room_id, &auth.user).await?;
     let rows =
         store::rooms::members(&state.db, &room_id, validate::limit(q.limit, 100, 500), q.after.as_deref()).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for m in &rows {
-        if let Some(member) = to_member(&state, &room_id, m).await? {
-            out.push(member);
-        }
-    }
-    Ok(Json(out))
+    // A constant number of statements per page: the users and the role ids of all its members at once.
+    let user_ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
+    let users: std::collections::HashMap<String, UserRow> =
+        store::users::by_ids(&state.db, &user_ids).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    let mut roles = store::rooms::member_role_ids_of(&state.db, &room_id, &user_ids).await?;
+    Ok(Json(
+        rows.iter()
+            .filter_map(|m| Some(member_of(m, users.get(&m.user_id)?, roles.remove(&m.user_id).unwrap_or_default())))
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -748,7 +801,7 @@ pub async fn update_member(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, user_id)): Path<(String, String)>,
-    Json(req): Json<UpdateMemberRequest>,
+    ApiJson(req): ApiJson<UpdateMemberRequest>,
 ) -> Result<Json<Member>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     let target = store::rooms::member(&state.db, &room_id, &user_id)
@@ -781,7 +834,7 @@ pub async fn update_member(
     }
     if let Some(role_ids) = req.roles {
         access.require(p::MANAGE_ROLES, "role.manage_forbidden", "Manage roles")?;
-        let roles = store::rooms::roles(&state.db, &room_id).await?;
+        let roles = &access.roles;
         // Own roles at or above the own top position may stay in the list (they are not assigned anew).
         let current = store::rooms::member_role_ids(&state.db, &room_id, &user_id).await?;
         let mut clean = Vec::new();
@@ -869,8 +922,8 @@ pub(crate) async fn moderation_target(
         });
     }
     let target_roles = store::rooms::member_role_ids(&state.db, &access.room.id, user_id).await?;
-    let roles = store::rooms::roles(&state.db, &access.room.id).await?;
-    let target_top = roles.iter().filter(|r| target_roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
+    let target_top =
+        access.roles.iter().filter(|r| target_roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
     if !access.outranks(target_top) {
         return Err(ApiError::Forbidden {
             code: "member.hierarchy",
@@ -893,8 +946,7 @@ pub async fn kick_member(
     let target = moderation_target(&state, &access, &user_id).await?;
     let reason = body.map(|b| b.0.reason).unwrap_or_default();
     let member = store::rooms::member(&state.db, &room_id, &user_id).await?;
-    if store::rooms::remove_member(&state.db, &room_id, &user_id).await? {
-        crate::welcome::membership_ended(&state, &access.room, &target, member.as_ref(), LeaveKind::Kick).await;
+    if end_membership(&state, &access.room, &target, member.as_ref(), LeaveKind::Kick, &auth.user.id).await? {
         store::rooms::audit(
             &state.db,
             Some(&room_id),
@@ -905,20 +957,6 @@ pub async fn kick_member(
             serde_json::json!({}),
         )
         .await?;
-        crate::subscriptions::room_event(
-            &state,
-            &room_id,
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": user_id, "kicked": true }),
-        )
-        .await;
-        state.hub.users(
-            vec![user_id.clone()],
-            "member.leave",
-            serde_json::json!({ "room_id": room_id, "user_id": user_id, "kicked": true }),
-        );
-        crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-        crate::installations::uninstalled(&state, &access.room, &target, "kicked", Some(&auth.user.id)).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -937,7 +975,7 @@ pub async fn timeout_member(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room_id, user_id)): Path<(String, String)>,
-    Json(req): Json<TimeoutRequest>,
+    ApiJson(req): ApiJson<TimeoutRequest>,
 ) -> Result<Json<Member>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::MODERATE_MEMBERS, "member.timeout_forbidden", "Moderate members")?;
@@ -995,7 +1033,7 @@ pub async fn ban(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<BanRequest>,
+    ApiJson(req): ApiJson<BanRequest>,
 ) -> Result<(StatusCode, Json<Ban>), ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::BAN_MEMBERS, "member.ban_forbidden", "Ban members")?;
@@ -1005,23 +1043,9 @@ pub async fn ban(
         if let Some(target) = store::users::by_username(&state.db, username, domain).await? {
             if let Some(member) = store::rooms::member(&state.db, &room_id, &target.id).await? {
                 moderation_target(&state, &access, &target.id).await?;
-                store::rooms::remove_member(&state.db, &room_id, &target.id).await?;
-                crate::welcome::membership_ended(&state, &access.room, &target, Some(&member), LeaveKind::Ban).await;
-                crate::subscriptions::room_event(
-                    &state,
-                    &room_id,
-                    "member.leave",
-                    serde_json::json!({ "room_id": room_id, "user_id": target.id, "banned": true }),
-                )
-                .await;
-                state.hub.users(
-                    vec![target.id.clone()],
-                    "member.leave",
-                    serde_json::json!({ "room_id": room_id, "user_id": target.id, "banned": true }),
-                );
-                crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-                crate::installations::uninstalled(&state, &access.room, &target, "banned", Some(&auth.user.id)).await?;
-                crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
+                if end_membership(&state, &access.room, &target, Some(&member), LeaveKind::Ban, &auth.user.id).await? {
+                    crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
+                }
             } else if target.id == access.room.owner_id {
                 return Err(ApiError::Forbidden {
                     code: "member.is_owner",
@@ -1043,16 +1067,9 @@ pub async fn ban(
         for user_id in &members {
             moderation_target(&state, &access, user_id).await?;
         }
-        for user_id in members {
-            let Some(target) = store::users::by_id(&state.db, &user_id).await? else { continue };
-            let member = store::rooms::member(&state.db, &room_id, &user_id).await?;
-            if store::rooms::remove_member(&state.db, &room_id, &user_id).await? {
-                crate::welcome::membership_ended(&state, &access.room, &target, member.as_ref(), LeaveKind::Ban).await;
-                let data = serde_json::json!({ "room_id": room_id, "user_id": user_id, "banned": true });
-                crate::subscriptions::room_event(&state, &room_id, "member.leave", &data).await;
-                state.hub.users(vec![user_id.clone()], "member.leave", &data);
-                crate::e2ee::user_left_room(&state, &room_id, &target).await?;
-                crate::installations::uninstalled(&state, &access.room, &target, "banned", Some(&auth.user.id)).await?;
+        for target in store::users::by_ids(&state.db, &members).await? {
+            let member = store::rooms::member(&state.db, &room_id, &target.id).await?;
+            if end_membership(&state, &access.room, &target, member.as_ref(), LeaveKind::Ban, &auth.user.id).await? {
                 crate::federation::remote::notify_ban(&state, &target, &room_id, &access.room.name, "room").await;
             }
         }
@@ -1309,7 +1326,7 @@ pub async fn purge(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
-    Json(req): Json<PurgeRequest>,
+    ApiJson(req): ApiJson<PurgeRequest>,
 ) -> Result<Json<PurgeResponse>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     access.require(p::PURGE, "moderation.purge_forbidden", "Purge")?;
@@ -1390,7 +1407,7 @@ pub async fn purge(
             Ok(Json(PurgeResponse { dry_run: true, messages: count, confirm_token: Some(token) }))
         }
         Some(token) => {
-            let (_, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
+            let (claims, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
                 .map_err(|_| {
                     bad(
                         "moderation.confirm_invalid",
@@ -1400,6 +1417,7 @@ pub async fn purge(
             if extra.filter_hash != filter_hash {
                 return Err(bad("moderation.confirm_mismatch", "The filter changed after the preview"));
             }
+            crate::routes::spend_confirmation(&state, &claims).await?;
             // Channel by channel: each `message.purge` names one channel and reaches only its viewers, so no member
             // learns of channels hidden from them (PROTOCOL.md §6).
             let mut deleted = 0;

@@ -1266,3 +1266,81 @@ async fn a_certificate_valid_only_for_the_srv_target_is_refused() {
     let old = reqwest::Url::parse(&format!("https://target.test:{only_target}/.well-known/tavrn")).unwrap();
     assert_eq!(client("target.test", only_target).get(old).send().await.unwrap().status(), 200);
 }
+
+/// DNS that never answers.
+struct HangingLookup;
+
+impl Lookup for HangingLookup {
+    fn lookup(&self, _host: String) -> BoxFuture<'static, std::io::Result<Vec<IpAddr>>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// The early address check shared by push, hooks, files channel stores and link previews: literals and names, and a
+/// resolver that hangs ends the check within the DNS timeout instead of stalling the caller.
+#[tokio::test(start_paused = true)]
+async fn the_precheck_vets_literals_and_names_within_a_dns_timeout() {
+    let lookup = MapLookup::with(&[("public.example", &["93.184.216.34"]), ("inside.example", &["10.0.0.7"])]);
+    let r = VettingResolver::new(lookup.clone(), false, std::collections::HashSet::new());
+    assert_eq!(r.precheck("public.example").await, Precheck::Allowed);
+    assert_eq!(r.precheck("inside.example").await, Precheck::Forbidden);
+    assert_eq!(r.precheck("unknown.example").await, Precheck::Unresolved);
+    assert_eq!(r.precheck("127.0.0.1").await, Precheck::Forbidden);
+    assert_eq!(r.precheck("[::1]").await, Precheck::Forbidden);
+    assert_eq!(r.precheck("93.184.216.34").await, Precheck::Allowed);
+    assert_eq!(lookup.calls.load(Ordering::SeqCst), 3, "literals need no lookup");
+    let private_ok = VettingResolver::new(lookup, true, std::collections::HashSet::new());
+    assert_eq!(private_ok.precheck("10.0.0.7").await, Precheck::Allowed);
+    let hanging = VettingResolver::new(Arc::new(HangingLookup), false, std::collections::HashSet::new());
+    let started = tokio::time::Instant::now();
+    assert_eq!(hanging.precheck("slow.example").await, Precheck::Unresolved);
+    assert!((PRECHECK_DNS_TIMEOUT..PRECHECK_DNS_TIMEOUT * 2).contains(&started.elapsed()));
+    // The refusal of the resolver at connect time is found anywhere in an error chain.
+    #[derive(Debug)]
+    struct Outer(AddressForbidden);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("outer")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    assert!(is_address_forbidden(&Outer(AddressForbidden("x".into()))));
+    assert!(!is_address_forbidden(&std::io::Error::other("no")));
+}
+
+/// Requests that miss the endpoint cache together resolve it once: one well-known fetch for 20 concurrent requests.
+#[tokio::test]
+async fn concurrent_cache_misses_resolve_the_endpoints_once() {
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    let app_addr = site(None, "app").await;
+    let doc = delegating_doc("deleg.test", &format!("http://app.test:{}", app_addr.port()));
+    let website = Router::new().route(
+        "/.well-known/tavrn",
+        get(move || {
+            let doc = doc.clone();
+            async move {
+                HITS.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ([(header::CACHE_CONTROL, "max-age=900")], Json(doc))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let website_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, website).await.unwrap() });
+    let lookup = MapLookup::with(&[("app.test", &["127.0.0.1"])]);
+    let c = delegation_client(
+        &format!("deleg.test=http://{website_addr}"),
+        true,
+        lookup,
+        Arc::new(MapSrv::default()),
+        false,
+    );
+    let all = futures::future::join_all((0..20).map(|_| c.delegation("deleg.test"))).await;
+    assert!(all.iter().all(Result::is_ok));
+    assert_eq!(HITS.load(Ordering::SeqCst), 1, "one discovery fetch");
+}

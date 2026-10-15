@@ -720,3 +720,27 @@ async fn after_a_key_reset_only_records_since_the_reset_make_a_member_wait() {
     assert_eq!(item["user"], format!("bob@{DOMAIN}"), "{pending}");
     assert!(item["key_reset_at"].is_string() && item["min_epoch"].is_i64(), "{item}");
 }
+
+/// After a key reset the records route, the listing and single entries serve only records written since the reset,
+/// whatever the policy (ENCRYPTION.md §7b "History after a key reset", FILES.md §8.7).
+#[tokio::test]
+async fn after_a_key_reset_records_from_before_it_are_not_served() {
+    let s = setup().await;
+    let (_, before) = s.upload(&s.alice, None, b"before").await;
+    // Bob reset (policy `all`): his new device joins and must not get the old record.
+    reset_and_rejoin(&s, true).await;
+    let bob = s.node.login("bob").await;
+    let (st, recs) = s.node.get_auth(&format!("{}/records", s.base()), &bob.token).await;
+    assert_eq!(st, StatusCode::OK, "{recs}");
+    let ids: Vec<&str> = recs["entries"].as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert!(!ids.is_empty(), "the record written after the reset is served: {recs}");
+    assert!(!ids.contains(&id(&before).as_str()), "no record from before the reset: {recs}");
+    let list = s.ls(&bob.token, "").await;
+    let old = list["entries"].as_array().unwrap().iter().find(|e| e["id"] == id(&before).as_str()).unwrap().clone();
+    assert!(old["record"].is_null(), "{old}");
+    let (_, one) = s.node.get_auth(&format!("{}/{}", s.base(), id(&before)), &bob.token).await;
+    assert!(one["entry"]["record"].is_null(), "{one}");
+    // Alice (no reset) keeps every record.
+    let (_, recs) = s.node.get_auth(&format!("{}/records", s.base()), s.alice.token()).await;
+    assert!(recs["entries"].as_array().unwrap().iter().any(|e| e["id"] == id(&before).as_str()), "{recs}");
+}

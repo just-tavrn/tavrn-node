@@ -19,9 +19,24 @@ First public release of the node and its container image.
   further idle ones after 30 minutes and pings a connection only after 30 seconds of idleness (the first requests
   after a quiet period no longer pay a new connection, and no request pays a ping); a role save is one statement
   with its audit row in the same transaction; a voice leave answers before LiveKit confirmed the removal (a rejoin
-  of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
+  of the same device waits for it); migration 0410 indexes a room's categories and permission overrides. A WebSocket
+  connection reads through a 4 KiB buffer instead of 128 KiB: zeroing the large buffer before every read was about
+  40 % of the node's user CPU while it fans messages out (the 20 msg/s benchmark to 200 connections needs a third
+  to almost half less CPU), and an open connection holds 70 to 100 KiB less memory.
+  `TAVRN_LOG_SLOW_REQUEST_MS` (default off) logs requests at or above a
   threshold with route template, status, duration and statement count; `TAVRN_DB_SLOW_STATEMENT_MS` (default 1000,
   0 = off) sets the threshold of the slow statement warning (docs/HANDBOOK.md "Performance").
+- **Fan-out and services under load**: a message's web pushes load their recipients in batches (one statement per
+  500 users instead of four per member; 108 statements for a channel with 20 offline subscribers became 13), skip
+  coalesced members first, deliver to several users at once, and DMs, mentions, rings and notices have a queue of
+  their own; attachments stream into storage (memory per upload is a chunk, not the file) and are cut off at the
+  limit; the embedded web client is served without a copy per request, compressed and with an `ETag`; room
+  auto-moderation rules are compiled once per room and matched in one pass over the message; the search index is
+  written from the message after its delivery; `notify` hints to many remote members are queued in one statement,
+  limited per node; the channel visibility snapshot evaluates each member once, keeps viewers as bit sets and
+  survives cosmetic updates (nicknames, topics, descriptions); WebSocket sends time out after 15 seconds; the
+  heartbeat checks all connected devices together; GIF searches are cached and limited per user, and provider
+  errors (GIF, captcha) answer `503`/`502` instead of `500`; background workers start again after a panic.
 
 - **Rooms and channels**: text, voice, announcement, forum and files channels, threads and forum posts, roles with
   layered permissions (room, channel and single-member overrides), visibility that withholds events, hints and pushes
@@ -40,7 +55,9 @@ First public release of the node and its container image.
   handbook and deployment examples (Docker Compose, reverse proxies).
 - **Container image for `linux/amd64` and `linux/arm64`**: one manifest list per tag (`edge` and the releases), so
   the node runs natively on ARM servers; the arm64 image is cross-compiled on the amd64 build host, and a plain
-  `docker build` still builds for the host's own architecture.
+  `docker build` still builds for the host's own architecture. The image's minimal ffmpeg is 8.1.3, the release the
+  tests run against (README.md "Tool versions"); the Rust dependencies are a layer of their own (cargo-chef), so a
+  build after a code change reuses them.
 - **Files channels on external stores only** (`TAVRN_FILES_INTERNAL=off`, protocol FILES.md §5): the node keeps no
   files of files channels; a new files channel takes uploads and folders once its managers set a WebDAV or S3 store
   (`403 files.internal_disabled` before, `backend: "none"` in its usage), and the node's own storage cannot be
@@ -97,6 +114,17 @@ First public release of the node and its container image.
 
 ### Fixed
 
+- A database outage during the WebSocket hello closes with `1013` (try again later, reason `db.unavailable`) instead
+  of `4001 auth.token_invalid`, which made clients refresh and then end the session.
+- Malformed JSON bodies and query strings answer Problem Details (`400 request.invalid_json`,
+  `400 request.invalid_query`) instead of plain text, and every Problem Details body carries the
+  `request_id` of the `x-request-id` header; the request log span (route, request id) is at level info, so a
+  reported error can be found in the log.
+- A message is written together with its attachments, spoilers and poll close time (one transaction), and an admin
+  user update is validated as a whole before anything changes.
+- The refresh of a remote bot's profile after `app.changed` sends `user.update { user }` like every other sender
+  (it sent the bare user object; fixes #90).
+
 - A passkey whose registration did not announce the PRF extension can unlock messages after all (protocol
   ENCRYPTION.md §2.4, fixes #69): `PUT /users/me/secret-storage/passkey/{credential_id}` accepts the entry for any
   passkey of the user and marks the credential `prf_supported` in the same transaction, instead of refusing it with
@@ -117,6 +145,18 @@ First public release of the node and its container image.
 
 ### Security
 
+- `check-config` prints the passwords of `TAVRN_DATABASE_URL` and `TAVRN_SMTP_URL`, secret query parameters, the
+  Turnstile secret and the GIF key as `***`. The image's health check is the new `tavrn-node health` (one request to
+  `/healthz`, nothing printed), so the container state no longer holds the configuration and the identity provider
+  is not contacted every 30 seconds.
+- The history window of encrypted conversations (ENCRYPTION.md §7b) also applies to the records of files channels
+  after a key reset and to pins and reactions: `GET …/pins` lists only pinned messages inside the requester's window,
+  and reaction and pin routes answer `404 message.not_found` for messages outside it.
+- `Tavrn-Relayed` (several instances) is honoured only with a valid HMAC of one of the node's instances; a header a
+  client sets is ignored.
+- Purge confirmation tokens (rooms and node admins) execute once.
+- The HTTP clients of link previews and external file stores fail closed when they cannot be built; provider and
+  LiveKit errors are logged without the request URL (no API key, search term or access token in the log).
 - The connect flow no longer issues a re-authentication token, and a connect code needs one.
 - Logout, password change or reset, device removal, disabling, second-factor reset and node bans end access tokens,
   WebSockets, voice and calls of the affected devices at once.

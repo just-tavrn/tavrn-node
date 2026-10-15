@@ -105,16 +105,7 @@ fn sqlite_parent_dir(url: &str) -> Option<String> {
 
 /// Removes the password from a connection URL for logs and error messages.
 pub fn redact(url: &str) -> String {
-    match (url.find("://"), url.find('@')) {
-        (Some(s), Some(a)) if a > s => {
-            let creds = &url[s + 3..a];
-            match creds.split_once(':') {
-                Some((user, _)) => format!("{}://{}:***@{}", &url[..s], user, &url[a + 1..]),
-                None => url.to_string(),
-            }
-        }
-        _ => url.to_string(),
-    }
+    crate::config::redact_url(url)
 }
 
 #[cfg(test)]
@@ -127,6 +118,8 @@ mod tests {
         assert_eq!(redact("postgres://tavrn:secret@db/tavrn"), "postgres://tavrn:***@db/tavrn");
         assert_eq!(redact("sqlite://x.db"), "sqlite://x.db");
         assert_eq!(redact("postgres://user@db/x"), "postgres://user@db/x");
+        assert_eq!(redact("postgres://tavrn:p@ss@db/tavrn"), "postgres://tavrn:***@db/tavrn", "an unencoded @");
+        assert_eq!(redact("postgres://db/tavrn?password=secret"), "postgres://db/tavrn?password=***");
     }
 
     #[test]
@@ -186,6 +179,37 @@ mod tests {
                 sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&pool).await.unwrap();
             assert!(plan.iter().any(|(.., detail)| detail.contains(index)), "{sql}: {plan:?}");
         }
+    }
+
+    /// Read states look up the newest message and the unread messages after a read marker as index ranges (migration
+    /// 0430 adds the partial index of the conversation's main messages), not as reads of the whole history.
+    #[tokio::test]
+    async fn read_states_use_the_main_message_index() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let plan = |sql: String, binds: usize| {
+            let pool = pool.clone();
+            async move {
+                let text = format!("EXPLAIN QUERY PLAN {sql}");
+                let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(&text);
+                for i in 0..binds {
+                    q = q.bind(format!("p{i}"));
+                }
+                q.fetch_all(&pool).await.unwrap().into_iter().map(|(.., detail)| detail).collect::<Vec<_>>()
+            }
+        };
+        // (SQLite may pick the partial index or `messages_conversation` on the same columns: both are ranges.)
+        let last = plan(crate::store::messages::last_ids_sql(2), 2).await;
+        assert!(
+            last.iter().any(|d| d.contains("INDEX messages_conversation") && d.contains("conversation_id=?")),
+            "newest message: {last:?}"
+        );
+        // One role pattern, two conversations with a marker, none without.
+        let counts = plan(crate::store::messages::unread_counts_sql(1, 2, 0), 5).await;
+        assert!(
+            counts.iter().any(|d| d.contains("INDEX messages_conversation") && d.contains("id>?")),
+            "unread after the marker: {counts:?}"
+        );
+        assert!(!counts.iter().any(|d| d.starts_with("SCAN m")), "no scan of the messages: {counts:?}");
     }
 
     /// Binary columns (BYTEA) round-trip through the `Any` driver on SQLite (and PostgreSQL in test-pg).

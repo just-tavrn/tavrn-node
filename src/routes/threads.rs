@@ -5,7 +5,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     routing::{get, post, put},
 };
@@ -17,7 +17,7 @@ use crate::{
     access,
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     permissions as p,
     routes::messages::CreateMessageRequest,
     store::{

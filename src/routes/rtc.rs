@@ -176,7 +176,8 @@ fn http_client() -> &'static reqwest::Client {
 
 async fn forward_http(url: &str, token: &str) -> Result<Response, ApiError> {
     let resp = http_client().get(url).header(header::AUTHORIZATION, bearer(token)?).send().await.map_err(|e| {
-        tracing::warn!(error = %e, "LiveKit unreachable");
+        // Without the URL: its query may carry the client's `access_token`.
+        tracing::warn!(error = %e.without_url(), "LiveKit unreachable");
         unavailable()
     })?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);

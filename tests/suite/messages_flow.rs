@@ -247,3 +247,85 @@ async fn purge_requires_preview_and_confirmation() {
     assert_eq!(log[0]["meta"]["deleted"], 1);
     let _ = perms(&[p::PURGE]);
 }
+
+/// Message ids in paths and bodies are ULIDs in any case: edit, read marker and delete address the message whatever
+/// the case of its id, and act on the stored (canonical) id.
+#[tokio::test]
+async fn message_ids_are_accepted_in_any_case() {
+    let (node, _alice, bob, room_id, channel_id) = setup().await;
+    let path = format!("/api/v1/rooms/{room_id}/channels/{channel_id}/messages");
+    let (s, m) = node.send(&bob.token, &room_id, &channel_id, "Hello").await;
+    assert_eq!(s, StatusCode::CREATED, "{m}");
+    let id = m["id"].as_str().unwrap().to_string();
+    let lower = id.to_lowercase();
+    let (s, j) = node
+        .patch(&format!("{path}/{lower}"), &bob.token, json!({ "content": { "type": "text", "body": "Edited" } }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!((j["id"].as_str(), j["content"]["body"].as_str()), (Some(id.as_str()), Some("Edited")));
+    let (s, j) = node
+        .put(&format!("/api/v1/conversations/{channel_id}/read"), &bob.token, json!({ "last_read_message_id": lower }))
+        .await;
+    assert!(s.is_success(), "{j}");
+    assert_eq!(
+        tavrn_node::store::messages::read_marker(&node.state.db, &channel_id, &bob.user_id).await.unwrap().as_deref(),
+        Some(id.as_str()),
+        "the marker holds the canonical id"
+    );
+    let (s, j) = node.delete(&format!("{path}/{lower}"), &bob.token).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
+    let (_, list) = node.get_auth(&path, &bob.token).await;
+    assert!(list.as_array().unwrap().iter().all(|m| m["id"] != id.as_str()), "deleted: {list}");
+}
+/// A message is stored together with its attachments, spoilers and poll close time, or not at all: a database
+/// failure halfway leaves no message behind that nobody was told about.
+#[tokio::test]
+async fn a_failed_message_write_leaves_nothing_behind() {
+    let (node, alice, _bob, _room_id, channel_id) = setup().await;
+    // The last step of the write (the poll's close time) fails.
+    let statements: &[&str] = if std::env::var("TAVRN_TEST_DATABASE_URL").is_ok() {
+        &[
+            "CREATE FUNCTION fail_close_time() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+            "CREATE TRIGGER fail_close_time BEFORE UPDATE OF poll_closes_at ON messages FOR EACH ROW EXECUTE FUNCTION fail_close_time()",
+        ]
+    } else {
+        &[
+            "CREATE TRIGGER fail_close_time BEFORE UPDATE OF poll_closes_at ON messages BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        ]
+    };
+    for sql in statements {
+        sqlx::query(sql).execute(&node.state.db).await.unwrap();
+    }
+    let poll = json!({ "type": "poll", "kind": "choice", "question": "Lunch?", "options": [{ "id": "a", "label": "Pizza" }, { "id": "b", "label": "Salad" }], "max_choices": 1, "results_visible": "always", "votes_visible": "public" });
+    let closes_at = tavrn_node::util::format_time(chrono::Utc::now() + chrono::Duration::hours(1));
+    let path = format!("/api/v1/conversations/{channel_id}/messages");
+    let (s, j) = node.post(&path, &alice.token, json!({ "content": poll, "poll_closes_at": closes_at })).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{j}");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = $1")
+        .bind(&channel_id)
+        .fetch_one(&node.state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "no orphan message");
+    // Everything else still writes.
+    let (s, j) = node.post(&path, &alice.token, json!({ "content": { "type": "text", "body": "hi" } })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+}
+
+/// A purge confirmation token deletes once: repeating the request needs a new preview.
+#[tokio::test]
+async fn a_purge_confirmation_is_single_use() {
+    let (node, alice, bob, room_id, channel_id) = setup().await;
+    node.send(&bob.token, &room_id, &channel_id, "bob").await;
+    let path = format!("/api/v1/rooms/{room_id}/moderation/purge");
+    let (_, preview) = node.post(&path, &alice.token, json!({ "author_id": bob.user_id })).await;
+    let confirm = json!({ "author_id": bob.user_id, "confirm_token": preview["confirm_token"] });
+    let (s, done) = node.post(&path, &alice.token, confirm.clone()).await;
+    assert_eq!((s, done["messages"].as_i64()), (StatusCode::OK, Some(1)), "{done}");
+    node.send(&bob.token, &room_id, &channel_id, "posted after the preview").await;
+    let (s, j) = node.post(&path, &alice.token, confirm).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("moderation.confirm_invalid")), "{j}");
+    let (_, list) =
+        node.get_auth(&format!("/api/v1/rooms/{room_id}/channels/{channel_id}/messages"), &alice.token).await;
+    assert!(list.as_array().unwrap().iter().any(|m| m["content"]["body"] == "posted after the preview"), "{list}");
+}

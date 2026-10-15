@@ -18,6 +18,7 @@
 //! instance reaches every room. The cache password goes to the child as `REDIS_PASSWORD` (LiveKit's
 //! `--redis-password`), never into the file, and each instance writes its own `livekit-<instance id>.yaml`.
 
+use crate::util::percent_decode;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -252,26 +253,6 @@ pub fn redis_of(url: Option<&str>) -> Option<(Redis, Option<zeroize::Zeroizing<S
     let db = url.path().trim_start_matches('/').parse::<u32>().unwrap_or(0);
     let address = format!("{host}:{}", url.port().unwrap_or(6379));
     Some((Redis { address, username, db, tls }, password))
-}
-
-/// `%XX` escapes of URL user info (no `+` handling: not a form).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Some(v) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(v);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The generated config file: `livekit.yaml`, or `livekit-<instance id>.yaml` when several instances share the
@@ -662,14 +643,20 @@ pub fn parse_log_line(line: &str) -> (LogLevel, String) {
     (level, message)
 }
 
-/// `true` if LiveKit answers on its local port (`GET /` → 200 "OK").
+/// `true` if LiveKit answers on its local port (`GET /` → 200 "OK"). Load balancers call `/readyz` every few
+/// seconds: one client (and its kept-alive connection) serves every probe.
 pub async fn reachable(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build();
-    match client {
-        Ok(c) => c.get(url).send().await.is_ok_and(|r| r.status().is_success()),
-        Err(_) => false,
-    }
+    static PROBE: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    let client = PROBE.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .inspect_err(|e| tracing::error!(error = %e, "the LiveKit probe client cannot be built"))
+            .ok()
+    });
+    let Some(client) = client else { return false };
+    client.get(format!("http://127.0.0.1:{port}/")).send().await.is_ok_and(|r| r.status().is_success())
 }
 
 /// Fails with the install hint if voice is enabled and the binary is missing (`serve`, `check-config`).

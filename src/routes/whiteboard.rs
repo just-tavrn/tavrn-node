@@ -20,7 +20,8 @@ use crate::{
     access::{self, Conv, ConvKind},
     app::AppState,
     auth::AuthUser,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ProblemDetails},
+    models::UserRow,
     permissions as p, store,
     validate::bad,
     whiteboard::{self, Actor, MAX_CONTENT_BYTES, SessionState, WhiteboardSession},
@@ -106,12 +107,14 @@ async fn check_content(state: &AppState, auth: &AuthUser, conv: &Conv, content: 
             }
             let header = tavrn_crypto::content_header(s)
                 .map_err(|_| bad("ephemeral.ciphertext_invalid", "Not valid encrypted content (format 1)"))?;
-            match store::e2ee::group_epoch(&state.db, &conv.id).await? {
-                Some(current) if i64::try_from(header.epoch).is_ok_and(|e| e <= current) => {}
-                _ => return Err(bad("ephemeral.epoch_unknown", "The node does not know this epoch (yet)")),
+            let known = match i64::try_from(header.epoch) {
+                Ok(epoch) => whiteboard::epoch_known(state, &conv.id, epoch).await?,
+                Err(_) => false,
+            };
+            if !known {
+                return Err(bad("ephemeral.epoch_unknown", "The node does not know this epoch (yet)"));
             }
-            crate::e2ee::attested_session_key(state, auth).await?;
-            Ok(())
+            whiteboard::require_attested(state, auth).await
         }
         (true, _) => Err(bad("ephemeral.encryption_mismatch", "This conversation is encrypted; plaintext is refused")),
         (false, Value::Object(_)) => {
@@ -144,6 +147,25 @@ fn may_moderate(conv: &Conv) -> bool {
     matches!(conv.kind, ConvKind::Channel { .. }) && p::has(conv.perms, p::MANAGE_WHITEBOARD)
 }
 
+/// The conversation of an ephemeral event. Room channels are evaluated on the shared channel visibility snapshot
+/// (`crate::visibility`, as typing over the WebSocket): cursors and strokes arrive many times per second, and the
+/// snapshot is dropped synchronously on every role, override, channel and membership event. DMs, group DMs and
+/// node admins who are not members take the full check (`access::conversation`).
+async fn ephemeral_conversation(state: &AppState, conversation_id: &str, user: &UserRow) -> Result<Conv, ApiError> {
+    if !crate::util::is_ulid(conversation_id) {
+        return Err(access::conversation_not_found());
+    }
+    let row =
+        store::social::conversation(&state.db, conversation_id).await?.ok_or_else(access::conversation_not_found)?;
+    if let ("channel", Some(room_id)) = (row.kind.as_str(), &row.room_id)
+        && let Some(view) = crate::visibility::room(state, room_id).await?
+        && let Some(conv) = view.conversation(conversation_id, user)
+    {
+        return conv;
+    }
+    access::conversation_of_row(state, row, user).await
+}
+
 /// Send an ephemeral event to the conversation: fanned out over the WebSocket (`ephemeral`) to every
 /// member with read access except the sending device, never stored. The node reads only the type and,
 /// for `whiteboard.open`, `whiteboard.grant` and `whiteboard.close`, the plaintext `session` field; it
@@ -156,7 +178,7 @@ pub async fn post_ephemeral(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(conversation_id): Path<String>,
-    Json(req): Json<EphemeralRequest>,
+    ApiJson(req): ApiJson<EphemeralRequest>,
 ) -> Result<Json<EphemeralAccepted>, ApiError> {
     if !valid_type(&req.kind) {
         return Err(bad("ephemeral.type_invalid", "type must be `cursor` or `whiteboard.<name>`"));
@@ -165,7 +187,7 @@ pub async fn post_ephemeral(
         crate::applications::require_scope(&auth, "whiteboard")?;
     }
     state.ephemeral_limiter.check_all(&[format!("eph:{}", auth.user.id)])?;
-    let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
+    let conv = ephemeral_conversation(&state, &conversation_id, &auth.user).await?;
     conv.require_entitled()?;
     if conv.is_request_for(&auth.user.id) {
         return Err(ApiError::Forbidden {
@@ -250,7 +272,7 @@ pub async fn get_session(
     auth: AuthUser,
     Path(conversation_id): Path<String>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
+    let conv = ephemeral_conversation(&state, &conversation_id, &auth.user).await?;
     conv.require_entitled()?;
     Ok(Json(SessionResponse { session: state.whiteboards.get(&conv.id, Instant::now()) }))
 }
@@ -435,7 +457,7 @@ pub async fn rename_scene(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(scene_id_raw): Path<String>,
-    Json(req): Json<RenameSceneRequest>,
+    ApiJson(req): ApiJson<RenameSceneRequest>,
 ) -> Result<Json<SceneInfo>, ApiError> {
     local_only(&state, &auth)?;
     scene_id(&scene_id_raw)?;

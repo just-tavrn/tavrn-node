@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 use crate::{
     app::{AppState, SOFTWARE_VERSION, capabilities},
     auth::NodeAdmin,
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     jwt,
     models::{AccountInvite, AuditEntry, Ban, User},
     store,
@@ -136,7 +136,7 @@ pub async fn update_user(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(user_id): Path<String>,
-    Json(req): Json<UpdateUserRequest>,
+    ApiJson(req): ApiJson<UpdateUserRequest>,
 ) -> Result<Json<AdminUser>, ApiError> {
     let target = store::users::by_id(&state.db, &user_id)
         .await?
@@ -149,6 +149,9 @@ pub async fn update_user(
     if target.is_bot() && (req.node_admin == Some(true) || req.app_creation_grant.is_some()) {
         return Err(bad("app.bot_forbidden", "Bots cannot be node admins or create applications"));
     }
+    // Everything is validated before the first write: a refused request changes nothing.
+    let room_grant = req.room_creation_grant.map(|n| validate::range("room_creation_grant", n, 0, 1000)).transpose()?;
+    let app_grant = req.app_creation_grant.map(|n| validate::range("app_creation_grant", n, 0, 100)).transpose()?;
     if let Some(d) = req.disabled {
         store::admin::set_disabled(&state.db, &user_id, d).await?;
         if d {
@@ -181,8 +184,7 @@ pub async fn update_user(
         )
         .await?;
     }
-    if let Some(n) = req.room_creation_grant {
-        let n = validate::range("room_creation_grant", n, 0, 1000)?;
+    if let Some(n) = room_grant {
         store::users::upsert_room_creation_grant(&state.db, &user_id, &admin.user.id, n).await?;
         store::rooms::audit(
             &state.db,
@@ -195,8 +197,7 @@ pub async fn update_user(
         )
         .await?;
     }
-    if let Some(n) = req.app_creation_grant {
-        let n = validate::range("app_creation_grant", n, 0, 100)?;
+    if let Some(n) = app_grant {
         store::applications::set_creation_grant(&state.db, &user_id, n).await?;
         store::rooms::audit(
             &state.db,
@@ -282,7 +283,7 @@ pub async fn purge_user(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(user_id): Path<String>,
-    Json(req): Json<PurgeUserRequest>,
+    ApiJson(req): ApiJson<PurgeUserRequest>,
 ) -> Result<Json<PurgeUserResponse>, ApiError> {
     let target = store::users::by_id(&state.db, &user_id)
         .await?
@@ -319,7 +320,7 @@ pub async fn purge_user(
             Ok(Json(PurgeUserResponse { dry_run: true, messages: count, confirm_token: Some(token) }))
         }
         Some(token) => {
-            let (_, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
+            let (claims, extra): (jwt::StandardClaims, ConfirmExtra) = jwt::verify(token, &key.verifying(), &expected)
                 .map_err(|_| {
                     bad(
                         "moderation.confirm_invalid",
@@ -329,6 +330,7 @@ pub async fn purge_user(
             if extra.target != user_id {
                 return Err(bad("moderation.confirm_mismatch", "The target changed after the preview"));
             }
+            crate::routes::spend_confirmation(&state, &claims).await?;
             let deleted = crate::routes::messages::purge_with_blobs(&state, &filter).await?;
             store::rooms::audit(
                 &state.db,
@@ -368,7 +370,7 @@ fn one() -> i64 {
 pub async fn create_invite(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
-    body: Option<Json<CreateAccountInviteRequest>>,
+    body: Option<ApiJson<CreateAccountInviteRequest>>,
 ) -> Result<(StatusCode, Json<AccountInvite>), ApiError> {
     let req = body.map(|b| b.0).unwrap_or_default();
     let note = validate::text("note", &req.note, 0, 200)?;
@@ -441,7 +443,7 @@ pub struct NodeBanRequest {
 pub async fn ban(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
-    Json(req): Json<NodeBanRequest>,
+    ApiJson(req): ApiJson<NodeBanRequest>,
 ) -> Result<(StatusCode, Json<Ban>), ApiError> {
     let subject = req.subject.trim().to_lowercase();
     let reason = validate::text("reason", &req.reason, 0, 500)?;

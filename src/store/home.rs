@@ -75,6 +75,29 @@ pub async fn put_conversation_index(
 }
 
 /// `true` if the device has a session that is neither revoked nor expired.
+/// Of `device_ids`, the devices with a live session whose account exists and is not disabled (one statement per
+/// 500 devices: the heartbeat's check of every connected device, `sessions::still_live`).
+pub async fn live_devices(db: &Pool, device_ids: &[String]) -> Result<std::collections::HashSet<String>, ApiError> {
+    let ts = now();
+    let mut out = std::collections::HashSet::new();
+    for chunk in device_ids.chunks(500) {
+        let placeholders: Vec<String> = (2..2 + chunk.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "SELECT d.id FROM devices d JOIN users u ON u.id = d.user_id
+             WHERE d.id IN ({}) AND u.disabled_at IS NULL
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id AND s.revoked_at IS NULL
+                           AND s.expires_at > $1)",
+            placeholders.join(", ")
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(&ts);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        out.extend(q.fetch_all(db).await?);
+    }
+    Ok(out)
+}
+
 pub async fn device_has_live_session(db: &Pool, device_id: &str) -> Result<bool, ApiError> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sessions WHERE device_id = $1 AND revoked_at IS NULL AND expires_at > $2",

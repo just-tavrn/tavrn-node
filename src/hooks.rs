@@ -18,7 +18,7 @@
 //!   `200 { "challenge": "<same>" }` within 5 seconds (`400 app.url_verification_failed`), so a node cannot be
 //!   pointed at a third party's server.
 
-use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use reqwest::{Url, header};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use crate::{
     app::AppState,
     config::Config,
     error::ApiError,
-    federation::client::{AddressForbidden, Lookup, SystemLookup, VettingResolver, forbidden_ip, user_agent},
+    federation::client::{Lookup, Precheck, SystemLookup, VettingResolver, is_address_forbidden, user_agent},
     jwt::{self, StandardClaims},
     util,
 };
@@ -113,7 +113,6 @@ pub struct HookResponse {
 pub struct HookClient {
     http: reqwest::Client,
     resolver: VettingResolver,
-    allow_private: bool,
     allow_http: bool,
 }
 
@@ -134,7 +133,7 @@ impl HookClient {
             .timeout(EVENT_TIMEOUT)
             .no_proxy()
             .build()?;
-        Ok(Self { http, resolver, allow_private: config.app_allow_private_urls, allow_http: config.dev })
+        Ok(Self { http, resolver, allow_http: config.dev })
     }
 
     /// Checks the URL rules and returns the parsed URL (`400 app.url_invalid`).
@@ -144,14 +143,10 @@ impl HookClient {
 
     /// The addresses of the URL's host must be public (unless private URLs are allowed).
     async fn check_target(&self, url: &Url) -> Result<(), HookError> {
-        let host = url.host_str().ok_or(HookError::Invalid)?.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return if !self.allow_private && forbidden_ip(ip) { Err(HookError::AddressForbidden) } else { Ok(()) };
-        }
-        match self.resolver.vetted(host).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.is::<AddressForbidden>() => Err(HookError::AddressForbidden),
-            Err(_) => Err(HookError::Unreachable),
+        match self.resolver.precheck(url.host_str().ok_or(HookError::Invalid)?).await {
+            Precheck::Allowed => Ok(()),
+            Precheck::Forbidden => Err(HookError::AddressForbidden),
+            Precheck::Unresolved => Err(HookError::Unreachable),
         }
     }
 
@@ -177,14 +172,13 @@ impl HookClient {
             request = request.header(*name, value);
         }
         let classify = |e: reqwest::Error| {
-            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
-            while let Some(err) = source {
-                if err.downcast_ref::<AddressForbidden>().is_some() {
-                    return HookError::AddressForbidden;
-                }
-                source = err.source();
+            if is_address_forbidden(&e) {
+                HookError::AddressForbidden
+            } else if e.is_timeout() {
+                HookError::Timeout
+            } else {
+                HookError::Unreachable
             }
-            if e.is_timeout() { HookError::Timeout } else { HookError::Unreachable }
         };
         let send = async {
             let mut response = request.body(body).send().await.map_err(classify)?;

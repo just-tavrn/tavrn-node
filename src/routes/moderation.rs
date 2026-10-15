@@ -4,7 +4,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -17,12 +17,12 @@ use crate::{
     app::AppState,
     auth::{AuthUser, NodeAdmin},
     automod::{self, AutomodRule},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     permissions as p,
     reports::{
-        self, CreateReportRequest, EvidenceEntry, MessageSnapshot, ModerationReport, ReportActionRecord,
-        ReportActionRequest, ReportActionResult, ReportCreated, ReportForward, ReportList, ReportOrigin,
-        UpdateReportRequest,
+        self, AppReport, AppReportList, CreateReportRequest, EvidenceEntry, MessageSnapshot, ModerationReport,
+        ReportActionRecord, ReportActionRequest, ReportActionResult, ReportCreated, ReportForward, ReportList,
+        ReportOrigin, UpdateReportRequest,
     },
     routes::rooms::RoomDetail,
     store::{self, reports::ListFilter},
@@ -82,6 +82,10 @@ pub fn routes() -> Router<AppState> {
         ReportActionResult,
         ReportForward,
         ReportOrigin,
+        AppReport,
+        AppReportList,
+        ReportView,
+        ReportListView,
         AutomodRule,
         AutomodSettings,
         AutomodBurst,
@@ -95,6 +99,22 @@ pub fn routes() -> Router<AppState> {
 pub struct ModerationApi;
 
 // ---------------------------------------------------------------- reports
+
+/// One report: the full `ModerationReport` for people, the reduced `AppReport` for app tokens (MODERATION.md §1.4a).
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ReportView {
+    Moderator(Box<ModerationReport>),
+    App(Box<AppReport>),
+}
+
+/// A page of the inbox: `ReportList` for people, `AppReportList` for app tokens (MODERATION.md §1.4a).
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ReportListView {
+    Moderator(ReportList),
+    App(AppReportList),
+}
 
 /// Report a message, a user or a room.
 ///
@@ -118,16 +138,22 @@ pub async fn create_report(
 /// One report with its evidence.
 ///
 /// For node admins, and for the room's moderators (`moderate_members`) when the report is about the room's content
-/// and not about themselves. Everybody else gets `404 report.not_found`.
+/// and not about themselves. Everybody else gets `404 report.not_found`. Moderation bots (scope `moderation`,
+/// `moderate_members` in the room) get the room's reports as `AppReport`: metadata only, no detail, snapshot,
+/// evidence, note or actions, the reporter as a pseudonym (MODERATION.md §1.4a).
 #[utoipa::path(get, path = "/api/v1/reports/{report_id}", security(("bearer" = [])), params(("report_id" = String, Path)),
-    responses((status = 200, body = ModerationReport), (status = 404, body = ProblemDetails)))]
+    responses((status = 200, description = "`ModerationReport`, or `AppReport` for app tokens", body = ReportView),
+        (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
 pub async fn get_report(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(report_id): Path<String>,
-) -> Result<Json<ModerationReport>, ApiError> {
+) -> Result<Json<ReportView>, ApiError> {
     let row = reports::visible(&state, &auth.user, &report_id).await?;
-    Ok(Json(reports::one(&state, row, true).await?))
+    if auth.user.is_bot() {
+        return Ok(Json(ReportView::App(Box::new(reports::app_one(&state, &auth.user, row).await?))));
+    }
+    Ok(Json(ReportView::Moderator(Box::new(reports::one(&state, row, true).await?))))
 }
 
 /// Change a report's status, assignee or resolution note.
@@ -212,17 +238,20 @@ pub struct ReportQuery {
 /// The room's reports, newest first.
 ///
 /// `moderate_members` (owners and node admins too). Moderators never see reports about themselves; reports about
-/// the owner go to the node admins only. List entries leave the evidence out (`evidence_count`).
+/// the owner go to the node admins only. List entries leave the evidence out (`evidence_count`). Moderation bots
+/// (scope `moderation`, `moderate_members`) read the same list as `AppReportList`: metadata only, the reporter as a
+/// pseudonym (MODERATION.md §1.4a).
 #[utoipa::path(get, path = "/api/v1/rooms/{room_id}/reports", security(("bearer" = [])), params(("room_id" = String, Path), ReportQuery),
-    responses((status = 200, body = ReportList), (status = 403, body = ProblemDetails)))]
+    responses((status = 200, description = "`ReportList`, or `AppReportList` for app tokens", body = ReportListView),
+        (status = 403, body = ProblemDetails)))]
 pub async fn room_reports(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(room_id): Path<String>,
     Query(q): Query<ReportQuery>,
-) -> Result<Json<ReportList>, ApiError> {
+) -> Result<Json<ReportListView>, ApiError> {
     let access = access::room_access(&state, &room_id, &auth.user).await?;
-    if auth.user.is_bot() || (access.member.is_none() && !access.is_node_admin) || !access.has(p::MODERATE_MEMBERS) {
+    if (access.member.is_none() && !access.is_node_admin) || !access.has(p::MODERATE_MEMBERS) {
         return Err(ApiError::Forbidden {
             code: "report.view_forbidden",
             detail: "Missing permission: Moderate members".into(),
@@ -232,10 +261,14 @@ pub async fn room_reports(
         room_id: Some(access.room.id.clone()),
         scope: Some("room".into()),
         status: q.status,
-        exclude_target: (!auth.user.is_node_admin()).then(|| auth.user.id.clone()),
+        exclude_target: (!auth.user.is_node_admin() || auth.user.is_bot()).then(|| auth.user.id.clone()),
         before: q.before,
     };
-    Ok(Json(reports::page(&state, filter, validate::limit(q.limit, 50, 100)).await?))
+    let limit = validate::limit(q.limit, 50, 100);
+    if auth.user.is_bot() {
+        return Ok(Json(ReportListView::App(reports::app_page(&state, &auth.user, filter, limit).await?)));
+    }
+    Ok(Json(ReportListView::Moderator(reports::page(&state, filter, limit).await?)))
 }
 
 /// Every report of the node, newest first (node admins).
@@ -339,6 +372,7 @@ pub async fn put_automod(
     let rules = automod::validate_rules(req.rules, &roles, &channels)?;
     let encoded = serde_json::to_string(&rules).map_err(|e| ApiError::Internal(e.into()))?;
     store::automod::set_rules(&state.db, &access.room.id, &encoded, &util::now()).await?;
+    automod::rules_changed(&state, &access.room.id);
     store::rooms::audit(
         &state.db,
         Some(&access.room.id),
@@ -409,7 +443,7 @@ pub async fn transfer_room(
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     state.hub.room(&room_id, "room.update", &access.room);
     tracing::info!(room = room_id, "room ownership transferred");
-    Ok(Json(crate::routes::rooms::detail(&state, &access).await?))
+    Ok(Json(crate::routes::rooms::detail(&state, &access, &auth.user).await?))
 }
 
 // ---------------------------------------------------------------- node admin: rooms

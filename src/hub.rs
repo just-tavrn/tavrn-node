@@ -13,7 +13,7 @@ use std::{
 use axum::extract::ws::Utf8Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use crate::util::ulid;
 
@@ -35,6 +35,28 @@ pub enum Scope {
     All,
     /// Exactly one WebSocket connection (a bot's receiving connection, APPLICATIONS.md §5.6).
     Connection(u64),
+}
+
+impl Scope {
+    /// The id lists sorted and without duplicates, so every connection finds itself by binary search
+    /// ([`Scope::listed`]) instead of scanning the list: a presence change or a whiteboard
+    /// stroke goes to many users, and every connection of the instance looks at it.
+    fn normalized(mut self) -> Self {
+        let tidy = |ids: &mut Vec<String>| {
+            ids.sort_unstable();
+            ids.dedup();
+        };
+        match &mut self {
+            Self::Users(ids) | Self::Devices(ids) | Self::UsersExceptDevice { users: ids, .. } => tidy(ids),
+            Self::Room(_) | Self::All | Self::Connection(_) => {}
+        }
+        self
+    }
+
+    /// Is `id` in the user or device list of a scope (lists normalized by the hub)?
+    pub fn listed(ids: &[String], id: &str) -> bool {
+        ids.binary_search_by(|x| x.as_str().cmp(id)).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,7 +88,7 @@ impl Event {
         // Serializing a `Value` cannot fail (string keys only); fall back to a resync just in case.
         let frame = serde_json::to_string(&Frame { op: "event", id: &id, kind, data: &data })
             .unwrap_or_else(|_| String::from(r#"{"op":"resync"}"#));
-        Self { id, kind: kind.to_string(), data, scope, frame: frame.into() }
+        Self { id, kind: kind.to_string(), data, scope: scope.normalized(), frame: frame.into() }
     }
 }
 
@@ -76,7 +98,7 @@ pub struct Hub {
     /// Open WebSocket connections per user id (for `notify` hints to remote members, FEDERATION.md §5.2).
     online: Arc<Mutex<HashMap<String, usize>>>,
     /// The cache bus of a node with several instances (`None` standalone).
-    bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>,
+    bus: Option<crate::cache::BusSender>,
     /// Who may view which room channel (`crate::visibility`), dropped per room by the events that change it.
     visibility: Arc<crate::visibility::Cache>,
     /// The moved voice participations per room as the leader announced them (`crate::voice::moved`).
@@ -113,7 +135,7 @@ impl Hub {
     }
 
     /// A hub that also hands every event to the cache bus (several instances).
-    pub fn with_bus(bus: Option<mpsc::UnboundedSender<crate::cache::Outbound>>) -> Self {
+    pub fn with_bus(bus: Option<crate::cache::BusSender>) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self { tx, online: Arc::default(), bus, visibility: Arc::default(), moved: Arc::default() }
     }
@@ -129,7 +151,8 @@ impl Hub {
     }
 
     /// A room event that changes roles, overrides, channels or membership drops the room's visibility snapshot
-    /// before any connection receives it: the events after it are checked against the new state. An announcement of
+    /// before any connection receives it: the events after it are checked against the new state. Updates that
+    /// change nothing the evaluation reads (a nickname, a topic) keep it (`visibility::Cache::unchanged_by`). An announcement of
     /// the room's moved voice participations is taken first and drops the snapshot when the set changed.
     fn invalidate(&self, kind: &str, scope: &Scope, data: &Value) {
         let Scope::Room(room_id) = scope else { return };
@@ -137,7 +160,7 @@ impl Hub {
             if self.moved.apply(room_id, data) {
                 self.visibility.invalidate(room_id);
             }
-        } else if crate::visibility::changes_visibility(kind) {
+        } else if crate::visibility::changes_visibility(kind) && !self.visibility.unchanged_by(room_id, kind, data) {
             self.visibility.invalidate(room_id);
         }
     }
@@ -175,7 +198,7 @@ impl Hub {
         if let Some(bus) = &self.bus
             && !matches!(event.scope, Scope::Connection(_))
         {
-            let _ = bus.send(crate::cache::Outbound::Event(event.clone()));
+            bus.send(crate::cache::Outbound::Event(event.clone()));
         }
         // No receiver is not an error (nobody connected).
         let _ = self.tx.send(event);
@@ -193,6 +216,7 @@ impl Hub {
             data: Value,
         }
         let data = serde_json::from_str::<Data>(&frame).map(|d| d.data).unwrap_or(Value::Null);
+        let scope = scope.normalized();
         self.invalidate(&kind, &scope, &data);
         let _ = self.tx.send(Arc::new(Event { id, kind, data, scope, frame: frame.into() }));
     }
@@ -273,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_go_to_the_bus_and_injected_ones_stay_local() {
-        let (tx, mut bus) = mpsc::unbounded_channel();
+        let (tx, mut bus) = crate::cache::BusSender::channel(16);
         let hub = Hub::with_bus(Some(tx));
         let mut rx = hub.subscribe();
         let id = hub.users(vec!["u1".into()], "friend.request", serde_json::json!({ "x": 1 }));
@@ -294,6 +318,19 @@ mod tests {
         let r = rx.recv().await.unwrap();
         assert_eq!((r.kind.as_str(), r.frame.as_str(), &r.scope), (RESYNC_KIND, r#"{"op":"resync"}"#, &Scope::All));
         assert!(bus.try_recv().is_err(), "the resync hint is local");
+    }
+
+    #[tokio::test]
+    async fn user_lists_are_sorted_once_for_binary_search() {
+        let hub = Hub::new();
+        let mut rx = hub.subscribe();
+        hub.users(vec!["c".into(), "a".into(), "b".into(), "a".into()], "presence.update", serde_json::json!({}));
+        let e = rx.recv().await.unwrap();
+        let Scope::Users(ids) = &e.scope else { unreachable!("users") };
+        assert_eq!(ids, &["a", "b", "c"]);
+        assert!(Scope::listed(ids, "b") && !Scope::listed(ids, "d"));
+        hub.inject("e".into(), "x".into(), Scope::Devices(vec!["z".into(), "y".into()]), "{}".into());
+        assert_eq!(rx.recv().await.unwrap().scope, Scope::Devices(vec!["y".into(), "z".into()]));
     }
 
     #[test]

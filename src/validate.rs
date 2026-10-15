@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Input validation with uniform error codes.
 
+use serde_json::{Map, Value};
+
 use crate::error::ApiError;
 
 pub fn bad(code: &'static str, detail: impl Into<String>) -> ApiError {
@@ -27,6 +29,55 @@ pub fn name(field: &str, value: &str, max: usize) -> Result<String, ApiError> {
         return Err(bad("validation.multiline", format!("{field}: a single line only")));
     }
     Ok(v)
+}
+
+/// The rules of a text field in a JSON document (embeds, components, commands, polls, link previews): the length in
+/// characters (Unicode scalar values) of the string, trimmed first with `trim`; `controls`: control characters are
+/// allowed. Each content type passes the rules of its spec and keeps its own error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextRules {
+    pub min: usize,
+    pub max: usize,
+    pub trim: bool,
+    pub controls: bool,
+}
+
+/// Why a JSON text field is invalid ([`json_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextError {
+    /// Not a string.
+    NotText,
+    /// Shorter than `min` or longer than `max`.
+    Length,
+    /// Contains control characters where the rules refuse them.
+    Control,
+}
+
+/// Checks `s` against `rules`; returns it (trimmed when the rules say so).
+pub fn text_of(s: &str, rules: TextRules) -> Result<&str, TextError> {
+    let s = if rules.trim { s.trim() } else { s };
+    let n = s.chars().count();
+    if n < rules.min || n > rules.max {
+        return Err(TextError::Length);
+    }
+    if !rules.controls && s.chars().any(char::is_control) {
+        return Err(TextError::Control);
+    }
+    Ok(s)
+}
+
+/// A JSON value as text under `rules`: `Ok(None)` when absent or null, `Ok(Some(text))` for a valid string.
+pub fn json_text(v: Option<&Value>, rules: TextRules) -> Result<Option<&str>, TextError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => text_of(s, rules).map(Some),
+        Some(_) => Err(TextError::NotText),
+    }
+}
+
+/// The first key of `obj` that `allowed` does not name.
+pub fn unknown_key<'a>(obj: &'a Map<String, Value>, allowed: &[&str]) -> Option<&'a str> {
+    obj.keys().map(String::as_str).find(|k| !allowed.contains(k))
 }
 
 pub fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String, ApiError> {
@@ -69,6 +120,29 @@ pub fn limit(value: Option<i64>, default: i64, max: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn json_text_rules() {
+        use super::{TextError, TextRules, json_text, text_of, unknown_key};
+        use serde_json::json;
+        let plain = TextRules { min: 1, max: 5, trim: false, controls: false };
+        assert_eq!(json_text(None, plain), Ok(None));
+        assert_eq!(json_text(Some(&json!(null)), plain), Ok(None));
+        assert_eq!(json_text(Some(&json!("ok")), plain), Ok(Some("ok")));
+        assert_eq!(json_text(Some(&json!("toolong")), plain), Err(TextError::Length));
+        assert_eq!(json_text(Some(&json!("")), plain), Err(TextError::Length));
+        assert_eq!(json_text(Some(&json!("a\u{1}")), plain), Err(TextError::Control));
+        assert_eq!(json_text(Some(&json!(3)), plain), Err(TextError::NotText));
+        let trimmed = TextRules { min: 1, max: 3, trim: true, controls: true };
+        assert_eq!(text_of("  äöü  ", trimmed), Ok("äöü"), "characters, not bytes, after trimming");
+        assert_eq!(text_of("   ", trimmed), Err(TextError::Length));
+        assert_eq!(text_of("a\tb", trimmed), Ok("a\tb"));
+        let obj = json!({ "a": 1, "b": 2 });
+        assert_eq!(unknown_key(obj.as_object().unwrap(), &["a"]), Some("b"));
+        assert_eq!(unknown_key(obj.as_object().unwrap(), &["a", "b"]), None);
+    }
+
     use super::*;
 
     #[test]

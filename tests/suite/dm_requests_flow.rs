@@ -277,3 +277,40 @@ async fn requests_across_nodes_are_decided_by_the_recipients_home_node() {
     assert_eq!(friends["incoming"][0]["message"], "Hi Carol", "{friends}");
     let _ = A;
 }
+
+/// The message requests come newest first (by conversation id) with the sender and the shared rooms, and can be paged
+/// with `limit` and `before` (the conversation id of the last item).
+#[tokio::test]
+async fn message_requests_are_listed_newest_first_and_can_be_paged() {
+    let node = test_node(DOMAIN).await;
+    let bob = node.register("bob").await;
+    let mut senders = Vec::new();
+    for i in 0..3 {
+        senders.push(node.register(&format!("sender{i}")).await);
+    }
+    let refs: Vec<&Session> = senders.iter().collect();
+    share_room(&node, &bob, &refs).await;
+    let mut ids = Vec::new();
+    for s in &senders {
+        let (st, j) = dm(&node, s, &format!("bob@{DOMAIN}")).await;
+        assert_eq!(st, StatusCode::CREATED, "{j}");
+        ids.push(j["id"].as_str().unwrap().to_string());
+    }
+    ids.reverse();
+    let (st, all) = node.get_auth("/api/v1/conversations/requests", &bob.token).await;
+    assert_eq!(st, StatusCode::OK, "{all}");
+    let order: Vec<&str> = all.as_array().unwrap().iter().map(|r| r["conversation"]["id"].as_str().unwrap()).collect();
+    assert_eq!(order, ids.iter().map(String::as_str).collect::<Vec<_>>());
+    for (r, s) in all.as_array().unwrap().iter().zip(senders.iter().rev()) {
+        assert_eq!(r["from"]["id"], s.user_id.as_str());
+        assert_eq!(r["shared_rooms"].as_array().unwrap().len(), 1, "every sender shares the room: {r}");
+    }
+    let (st, first) = node.get_auth("/api/v1/conversations/requests?limit=2", &bob.token).await;
+    assert_eq!(st, StatusCode::OK, "{first}");
+    assert_eq!(first.as_array().unwrap().len(), 2);
+    let (st, rest) =
+        node.get_auth(&format!("/api/v1/conversations/requests?limit=2&before={}", ids[1]), &bob.token).await;
+    assert_eq!(st, StatusCode::OK, "{rest}");
+    assert_eq!(rest.as_array().unwrap().len(), 1);
+    assert_eq!(rest[0]["conversation"]["id"], ids[2].as_str());
+}

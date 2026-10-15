@@ -22,7 +22,7 @@ use crate::{
     auth::AuthUser,
     config::DmPolicy,
     e2ee,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     federation::{remote, social},
     models::{User, UserRow},
     store::{self, social::ConversationRow},
@@ -80,49 +80,92 @@ pub struct SharedRoom {
 }
 
 async fn view(state: &AppState, row: &ConversationRow) -> Result<Conversation, ApiError> {
-    let member_ids = store::social::member_ids(&state.db, &row.id).await?;
-    let members = store::users::by_ids(&state.db, &member_ids).await?;
-    let creator = match &row.creator_id {
-        Some(id) => store::users::by_id(&state.db, id).await?.map(|u| u.address()),
-        None => None,
-    };
-    let requested = store::social::requested_ids(&state.db, &row.id).await?;
-    let pending = members.iter().filter(|m| requested.contains(&m.id)).map(UserRow::address).collect();
-    Ok(Conversation {
-        id: row.id.clone(),
-        kind: row.kind.clone(),
-        name: row.name.clone(),
-        creator,
-        encrypted: row.encrypted != 0,
-        members: members.iter().map(UserRow::to_public).collect(),
-        last_message_id: store::social::last_message_id(&state.db, &row.id).await?,
-        created_at: row.created_at.clone(),
-        last_read_message_id: None,
-        unread_count: None,
-        mention_count: None,
-        pending,
-    })
+    let mut views = views(state, std::slice::from_ref(row)).await?;
+    views.pop().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("conversation view missing")))
+}
+
+/// The views of several conversations with a constant number of statements: the members of all, their users (and
+/// the creators who left), and the newest message ids.
+async fn views(state: &AppState, rows: &[ConversationRow]) -> Result<Vec<Conversation>, ApiError> {
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let last = store::social::edge_message_ids(&state.db, &ids, true).await?;
+    views_with(state, rows, &last).await
+}
+
+/// [`views`] with the newest message ids already loaded (conversation id → message id).
+async fn views_with(
+    state: &AppState,
+    rows: &[ConversationRow],
+    last: &std::collections::HashMap<String, String>,
+) -> Result<Vec<Conversation>, ApiError> {
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let mut members = store::social::members_of(&state.db, &ids).await?;
+    let mut user_ids: Vec<String> = members.values().flatten().map(|m| m.user_id.clone()).collect();
+    user_ids.extend(rows.iter().filter_map(|r| r.creator_id.clone()));
+    let users: std::collections::HashMap<String, UserRow> =
+        store::users::by_ids(&state.db, &user_ids).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let of = members.remove(&row.id).unwrap_or_default();
+            let known: Vec<(&UserRow, bool)> =
+                of.iter().filter_map(|m| Some((users.get(&m.user_id)?, m.requested))).collect();
+            Conversation {
+                id: row.id.clone(),
+                kind: row.kind.clone(),
+                name: row.name.clone(),
+                creator: row.creator_id.as_ref().and_then(|id| users.get(id)).map(UserRow::address),
+                encrypted: row.encrypted != 0,
+                members: known.iter().map(|(u, _)| u.to_public()).collect(),
+                last_message_id: last.get(&row.id).cloned(),
+                created_at: row.created_at.clone(),
+                last_read_message_id: None,
+                unread_count: None,
+                mention_count: None,
+                pending: known.iter().filter(|(_, requested)| *requested).map(|(u, _)| u.address()).collect(),
+            }
+        })
+        .collect())
 }
 
 async fn request_view(state: &AppState, row: &ConversationRow, me: &UserRow) -> Result<ConversationRequest, ApiError> {
-    let from = match &row.creator_id {
-        Some(id) => store::users::by_id(&state.db, id).await?,
-        None => None,
-    };
-    let shared_rooms = match &from {
-        Some(from) => store::rooms::shared_rooms(&state.db, &me.id, &from.id)
-            .await?
-            .into_iter()
-            .map(|(id, name)| SharedRoom { id, name })
-            .collect(),
-        None => Vec::new(),
-    };
-    Ok(ConversationRequest {
-        conversation: view(state, row).await?,
-        from: from.as_ref().map(UserRow::to_public),
-        shared_rooms,
-        first_message_id: store::social::first_message_id(&state.db, &row.id).await?,
-    })
+    let mut views = request_views(state, std::slice::from_ref(row), me).await?;
+    views.pop().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("request view missing")))
+}
+
+/// The message request views of several conversations (as [`views`], plus the senders, the rooms `me` shares with
+/// each and the first message ids).
+async fn request_views(
+    state: &AppState,
+    rows: &[ConversationRow],
+    me: &UserRow,
+) -> Result<Vec<ConversationRequest>, ApiError> {
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let creator_ids: Vec<String> = rows.iter().filter_map(|r| r.creator_id.clone()).collect();
+    let creators: std::collections::HashMap<String, UserRow> =
+        store::users::by_ids(&state.db, &creator_ids).await?.into_iter().map(|u| (u.id.clone(), u)).collect();
+    let known: Vec<String> = creators.keys().cloned().collect();
+    let shared = store::rooms::shared_rooms_with(&state.db, &me.id, &known).await?;
+    let first = store::social::edge_message_ids(&state.db, &ids, false).await?;
+    Ok(views(state, rows)
+        .await?
+        .into_iter()
+        .zip(rows)
+        .map(|(conversation, row)| {
+            let from = row.creator_id.as_ref().and_then(|id| creators.get(id));
+            ConversationRequest {
+                shared_rooms: from
+                    .and_then(|f| shared.get(&f.id))
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, name)| SharedRoom { id: id.clone(), name: name.clone() })
+                    .collect(),
+                from: from.map(UserRow::to_public),
+                first_message_id: first.get(&row.id).cloned(),
+                conversation,
+            }
+        })
+        .collect())
 }
 
 /// Tells `user` (local, with open connections) about a new message request.
@@ -368,10 +411,39 @@ async fn reopen_dm(
     Ok((StatusCode::OK, Json(conversation)))
 }
 
-/// My DMs and group DMs, most recent activity first.
-#[utoipa::path(get, path = "/api/v1/conversations", security(("bearer" = [])), responses((status = 200, body = Vec<Conversation>)))]
-pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<Vec<Conversation>>, ApiError> {
+/// Paging of `GET /conversations` and `GET /conversations/requests` (PROTOCOL.md §8a): without `limit` the whole
+/// list; with it at most `limit` items, the next page passing the sort key of the last item as `before`.
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct ConversationListQuery {
+    /// 1–200; without it, every conversation.
+    pub limit: Option<i64>,
+    /// Only conversations whose sort key is lower: for `GET /conversations` the `last_message_id` (else the id) of
+    /// the last item of the previous page, for the requests its conversation id.
+    pub before: Option<String>,
+}
+
+/// Most recent first by `key`, then `before` and `limit` of `q` (sort keys are ULIDs, compared in upper case).
+fn page<T>(mut items: Vec<(String, T)>, q: &ConversationListQuery) -> Result<Vec<T>, ApiError> {
+    let before = q.before.as_deref().map(|b| validate::ulid("before", b)).transpose()?.map(|b| b.to_ascii_uppercase());
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    let limit = q.limit.map_or(usize::MAX, |l| validate::limit(Some(l), 50, 200) as usize);
+    Ok(items.into_iter().filter(|(k, _)| before.as_ref().is_none_or(|b| k < b)).take(limit).map(|(_, t)| t).collect())
+}
+
+/// My DMs and group DMs, most recent activity first (`last_message_id`, else the conversation id); optionally paged
+/// with `limit` and `before`.
+#[utoipa::path(get, path = "/api/v1/conversations", security(("bearer" = [])), params(ConversationListQuery),
+    responses((status = 200, body = Vec<Conversation>), (status = 400, body = ProblemDetails)))]
+pub async fn list(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(q): Query<ConversationListQuery>,
+) -> Result<Json<Vec<Conversation>>, ApiError> {
     let rows = store::social::conversations_of(&state.db, &auth.user.id, store::social::STATE_ACTIVE).await?;
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let last = store::social::edge_message_ids(&state.db, &ids, true).await?;
+    let keyed = rows.into_iter().map(|r| (last.get(&r.id).unwrap_or(&r.id).to_ascii_uppercase(), r)).collect();
+    let rows = page(keyed, &q)?;
     let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
     let settings = if auth.user.domain == state.config.domain {
         Some(crate::notifications::load(&state.db, &auth.user.id).await?)
@@ -380,19 +452,12 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> Result<Json<
     };
     let ctx = store::messages::ReadContext { settings: settings.as_ref(), ..Default::default() };
     let states = store::messages::read_states(&state.db, &auth.user.id, &auth.user.address(), &ids, "", &ctx).await?;
-    let mut out = Vec::new();
-    for (row, read) in rows.iter().zip(states) {
-        let mut c = view(&state, row).await?;
+    let mut out = views_with(&state, &rows, &last).await?;
+    for (c, read) in out.iter_mut().zip(states) {
         c.last_read_message_id = read.last_read_message_id;
         c.unread_count = Some(read.unread_count);
         c.mention_count = Some(read.mention_count);
-        out.push(c);
     }
-    out.sort_by(|a, b| {
-        let ka = a.last_message_id.as_deref().unwrap_or(&a.id);
-        let kb = b.last_message_id.as_deref().unwrap_or(&b.id);
-        kb.cmp(ka)
-    });
     Ok(Json(out))
 }
 
@@ -482,20 +547,18 @@ pub async fn add_member(
     Ok(Json(conversation))
 }
 
-/// My message requests: conversations of people who are not my friends, until I accept or decline them.
+/// My message requests: conversations of people who are not my friends, until I accept or decline them; newest
+/// first (by conversation id), optionally paged with `limit` and `before`.
 #[utoipa::path(get, path = "/api/v1/conversations/requests", security(("bearer" = [])),
-    responses((status = 200, body = Vec<ConversationRequest>)))]
+    params(ConversationListQuery), responses((status = 200, body = Vec<ConversationRequest>), (status = 400, body = ProblemDetails)))]
 pub async fn requests(
     State(state): State<AppState>,
     auth: AuthUser,
+    Query(q): Query<ConversationListQuery>,
 ) -> Result<Json<Vec<ConversationRequest>>, ApiError> {
     let rows = store::social::conversations_of(&state.db, &auth.user.id, store::social::STATE_REQUESTED).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out.push(request_view(&state, row, &auth.user).await?);
-    }
-    out.sort_by(|a, b| b.conversation.created_at.cmp(&a.conversation.created_at));
-    Ok(Json(out))
+    let rows = page(rows.into_iter().map(|r| (r.id.to_ascii_uppercase(), r)).collect(), &q)?;
+    Ok(Json(request_views(&state, &rows, &auth.user).await?))
 }
 
 /// Accept a message request: the conversation becomes a normal DM or group DM (idempotent).

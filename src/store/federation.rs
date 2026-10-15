@@ -886,6 +886,28 @@ pub async fn enqueue(db: &Pool, e: NewOutbox<'_>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// [`enqueue`] for many entries: one multi-row `INSERT` per 500 (a message's `notify` hints to many members).
+pub async fn enqueue_many(db: &Pool, entries: &[NewOutbox<'_>]) -> Result<(), ApiError> {
+    for chunk in entries.chunks(500) {
+        let rows: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let b = i * 6;
+                format!("(${}, ${}, ${}, ${}, 0, ${}, ${}, ${})", b + 1, b + 2, b + 3, b + 4, b + 5, b + 5, b + 6)
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO federation_outbox (id, target, type, body, attempts, next_at, created_at, expires_at) VALUES {}",
+            rows.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        for e in chunk {
+            q = q.bind(e.id).bind(e.target).bind(e.kind).bind(e.body).bind(e.created_at).bind(e.expires_at);
+        }
+        q.execute(db).await?;
+    }
+    Ok(())
+}
+
 /// Queues `e` in place of the entries of the same target and type that `from` sent and that are still queued
 /// (coalescing, FEDERATION.md §5.2 `profile.changed`): at most one such entry stays. The new entry is due at the
 /// earliest `next_at` of the replaced ones (a waiting or backed-off target keeps its schedule), else at `next_at`.
@@ -984,15 +1006,14 @@ pub async fn delay_target(db: &Pool, target: &str, next_at: &str) -> Result<(), 
 
 const UNDELIVERABLE_KEY: &str = "federation.undeliverable";
 
-/// Counts a given-up outbox entry (admin overview).
+/// Counts a given-up outbox entry (admin overview), in one statement: up to 16 targets give up at once, and a read
+/// followed by a write would lose increments.
 pub async fn count_undeliverable(db: &Pool) -> Result<(), ApiError> {
-    let current = undeliverable_count(db).await?;
     sqlx::query(
-        "INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)
-         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3",
+        "INSERT INTO node_settings (key, value, updated_at) VALUES ($1, '1', $2)
+         ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(node_settings.value AS BIGINT) + 1 AS TEXT), updated_at = $2",
     )
     .bind(UNDELIVERABLE_KEY)
-    .bind((current + 1).to_string())
     .bind(now())
     .execute(db)
     .await?;

@@ -5,7 +5,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     routing::{get, patch},
 };
@@ -18,7 +18,7 @@ use crate::{
     app::AppState,
     auth::{AuthUser, NodeAdmin},
     entitlements::{self, Entitlements, Limits, SubjectKind},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     models::UserRow,
     store::{self, entitlements as db},
     util,

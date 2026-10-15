@@ -242,16 +242,18 @@ async fn channel_conv(state: &AppState, channel: ChannelRow) -> Result<Conv, Api
     let room = store::rooms::room_by_id(&state.db, &channel.room_id)
         .await?
         .ok_or_else(|| crate::access::not_found("Room", "room.not_found"))?;
-    let everyone = store::rooms::roles(&state.db, &room.id)
-        .await?
-        .into_iter()
+    let roles = store::rooms::roles(&state.db, &room.id).await?;
+    let everyone = roles
+        .iter()
         .find(|r| r.is_everyone != 0)
+        .cloned()
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("room without @everyone")))?;
     let access = RoomAccess {
         room,
         member: None,
         everyone,
         member_roles: Vec::new(),
+        roles: std::sync::Arc::new(roles),
         is_owner: false,
         is_node_admin: false,
         room_perms: 0,
@@ -355,7 +357,6 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
     )
     .await?;
     store::webhooks::touch(&state.db, &webhook.id).await?;
-    crate::search::index_message(state, &id).await;
     let message = crate::routes::messages::enrich_one(state, &webhook.user_id, &id).await?;
     if let Some(t) = &thread {
         // Like a member's reply (an archived thread reopens), without following: the pseudo user reads nothing.
@@ -366,6 +367,10 @@ pub async fn execute(state: &AppState, webhook: &WebhookRow, body: &[u8]) -> Res
     let event_id = state.hub.room(&webhook.room_id, "message.create", &message);
     crate::subscriptions::record(state, &webhook.room_id, "message.create", &event_id, &message).await;
     crate::federation::social::notify_members(state, &conv, &message, &webhook.user_id).await;
+    // Plaintext channels only; sealed webhook messages are encrypted (`index` skips them).
+    if !conv.encrypted {
+        crate::search::index(state, &message, true).await;
+    }
     tracing::info!(webhook = webhook.id, message = id, "webhook executed");
     Ok(message)
 }
@@ -682,15 +687,21 @@ pub fn redact_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-/// The request span of the HTTP trace layer: method, the redacted path (never the query string) and version.
+/// The request span of the HTTP trace layer (level info, so that warnings and errors of a request carry it): method,
+/// route template, the `x-request-id` (the `request_id` of Problem Details), the redacted path (never the query
+/// string) and version.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RedactedSpan;
 
 impl<B> tower_http::trace::MakeSpan<B> for RedactedSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
-        tracing::debug_span!(
+        let route = request.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("-");
+        let request_id = request.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("-");
+        tracing::info_span!(
             "request",
             method = %request.method(),
+            route,
+            request_id,
             path = %redact_path(request.uri().path()),
             version = ?request.version(),
         )

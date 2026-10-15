@@ -423,6 +423,33 @@ async fn acks_over_the_read_limit_are_dropped() {
     assert!(tavrn_node::store::messages::read_marker(db, &channel, &alice.user_id).await.unwrap().is_none());
 }
 
+/// Frames up to the 64 KiB limit still arrive whole although the read buffer of a connection is small (a few KiB,
+/// `ws::READ_BUFFER`): two of them back to back, then the socket keeps working.
+#[tokio::test]
+async fn frames_up_to_the_limit_arrive_through_the_small_read_buffer() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let channel_id = common::TestNode::text_channel(&room);
+    let url = serve(&node).await;
+    let mut ws = connect(&url).await;
+    ws.send(Message::Text(json!({ "op": "hello", "token": alice.token }).to_string().into())).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["op"], "ready");
+    // The frames below take several reads.
+    const { assert!(tavrn_node::ws::READ_BUFFER * 8 <= tavrn_node::ws::MAX_FRAME) };
+    // A pong padded to just under the limit (the node ignores the unknown field), twice in one write.
+    let pad = "x".repeat(tavrn_node::ws::MAX_FRAME - 64);
+    let big = json!({ "op": "pong", "pad": pad }).to_string();
+    assert!(big.len() > tavrn_node::ws::MAX_FRAME - 64 && big.len() <= tavrn_node::ws::MAX_FRAME);
+    ws.feed(Message::Text(big.clone().into())).await.unwrap();
+    ws.feed(Message::Text(big.into())).await.unwrap();
+    ws.flush().await.unwrap();
+    let (_, msg) = node.send(&alice.token, &room_id, &channel_id, "after the large frames").await;
+    let ev = next_json(&mut ws).await;
+    assert_eq!((ev["type"].as_str(), ev["data"]["id"].as_str()), (Some("message.create"), msg["id"].as_str()), "{ev}");
+}
+
 /// A frame header announcing more than 64 KiB is refused as soon as it is read, before the hello and before any
 /// payload is buffered (with only the message limit the node would wait for the payload until the hello timeout).
 #[tokio::test]
@@ -509,4 +536,143 @@ async fn answer_pings(ws: &mut Socket, ms: u64) -> Option<u16> {
             Ok(Some(Ok(_))) => {}
         }
     }
+}
+
+/// A client that stops reading (a frozen tab, a half-open link) is disconnected once a send takes longer than the
+/// send timeout: its task does not hang, and the user goes offline (so web push reaches them again).
+#[tokio::test]
+async fn a_client_that_stops_reading_is_disconnected() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let mut state = node.state.clone();
+    state.ws_send_timeout = Duration::from_millis(300);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = tavrn_node::app::router(state);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let ws = hello(&format!("ws://{addr}/api/v1/ws"), &alice.token).await;
+    assert!(node.state.hub.is_online(&alice.user_id));
+    // From now on the client reads nothing; the node keeps sending large events until the buffers are full.
+    let big = "x".repeat(256 * 1024);
+    let hub = node.state.hub.clone();
+    let user = alice.user_id.clone();
+    let flood = tokio::spawn(async move {
+        for _ in 0..400 {
+            hub.users(vec![user.clone()], "test.flood", json!({ "pad": big }));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    common::wait_until(Duration::from_secs(10), "the stalled client is disconnected", || async {
+        !node.state.hub.is_online(&alice.user_id)
+    })
+    .await;
+    flood.abort();
+    drop(ws);
+}
+
+/// The heartbeat checks the sessions of every connected device at once: one statement for all of them per
+/// interval, not two per socket and ping.
+#[tokio::test]
+async fn the_heartbeat_checks_every_connected_device_in_one_statement() {
+    let node = test_node("t.local").await;
+    let mut users = Vec::new();
+    for i in 0..12 {
+        users.push(node.register(&format!("user{i}")).await);
+    }
+    let guards: Vec<_> = users
+        .iter()
+        .map(|u| tavrn_node::sessions::watch(&node.state.live_sessions, &u.user_id, &u.device_id))
+        .collect();
+    let interval = Duration::from_secs(30);
+    let (live, statements) = common::logs::statements(async {
+        let mut live = 0;
+        for u in &users {
+            live += usize::from(tavrn_node::sessions::still_live(&node.state, &u.device_id, interval).await);
+        }
+        live
+    })
+    .await;
+    assert_eq!((live, statements), (12, 1), "12 pings, one check");
+    // A session that ends without the event is found at the next check.
+    tavrn_node::store::users::revoke_device_sessions(&node.state.db, &users[3].user_id, &users[3].device_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET disabled_at = $1 WHERE id = $2")
+        .bind(tavrn_node::util::now())
+        .bind(&users[5].user_id)
+        .execute(&node.state.db)
+        .await
+        .unwrap();
+    node.state.live_sessions.forget(std::slice::from_ref(&users[3].device_id));
+    let alive: Vec<bool> = {
+        let mut out = Vec::new();
+        for u in &users {
+            out.push(tavrn_node::sessions::still_live(&node.state, &u.device_id, interval).await);
+        }
+        out
+    };
+    assert_eq!(alive.iter().filter(|a| !**a).count(), 2, "{alive:?}");
+    assert!(!alive[3] && !alive[5]);
+    drop(guards);
+}
+
+/// Leaving a room tells the user's other devices too (as kick and ban do): their room list must not keep the room.
+#[tokio::test]
+async fn leaving_a_room_reaches_the_users_other_devices() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let bob = node.register("bob").await;
+    let room = node.plaintext_room(&alice.token, "Room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let (_, invite) = node.post(&format!("/api/v1/rooms/{room_id}/invites"), &alice.token, json!({})).await;
+    let (st, j) =
+        node.post(&format!("/api/v1/invites/{}/join", invite["code"].as_str().unwrap()), &bob.token, json!({})).await;
+    assert!(st.is_success(), "{j}");
+    let other_device = node.login("bob").await;
+    let url = serve(&node).await;
+    let mut bob_ws = hello(&url, &other_device.token).await;
+    let mut alice_ws = hello(&url, &alice.token).await;
+
+    let (st, j) = node.post(&format!("/api/v1/rooms/{room_id}/leave"), &bob.token, json!({})).await;
+    assert_eq!(st, axum::http::StatusCode::NO_CONTENT, "{j}");
+    for ws in [&mut bob_ws, &mut alice_ws] {
+        loop {
+            let ev = next_json(ws).await;
+            assert_eq!(ev["op"], "event", "{ev}");
+            if ev["type"] == "member.leave" {
+                assert_eq!(
+                    (ev["data"]["room_id"].as_str(), ev["data"]["user_id"].as_str()),
+                    (Some(room_id.as_str()), Some(bob.user_id.as_str()))
+                );
+                break;
+            }
+        }
+    }
+    // Exactly once on the leaving user's device.
+    assert!(silent(&mut bob_ws, 300).await);
+}
+/// The close frame (code and reason) that ends a hello.
+async fn hello_close(url: &str, token: &str) -> (u16, String) {
+    let mut ws = connect(url).await;
+    ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
+    loop {
+        match common::within(Duration::from_secs(15), "the close frame", ws.next()).await {
+            Some(Ok(Message::Close(Some(frame)))) => return (u16::from(frame.code), frame.reason.to_string()),
+            Some(Ok(Message::Text(t))) => assert!(!t.contains("\"ready\""), "no ready without a database: {t}"),
+            other => return (0, format!("expected a close frame, got {other:?}")),
+        }
+    }
+}
+
+/// A database outage during the hello is no authentication failure: clients would refresh and then end the session
+/// on `4001`. The node closes with `1013` (try again later) and a neutral reason instead; a bad token stays `4001`.
+#[tokio::test]
+async fn a_database_outage_during_the_hello_does_not_end_the_session() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let url = serve(&node).await;
+    assert_eq!(hello_close(&url, "broken").await.0, 4001);
+    node.state.db.close().await;
+    let (code, reason) = hello_close(&url, &alice.token).await;
+    assert_eq!((code, reason.as_str()), (1013, "db.unavailable"));
 }

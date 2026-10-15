@@ -4,13 +4,12 @@
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
@@ -18,7 +17,8 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     entitlements::{self, Entitlements},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiQuery as Query, ProblemDetails},
+    files,
     models::{Attachment, Message, MessageRow, MessageUpdate, ReactionChange},
     permissions as p,
     storage::mime_allowed,
@@ -114,16 +114,49 @@ async fn upload_in(
     conv.require(p::VIEW_CHANNEL | p::SEND_MESSAGES | p::ATTACH_FILES, "upload.forbidden", "Attach files")?;
     crate::routes::messages::check_direct_write(state, auth, conv).await?;
     let (max, quota) = upload_limits(state, &auth.user, conv).await?;
-    // The body is read here with the effective limit (the route has no body limit of its own; the router's
-    // global limit is `TAVRN_UPLOAD_MAX_BYTES_CEILING`).
+    // The body streams into storage with the effective limit (the route has no body limit of its own; the
+    // router's global limit is `TAVRN_UPLOAD_MAX_BYTES_CEILING`): it is classified by its first bytes, counted
+    // and hashed as it passes, and cut off at the limit, so memory stays at a chunk per upload.
     let declared =
         headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > max) {
         return Err(too_large(max));
     }
-    let body =
-        axum::body::to_bytes(body, usize::try_from(max).unwrap_or(usize::MAX)).await.map_err(|_| too_large(max))?;
-    if body.is_empty() {
+    let room_id = conv.room_id();
+    let usage = match room_id {
+        Some(room_id) => store::blobs::room_usage(&state.db, room_id).await?,
+        None => store::blobs::conversation_usage(&state.db, &conv.id).await?,
+    };
+    let quota_exceeded = || ApiError::PayloadTooLarge {
+        code: "upload.quota_exceeded",
+        detail: "The storage quota of this room is exhausted".into(),
+        meta: serde_json::json!({ "quota_bytes": quota, "used_bytes": usage }),
+    };
+    let remaining = quota.map(|q| u64::try_from(q.saturating_sub(usage)).unwrap_or(0));
+    if remaining.is_some_and(|left| declared.unwrap_or(1) > left) {
+        return Err(quota_exceeded());
+    }
+    let limit = remaining.map_or(max, |left| left.min(max));
+    let client_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = client_failed.clone();
+    let body: files::ByteStream = Box::pin(body.into_data_stream().map_err(move |e| {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::io::Error::other(e)
+    }));
+    let (stream, meter) = files::metered(body, limit);
+    // Over the limit: too large for the file limit, else the quota is exhausted; a client that went away aborted.
+    let failed = |meter: &std::sync::Mutex<files::Meter>| -> ApiError {
+        match meter.lock().map(|m| (m.exceeded, m.len)).unwrap_or((false, 0)) {
+            (true, len) if len <= max && quota.is_some() => quota_exceeded(),
+            (true, _) => too_large(max),
+            _ if client_failed.load(std::sync::atomic::Ordering::Relaxed) => {
+                bad("upload.aborted", "The upload was interrupted")
+            }
+            _ => ApiError::Internal(anyhow::anyhow!("upload failed")),
+        }
+    };
+    let (head, stream) = files::read_head(stream, files::SNIFF_BYTES).await.map_err(|_| failed(&meter))?;
+    if head.is_empty() {
         return Err(bad("upload.empty", "Empty file"));
     }
     let (name, mime, class) = if conv.encrypted {
@@ -152,47 +185,42 @@ async fn upload_in(
         }
         let raw_name = header_str(headers, "tavrn-file-name").map(percent_decode).unwrap_or_else(|| "file".into());
         // Classified by the name it is stored and downloaded under (control and bidi characters gone), never by the
-        // raw header: `run.bat\0` is `run.bat`.
+        // raw header: `run.bat\0` is `run.bat`. Content sniffing needs the first bytes only (`files::SNIFF_BYTES`).
         let name = sanitize_name(&raw_name);
-        let class = crate::uploads::classify(&body, &name, &mime);
+        let class = crate::uploads::classify(&head, &name, &mime);
         // SVG is stored as what it is, whatever type was declared: clients never render it inline.
-        let mime = if crate::uploads::is_svg(&body, &name, &mime) { "image/svg+xml".to_string() } else { mime };
+        let mime = if crate::uploads::is_svg(&head, &name, &mime) { "image/svg+xml".to_string() } else { mime };
         (name, mime, class)
     };
     check_category(state, conv, &auth.user.id, class).await?;
-    let room_id = conv.room_id();
-    let usage = match room_id {
-        Some(room_id) => store::blobs::room_usage(&state.db, room_id).await?,
-        None => store::blobs::conversation_usage(&state.db, &conv.id).await?,
-    };
-    if let Some(quota) = quota
-        && usage.saturating_add(body.len() as i64) > quota
-    {
-        return Err(ApiError::PayloadTooLarge {
-            code: "upload.quota_exceeded",
-            detail: "The storage quota of this room is exhausted".into(),
-            meta: serde_json::json!({ "quota_bytes": quota, "used_bytes": usage }),
+    let id = crate::util::ulid();
+    if let Err(e) = state.storage.write_stream(&id, stream).await {
+        return Err(match failed(&meter) {
+            ApiError::Internal(_) => ApiError::Internal(e),
+            other => other,
         });
     }
-    let sha256 = URL_SAFE_NO_PAD.encode(Sha256::digest(&body));
-    let blob = store::blobs::insert(
-        &state.db,
-        store::blobs::NewBlob {
-            uploader_id: &auth.user.id,
-            conversation_id: &conv.id,
-            room_id,
-            name: &name,
-            mime: &mime,
-            size: body.len() as i64,
-            sha256: &sha256,
-        },
-    )
-    .await?;
-    if let Err(e) = state.storage.write(&blob.id, &body).await {
-        store::blobs::delete_rows(&state.db, std::slice::from_ref(&blob.id)).await?;
-        return Err(ApiError::Internal(e));
-    }
-    state.metrics.upload_bytes.inc_by(body.len() as u64);
+    let (size, sha256) = {
+        let m = meter.lock().map_err(|_| ApiError::Internal(anyhow::anyhow!("meter poisoned")))?;
+        (m.len as i64, m.sha256())
+    };
+    let new = store::blobs::NewBlob {
+        uploader_id: &auth.user.id,
+        conversation_id: &conv.id,
+        room_id,
+        name: &name,
+        mime: &mime,
+        size,
+        sha256: &sha256,
+    };
+    let blob = match store::blobs::insert_as(&state.db, &id, new).await {
+        Ok(blob) => blob,
+        Err(e) => {
+            state.storage.delete(&id).await;
+            return Err(e);
+        }
+    };
+    state.metrics.upload_bytes.inc_by(size as u64);
     Ok((StatusCode::CREATED, Json(blob.to_api())))
 }
 
@@ -263,29 +291,8 @@ pub async fn upload_policy(
     }))
 }
 
-pub(crate) fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let decoded = (bytes[i] == b'%')
-            .then(|| bytes.get(i + 1..i + 3))
-            .flatten()
-            .and_then(|h| std::str::from_utf8(h).ok())
-            .and_then(|h| u8::from_str_radix(h, 16).ok());
-        match decoded {
-            Some(v) => {
-                out.push(v);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+/// The lenient decoder of file name headers (`util::percent_decode`).
+pub(crate) use crate::util::percent_decode;
 
 /// File name for display only: strip control characters and path separators, limit the length.
 /// The stored file name: no control or bidirectional control characters (a right-to-left override would show
@@ -376,8 +383,11 @@ fn valid_emoji(e: &str) -> bool {
     crate::emoji::valid_reaction(e)
 }
 
+/// A message the caller may read ([`crate::routes::messages::readable`]: `view_channel` and the history window of
+/// ENCRYPTION.md §7b) and act on with `needed`.
 async fn message_in_conv(
     state: &AppState,
+    auth: &AuthUser,
     conv: &Conv,
     message_id: &str,
     needed: u64,
@@ -385,10 +395,7 @@ async fn message_in_conv(
     what: &str,
 ) -> Result<MessageRow, ApiError> {
     conv.require(p::VIEW_CHANNEL | needed, code, what)?;
-    store::messages::by_id(&state.db, message_id)
-        .await?
-        .filter(|m| m.conversation_id == conv.id)
-        .ok_or_else(|| access::not_found("Message", "message.not_found"))
+    crate::routes::messages::readable(state, auth, conv, message_id).await
 }
 
 async fn react(
@@ -403,14 +410,14 @@ async fn react(
         if !valid_emoji(emoji) {
             return Err(bad("reaction.invalid", "Invalid emoji"));
         }
-        message_in_conv(state, conv, message_id, p::ADD_REACTIONS, "reaction.forbidden", "Add reactions").await?;
+        message_in_conv(state, auth, conv, message_id, p::ADD_REACTIONS, "reaction.forbidden", "Add reactions").await?;
         crate::routes::messages::check_direct_write(state, auth, conv).await?;
         if let Some(token) = crate::emoji::parse_token(emoji) {
             crate::emoji::check_external(state, conv, &[token]).await?;
         }
         store::blobs::add_reaction(&state.db, message_id, &auth.user.id, emoji).await?
     } else {
-        message_in_conv(state, conv, message_id, 0, "channel.view_forbidden", "View channel").await?;
+        message_in_conv(state, auth, conv, message_id, 0, "channel.view_forbidden", "View channel").await?;
         store::blobs::remove_reaction(&state.db, message_id, &auth.user.id, emoji).await?
     };
     let message = crate::routes::messages::enrich_one(state, &auth.user.id, message_id).await?;
@@ -438,7 +445,7 @@ async fn set_pin(
     message_id: &str,
     pinned: bool,
 ) -> Result<Json<Message>, ApiError> {
-    message_in_conv(state, conv, message_id, p::PIN_MESSAGES, "pin.forbidden", "Pin messages").await?;
+    message_in_conv(state, auth, conv, message_id, p::PIN_MESSAGES, "pin.forbidden", "Pin messages").await?;
     crate::routes::messages::check_direct_write(state, auth, conv).await?;
     if pinned {
         if store::blobs::pin_count(&state.db, &conv.id).await? >= 50 {
@@ -453,11 +460,16 @@ async fn set_pin(
     Ok(Json(message))
 }
 
+/// The pinned messages the caller may read: encrypted ones only inside the history window (ENCRYPTION.md §7b), as
+/// for a page of messages.
 async fn pins_of(state: &AppState, auth: &AuthUser, conv: &Conv) -> Result<Json<PinList>, ApiError> {
     conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
+    let cut = crate::history::list_cutoff(state, conv, &auth.user).await?;
     let mut rows = Vec::new();
     for id in store::blobs::pinned_ids(&state.db, &conv.id).await? {
-        if let Some(m) = store::messages::by_id(&state.db, &id).await? {
+        if let Some(m) = store::messages::by_id(&state.db, &id).await?
+            && (m.encrypted == 0 || cut.as_deref().is_none_or(|cut| m.id.as_str() >= cut))
+        {
             rows.push(m);
         }
     }

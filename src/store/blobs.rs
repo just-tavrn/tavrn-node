@@ -22,9 +22,13 @@ pub struct NewBlob<'a> {
 }
 
 pub async fn insert(db: &Pool, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
-    let id = ulid();
+    insert_as(db, &ulid(), b).await
+}
+
+/// [`insert`] with the id chosen by the caller (the file was stored under it first, streamed).
+pub async fn insert_as(db: &Pool, id: &str, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
     sqlx::query("INSERT INTO blobs (id, uploader_id, conversation_id, room_id, name, mime, size, sha256, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
-        .bind(&id)
+        .bind(id)
         .bind(b.uploader_id)
         .bind(b.conversation_id)
         .bind(b.room_id)
@@ -35,7 +39,7 @@ pub async fn insert(db: &Pool, b: NewBlob<'_>) -> Result<BlobRow, ApiError> {
         .bind(now())
         .execute(db)
         .await?;
-    by_id(db, &id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("blob not found after INSERT")))
+    by_id(db, id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("blob not found after INSERT")))
 }
 
 pub async fn by_id(db: &Pool, id: &str) -> Result<Option<BlobRow>, ApiError> {
@@ -87,6 +91,17 @@ pub async fn bind_to_message(
     author_id: &str,
     conversation_id: &str,
 ) -> Result<Vec<String>, ApiError> {
+    bind_to_message_on(&mut *db.acquire().await?, blob_ids, message_id, author_id, conversation_id).await
+}
+
+/// [`bind_to_message`] on one connection (a transaction).
+pub async fn bind_to_message_on(
+    db: &mut sqlx::AnyConnection,
+    blob_ids: &[String],
+    message_id: &str,
+    author_id: &str,
+    conversation_id: &str,
+) -> Result<Vec<String>, ApiError> {
     let mut bound = Vec::new();
     for id in blob_ids {
         let r = sqlx::query("UPDATE blobs SET message_id = $1 WHERE id = $2 AND message_id IS NULL AND uploader_id = $3 AND conversation_id = $4")
@@ -94,7 +109,7 @@ pub async fn bind_to_message(
             .bind(id)
             .bind(author_id)
             .bind(conversation_id)
-            .execute(db)
+            .execute(&mut *db)
             .await?;
         if r.rows_affected() > 0 {
             bound.push(id.clone());
@@ -105,11 +120,20 @@ pub async fn bind_to_message(
 
 /// Marks bound attachments of a plaintext message as spoilers.
 pub async fn mark_spoilers(db: &Pool, message_id: &str, blob_ids: &[String]) -> Result<(), ApiError> {
+    mark_spoilers_on(&mut *db.acquire().await?, message_id, blob_ids).await
+}
+
+/// [`mark_spoilers`] on one connection (a transaction).
+pub async fn mark_spoilers_on(
+    db: &mut sqlx::AnyConnection,
+    message_id: &str,
+    blob_ids: &[String],
+) -> Result<(), ApiError> {
     for id in blob_ids {
         sqlx::query("UPDATE blobs SET spoiler = 1 WHERE id = $1 AND message_id = $2")
             .bind(id)
             .bind(message_id)
-            .execute(db)
+            .execute(&mut *db)
             .await?;
     }
     Ok(())

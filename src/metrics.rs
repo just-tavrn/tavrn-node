@@ -233,7 +233,7 @@ pub async fn endpoint(State(state): State<AppState>, request: Request) -> Respon
         None => connect.is_some_and(|ConnectInfo(addr)| {
             let internal = |ip: std::net::IpAddr| {
                 let ip = ip.to_canonical();
-                ip.is_loopback() || state.config.is_trusted_proxy(ip)
+                ip.is_loopback() || state.trusted_proxies.iter().any(|n| n.contains(&ip))
             };
             let forwarded = headers.get_all("x-forwarded-for").iter().all(|v| {
                 v.to_str().is_ok_and(|v| v.split(',').all(|a| a.trim().parse::<std::net::IpAddr>().is_ok_and(internal)))

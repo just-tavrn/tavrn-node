@@ -333,3 +333,77 @@ async fn dm_messages_reactions_pins_and_attachments() {
     let (_, convs) = node.get_auth("/api/v1/conversations", bob.token()).await;
     assert!(convs[0]["last_message_id"].is_null());
 }
+
+/// `GET /conversations` without `limit` lists everything (most recent activity first); with `limit` and `before` (the
+/// sort key of the last item: `last_message_id`, else the id) the pages add up to the same list.
+#[tokio::test]
+async fn the_dm_list_can_be_paged() {
+    let node = test_node(DOMAIN).await;
+    let alice = node.register("alice").await;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let friend = node.register(&format!("friend{i}")).await;
+        node.befriend(&alice, &friend).await;
+        let (s, j) = node
+            .post(
+                "/api/v1/conversations",
+                &alice.token,
+                json!({ "kind": "dm", "members": [format!("{}@{DOMAIN}", friend.username)] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{j}");
+        ids.push(j["id"].as_str().unwrap().to_string());
+    }
+    // A message in the oldest DM makes it the most recent one.
+    let message = tavrn_node::util::ulid();
+    tavrn_node::store::messages::insert(
+        &node.state.db,
+        tavrn_node::store::messages::NewMessage {
+            id: &message,
+            conversation_id: &ids[0],
+            author_id: &alice.user_id,
+            device_id: None,
+            encrypted: true,
+            format: 1,
+            epoch: Some(0),
+            content: "ciphertext",
+            reply_to_id: None,
+            thread_id: None,
+            mentions: &[],
+            mentions_everyone: false,
+            signature: None,
+        },
+    )
+    .await
+    .unwrap();
+    let order = |list: &serde_json::Value| -> Vec<String> {
+        list.as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect()
+    };
+    let (s, all) = node.get_auth("/api/v1/conversations", &alice.token).await;
+    assert_eq!(s, StatusCode::OK, "{all}");
+    let expected = vec![ids[0].clone(), ids[4].clone(), ids[3].clone(), ids[2].clone(), ids[1].clone()];
+    assert_eq!(order(&all), expected);
+    assert_eq!(all[0]["last_message_id"], message.as_str());
+
+    let mut paged = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let path = match &before {
+            Some(b) => format!("/api/v1/conversations?limit=2&before={}", b.to_lowercase()),
+            None => "/api/v1/conversations?limit=2".to_string(),
+        };
+        let (s, page) = node.get_auth(&path, &alice.token).await;
+        assert_eq!(s, StatusCode::OK, "{page}");
+        let items = page.as_array().unwrap();
+        assert!(items.len() <= 2);
+        paged.extend(order(&page));
+        if items.len() < 2 {
+            break;
+        }
+        let last = &items[1];
+        before = Some(last["last_message_id"].as_str().unwrap_or(last["id"].as_str().unwrap()).to_string());
+    }
+    assert_eq!(paged, expected, "the pages add up to the whole list (lowercase cursors too)");
+    let (s, j) = node.get_auth("/api/v1/conversations?limit=2&before=nonsense", &alice.token).await;
+    assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("validation.id")), "{j}");
+}

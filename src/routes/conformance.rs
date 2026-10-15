@@ -5,7 +5,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -17,7 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     app::AppState,
     auth::{AuthUser, ClientIp, NodeAdmin},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     federation::{
         self,
         conformance::{self, ConformanceRoom, Record},
@@ -248,7 +248,7 @@ pub async fn block_peer(
     State(state): State<AppState>,
     NodeAdmin(admin): NodeAdmin,
     Path(domain): Path<String>,
-    body: Option<Json<BlockPeerRequest>>,
+    body: Option<ApiJson<BlockPeerRequest>>,
 ) -> Result<Json<FederationPeer>, ApiError> {
     let domain = checked_domain(&state, &domain)?;
     let reason = validate::text("reason", &body.map(|b| b.0.reason).unwrap_or_default(), 0, 500)?;

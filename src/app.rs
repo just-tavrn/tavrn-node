@@ -161,8 +161,8 @@ pub struct AppState {
     pub direct_invite_limiter: Arc<RateLimiter>,
     /// Received `room.invite` notifications per sender and recipient (10 per hour, §5.2).
     pub room_invite_inbox_limiter: Arc<RateLimiter>,
-    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2).
-    pub notify_limiter: Arc<RateLimiter>,
+    /// `notify` hints per remote member and conversation (1 per 60 seconds, §5.2), counted for the whole node.
+    pub notify_limiter: Arc<SharedLimiter>,
     /// Key cache refetches through `federation::keys::ensure` per remote user (1 per minute, §3.5).
     pub keys_fetch_limiter: Arc<RateLimiter>,
     /// Background refreshes of a remote user's profile mirror started by profile reads (`<user id>`, 1 per minute,
@@ -173,7 +173,8 @@ pub struct AppState {
     pub profile_changed_limiter: Arc<SharedLimiter>,
     /// Received `node.announce` per sending domain (`domain:<domain>`, 1 per 10 minutes, FEDERATION.md §7.2).
     pub directory_announce_limiter: Arc<RateLimiter>,
-    /// Public directory reads per client IP (`dir-ip:<ip>`, 120 per minute).
+    /// Public directory reads per client IP (`dir-ip:<ip>`; anonymous room discovery `discover-ip:<ip>`; 120 per
+    /// minute each).
     pub directory_limiter: Arc<RateLimiter>,
     /// Wakes the outbox worker when a notification was queued.
     pub outbox_wakeup: Arc<tokio::sync::Notify>,
@@ -271,9 +272,10 @@ pub struct AppState {
     pub reports_inbound_total_limiter: Arc<SharedLimiter>,
     /// Status-link lookups (notices, account deletions) per client IP (`lookup-ip:<ip>`, 60 per hour).
     pub legal_lookup_limiter: Arc<SharedLimiter>,
-    /// Access tokens issued before this Unix time are expired. Only development nodes move it
-    /// (`POST /dev/expire-access-tokens`, e2e tests of the refresh paths); 0 otherwise.
-    pub access_not_before: Arc<std::sync::atomic::AtomicI64>,
+    /// Per account (user id): access tokens issued before this Unix time are expired. Only development nodes fill it
+    /// (`POST /dev/expire-access-tokens`, e2e tests of the refresh paths); empty otherwise. Per account, so a test
+    /// never ends the sessions of the tests running in parallel on the same node.
+    pub access_not_before: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// Web push (`push.rs`): VAPID key, subscriptions' sender, limits.
     pub push: Arc<crate::push::Push>,
     /// Counters and gauges of `GET /metrics` (`metrics.rs`).
@@ -282,6 +284,10 @@ pub struct AppState {
     pub live_sessions: Arc<crate::sessions::LiveCache>,
     /// Heartbeat of WebSockets (`ws::PING_INTERVAL`; tests shorten it to watch the session re-check).
     pub ws_ping: Duration,
+    /// `TAVRN_TRUSTED_PROXIES`, parsed once (`auth::ClientIp` consults it for every request).
+    pub trusted_proxies: Arc<[ipnet::IpNet]>,
+    /// How long a WebSocket send may take before the connection ends (`ws::SEND_TIMEOUT`; tests shorten it).
+    pub ws_send_timeout: Duration,
     /// Argon2 runs at once (`TAVRN_PASSWORD_HASH_CONCURRENCY`, `auth::hash`/`auth::verify`).
     pub password_hashing: Arc<tokio::sync::Semaphore>,
 }
@@ -393,7 +399,7 @@ impl AppState {
             ),
             direct_invite_limiter: limiter(invites.1, 3600),
             room_invite_inbox_limiter: limiter(invites.2, 3600),
-            notify_limiter: limiter(1, 60),
+            notify_limiter: shared("fed-notify", 1, 60),
             keys_fetch_limiter: limiter(1, 60),
             profile_refresh_limiter: limiter(1, 60),
             profile_changed_limiter: shared(
@@ -450,9 +456,11 @@ impl AppState {
             legal_lookup_limiter: shared("legal-lookup", if config.dev { 1000 } else { 60 }, 3600),
             search_limiter: limiter(config.search_rate_per_minute, 60),
             node_automod: Arc::new(crate::automod::NodeFilter::from_config(&config)?),
-            access_not_before: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            access_not_before: Arc::default(),
             live_sessions: Arc::default(),
             ws_ping: crate::ws::PING_INTERVAL,
+            trusted_proxies: config.trusted_proxies().into(),
+            ws_send_timeout: crate::ws::SEND_TIMEOUT,
             password_hashing: Arc::new(tokio::sync::Semaphore::new(match config.password_hash_concurrency {
                 0 => crate::auth::default_hash_concurrency(),
                 n => n as usize,
@@ -1053,9 +1061,12 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::legal::page_routes())
         .fallback(crate::webapp::handler)
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
-        .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
-        // Request spans log the path with webhook secrets redacted (APPLICATIONS.md §9.4), never the query.
+        // Problem Details name the request id (`request_id`), from the header set below.
+        .layer(axum::middleware::from_fn(crate::error::request_scope))
+        // Request spans carry the route, the request id and the path with webhook secrets redacted (APPLICATIONS.md
+        // §9.4), never the query: every log line of a request (an internal error too) can be matched to its report.
         .layer(TraceLayer::new_for_http().make_span_with(crate::webhooks::RedactedSpan))
+        .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         // Files channel uploads stream large files: outside the 30-second limit.
         .route(

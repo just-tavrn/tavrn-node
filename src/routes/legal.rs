@@ -4,7 +4,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -15,7 +15,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::{
     app::AppState,
     auth::{AuthUser, ClientIp, NodeAdmin},
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     legal::{
         self, LegalContact, LegalInfo,
         account::{self, AccountDeletion, DeleteAccountRequest, DeletionStarted},
@@ -185,9 +185,14 @@ fn title_of(kind: &str) -> &'static str {
 
 /// `/legal/{kind}`: the document as a standalone HTML page in the app's dark style (crawlers, other clients, links
 /// in mails). Other paths below `/legal/` (the notice form) belong to the web client.
-pub async fn page_html(State(state): State<AppState>, Path(kind): Path<String>, uri: axum::http::Uri) -> Response {
+pub async fn page_html(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !documents::valid_kind(&kind) {
-        return crate::webapp::handler(State(state), uri).await;
+        return crate::webapp::handler(State(state), uri, headers).await;
     }
     let doc = documents::get(&state.db, &kind).await.ok().flatten();
     let others: String = documents::all(&state.db)

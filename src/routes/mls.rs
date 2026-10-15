@@ -4,7 +4,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     e2ee,
-    error::{ApiError, ApiJson, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     permissions as p, store,
     validate::{self, bad},
 };
@@ -255,23 +255,29 @@ async fn authorize(
             return Err(forbidden("An external join must remove the old leaf of this device"));
         }
     }
-    // Rule 3: added devices are attested devices of entitled users.
-    let mut added_devices = Vec::new();
+    // Rule 3: added devices are attested devices of entitled users (entitlement checked for all users at once).
+    let mut added_resolved = Vec::with_capacity(summary.added.len());
     for added in &summary.added {
-        let device = resolve_device(state, &added.identity).await?;
+        added_resolved.push(resolve_device(state, &added.identity).await?);
+    }
+    let users: Vec<&crate::models::UserRow> = added_resolved.iter().flatten().map(|(user, ..)| user).collect();
+    let entitled = access::entitled_users(state, conv, &users).await?;
+    let mut added_devices = Vec::new();
+    for (added, device) in summary.added.iter().zip(added_resolved) {
         let Some((user, device_id, key)) = device else {
             return Err(forbidden(format!("Unknown or unattested device: {}", added.identity)));
         };
         if key != added.signature_key {
             return Err(forbidden(format!("Key does not match the attested device: {}", added.identity)));
         }
-        if !access::user_entitled(state, conv, &user).await? {
+        if !entitled.contains(&user.id) {
             return Err(forbidden(format!("{} does not belong to this conversation", user.address())));
         }
         added_devices.push(device_id);
     }
     // Rule 4: removed leaves belong to the committer's user, to users no longer entitled, or to
     // deleted / unattested devices, or carry a key other than the attested key of the device they name.
+    let mut removed_resolved = Vec::new();
     for removed in &summary.removed_leaves {
         let Some((address, _)) = removed.identity.split_once('/') else { continue };
         if address == auth.user.address() {
@@ -279,8 +285,14 @@ async fn authorize(
         }
         if let Some((user, _, key)) = resolve_device(state, &removed.identity).await?
             && key == removed.signature_key
-            && access::user_entitled(state, conv, &user).await?
         {
+            removed_resolved.push((removed, user));
+        }
+    }
+    let users: Vec<&crate::models::UserRow> = removed_resolved.iter().map(|(_, user)| user).collect();
+    let entitled = access::entitled_users(state, conv, &users).await?;
+    for (removed, user) in &removed_resolved {
+        if entitled.contains(&user.id) {
             return Err(forbidden(format!(
                 "{} is an attested device of an entitled member; the node governs membership",
                 removed.identity

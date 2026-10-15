@@ -87,8 +87,9 @@ const MOD_OR_MANAGE: Access = AnyScope(&["moderation", "rooms:manage"]);
 /// `(method, route template, access)` for app tokens. A template that is not here is refused with
 /// `403 app.bot_forbidden` (fail closed). Deliberately absent (§2.5): password, second factor, WebAuthn,
 /// secret storage, identity reset, `PATCH /users/me`, profile images, the scene library, friends and blocks,
-/// the invite list, account invites, `POST /rooms`, `POST /rooms/{id}/join`, `/auth/connect/*`, reports,
-/// the owner routes of `/applications`, `/admin/*` and group DM management.
+/// the invite list, account invites, `POST /rooms`, `POST /rooms/{id}/join`, `/auth/connect/*`, reports (except the
+/// two reads of a room's inbox, MODERATION.md §1.4a), the owner routes of `/applications`, `/admin/*` and group DM
+/// management.
 pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     // Always allowed (§2.4)
     ("GET", "/api/v1/node", Always),
@@ -139,6 +140,21 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/conversations/{conversation_id}", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis", Scope("messages:read")),
     ("GET", "/api/v1/rooms/{room_id}/emojis/{emoji_id}/image", Scope("messages:read")),
+    // files channels (FILES.md §3 "Bots"): reading under messages:read, writing under messages:write (the channel's
+    // attach_files; others' entries need manage_files, i.e. rooms:manage). The storage backend (`…/files/backend`,
+    // `…/files/backend/test`) is deliberately absent: bots never see or set store credentials.
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/download", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/records", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/mine", Scope("messages:read")),
+    ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/usage", Scope("messages:read")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/folders", Scope("messages:write")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/upload", Scope("messages:write")),
+    ("PATCH", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:write")),
+    ("DELETE", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}", Scope("messages:write")),
+    ("PUT", "/api/v1/rooms/{room_id}/channels/{channel_id}/files/{entry_id}/thumbnail", Scope("messages:write")),
     // threads (PROTOCOL.md §7e): reading under messages:read, writing under messages:write
     ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/threads", Scope("messages:read")),
     ("GET", "/api/v1/threads/{thread_id}", Scope("messages:read")),
@@ -202,6 +218,10 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/members/{address}/disconnect", Scope("moderation")),
     ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/members/{address}/move", Scope("moderation")),
     ("POST", "/api/v1/rooms/{room_id}/voice/move-all", Scope("moderation")),
+    // the room's report inbox, read-only and metadata only (MODERATION.md §1.4a); creating, triage, actions,
+    // forwarding and deleting reports stay out
+    ("GET", "/api/v1/rooms/{room_id}/reports", Scope("moderation")),
+    ("GET", "/api/v1/reports/{report_id}", Scope("moderation")),
     // rooms:manage
     ("PATCH", "/api/v1/rooms/{room_id}", Scope("rooms:manage")),
     ("PUT", "/api/v1/rooms/{room_id}/icon", Scope("rooms:manage")),
@@ -306,11 +326,16 @@ pub fn event_allowed(kind: &str, data: &Value, scopes: &[String]) -> bool {
         | (_, "override.update" | "identity.changed" | "identity.rotated" | "devices.changed")
         | (_, crate::federation::inbox::SESSION_REVOKED_EVENT) => !matches!(kind, "room.invite"),
         ("message" | "reaction" | "pin" | "poll" | "emoji" | "conversation" | "thread", _)
-        | (_, "typing" | "read.update") => kind != "conversation.invite" && has("messages:read"),
+        | (_, "typing" | "read.update" | "files.update" | "files.backend") => {
+            kind != "conversation.invite" && has("messages:read")
+        }
         ("member" | "presence", _) | (_, "user.update") => has("members:read"),
         ("voice" | "call" | "soundboard", _) => has("voice"),
         ("whiteboard", _) => has("whiteboard"),
         ("command" | "commands" | "component" | "modal", _) => has("commands"),
+        // Only reaches bots in the audience of a room report (MODERATION.md §1.4a); the payloads carry no detail,
+        // evidence or reporter.
+        ("report", _) => has("moderation"),
         (_, "ephemeral") => {
             let typ = data.get("type").and_then(Value::as_str).unwrap_or("");
             if typ.starts_with("whiteboard.") { has("whiteboard") } else { has("messages:read") }
@@ -824,6 +849,12 @@ mod tests {
             (Method::POST, "/api/v1/applications"),
             (Method::POST, "/api/v1/conversations/{conversation_id}/members"),
             (Method::DELETE, "/api/v1/rooms/{room_id}"),
+            (Method::POST, "/api/v1/reports"),
+            (Method::PATCH, "/api/v1/reports/{report_id}"),
+            (Method::DELETE, "/api/v1/reports/{report_id}"),
+            (Method::POST, "/api/v1/reports/{report_id}/actions"),
+            (Method::POST, "/api/v1/reports/{report_id}/forward"),
+            (Method::GET, "/api/v1/admin/reports"),
             (Method::GET, "/api/v1/some/future/route"),
         ] {
             assert_eq!(
@@ -834,10 +865,49 @@ mod tests {
         }
         assert_eq!(check_route(&read, &get, None).unwrap_err().code(), "app.bot_forbidden", "no matched route");
         assert!(check_route(&[], &get, Some("/api/v1/users/me")).is_ok());
+        for p in ["/api/v1/rooms/{room_id}/reports", "/api/v1/reports/{report_id}"] {
+            assert!(check_route(&s(&["moderation"]), &get, Some(p)).is_ok(), "{p}");
+            assert_eq!(check_route(&read, &get, Some(p)).unwrap_err().code(), "app.scope_missing", "{p}");
+        }
         assert!(
             check_route(&s(&["rooms:manage"]), &Method::PATCH, Some("/api/v1/rooms/{room_id}/members/{user_id}"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn files_routes_follow_the_scope_split() {
+        let f = "/api/v1/rooms/{room_id}/channels/{channel_id}/files";
+        let reads = [
+            f.to_string(),
+            format!("{f}/{{entry_id}}"),
+            format!("{f}/{{entry_id}}/download"),
+            format!("{f}/{{entry_id}}/thumbnail"),
+            format!("{f}/records"),
+            format!("{f}/mine"),
+            format!("{f}/usage"),
+        ];
+        for p in &reads {
+            assert_eq!(route_access(&Method::GET, p), Some(Scope("messages:read")), "{p}");
+        }
+        let writes = [
+            (Method::POST, format!("{f}/folders")),
+            (Method::POST, format!("{f}/upload")),
+            (Method::PATCH, format!("{f}/{{entry_id}}")),
+            (Method::DELETE, format!("{f}/{{entry_id}}")),
+            (Method::PUT, format!("{f}/{{entry_id}}/thumbnail")),
+        ];
+        for (m, p) in &writes {
+            assert_eq!(route_access(m, p), Some(Scope("messages:write")), "{m} {p}");
+        }
+        // The storage backend (store credentials) stays closed whatever the scopes.
+        for (m, p) in [
+            (Method::GET, format!("{f}/backend")),
+            (Method::PUT, format!("{f}/backend")),
+            (Method::POST, format!("{f}/backend/test")),
+        ] {
+            assert_eq!(check_route(&permissions::all_scopes(), &m, Some(&p)).unwrap_err().code(), "app.bot_forbidden");
+        }
     }
 
     #[test]
@@ -873,6 +943,10 @@ mod tests {
         assert!(!event_allowed("ephemeral", &wb, &s(&["messages:read"])));
         assert!(event_allowed("ephemeral", &wb, &s(&["whiteboard"])));
         assert!(event_allowed("ephemeral", &json!({ "type": "cursor" }), &s(&["messages:read"])));
+        for kind in ["files.update", "files.backend"] {
+            assert!(event_allowed(kind, &d, &s(&["messages:read"])), "{kind}");
+            assert!(!event_allowed(kind, &d, &s(&["messages:write", "members:read", "rooms:manage"])), "{kind}");
+        }
         assert!(event_allowed("command.invoke", &d, &s(&["commands"])));
         assert!(event_allowed("commands.update", &d, &s(&["commands"])));
         assert!(!event_allowed("command.invoke", &d, &s(&["messages:read", "messages:write"])));
@@ -881,6 +955,10 @@ mod tests {
             assert!(!event_allowed(kind, &d, &s(&["messages:read", "messages:write"])), "{kind}");
         }
         assert!(!event_allowed("interaction.reply", &d, &permissions::all_scopes()), "only for invokers");
+        for kind in ["report.create", "report.update"] {
+            assert!(event_allowed(kind, &d, &s(&["moderation"])), "{kind}");
+            assert!(!event_allowed(kind, &d, &s(&["messages:read", "members:read", "rooms:manage"])), "{kind}");
+        }
     }
 
     #[test]

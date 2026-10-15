@@ -56,7 +56,8 @@ Scenarios, in this order:
 5. **Plaintext load** (60 s): 20 messages per second in total, round-robin over the users, sent open-loop
    (on schedule, not waiting for earlier requests). Alongside, 5 message lists per second (`limit=50`).
    Results: send, list and send → WebSocket delivery latencies (p50/p95/p99), node CPU, errors, and the
-   share of `message.create` events that reached all 200 connections.
+   share of `message.create` events that reached all 200 connections. The node's CPU is budgeted on the
+   reference machine (see "Machine speed" below).
 6. **Encrypted load** (60 s): the same with real MLS ciphertext from `tavrn-crypto`. A member commits a
    self-update every 100 messages; the commit latency is budgeted. The load generator is the only
    committer, so members catch up from its local commit log instead of the node's handshake log.
@@ -69,6 +70,43 @@ clients, rate, durations).
 
 The load generator runs on the same machine as the node and uses CPU too (MLS clients, 1000 sockets).
 Compare runs from the same machine.
+
+### Machine speed
+
+A CPU share depends on the machine as much as on the node. GitHub's 4-core `ubuntu-latest` runners are
+not one machine: the nightlies of October 2026 ran on an AMD EPYC 9V45 once and on an EPYC 7763 after
+that, and the node's plaintext load went from 12.5 % to 23.7 % and 25.3 % of one core although nothing in
+between touched its hot path (locally, on one machine, the commits of the first two nights measured the same
+within 2 %). The
+load generator's own work, which did not change at all, slowed down by the same factor: its MLS catch-up took
+12.5 s, 22.7 s and 24.8 s. A fixed CPU budget therefore measured the runner, not the node.
+
+The load generator calibrates every run with that catch-up: every member processes the commits after its
+own join (OpenMLS from the pinned tavrn-crypto), the same computation in every run of the default scale. The
+CPU time of its threads together is `node.machine_catch_up_cpu_secs` (a baseline; lower is faster). The
+node's CPU under load is reported twice:
+
+- `node.plain_cpu_pct` / `node.enc_cpu_pct`: as measured on this machine (info);
+- `node.plain_cpu_ref_pct` / `node.enc_cpu_ref_pct`: the same on the reference machine, the measured share
+  times *reference catch-up / this catch-up* (budgeted).
+
+The reference machine is one whose catch-up takes 60 CPU seconds
+(`perf/loadgen/src/machine.rs`), about the EPYC 7763 runner (22.7 s and 24.8 s of wall time on four
+threads, which are busy 65 % of it together). Scaled this way, the October runs give 23.1 % (EPYC 9V45),
+24.1 % and 23.5 % (EPYC 7763): the spread between the runners shrinks from a factor of 2 to 4 %. The
+calibration holds for the default 200 clients only; at another scale the `_ref` values are missing (the
+report fails them) and only the measured shares can be compared between runs of the same parameters. A local
+machine scales differently from the runners (a virtualized Linux such as WSL pays more for the node's many
+small system calls), so compare local `_ref` values with local runs, not with the nightly.
+
+The budget is 20 % of one reference core at 20 messages per second. The node itself got cheaper at the same
+time: before every read, tungstenite zeroed the free part of a connection's 128 KiB read buffer, also for
+the reads that found nothing, and each event wakes every connection, which polls its socket. That zeroing
+was 39 % of the node's user CPU under this load; with a 4 KiB buffer (`ws::READ_BUFFER`) the plaintext load
+fell from 15.0 % to 10.1 % and the encrypted load from 13.2 % to 8.3 % (pinned to four CPUs; 19.6 % to
+11.4 % and 17.0 % to 9.4 % unpinned). On the reference machine that is about 16 % (from about 24 %). The
+budget leaves room for noise and catches a regression of about a quarter; the warning from 16 % shows a
+creep before.
 
 ## Reading the report
 

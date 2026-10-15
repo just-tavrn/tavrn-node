@@ -8,7 +8,7 @@
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -20,7 +20,7 @@ use crate::{
     app::AppState,
     auth::AuthUser,
     emoji::{personal_limits, valid_name as valid_emoji_name},
-    error::{ApiError, ProblemDetails},
+    error::{ApiError, ApiJson, ApiQuery as Query, ProblemDetails},
     gifs::Gif,
     media::{MediaKind, Processed},
     models::Emoji,
@@ -452,7 +452,7 @@ pub async fn rename_personal(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(emoji_id): Path<String>,
-    Json(req): Json<RenameEmoji>,
+    ApiJson(req): ApiJson<RenameEmoji>,
 ) -> Result<Json<store::emojis::UserEmoji>, ApiError> {
     local_only(&state, &auth)?;
     let name = req.name.trim().to_ascii_lowercase();
@@ -502,18 +502,19 @@ pub struct GifResults {
 #[utoipa::path(get, path = "/api/v1/gifs", security(("bearer" = [])), params(GifQuery), responses((status = 200, body = GifResults), (status = 404, body = ProblemDetails)))]
 pub async fn gifs(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Query(q): Query<GifQuery>,
 ) -> Result<Json<GifResults>, ApiError> {
     let client =
         state.gifs.as_ref().ok_or_else(|| ApiError::NotFound { code: "gif.disabled", what: "GIF search".into() })?;
+    client.check_user(&auth.user.id)?;
     let query = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(s) = query
         && s.chars().count() > 100
     {
         return Err(bad("gif.query_too_long", "Search term too long"));
     }
-    let results = client.search(query, q.limit.unwrap_or(24)).await?;
+    let results = client.search(query, q.limit.unwrap_or(24)).await?.as_ref().clone();
     Ok(Json(GifResults {
         provider: serde_json::to_value(client.provider())
             .ok()

@@ -102,9 +102,7 @@ pub async fn claim_budget(state: &AppState, source: &str, requester: &str, targe
 /// pending removals (`reason`: `deleted`, `unattested` or `not_member`, ENCRYPTION.md §4.7) so that clients that
 /// were offline find them later.
 async fn remove_needed(state: &AppState, groups: Vec<(String, Vec<u8>)>, reason: &str, matches: impl Fn(&str) -> bool) {
-    for (conversation_id, ds_state) in groups {
-        let Ok(group) = DsGroup::import_state(&ds_state) else { continue };
-        let Ok(roster) = group.roster() else { continue };
+    for (conversation_id, roster) in rosters(groups).await {
         let identities: Vec<String> = roster.into_iter().map(|e| e.identity).filter(|i| matches(i)).collect();
         if identities.is_empty() {
             continue;
@@ -128,6 +126,25 @@ async fn remove_needed(state: &AppState, groups: Vec<(String, Vec<u8>)>, reason:
             }
         }
     }
+}
+
+/// The rosters of stored MLS group states, read on the blocking pool: each import parses an openmls state that
+/// grows with the group, and a kick or a device removal reads every group of a room or of a user. States that do
+/// not import are left out.
+pub async fn rosters(groups: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<tavrn_crypto::mls::RosterEntry>)> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let read = move || -> Vec<(String, Vec<tavrn_crypto::mls::RosterEntry>)> {
+        groups
+            .into_iter()
+            .filter_map(|(id, state)| Some((id, DsGroup::import_state(&state).and_then(|g| g.roster()).ok()?)))
+            .collect()
+    };
+    tokio::task::spawn_blocking(read).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "MLS group states could not be read");
+        Vec::new()
+    })
 }
 
 fn of_user(address: String) -> impl Fn(&str) -> bool {

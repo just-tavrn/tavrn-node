@@ -21,6 +21,7 @@ mod suite {
     mod automod_content_flow;
     mod backups_flow;
     mod blob_deletion_flow;
+    mod bot_files_flow;
     mod bots_encrypted_flow;
     mod calls_flow;
     mod channel_visibility_flow;
@@ -72,6 +73,7 @@ mod suite {
     mod reactions_flow;
     mod reauth_flow;
     mod report_push_flow;
+    mod reports_bots_flow;
     mod reports_flow;
     mod reports_forward_flow;
     mod room_invites_flow;
@@ -86,6 +88,7 @@ mod suite {
     mod sessions_flow;
     mod signatures_flow;
     mod sso_flow;
+    mod statement_budget_flow;
     mod storage_encryption_flow;
     mod subscriptions_flow;
     mod test_databases_flow;
