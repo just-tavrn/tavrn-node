@@ -145,6 +145,9 @@ First public release of the node and its container image.
 
 ### Security
 
+- Several instances: when events may have been lost on the cache bus, an instance drops its channel visibility
+  snapshots and every WebSocket reloads the rooms it receives, so a membership whose `member.leave` was lost no longer
+  receives the room's events.
 - A remote user counts against their own limit (`TAVRN_FEDERATION_RATE_API_PER_USER`, default 600 per minute) before
   the budget of their home domain, and federated logins against a share per account and per client address, so one
   account can no longer lock the other users of its domain out; a rate-limited WebSocket hello closes with `4002

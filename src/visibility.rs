@@ -551,6 +551,13 @@ impl Cache {
         }
     }
 
+    /// Drops every room's snapshot (events may have been lost: [`crate::hub::Hub::resync_all`]).
+    pub fn invalidate_all(&self) {
+        for (_, slot) in self.rooms().drain() {
+            slot.stale.store(true, Ordering::Release);
+        }
+    }
+
     /// Drops the room's snapshot: the next check loads the current state.
     pub fn invalidate(&self, room_id: &str) {
         if let Some(slot) = self.rooms().remove(room_id) {
@@ -827,6 +834,18 @@ mod tests {
         hub.inject("e".into(), "member.leave".into(), crate::hub::Scope::Room("r2".into()), "{}".into());
         assert!(!r2.current(now), "events of other instances too");
         assert!(!r2.current(now + TTL) && !hub.visibility().slot("r3", now).current(now + TTL), "expiry");
+    }
+
+    /// A resync answers lost bus messages: the events that would have dropped a room's snapshot may be among them.
+    #[test]
+    fn a_resync_drops_every_snapshot() {
+        let hub = crate::hub::Hub::new();
+        let now = Instant::now();
+        let r1 = hub.visibility().slot("r1", now);
+        let r2 = hub.visibility().slot("r2", now);
+        hub.resync_all();
+        assert!(!r1.current(now) && !r2.current(now));
+        assert!(!Arc::ptr_eq(&r1, &hub.visibility().slot("r1", now)), "the next check loads anew");
     }
 
     #[test]

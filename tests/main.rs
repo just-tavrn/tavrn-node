@@ -106,4 +106,5 @@ mod suite {
     mod welcome_flow;
     mod whiteboard_flow;
     mod ws_flow;
+    mod ws_resync_flow;
 }
