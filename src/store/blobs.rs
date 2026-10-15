@@ -341,6 +341,41 @@ pub async fn remove_reaction(db: &Pool, message_id: &str, user_id: &str, emoji: 
     Ok(r.rows_affected() > 0)
 }
 
+/// One reactor of an emoji on a message.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReactorRow {
+    pub user_id: String,
+    pub username: String,
+    pub domain: String,
+    pub created_at: String,
+}
+
+/// Who reacted with `emoji` on a message, oldest reaction first (ties by user id), after the cursor
+/// `(created_at, user_id)` of the previous page. Uses the primary key's `message_id` prefix: a message has at most
+/// as many reactors as its conversation has members.
+pub async fn reactors(
+    db: &Pool,
+    message_id: &str,
+    emoji: &str,
+    after: Option<(&str, &str)>,
+    limit: i64,
+) -> Result<Vec<ReactorRow>, ApiError> {
+    let (after_at, after_id) = after.unwrap_or(("", ""));
+    let rows = sqlx::query_as::<_, ReactorRow>(
+        "SELECT r.user_id, u.username, u.domain, r.created_at FROM reactions r JOIN users u ON u.id = r.user_id \
+         WHERE r.message_id = $1 AND r.emoji = $2 AND (r.created_at > $3 OR (r.created_at = $3 AND r.user_id > $4)) \
+         ORDER BY r.created_at, r.user_id LIMIT $5",
+    )
+    .bind(message_id)
+    .bind(emoji)
+    .bind(after_at)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 /// (emoji, count, whether the user reacted) per message, in the order of the first reaction.
 /// One query per chunk of messages instead of one per message.
 pub async fn reactions_for(
@@ -433,4 +468,91 @@ pub async fn pin_count(db: &Pool, conversation_id: &str) -> Result<i64, ApiError
         .fetch_one(db)
         .await?;
     Ok(row.try_get::<i64, _>("n")?)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    async fn db() -> Pool {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let t = now();
+        for (id, name) in [("u1", "alice"), ("u2", "bob"), ("u3", "carol")] {
+            sqlx::query(
+                "INSERT INTO users (id, username, domain, display_name, created_at) VALUES ($1, $2, 'd', $2, $3)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(&t)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO conversations (id, kind, encrypted, created_at) VALUES ('c', 'dm', 0, $1)")
+            .bind(&t)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, conversation_id, author_id, encrypted, format, content, content_size, mentions, mentions_everyone, created_at)
+             VALUES ('m1', 'c', 'u1', 0, 1, '{}', 2, '[]', 0, $1)",
+        )
+        .bind(&t)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn react_at(db: &Pool, user_id: &str, emoji: &str, at: &str) {
+        sqlx::query("INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES ('m1', $1, $2, $3)")
+            .bind(user_id)
+            .bind(emoji)
+            .bind(at)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    fn ids(rows: &[ReactorRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.user_id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_report_whether_anything_changed() {
+        let db = db().await;
+        assert!(add_reaction(&db, "m1", "u1", "👍").await.unwrap());
+        assert!(!add_reaction(&db, "m1", "u1", "👍").await.unwrap(), "a repeated reaction changes nothing");
+        assert!(remove_reaction(&db, "m1", "u1", "👍").await.unwrap());
+        assert!(!remove_reaction(&db, "m1", "u1", "👍").await.unwrap(), "a missing reaction changes nothing");
+    }
+
+    #[tokio::test]
+    async fn reactors_page_oldest_first_with_ties_by_user_id() {
+        let db = db().await;
+        react_at(&db, "u3", "👍", "2026-10-15T10:00:00.000Z").await;
+        react_at(&db, "u2", "👍", "2026-10-15T10:00:01.000Z").await;
+        react_at(&db, "u1", "👍", "2026-10-15T10:00:01.000Z").await;
+        react_at(&db, "u1", "🎉", "2026-10-15T09:00:00.000Z").await;
+
+        let all = reactors(&db, "m1", "👍", None, 10).await.unwrap();
+        assert_eq!(ids(&all), vec!["u3", "u1", "u2"]);
+        assert_eq!((all[0].username.as_str(), all[0].domain.as_str()), ("carol", "d"));
+        assert_eq!(all[0].created_at, "2026-10-15T10:00:00.000Z");
+
+        let first = reactors(&db, "m1", "👍", None, 2).await.unwrap();
+        assert_eq!(ids(&first), vec!["u3", "u1"]);
+        let last = &first[1];
+        let rest = reactors(&db, "m1", "👍", Some((&last.created_at, &last.user_id)), 2).await.unwrap();
+        assert_eq!(ids(&rest), vec!["u2"], "the tie on created_at continues by user id");
+        // A cursor whose reaction is gone still pages from its position.
+        remove_reaction(&db, "m1", "u1", "👍").await.unwrap();
+        let rest = reactors(&db, "m1", "👍", Some(("2026-10-15T10:00:01.000Z", "u1")), 2).await.unwrap();
+        assert_eq!(ids(&rest), vec!["u2"]);
+
+        assert_eq!(ids(&reactors(&db, "m1", "🎉", None, 10).await.unwrap()), vec!["u1"]);
+        assert!(reactors(&db, "m1", "❤", None, 10).await.unwrap().is_empty());
+        assert!(reactors(&db, "m2", "👍", None, 10).await.unwrap().is_empty());
+    }
 }

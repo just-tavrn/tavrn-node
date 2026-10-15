@@ -59,6 +59,12 @@ First public release of the node and its container image.
   channel.status_forbidden`, `400 channel.status_not_voice` on other kinds; audit `channel.voice_status`, event
   `channel.update`). Migration 0390 adds the column; a startup fixup grants the bit once to every role that holds
   `manage_channels` (`fixup.voice_status`).
+- **Reaction events name the change and the reactor** (protocol PROTOCOL.md §6, §7 "Reactions"; fixes #83,
+  just-tavrn/tavrn-protocol#43): the `message.update` of a reaction change carries `reaction: { emoji, user,
+  user_id, added }` and is sent only when the reactions changed. Message events (`message.create`, `message.update`
+  of reactions, edits, pins and poll closes, also those of event subscriptions) carry `reactions[].me = false` for
+  every recipient; responses keep the caller's flags. `GET /conversations/{id}/messages/{message_id}/reactions/{emoji}?after=&limit=`
+  lists the reactors (oldest first, at most 100 per page, the message's read rules, bots `messages:read`).
 - **Polls and date polls** (protocol PROTOCOL.md §7g, capability `polls.v1`; fixes just-tavrn/tavrn-protocol#35):
   messages carry the plaintext close time `poll_closes_at` (migration 0400; set on create 1 minute to 1 year ahead;
   through `PATCH …/messages/{id} { poll_closes_at }` the author or `manage_messages` closes a poll now, also one

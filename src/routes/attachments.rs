@@ -4,14 +4,14 @@
 use axum::{
     Json,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     access::{self, Conv},
@@ -19,7 +19,7 @@ use crate::{
     auth::AuthUser,
     entitlements::{self, Entitlements},
     error::{ApiError, ProblemDetails},
-    models::{Attachment, Message, MessageRow},
+    models::{Attachment, Message, MessageRow, MessageUpdate, ReactionChange},
     permissions as p,
     storage::mime_allowed,
     store,
@@ -399,7 +399,7 @@ async fn react(
     emoji: &str,
     add: bool,
 ) -> Result<Json<Message>, ApiError> {
-    if add {
+    let changed = if add {
         if !valid_emoji(emoji) {
             return Err(bad("reaction.invalid", "Invalid emoji"));
         }
@@ -408,13 +408,26 @@ async fn react(
         if let Some(token) = crate::emoji::parse_token(emoji) {
             crate::emoji::check_external(state, conv, &[token]).await?;
         }
-        store::blobs::add_reaction(&state.db, message_id, &auth.user.id, emoji).await?;
+        store::blobs::add_reaction(&state.db, message_id, &auth.user.id, emoji).await?
     } else {
         message_in_conv(state, conv, message_id, 0, "channel.view_forbidden", "View channel").await?;
-        store::blobs::remove_reaction(&state.db, message_id, &auth.user.id, emoji).await?;
-    }
+        store::blobs::remove_reaction(&state.db, message_id, &auth.user.id, emoji).await?
+    };
     let message = crate::routes::messages::enrich_one(state, &auth.user.id, message_id).await?;
-    conv.publish(&state.hub, "message.update", &message);
+    // The event names the change and carries no per-viewer state (PROTOCOL.md §6); the response keeps the
+    // caller's flags. Nothing changed (a repeated reaction, a missing one removed): no event.
+    if changed {
+        let update = MessageUpdate {
+            message: message.for_broadcast(),
+            reaction: Some(ReactionChange {
+                emoji: emoji.to_string(),
+                user: auth.user.address(),
+                user_id: auth.user.id.clone(),
+                added: add,
+            }),
+        };
+        conv.publish(&state.hub, "message.update", &update);
+    }
     Ok(Json(message))
 }
 
@@ -436,7 +449,7 @@ async fn set_pin(
         store::blobs::unpin(&state.db, &conv.id, message_id).await?;
     }
     let message = crate::routes::messages::enrich_one(state, &auth.user.id, message_id).await?;
-    conv.publish(&state.hub, "message.update", &message);
+    conv.publish(&state.hub, "message.update", message.for_broadcast());
     Ok(Json(message))
 }
 
@@ -531,6 +544,83 @@ pub async fn remove_conversation_reaction(
 ) -> Result<Json<Message>, ApiError> {
     let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
     react(&state, &auth, &conv, &message_id, &emoji, false).await
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct ReactorsQuery {
+    /// `next` of the previous page (opaque).
+    pub after: Option<String>,
+    /// 1–100 (default 50).
+    pub limit: Option<i64>,
+}
+
+/// One user who reacted with an emoji.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct Reactor {
+    /// `username@domain`
+    pub user: String,
+    /// The user's id on this node.
+    pub user_id: String,
+    /// When the user reacted (RFC 3339).
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReactorList {
+    /// Oldest reaction first.
+    pub items: Vec<Reactor>,
+    /// `after` of the next page; null on the last page.
+    pub next: Option<String>,
+}
+
+/// A page cursor: `<created_at>_<user id>` of the last reactor of a page.
+fn reactors_cursor(created_at: &str, user_id: &str) -> String {
+    format!("{created_at}_{user_id}")
+}
+
+fn parse_reactors_cursor(cursor: &str) -> Result<(String, String), ApiError> {
+    let invalid = || bad("reaction.cursor_invalid", "after: the next value of a previous page");
+    let (at, user_id) = cursor.rsplit_once('_').ok_or_else(invalid)?;
+    if !crate::util::is_ulid(user_id) || chrono::DateTime::parse_from_rfc3339(at).is_err() {
+        return Err(invalid());
+    }
+    Ok((at.to_string(), user_id.to_ascii_uppercase()))
+}
+
+/// The reactors of one emoji on a message.
+#[utoipa::path(get, path = "/api/v1/conversations/{conversation_id}/messages/{message_id}/reactions/{emoji}", security(("bearer" = [])),
+    params(("conversation_id" = String, Path), ("message_id" = String, Path), ("emoji" = String, Path, description = "Percent-encoded"), ReactorsQuery),
+    description = "Lists who reacted with `emoji` on a message (PROTOCOL.md §7 \"Reactions\"), oldest reaction first (ties by user id), `limit` 1–100 per page (default 50); pass `next` as `after` for the next page (`400 reaction.cursor_invalid` for a malformed cursor). Needs what reading the message needs (`view_channel`, the history window of ENCRYPTION.md §7b; bots `messages:read`). An emoji nobody reacted with lists no one.",
+    responses((status = 200, body = ReactorList), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 404, body = ProblemDetails)))]
+pub async fn list_reactors(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id, emoji)): Path<(String, String, String)>,
+    Query(q): Query<ReactorsQuery>,
+) -> Result<Json<ReactorList>, ApiError> {
+    if !valid_emoji(&emoji) {
+        return Err(bad("reaction.invalid", "Invalid emoji"));
+    }
+    let after = q.after.as_deref().map(parse_reactors_cursor).transpose()?;
+    let limit = validate::limit(q.limit, 50, 100);
+    let conv = access::conversation(&state, &conversation_id, &auth.user).await?;
+    let message = crate::routes::messages::readable(&state, &auth, &conv, &message_id).await?;
+    let mut rows = store::blobs::reactors(
+        &state.db,
+        &message.id,
+        &emoji,
+        after.as_ref().map(|(at, id)| (at.as_str(), id.as_str())),
+        limit + 1,
+    )
+    .await?;
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next = if more { rows.last().map(|r| reactors_cursor(&r.created_at, &r.user_id)) } else { None };
+    let items = rows
+        .into_iter()
+        .map(|r| Reactor { user: format!("{}@{}", r.username, r.domain), user_id: r.user_id, created_at: r.created_at })
+        .collect();
+    Ok(Json(ReactorList { items, next }))
 }
 
 /// Pin a message in any conversation.

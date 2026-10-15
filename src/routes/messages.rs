@@ -98,6 +98,28 @@ pub async fn enrich(state: &AppState, user_id: &str, rows: &[MessageRow]) -> Res
     Ok(out)
 }
 
+/// A message of `conv` the caller may read: `view_channel` and, for encrypted messages, the history window of
+/// ENCRYPTION.md §7b (`404 message.not_found` outside it, as for a page of messages).
+pub async fn readable(
+    state: &AppState,
+    auth: &AuthUser,
+    conv: &Conv,
+    message_id: &str,
+) -> Result<MessageRow, ApiError> {
+    conv.require(p::VIEW_CHANNEL, "channel.view_forbidden", "View channel")?;
+    let message = store::messages::by_id(&state.db, message_id)
+        .await?
+        .filter(|m| m.conversation_id == conv.id)
+        .ok_or_else(|| access::not_found("Message", "message.not_found"))?;
+    if message.encrypted != 0
+        && let Some(cut) = crate::history::list_cutoff(state, conv, &auth.user).await?
+        && message.id.as_str() < cut.as_str()
+    {
+        return Err(access::not_found("Message", "message.not_found"));
+    }
+    Ok(message)
+}
+
 pub async fn enrich_one(state: &AppState, user_id: &str, message_id: &str) -> Result<Message, ApiError> {
     let row = store::messages::by_id(&state.db, message_id)
         .await?
@@ -750,7 +772,7 @@ pub(crate) async fn create_in(
     if let Some(t) = &thread {
         crate::threads::after_message(state, &t.id, &message).await?;
     }
-    conv.publish_recorded(state, "message.create", &message).await;
+    conv.publish_recorded(state, "message.create", message.for_broadcast()).await;
     crate::federation::social::notify_members(state, conv, &message, &auth.user.id).await;
     Ok((StatusCode::CREATED, Json(message)))
 }
@@ -897,7 +919,7 @@ async fn close_poll(
         .await?;
     }
     let message = enrich_one(state, &auth.user.id, &existing.id).await?;
-    conv.publish_recorded(state, "message.update", &message).await;
+    conv.publish_recorded(state, "message.update", message.for_broadcast()).await;
     Ok(Json(message))
 }
 
@@ -990,7 +1012,7 @@ pub(crate) async fn edit_in(
     if !conv.encrypted {
         crate::search::index_message(state, message_id).await;
     }
-    conv.publish_recorded(state, "message.update", &message).await;
+    conv.publish_recorded(state, "message.update", message.for_broadcast()).await;
     Ok(Json(message))
 }
 

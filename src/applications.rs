@@ -129,6 +129,7 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/rooms/{room_id}/channels/{channel_id}/pins", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/pins", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/messages/{message_id}/poll/votes", Scope("messages:read")),
+    ("GET", "/api/v1/conversations/{conversation_id}/messages/{message_id}/reactions/{emoji}", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/history-keys", Scope("messages:read")),
     ("DELETE", "/api/v1/conversations/{conversation_id}/history-keys/{share_id}", Scope("messages:read")),
     ("GET", "/api/v1/conversations/{conversation_id}/history-pending", Scope("messages:read")),
