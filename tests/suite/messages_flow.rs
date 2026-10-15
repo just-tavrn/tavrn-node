@@ -276,7 +276,7 @@ async fn message_ids_are_accepted_in_any_case() {
     assert_eq!(s, StatusCode::NO_CONTENT, "{j}");
     let (_, list) = node.get_auth(&path, &bob.token).await;
     assert!(list.as_array().unwrap().iter().all(|m| m["id"] != id.as_str()), "deleted: {list}");
-
+}
 /// A message is stored together with its attachments, spoilers and poll close time, or not at all: a database
 /// failure halfway leaves no message behind that nobody was told about.
 #[tokio::test]

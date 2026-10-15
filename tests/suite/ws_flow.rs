@@ -650,7 +650,7 @@ async fn leaving_a_room_reaches_the_users_other_devices() {
     }
     // Exactly once on the leaving user's device.
     assert!(silent(&mut bob_ws, 300).await);
-
+}
 /// The close frame (code and reason) that ends a hello.
 async fn hello_close(url: &str, token: &str) -> (u16, String) {
     let mut ws = connect(url).await;

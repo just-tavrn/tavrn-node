@@ -349,7 +349,7 @@ async fn gif_search_is_cached_limited_per_user_and_maps_provider_errors() {
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     let (s, _) = node.get_auth("/api/v1/gifs?q=dog", &bob.token).await;
     assert_eq!(s, StatusCode::OK, "the limit is per user");
-
+}
 /// An unreachable GIF provider answers `503 gif.unavailable`; the log line names the failure and the request (route,
 /// request id), never the provider URL with the node's API key and the user's search term.
 #[tokio::test]
