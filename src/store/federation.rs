@@ -1006,15 +1006,14 @@ pub async fn delay_target(db: &Pool, target: &str, next_at: &str) -> Result<(), 
 
 const UNDELIVERABLE_KEY: &str = "federation.undeliverable";
 
-/// Counts a given-up outbox entry (admin overview).
+/// Counts a given-up outbox entry (admin overview), in one statement: up to 16 targets give up at once, and a read
+/// followed by a write would lose increments.
 pub async fn count_undeliverable(db: &Pool) -> Result<(), ApiError> {
-    let current = undeliverable_count(db).await?;
     sqlx::query(
-        "INSERT INTO node_settings (key, value, updated_at) VALUES ($1, $2, $3)
-         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3",
+        "INSERT INTO node_settings (key, value, updated_at) VALUES ($1, '1', $2)
+         ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(node_settings.value AS BIGINT) + 1 AS TEXT), updated_at = $2",
     )
     .bind(UNDELIVERABLE_KEY)
-    .bind((current + 1).to_string())
     .bind(now())
     .execute(db)
     .await?;

@@ -1469,3 +1469,18 @@ async fn stalling_issuers_on_many_domains_do_not_starve_other_peers() {
     }
     assert!(busy >= 70 - 12, "requests beyond the discovery slots are refused at once: {busy}");
 }
+
+/// Given-up notifications are counted in one statement: concurrent give-ups (up to 16 targets at once) lose no
+/// increment.
+#[tokio::test]
+async fn concurrent_undeliverable_counts_add_up() {
+    let node = common::test_node("a.test").await;
+    let db = &node.state.db;
+    futures::future::join_all((0..10).map(|_| tavrn_node::store::federation::count_undeliverable(db)))
+        .await
+        .into_iter()
+        .for_each(|r| r.unwrap());
+    assert_eq!(tavrn_node::store::federation::undeliverable_count(db).await.unwrap(), 10);
+    tavrn_node::store::federation::count_undeliverable(db).await.unwrap();
+    assert_eq!(tavrn_node::store::federation::undeliverable_count(db).await.unwrap(), 11);
+}

@@ -176,10 +176,16 @@ impl DeliveryReport {
 
 /// Delivers every entry due at `now`. Paused while federation is disabled.
 pub async fn deliver_due(state: &AppState, now: DateTime<Utc>) -> Result<DeliveryReport, ApiError> {
+    deliver_round(state, now).await.map(|(report, _)| report)
+}
+
+/// [`deliver_due`] for at most [`BATCH`] entries; also returns how many were due (a full batch: more are waiting).
+async fn deliver_round(state: &AppState, now: DateTime<Utc>) -> Result<(DeliveryReport, usize), ApiError> {
     if !state.config.federation_enabled {
-        return Ok(DeliveryReport::default());
+        return Ok((DeliveryReport::default(), 0));
     }
     let rows = store::federation::due(&state.db, &util::format_time(now), BATCH).await?;
+    let fetched = rows.len();
     let mut by_target: Vec<(String, Vec<OutboxRow>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for row in rows {
@@ -200,7 +206,7 @@ pub async fn deliver_due(state: &AppState, now: DateTime<Utc>) -> Result<Deliver
     for r in results {
         report.add(&r?);
     }
-    Ok(report)
+    Ok((report, fetched))
 }
 
 /// Delivers the due entries of one target in order; stops at the first retryable failure and delays
@@ -322,8 +328,16 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             if !state.cluster.is_leader() {
                 continue;
             }
-            if let Err(e) = deliver_due(&state, Utc::now()).await {
-                tracing::warn!(error = %e, "federation outbox round failed");
+            // A full batch means more are due (a backlog after an outage): the next round follows at once.
+            loop {
+                match deliver_round(&state, Utc::now()).await {
+                    Ok((_, fetched)) if fetched as i64 >= BATCH => {}
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "federation outbox round failed");
+                        break;
+                    }
+                }
             }
         }
     })
