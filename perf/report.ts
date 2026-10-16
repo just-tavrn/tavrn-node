@@ -14,10 +14,14 @@ export interface Budget {
   max?: number;
   min?: number;
   note?: string;
+  /** A write latency: on a slow disk (`Budgets.disk`) a value over budget is inconclusive instead of failed. */
+  disk_bound?: boolean;
 }
 
 export interface Budgets {
   warning_at: number;
+  /** The machine's disk: when `metric` (a commit p95 measured without the node) exceeds `slow_ms`, the disk-bound budgets cannot be judged. */
+  disk?: { metric: string; slow_ms: number; note?: string };
   budgets: Record<string, Budget>;
 }
 
@@ -41,7 +45,7 @@ export interface RawFile {
   config?: Record<string, unknown>;
 }
 
-export type Status = "ok" | "warning" | "over" | "missing" | "info";
+export type Status = "ok" | "warning" | "over" | "inconclusive" | "missing" | "info";
 
 export interface Classified extends RawMetric {
   status: Status;
@@ -73,6 +77,12 @@ export function evaluate(files: RawFile[], budgets: Budgets): Classified[] {
       seen.add(m.id);
       out.push({ ...m, ...classify(m.value, budget, budgets.warning_at), budget });
     }
+  }
+  // A write latency over budget on a disk that is slow by itself says nothing about the node (perf/README.md "Noisy
+  // runners"): inconclusive, reported but not failed. Budgets that do not depend on the disk keep their status.
+  const disk = budgets.disk && out.find((m) => m.id === budgets.disk!.metric)?.value;
+  if (budgets.disk && typeof disk === "number" && disk > budgets.disk.slow_ms) {
+    for (const m of out) if (m.status === "over" && m.budget?.disk_bound) m.status = "inconclusive";
   }
   // A budget of a benchmark that ran but did not produce the metric (a step failed) is missing.
   const prefixes = files.map(prefixOf);
@@ -151,7 +161,7 @@ function main() {
     // fsync=off on the test database makes the node's write latencies optimistic.
     postgres_fsync: files.find((f) => f.kind === "node")?.machine.postgres_fsync ?? null,
   };
-  const counts = Object.fromEntries((["ok", "warning", "over", "missing"] as Status[]).map((s) => [s, budgeted.filter((m) => m.status === s).length]));
+  const counts = Object.fromEntries((["ok", "warning", "over", "inconclusive", "missing"] as Status[]).map((s) => [s, budgeted.filter((m) => m.status === s).length]));
 
   console.log(`\ntavrn performance report (budgets: perf/budgets.json)\n`);
   console.log(table(budgeted));
@@ -159,7 +169,10 @@ function main() {
   if (baselines.length) console.log(`\nBaselines\n\n${table(baselines)}`);
   console.log(`\nMachine: ${machine.cpu}, ${machine.cores} cores (${machine.threads_per_core ?? "?"} threads per core), load average before ${JSON.stringify(machine.loadavg_before)}`);
   console.log(`         Node ${machine.node}, Chromium ${machine.chromium}, ${machine.rustc}, PostgreSQL fsync ${machine.postgres_fsync ?? "n/a"}`);
-  console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.missing} missing`);
+  console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.inconclusive} inconclusive, ${counts.missing} missing`);
+  if (counts.inconclusive && budgets.disk) {
+    console.log(`         inconclusive: write latencies over budget while ${budgets.disk.metric} exceeds ${budgets.disk.slow_ms} ms (a slow disk; perf/README.md "Noisy runners")`);
+  }
 
   const generatedAt = new Date().toISOString();
   const outFile = join(here, "results", `${generatedAt.replace(/[:.]/g, "-")}.json`);

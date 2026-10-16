@@ -52,7 +52,7 @@ Scenarios, in this order:
    uploads an identity key and an attested device key. The owner creates the MLS group and the other 199
    devices join it by external commit, one after the other. Then every member catches up to the final
    epoch.
-4. **200 idle WebSockets** (30 s): RSS and CPU.
+4. **200 idle WebSockets** (30 s): RSS and CPU. Alongside, the disk probe (see "Noisy runners").
 5. **Plaintext load** (60 s): 20 messages per second in total, round-robin over the users, sent open-loop
    (on schedule, not waiting for earlier requests). Alongside, 5 message lists per second (`limit=50`).
    Results: send, list and send → WebSocket delivery latencies (p50/p95/p99), node CPU, errors, and the
@@ -135,14 +135,29 @@ mean; the warning from 13.6 % (80 %) shows a creep before.
 
 ### Noisy runners
 
-The latency budgets (send p95 50 ms) measure the node and the runner's disk: PostgreSQL commits with `fsync`.
-On 2026-10-16 one nightly measured a send p95 of 115 ms (plaintext) and 61 ms (encrypted) while three runs of
-the same commit on the same day measured 10–12 ms; in that run the reads (list p95 9 ms) and the node's CPU
-(steady at 10 % second by second) were as always, only the writes were slow. A load scenario whose send p95
-is above 50 ms is therefore repeated once, right away, and the repetition is reported (the first attempt stays
-in the info as `<scenario>_first_attempt`). A slow node is slow twice; a stretch of slow disk flushes is not.
+The latency budgets of writes (send p95 50 ms, MLS commit p95 150 ms) measure the node and the machine's
+disk: every accepted message is a PostgreSQL commit, and the server commits with `fsync`. GitHub's runners
+differ there. On the AMD EPYC 9V74 runners the plaintext send p95 was 115 ms and 107-134 ms (two runs) while
+eight runs of the same and older code on other runners measured 10-18 ms; in those runs the reads (list p95
+8-9 ms) and the node's CPU (steady second by second) were as always, the slow sends were spread over the whole
+minute (where recorded), and even the 199 MLS join commits of the setup, one after the other with no load, took 98-110 ms at
+p95 (20-30 ms on the other runners). The load average gate does not tell these runs apart: every run waits
+for the load of the release build to fall below half the cores.
+
+Two measures keep such a runner from failing the nightly without hiding a slow node:
+
+- **Disk probe.** While the 200 connections idle (scenario 4), the load generator commits one row every
+  100 ms on a table of its own in the run's database (`perf/loadgen/src/disk.rs`), without the node:
+  `node.machine_pg_commit_p95_ms` (a baseline). When it exceeds `disk.slow_ms` of `budgets.json` (20 ms;
+  1.5 ms on a local SSD), a write latency over its budget (`"disk_bound": true`) is reported
+  **INCONCLUSIVE** instead of OVER and does not fail the run. Everything else, CPU, reads, errors, RSS,
+  is judged as always, and the write latencies are judged on every other runner.
+- **Repetition.** A load scenario whose send p95 is above 50 ms is repeated once, right away, and the
+  repetition is reported (the first attempt stays in the info as `<scenario>_first_attempt`). A stretch of
+  slow flushes on an otherwise normal disk passes the second time; a slow node is slow twice.
+
 For every attempt the info also lists the seconds in which sends took longer than 50 ms
-(`<scenario>_slow_sends_by_second`): a stall shows as many in a few seconds, a general slowness spread out.
+(`<scenario>_slow_sends_by_second`): a stall shows as many in a few seconds, a slow disk as a few in most.
 
 ## Reading the report
 
@@ -155,6 +170,7 @@ classifies each metric that has a budget in `budgets.json`:
 | `OK` | below 80 % of the budget |
 | `WARNING` | 80 % to 100 % of the budget |
 | `OVER` | above the budget: the run fails (exit code 1) |
+| `INCONCLUSIVE` | a write latency above its budget on a slow disk (see "Noisy runners"): reported, the run does not fail |
 | `MISSING` | the benchmark ran but produced no value (a step failed): the run fails |
 | `INFO` | no budget, for context (p50/p99, heap after a run, slow-machine values without a budget) |
 

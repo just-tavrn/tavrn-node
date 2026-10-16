@@ -10,6 +10,7 @@
 //! JSON file that `perf/report.ts` classifies against `perf/budgets.json`.
 
 mod api;
+mod disk;
 mod guard;
 mod machine;
 mod mls;
@@ -206,7 +207,7 @@ async fn run(args: Args) -> Result<()> {
         }
     };
     let result = match target {
-        Ok((url, pid)) => bench(&args, &url, pid).await,
+        Ok((url, pid)) => bench(&args, &url, pid, database.as_ref().map(|d| d.url.as_str())).await,
         Err(e) => Err(e),
     };
 
@@ -276,7 +277,12 @@ where
     stream::iter(items.into_iter().map(f)).buffered(n).collect::<Vec<_>>().await.into_iter().collect()
 }
 
-async fn bench(args: &Args, url: &str, pid: Option<u32>) -> Result<(Report, Vec<procstat::Snapshot>)> {
+async fn bench(
+    args: &Args,
+    url: &str,
+    pid: Option<u32>,
+    database_url: Option<&str>,
+) -> Result<(Report, Vec<procstat::Snapshot>)> {
     let mut report = Report::default();
     let api = Api::new(url)?;
     let sampler = pid.map(Sampler::start).transpose()?;
@@ -355,7 +361,27 @@ async fn bench(args: &Args, url: &str, pid: Option<u32>) -> Result<(Report, Vec<
 
     eprintln!("[4/7] {} idle connections ({} s)", ctx.connections, args.idle_secs);
     let dropped = WsStats::get(&ws.dropped);
-    let usage = measure(&ctx.sampler, Duration::from_secs(args.idle_secs)).await?;
+    // The disk probe runs while the node idles, so that it measures the machine and not the node.
+    let idle = Duration::from_secs(args.idle_secs);
+    let probe = async {
+        match database_url {
+            Some(db) => disk::commit_latency(db, idle, Duration::from_millis(100)).await.map(Some),
+            None => Ok(None),
+        }
+    };
+    let (usage, probe) = tokio::join!(measure(&ctx.sampler, idle), probe);
+    let usage = usage?;
+    let probe = probe.context("disk probe")?;
+    report.add(
+        "node.machine_pg_commit_p95_ms",
+        "Machine: PostgreSQL commit of one row, p95 (the disk under the send latencies)",
+        probe.as_ref().and_then(|p| p.percentile(95.0)).map(round1),
+        "ms",
+        probe.as_ref().map_or(Value::Null, Samples::summary),
+    );
+    if let Some(m) = report.metrics.last_mut() {
+        m.baseline = true;
+    }
     report.usage("node.ws_idle", &format!("{} idle WebSockets", ctx.connections), usage, true);
     report.add(
         "node.ws_idle_dropped",
