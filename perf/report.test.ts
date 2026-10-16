@@ -46,6 +46,40 @@ test("evaluate: budgets of benchmarks that ran must have a value, others are ign
   assert.match(table(result), /WARNING\s+node\.a\s+9 ms\s+<= 10 ms\s+90 %/);
 });
 
+test("evaluate: a write latency over budget on a slow disk is inconclusive, not failed", () => {
+  const budgets: Budgets = {
+    warning_at: 0.8,
+    disk: { slow_ms: 3 },
+    budgets: { "node.send": { max: 50, disk_probe: "node.probe" }, "node.cpu": { max: 10 }, "node.list": { max: 50 } },
+  };
+  const run = (probe: number | null, send: number, cpu = 5, list = 10): RawFile => ({
+    kind: "node",
+    started_at: "",
+    finished_at: "",
+    machine: {},
+    metrics: [
+      { id: "node.probe", label: "disk", value: probe, unit: "ms" },
+      { id: "node.send", label: "send", value: send, unit: "ms" },
+      { id: "node.cpu", label: "cpu", value: cpu, unit: "%" },
+      { id: "node.list", label: "list", value: list, unit: "ms" },
+    ],
+  });
+  const status = (f: RawFile) => Object.fromEntries(evaluate([f], budgets).map((m) => [m.id, m.status]));
+  // Slow disk: the send budget cannot be judged; the run does not fail on it.
+  const slow = evaluate([run(9.6, 110)], budgets);
+  assert.equal(slow.find((m) => m.id === "node.send")?.status, "inconclusive");
+  assert.equal(failed(slow), false);
+  assert.match(table(slow), /INCONCLUSIVE\s+node\.send\s+110 ms/);
+  // A fast disk keeps the failure, and so do budgets that do not depend on the disk.
+  assert.equal(status(run(0.8, 110))["node.send"], "over");
+  assert.equal(status(run(3, 110))["node.send"], "over");
+  assert.equal(status(run(9.6, 110, 12))["node.cpu"], "over");
+  assert.equal(status(run(9.6, 110, 5, 60))["node.list"], "over");
+  // Within budget stays ok; without a probe (an external node) nothing changes.
+  assert.equal(status(run(9.6, 20))["node.send"], "ok");
+  assert.equal(status(run(null, 110))["node.send"], "over");
+});
+
 test("the budget file carries the decided budgets", async () => {
   const { readFileSync } = await import("node:fs");
   const budgets = JSON.parse(readFileSync(new URL("./budgets.json", import.meta.url), "utf8")) as Budgets;
@@ -57,9 +91,17 @@ test("the budget file carries the decided budgets", async () => {
   assert.equal(max("node.enc_commit_p95_ms"), 150);
   assert.equal(max("node.ramp_rss_mb"), 400);
   // The node's CPU under load on the reference machine (perf/README.md "Machine speed"); the measured share is info.
-  assert.equal(max("node.plain_cpu_ref_pct"), 20);
-  assert.equal(max("node.enc_cpu_ref_pct"), 20);
+  assert.equal(max("node.plain_cpu_ref_pct"), 17);
+  assert.equal(max("node.enc_cpu_ref_pct"), 17);
   assert.equal(max("node.plain_cpu_pct"), undefined);
+  // Write latencies are inconclusive when the disk probe of their window exceeds 3 ms (perf/README.md "Noisy runners").
+  assert.equal(budgets.disk?.slow_ms, 3);
+  const probes = Object.fromEntries(Object.entries(budgets.budgets).filter(([, b]) => b.disk_probe).map(([id, b]) => [id, b.disk_probe]));
+  assert.deepEqual(probes, {
+    "node.plain_send_p95_ms": "node.plain_pg_commit_p95_ms",
+    "node.enc_send_p95_ms": "node.enc_pg_commit_p95_ms",
+    "node.enc_commit_p95_ms": "node.enc_pg_commit_p95_ms",
+  });
   // Phase 4 voice: connected idle <= 5 %, talking <= 15 % of one core.
   assert.equal(max("client.desktop.voice_idle_cpu_pct"), 5);
   assert.equal(max("client.desktop.voice_talk_cpu_pct"), 15);

@@ -3,24 +3,37 @@
 //! (perf/README.md "Machine speed").
 //!
 //! The node's CPU share depends on the machine as much as on the node: GitHub's 4-core runners of the
-//! same label are AMD EPYC 9V45 or EPYC 7763 machines, and nodes without a relevant change measured
-//! 12.5 % and 23.7 % plaintext load on them, while the load generator's own unchanged catch-up took
-//! 12.5 s and 22.7 s: the same factor. That work is fixed: the MLS catch-up of the setup (every member
-//! processes the commits after its own join, OpenMLS from the pinned tavrn-crypto) is the same
-//! computation in every run of the default scale. Its CPU time is the machine's speed; the node's CPU
-//! is scaled by it to the reference machine.
+//! same label are AMD EPYC 7763, 9V45 or 9V74 or Intel Xeon machines, and the same node measured from
+//! 10.2 % to 13.9 % (and before the read buffer fix from 12.5 % to 25.3 %) of one core on them. The MLS
+//! catch-up of the setup (every member processes the commits after its own join) is the same computation
+//! in every run of the default scale, and its CPU time follows the runner the way the node's does: scaled
+//! by it, the runners agree within about 10 %. Its CPU time is the machine's speed; the node's CPU is
+//! scaled by it to the reference machine.
+//!
+//! The computation is fixed only as long as the code doing it is: OpenMLS through tavrn-crypto. The
+//! tavrn-crypto release of 0.4.0-rc.10 caches loaded groups and made the catch-up twice as cheap on the
+//! same machine, which hid the node's own gain of the same night in the scaled values. The reference
+//! therefore names the crate versions it was taken with ([`CALIBRATED_WITH`]), and a test fails when
+//! `Cargo.lock` moves away from them, so that the reference is measured again (perf/README.md).
 
 use crate::stats::round2;
 
 /// Members of the default run. The catch-up's work grows with the group, so the calibration holds for this scale only.
 pub const CALIBRATED_CLIENTS: usize = 200;
 
-/// CPU seconds of the default run's catch-up on the reference machine. The reference is about GitHub's 4-core
-/// `ubuntu-latest` runner with an AMD EPYC 7763, the nightly's usual machine: its catch-up took 22.7 s and 24.8 s of
-/// wall time on four threads (2026-10-13 and 2026-10-14), and four catch-up threads are busy 65 % of that wall time
-/// together (the members who joined first have the most commits to process; 30.7 CPU seconds in 11.8 s pinned to
-/// four CPUs), so 59 to 64 CPU seconds.
-pub const REFERENCE_CATCH_UP_CPU_SECS: f64 = 60.0;
+/// CPU seconds of the default run's catch-up on the reference machine: GitHub's 4-core `ubuntu-latest` runner with an
+/// AMD EPYC 7763, with the crates of [`CALIBRATED_WITH`]. Two runs of 0.4.0-rc.10 on that runner measured 32.3 and 32.2
+/// CPU seconds (2026-10-16, runs 38961332219 and 38961335441). The reference machine is the same as before the
+/// tavrn-crypto update (60 CPU seconds with the uncached groups), so the scaled values of older runs stay comparable.
+pub const REFERENCE_CATCH_UP_CPU_SECS: f64 = 32.25;
+
+/// The crates that do the catch-up's work, with the `Cargo.lock` checksums the reference was measured with. A new
+/// version (or a git source instead of the registry) can change the work; then measure the reference again.
+pub const CALIBRATED_WITH: [(&str, &str); 3] = [
+    ("tavrn-crypto", "ff97c66ebb266d2f06a72251e470a384ae132a737e0030e57bf85df210d9c86f"),
+    ("openmls", "88ea97f8931047590bda498a9502e8fe6c9bb2bb04547a9a463618783481e0ec"),
+    ("openmls_rust_crypto", "36bf3fe824ead6e81d22f49a9cd7feffca3494979fac14c1248e19516e3625f1"),
+];
 
 /// CPU time of the calling thread in seconds.
 pub fn thread_cpu_secs() -> Option<f64> {
@@ -35,6 +48,21 @@ pub fn thread_cpu_secs() -> Option<f64> {
 pub fn speed_factor(catch_up_cpu_secs: Option<f64>, clients: usize) -> Option<f64> {
     let secs = catch_up_cpu_secs.filter(|s| s.is_finite() && *s > 0.0)?;
     (clients == CALIBRATED_CLIENTS).then(|| REFERENCE_CATCH_UP_CPU_SECS / secs)
+}
+
+/// CPU model and topology from `/proc/cpuinfo`: whether the logical CPUs are cores of their own or hyperthreads that
+/// share one (`threads_per_core` 2). Runners of the same label differ in both.
+pub fn cpu_topology(cpuinfo: &str) -> serde_json::Value {
+    let field = |name: &str| {
+        cpuinfo.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == name).then(|| v.trim().to_string())
+        })
+    };
+    let num = |name: &str| field(name).and_then(|v| v.parse::<u32>().ok());
+    let logical = cpuinfo.lines().filter(|l| l.split_once(':').is_some_and(|(k, _)| k.trim() == "processor")).count();
+    let threads_per_core = num("siblings").zip(num("cpu cores")).filter(|(_, c)| *c > 0).map(|(s, c)| s / c);
+    serde_json::json!({ "model": field("model name"), "logical": logical, "threads_per_core": threads_per_core })
 }
 
 /// Rounds to three decimal places (the speed factor in the results).
@@ -71,6 +99,42 @@ mod tests {
         assert_eq!(on_reference(24.0, 0.5), 12.0);
         assert_eq!(on_reference(12.0, 2.0), 24.0);
         assert_eq!(speed_factor(Some(REFERENCE_CATCH_UP_CPU_SECS), CALIBRATED_CLIENTS), Some(1.0));
+    }
+
+    /// The `checksum` of a package in `Cargo.lock` (`None` for a git or path source, or a missing package).
+    fn locked_checksum<'a>(lock: &'a str, name: &str) -> Option<&'a str> {
+        let entry = lock.split("[[package]]").find(|p| p.lines().any(|l| l.trim() == format!("name = \"{name}\"")))?;
+        entry.lines().find_map(|l| l.trim().strip_prefix("checksum = \"")?.strip_suffix('"'))
+    }
+
+    #[test]
+    fn the_reference_matches_the_locked_crates() {
+        let lock = include_str!("../../../Cargo.lock");
+        for (name, checksum) in CALIBRATED_WITH {
+            assert_eq!(
+                locked_checksum(lock, name),
+                Some(checksum),
+                "{name} changed in Cargo.lock: the MLS catch-up that calibrates the machine speed may cost differently \
+                 now. Measure REFERENCE_CATCH_UP_CPU_SECS again (perf/README.md \"Machine speed\"), then update \
+                 CALIBRATED_WITH."
+            );
+        }
+        let sample = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"git+https://example.org/a\"\n\n\
+                      [[package]]\nname = \"b\"\nversion = \"2.0.0\"\nchecksum = \"abc\"\n";
+        assert_eq!(locked_checksum(sample, "a"), None);
+        assert_eq!(locked_checksum(sample, "b"), Some("abc"));
+        assert_eq!(locked_checksum(sample, "c"), None);
+    }
+
+    #[test]
+    fn topology_from_cpuinfo() {
+        let smt = "processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\nsiblings\t: 4\ncpu cores\t: 2\n\n\
+                   processor\t: 1\nmodel name\t: AMD EPYC 7763 64-Core Processor\nsiblings\t: 4\ncpu cores\t: 2\n";
+        let t = cpu_topology(smt);
+        assert_eq!(t["model"], "AMD EPYC 7763 64-Core Processor");
+        assert_eq!(t["logical"], 2);
+        assert_eq!(t["threads_per_core"], 2);
+        assert_eq!(cpu_topology("processor : 0\n")["threads_per_core"], serde_json::Value::Null);
     }
 
     #[test]

@@ -14,10 +14,14 @@ export interface Budget {
   max?: number;
   min?: number;
   note?: string;
+  /** A write latency: the metric of the disk probe of the same window. When that probe exceeds `Budgets.disk.slow_ms`, a value over budget is inconclusive instead of failed. */
+  disk_probe?: string;
 }
 
 export interface Budgets {
   warning_at: number;
+  /** The disk: above `slow_ms` (a probe's commit p95), the write latencies measured beside it cannot be judged. */
+  disk?: { slow_ms: number; note?: string };
   budgets: Record<string, Budget>;
 }
 
@@ -41,7 +45,7 @@ export interface RawFile {
   config?: Record<string, unknown>;
 }
 
-export type Status = "ok" | "warning" | "over" | "missing" | "info";
+export type Status = "ok" | "warning" | "over" | "inconclusive" | "missing" | "info";
 
 export interface Classified extends RawMetric {
   status: Status;
@@ -73,6 +77,13 @@ export function evaluate(files: RawFile[], budgets: Budgets): Classified[] {
       seen.add(m.id);
       out.push({ ...m, ...classify(m.value, budget, budgets.warning_at), budget });
     }
+  }
+  // A write latency over budget on a disk that is slow by itself says nothing about the node (perf/README.md "Noisy
+  // runners"): inconclusive, reported but not failed. Budgets that do not depend on the disk keep their status.
+  const value = (id: string) => out.find((m) => m.id === id)?.value;
+  for (const m of out) {
+    const probe = m.budget?.disk_probe === undefined ? undefined : value(m.budget.disk_probe);
+    if (m.status === "over" && budgets.disk && typeof probe === "number" && probe > budgets.disk.slow_ms) m.status = "inconclusive";
   }
   // A budget of a benchmark that ran but did not produce the metric (a step failed) is missing.
   const prefixes = files.map(prefixOf);
@@ -141,6 +152,8 @@ function main() {
   const machine = {
     cpu: cpus()[0]?.model ?? "unknown",
     cores: cpus().length,
+    // 2: the logical CPUs are hyperthreads sharing a core (recorded by the load generator from /proc/cpuinfo).
+    threads_per_core: (files.find((f) => f.kind === "node")?.machine.cpu as { threads_per_core?: number } | undefined)?.threads_per_core ?? null,
     loadavg_before: Object.fromEntries(files.map((f) => [f.kind === "node" ? "node" : `client-${f.project}`, f.machine.loadavg_before])),
     loadavg_after: loadavg().map((v) => Math.round(v * 100) / 100),
     node: process.version,
@@ -149,15 +162,18 @@ function main() {
     // fsync=off on the test database makes the node's write latencies optimistic.
     postgres_fsync: files.find((f) => f.kind === "node")?.machine.postgres_fsync ?? null,
   };
-  const counts = Object.fromEntries((["ok", "warning", "over", "missing"] as Status[]).map((s) => [s, budgeted.filter((m) => m.status === s).length]));
+  const counts = Object.fromEntries((["ok", "warning", "over", "inconclusive", "missing"] as Status[]).map((s) => [s, budgeted.filter((m) => m.status === s).length]));
 
   console.log(`\ntavrn performance report (budgets: perf/budgets.json)\n`);
   console.log(table(budgeted));
   if (infos.length) console.log(`\nInformational (no budget)\n\n${table(infos)}`);
   if (baselines.length) console.log(`\nBaselines\n\n${table(baselines)}`);
-  console.log(`\nMachine: ${machine.cpu}, ${machine.cores} cores, load average before ${JSON.stringify(machine.loadavg_before)}`);
+  console.log(`\nMachine: ${machine.cpu}, ${machine.cores} cores (${machine.threads_per_core ?? "?"} threads per core), load average before ${JSON.stringify(machine.loadavg_before)}`);
   console.log(`         Node ${machine.node}, Chromium ${machine.chromium}, ${machine.rustc}, PostgreSQL fsync ${machine.postgres_fsync ?? "n/a"}`);
-  console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.missing} missing`);
+  console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.inconclusive} inconclusive, ${counts.missing} missing`);
+  if (counts.inconclusive && budgets.disk) {
+    console.log(`         inconclusive: write latencies over budget while the disk probe beside them exceeded ${budgets.disk.slow_ms} ms (perf/README.md "Noisy runners")`);
+  }
 
   const generatedAt = new Date().toISOString();
   const outFile = join(here, "results", `${generatedAt.replace(/[:.]/g, "-")}.json`);
