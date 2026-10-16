@@ -1,7 +1,7 @@
 {
   "description": "Performance budgets of the node. `max`: the value must stay at or below it (warning from `warning_at` of the budget); `min`: the value must reach it. Metrics without an entry are reported as info. Budgets are product decisions: change a number only in a reviewed pull request (see perf/README.md).",
   "warning_at": 0.8,
-  "disk": { "metric": "node.machine_pg_commit_p95_ms", "slow_ms": 20, "note": "A disk whose own commit p95 exceeds this makes the disk-bound write latencies inconclusive (perf/README.md \"Noisy runners\")" },
+  "disk": { "metric": "node.machine_pg_commit_p95_ms", "slow_ms": 3, "note": "A disk whose own commit p95 exceeds this makes the disk-bound write latencies inconclusive (perf/README.md \"Noisy runners\")" },
   "budgets": {
     "client.desktop.start_to_shell_ms": { "max": 2000, "note": "start to app shell" },
     "client.slow.start_to_shell_ms": { "max": 5000, "note": "start to app shell, 4x CPU throttling" },

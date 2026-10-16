@@ -93,8 +93,8 @@ test("the budget file carries the decided budgets", async () => {
   assert.equal(max("node.plain_cpu_ref_pct"), 17);
   assert.equal(max("node.enc_cpu_ref_pct"), 17);
   assert.equal(max("node.plain_cpu_pct"), undefined);
-  // Write latencies are inconclusive on a disk whose commit p95 exceeds 20 ms (perf/README.md "Noisy runners").
-  assert.deepEqual(budgets.disk, { metric: "node.machine_pg_commit_p95_ms", slow_ms: 20, note: budgets.disk?.note });
+  // Write latencies are inconclusive on a disk whose commit p95 exceeds 3 ms (perf/README.md "Noisy runners").
+  assert.deepEqual(budgets.disk, { metric: "node.machine_pg_commit_p95_ms", slow_ms: 3, note: budgets.disk?.note });
   const diskBound = Object.entries(budgets.budgets).filter(([, b]) => b.disk_bound).map(([id]) => id);
   assert.deepEqual(diskBound, ["node.plain_send_p95_ms", "node.enc_send_p95_ms", "node.enc_commit_p95_ms"]);
   // Phase 4 voice: connected idle <= 5 %, talking <= 15 % of one core.

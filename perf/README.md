@@ -148,9 +148,11 @@ Two measures keep such a runner from failing the nightly without hiding a slow n
 
 - **Disk probe.** While the 200 connections idle (scenario 4), the load generator commits one row every
   100 ms on a table of its own in the run's database (`perf/loadgen/src/disk.rs`), without the node:
-  `node.machine_pg_commit_p95_ms` (a baseline). When it exceeds `disk.slow_ms` of `budgets.json` (20 ms;
-  1.5 ms on a local SSD), a write latency over its budget (`"disk_bound": true`) is reported
-  **INCONCLUSIVE** instead of OVER and does not fail the run. Everything else, CPU, reads, errors, RSS,
+  `node.machine_pg_commit_p95_ms` (a baseline). The median is the same everywhere (0.6 ms); the tail is not:
+  the p95 was 0.8 ms on an EPYC 7763 runner, 1.5 ms on a local SSD and 9.6 ms on an EPYC 9V74 runner
+  (p99 2.5 against 41.6 ms, slowest commit 5.5 against 318 ms). When it exceeds `disk.slow_ms` of
+  `budgets.json` (3 ms, about midway between those on a log scale), a write latency over its budget
+  (`"disk_bound": true`) is reported **INCONCLUSIVE** instead of OVER and does not fail the run. Everything else, CPU, reads, errors, RSS,
   is judged as always, and the write latencies are judged on every other runner.
 - **Repetition.** A load scenario whose send p95 is above 50 ms is repeated once, right away, and the
   repetition is reported (the first attempt stays in the info as `<scenario>_first_attempt`). A stretch of
