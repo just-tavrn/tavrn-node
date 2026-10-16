@@ -14,6 +14,12 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: ed25519-dalek
         update-types: ["version-update:semver-major"]
+      # livekit-api 0.9.0 does not compile against the livekit-protocol 0.8.1 it requires (missing field in
+      # SipInboundTrunkInfo, 2026-10-16); the two move together by hand once upstream publishes a consistent pair.
+      - dependency-name: livekit-api
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: livekit-protocol
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: docker
     directory: /deploy
     schedule: { interval: weekly }
@@ -24,6 +30,9 @@ updates:
       # The build toolchain stays on the Node LTS the runner image uses; Node 26's alpine image has no corepack.
       - dependency-name: node
         update-types: ["version-update:semver-major"]
+      # livekit-server is pinned alike in the justfile, ci.yml and this Dockerfile (scripts/check-tool-pins.sh) and in
+      # the organization's runner image; a bump touches all of them at once by hand, Dependabot cannot.
+      - dependency-name: livekit/livekit-server
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
