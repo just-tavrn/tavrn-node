@@ -14,14 +14,14 @@ export interface Budget {
   max?: number;
   min?: number;
   note?: string;
-  /** A write latency: on a slow disk (`Budgets.disk`) a value over budget is inconclusive instead of failed. */
-  disk_bound?: boolean;
+  /** A write latency: the metric of the disk probe of the same window. When that probe exceeds `Budgets.disk.slow_ms`, a value over budget is inconclusive instead of failed. */
+  disk_probe?: string;
 }
 
 export interface Budgets {
   warning_at: number;
-  /** The machine's disk: when `metric` (a commit p95 measured without the node) exceeds `slow_ms`, the disk-bound budgets cannot be judged. */
-  disk?: { metric: string; slow_ms: number; note?: string };
+  /** The disk: above `slow_ms` (a probe's commit p95), the write latencies measured beside it cannot be judged. */
+  disk?: { slow_ms: number; note?: string };
   budgets: Record<string, Budget>;
 }
 
@@ -80,9 +80,10 @@ export function evaluate(files: RawFile[], budgets: Budgets): Classified[] {
   }
   // A write latency over budget on a disk that is slow by itself says nothing about the node (perf/README.md "Noisy
   // runners"): inconclusive, reported but not failed. Budgets that do not depend on the disk keep their status.
-  const disk = budgets.disk && out.find((m) => m.id === budgets.disk!.metric)?.value;
-  if (budgets.disk && typeof disk === "number" && disk > budgets.disk.slow_ms) {
-    for (const m of out) if (m.status === "over" && m.budget?.disk_bound) m.status = "inconclusive";
+  const value = (id: string) => out.find((m) => m.id === id)?.value;
+  for (const m of out) {
+    const probe = m.budget?.disk_probe === undefined ? undefined : value(m.budget.disk_probe);
+    if (m.status === "over" && budgets.disk && typeof probe === "number" && probe > budgets.disk.slow_ms) m.status = "inconclusive";
   }
   // A budget of a benchmark that ran but did not produce the metric (a step failed) is missing.
   const prefixes = files.map(prefixOf);
@@ -171,7 +172,7 @@ function main() {
   console.log(`         Node ${machine.node}, Chromium ${machine.chromium}, ${machine.rustc}, PostgreSQL fsync ${machine.postgres_fsync ?? "n/a"}`);
   console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.inconclusive} inconclusive, ${counts.missing} missing`);
   if (counts.inconclusive && budgets.disk) {
-    console.log(`         inconclusive: write latencies over budget while ${budgets.disk.metric} exceeds ${budgets.disk.slow_ms} ms (a slow disk; perf/README.md "Noisy runners")`);
+    console.log(`         inconclusive: write latencies over budget while the disk probe beside them exceeded ${budgets.disk.slow_ms} ms (perf/README.md "Noisy runners")`);
   }
 
   const generatedAt = new Date().toISOString();

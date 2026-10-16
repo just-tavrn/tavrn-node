@@ -52,7 +52,8 @@ Scenarios, in this order:
    uploads an identity key and an attested device key. The owner creates the MLS group and the other 199
    devices join it by external commit, one after the other. Then every member catches up to the final
    epoch.
-4. **200 idle WebSockets** (30 s): RSS and CPU. Alongside, the disk probe (see "Noisy runners").
+4. **200 idle WebSockets** (30 s): RSS and CPU. Alongside, the disk probe (see "Noisy runners"), which
+   also runs beside the two load scenarios.
 5. **Plaintext load** (60 s): 20 messages per second in total, round-robin over the users, sent open-loop
    (on schedule, not waiting for earlier requests). Alongside, 5 message lists per second (`limit=50`).
    Results: send, list and send → WebSocket delivery latencies (p50/p95/p99), node CPU, errors, and the
@@ -137,23 +138,29 @@ mean; the warning from 13.6 % (80 %) shows a creep before.
 
 The latency budgets of writes (send p95 50 ms, MLS commit p95 150 ms) measure the node and the machine's
 disk: every accepted message is a PostgreSQL commit, and the server commits with `fsync`. GitHub's runners
-differ there. On the AMD EPYC 9V74 runners the plaintext send p95 was 115 ms and 107-134 ms (two runs) while
-eight runs of the same and older code on other runners measured 10-18 ms; in those runs the reads (list p95
-8-9 ms) and the node's CPU (steady second by second) were as always, the slow sends were spread over the whole
-minute (where recorded), and even the 199 MLS join commits of the setup, one after the other with no load, took 98-110 ms at
-p95 (20-30 ms on the other runners). The load average gate does not tell these runs apart: every run waits
-for the load of the release build to fall below half the cores.
+differ there. On the four AMD EPYC 9V74 runs of October 2026 the plaintext send p95 was 75-140 ms (101-124 ms
+after a repetition), while ten runs on EPYC 7763, 9V45 and Xeon runners, of the same and of older code, measured 10-18 ms. In
+the 9V74 runs the reads (list p95 8-9 ms) and the node's CPU (steady second by second) were as always, the
+slow sends were spread over the whole minute (where recorded), and the 199 MLS join commits of the setup, one
+after the other with no load, took 42-110 ms at p95 (20-30 ms on the other runners). The load average gate
+does not tell these runs apart: every run waits for the load of the release build to fall below half the
+cores.
 
 Two measures keep such a runner from failing the nightly without hiding a slow node:
 
-- **Disk probe.** While the 200 connections idle (scenario 4), the load generator commits one row every
-  100 ms on a table of its own in the run's database (`perf/loadgen/src/disk.rs`), without the node:
-  `node.machine_pg_commit_p95_ms` (a baseline). The median is the same everywhere (0.6 ms); the tail is not:
-  the p95 was 0.8 ms on an EPYC 7763 runner, 1.5 ms on a local SSD and 9.6 ms on an EPYC 9V74 runner
-  (p99 2.5 against 41.6 ms, slowest commit 5.5 against 318 ms). When it exceeds `disk.slow_ms` of
-  `budgets.json` (3 ms, about midway between those on a log scale), a write latency over its budget
-  (`"disk_bound": true`) is reported **INCONCLUSIVE** instead of OVER and does not fail the run. Everything else, CPU, reads, errors, RSS,
-  is judged as always, and the write latencies are judged on every other runner.
+- **Disk probe.** Beside each load scenario, the load generator commits one small row every 250 ms on a
+  table of its own in the run's database (`perf/loadgen/src/disk.rs`): `node.plain_pg_commit_p95_ms` and
+  `node.enc_pg_commit_p95_ms` (info; `node.machine_pg_commit_p95_ms` is the same with the node idle, every
+  100 ms, a baseline). The median commit is the same everywhere (0.6 ms); the tail is not. With the node
+  idle, the p95 was 0.8 and 0.9 ms on EPYC 7763 runners, 1.2-1.5 ms on a local SSD and 9.6 ms on one EPYC
+  9V74 runner (p99 2.5 against 41.6 ms, slowest commit 5.5 against 318 ms), but 1.9 ms on another 9V74 run
+  whose sends were slow all the same: the tail comes and goes, so only a probe in the same window as the
+  sends can speak for them. When a probe exceeds `disk.slow_ms` of `budgets.json` (3 ms, about midway
+  between the normal and the slow disks on a log scale), the write latencies of its window that are over
+  their budget (the budgets with a `disk_probe`) are reported **INCONCLUSIVE** instead of OVER and do not
+  fail the run. Everything else, CPU, reads, errors, RSS, is judged as always, and the write latencies are
+  judged on every runner whose disk keeps up. (A node that wrote so much more that it slowed the disk by
+  itself would also show in its CPU budget.)
 - **Repetition.** A load scenario whose send p95 is above 50 ms is repeated once, right away, and the
   repetition is reported (the first attempt stays in the info as `<scenario>_first_attempt`). A stretch of
   slow flushes on an otherwise normal disk passes the second time; a slow node is slow twice.
@@ -172,7 +179,7 @@ classifies each metric that has a budget in `budgets.json`:
 | `OK` | below 80 % of the budget |
 | `WARNING` | 80 % to 100 % of the budget |
 | `OVER` | above the budget: the run fails (exit code 1) |
-| `INCONCLUSIVE` | a write latency above its budget on a slow disk (see "Noisy runners"): reported, the run does not fail |
+| `INCONCLUSIVE` | a write latency above its budget while the disk probe of its window was slow (see "Noisy runners"): reported, the run does not fail |
 | `MISSING` | the benchmark ran but produced no value (a step failed): the run fails |
 | `INFO` | no budget, for context (p50/p99, heap after a run, slow-machine values without a budget) |
 

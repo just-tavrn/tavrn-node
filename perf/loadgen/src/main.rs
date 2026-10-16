@@ -266,6 +266,23 @@ struct Ctx {
     sampler: Option<Sampler>,
     /// Speed of this machine relative to the reference (`machine::speed_factor`).
     speed: Option<f64>,
+    /// The node's database (a started node only): the disk probe's.
+    database_url: Option<String>,
+}
+
+/// Starts the disk probe (`disk.rs`) when the node's database is known.
+async fn start_probe(database_url: Option<&str>, every: Duration) -> Result<Option<disk::Probe>> {
+    match database_url {
+        Some(url) => Ok(Some(disk::Probe::start(url, every).await.context("disk probe")?)),
+        None => Ok(None),
+    }
+}
+
+async fn finish_probe(probe: Option<disk::Probe>) -> Result<Option<Samples>> {
+    match probe {
+        Some(p) => Ok(Some(p.finish().await?)),
+        None => Ok(None),
+    }
 }
 
 /// Runs `f` for every item with at most `n` in flight, failing on the first error.
@@ -357,24 +374,18 @@ async fn bench(
         connections: args.clients,
         sampler,
         speed,
+        database_url: database_url.map(String::from),
     };
 
     eprintln!("[4/7] {} idle connections ({} s)", ctx.connections, args.idle_secs);
     let dropped = WsStats::get(&ws.dropped);
-    // The disk probe runs while the node idles, so that it measures the machine and not the node.
-    let idle = Duration::from_secs(args.idle_secs);
-    let probe = async {
-        match database_url {
-            Some(db) => disk::commit_latency(db, idle, Duration::from_millis(100)).await.map(Some),
-            None => Ok(None),
-        }
-    };
-    let (usage, probe) = tokio::join!(measure(&ctx.sampler, idle), probe);
-    let usage = usage?;
-    let probe = probe.context("disk probe")?;
+    // The disk while the node idles: the machine's own write latency.
+    let probe = start_probe(ctx.database_url.as_deref(), Duration::from_millis(100)).await?;
+    let usage = measure(&ctx.sampler, Duration::from_secs(args.idle_secs)).await?;
+    let probe = finish_probe(probe).await?;
     report.add(
         "node.machine_pg_commit_p95_ms",
-        "Machine: PostgreSQL commit of one row, p95 (the disk under the send latencies)",
+        "Machine: PostgreSQL commit of one row with the node idle, p95",
         probe.as_ref().and_then(|p| p.percentile(95.0)).map(round1),
         "ms",
         probe.as_ref().map_or(Value::Null, Samples::summary),
@@ -622,6 +633,8 @@ async fn load(args: &Args, ctx: &Ctx, encrypted: bool, report: &mut Report) -> R
     let total = u64::from(args.rate) * args.load_secs;
     let interval = Duration::from_secs_f64(1.0 / f64::from(args.rate.max(1)));
     let list_every = u64::from((args.rate / args.list_rate.max(1)).max(1));
+    // The disk beside the node's writes, a commit every 250 ms (a fifth of the node's message rate).
+    let probe = start_probe(ctx.database_url.as_deref(), Duration::from_millis(250)).await?;
     let window = ctx.sampler.as_ref().map(Sampler::window).transpose()?;
     let start = tokio::time::Instant::now();
     let mut handles = Vec::new();
@@ -738,6 +751,7 @@ async fn load(args: &Args, ctx: &Ctx, encrypted: bool, report: &mut Report) -> R
         (Some(s), Some(w)) => Some(w.finish(s)?),
         _ => None,
     };
+    let probe = finish_probe(probe).await?;
     // Late WebSocket deliveries.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -762,6 +776,11 @@ async fn load(args: &Args, ctx: &Ctx, encrypted: bool, report: &mut Report) -> R
     let users = ctx.users.len();
     report.latency(&format!("node.{name}_send_p95_ms"), &format!("{label}: send p95 ({users} clients)"), &send);
     report.latency(&format!("node.{name}_list_p95_ms"), &format!("{label}: list 50 p95 (under load)"), &list);
+    report.latency(
+        &format!("node.{name}_pg_commit_p95_ms"),
+        &format!("{label}: PostgreSQL commit of one row beside the load, p95 (the disk)"),
+        &probe.unwrap_or_default(),
+    );
     if encrypted {
         report.latency("node.enc_commit_p95_ms", "Encrypted: MLS commit p95", &commit);
     }
