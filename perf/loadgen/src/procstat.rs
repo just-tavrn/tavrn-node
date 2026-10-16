@@ -48,6 +48,12 @@ pub fn parse_rss_kb(status: &str) -> Result<u64> {
     Ok(kb.parse()?)
 }
 
+/// User + system CPU time of the load generator itself in seconds (all its threads).
+pub fn own_cpu_secs() -> Result<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").context("/proc/self/stat")?;
+    Ok(parse_stat_ticks(&stat)? as f64 / clock_ticks())
+}
+
 /// Reads the process once (`t` is filled in by the caller).
 pub fn read(pid: u32) -> Result<Snapshot> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).with_context(|| format!("/proc/{pid}/stat"))?;
@@ -96,7 +102,7 @@ impl Sampler {
 
     /// Starts a measurement window.
     pub fn window(&self) -> Result<Window> {
-        Ok(Window { from: self.now()? })
+        Ok(Window { from: self.now()?, own_from: own_cpu_secs()? })
     }
 
     /// Highest RSS seen between two points in time (including both readings).
@@ -117,6 +123,8 @@ impl Sampler {
 /// CPU and memory of the node over one scenario.
 pub struct Window {
     from: Snapshot,
+    /// The load generator's own CPU seconds at the start.
+    own_from: f64,
 }
 
 /// Result of a [`Window`].
@@ -127,14 +135,18 @@ pub struct Usage {
     pub rss_max_mb: f64,
     pub rss_end_mb: f64,
     pub secs: f64,
+    /// CPU of the load generator itself over the same window, in percent of one core.
+    pub loadgen_cpu_pct: f64,
 }
 
 impl Window {
     pub fn finish(self, sampler: &Sampler) -> Result<Usage> {
         let to = sampler.now()?;
+        let own_to = own_cpu_secs()?;
         let secs = (to.t - self.from.t).max(1e-3);
         Ok(Usage {
             cpu_pct: round2((to.cpu_secs - self.from.cpu_secs) / secs * 100.0),
+            loadgen_cpu_pct: round2((own_to - self.own_from) / secs * 100.0),
             rss_max_mb: round1(sampler.max_rss(&self.from, &to)),
             rss_end_mb: round1(to.rss_mb),
             secs: round1(secs),
@@ -161,6 +173,18 @@ mod tests {
         let status = "Name:\ttavrn-node\nVmPeak:\t  100 kB\nVmRSS:\t   51200 kB\nThreads:\t9\n";
         assert_eq!(parse_rss_kb(status)?, 51200);
         assert!(parse_rss_kb("Name: x\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn own_cpu_time_grows_with_work() -> Result<()> {
+        let before = own_cpu_secs()?;
+        let mut x = 0u64;
+        for i in 0..100_000_000u64 {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+        }
+        std::hint::black_box(x);
+        assert!(own_cpu_secs()? > before);
         Ok(())
     }
 

@@ -141,6 +141,8 @@ function main() {
   const machine = {
     cpu: cpus()[0]?.model ?? "unknown",
     cores: cpus().length,
+    // 2: the logical CPUs are hyperthreads sharing a core (recorded by the load generator from /proc/cpuinfo).
+    threads_per_core: (files.find((f) => f.kind === "node")?.machine.cpu as { threads_per_core?: number } | undefined)?.threads_per_core ?? null,
     loadavg_before: Object.fromEntries(files.map((f) => [f.kind === "node" ? "node" : `client-${f.project}`, f.machine.loadavg_before])),
     loadavg_after: loadavg().map((v) => Math.round(v * 100) / 100),
     node: process.version,
@@ -155,7 +157,7 @@ function main() {
   console.log(table(budgeted));
   if (infos.length) console.log(`\nInformational (no budget)\n\n${table(infos)}`);
   if (baselines.length) console.log(`\nBaselines\n\n${table(baselines)}`);
-  console.log(`\nMachine: ${machine.cpu}, ${machine.cores} cores, load average before ${JSON.stringify(machine.loadavg_before)}`);
+  console.log(`\nMachine: ${machine.cpu}, ${machine.cores} cores (${machine.threads_per_core ?? "?"} threads per core), load average before ${JSON.stringify(machine.loadavg_before)}`);
   console.log(`         Node ${machine.node}, Chromium ${machine.chromium}, ${machine.rustc}, PostgreSQL fsync ${machine.postgres_fsync ?? "n/a"}`);
   console.log(`Result:  ${counts.ok} ok, ${counts.warning} warning, ${counts.over} over, ${counts.missing} missing`);
 

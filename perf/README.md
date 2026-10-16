@@ -74,39 +74,75 @@ Compare runs from the same machine.
 ### Machine speed
 
 A CPU share depends on the machine as much as on the node. GitHub's 4-core `ubuntu-latest` runners are
-not one machine: the nightlies of October 2026 ran on an AMD EPYC 9V45 once and on an EPYC 7763 after
-that, and the node's plaintext load went from 12.5 % to 23.7 % and 25.3 % of one core although nothing in
-between touched its hot path (locally, on one machine, the commits of the first two nights measured the same
-within 2 %). The
-load generator's own work, which did not change at all, slowed down by the same factor: its MLS catch-up took
-12.5 s, 22.7 s and 24.8 s. A fixed CPU budget therefore measured the runner, not the node.
+not one machine: the nightlies of October 2026 ran on AMD EPYC 7763, 9V45 and 9V74 and on two Intel Xeon
+models, and the same node measured 10.2 % to 13.9 % of one core under the plaintext load on them (12.5 % to
+25.3 % before the read buffer fix below). A fixed CPU budget measures the runner, not the node.
 
-The load generator calibrates every run with that catch-up: every member processes the commits after its
-own join (OpenMLS from the pinned tavrn-crypto), the same computation in every run of the default scale. The
-CPU time of its threads together is `node.machine_catch_up_cpu_secs` (a baseline; lower is faster). The
-node's CPU under load is reported twice:
+The load generator calibrates every run with the MLS catch-up of its setup: every member processes the
+commits after its own join, the same computation in every run of the default scale. The CPU time of its
+threads together is `node.machine_catch_up_cpu_secs` (a baseline; lower is faster). The node's CPU under load
+is reported twice:
 
 - `node.plain_cpu_pct` / `node.enc_cpu_pct`: as measured on this machine (info);
 - `node.plain_cpu_ref_pct` / `node.enc_cpu_ref_pct`: the same on the reference machine, the measured share
   times *reference catch-up / this catch-up* (budgeted).
 
-The reference machine is one whose catch-up takes 60 CPU seconds
-(`perf/loadgen/src/machine.rs`), about the EPYC 7763 runner (22.7 s and 24.8 s of wall time on four
-threads, which are busy 65 % of it together). Scaled this way, the October runs give 23.1 % (EPYC 9V45),
-24.1 % and 23.5 % (EPYC 7763): the spread between the runners shrinks from a factor of 2 to 4 %. The
-calibration holds for the default 200 clients only; at another scale the `_ref` values are missing (the
+The reference machine is the EPYC 7763 runner. That the catch-up follows the runners the way the node does is
+measured, not assumed: for one version of the code, the node's share divided by the catch-up varies by about
+10 % over the runners while the share itself varies by 40 % to 100 %:
+
+| Run (2026-10) | Code | Runner | Catch-up | Measured plain / enc | On the reference |
+|---|---|---|---|---|---|
+| 38227947218 (10-12) | 3d7ab04 | EPYC 9V45 | 12.5 s wall | 12.5 / 12.4 % | 23.1 % (60 s ref.) |
+| 38375860961 (10-13) | 706697b | EPYC 7763 | 22.7 s wall | 23.7 / 23.0 % | 24.1 % (60 s ref.) |
+| 38529235052 (10-14) | 9506e17 | EPYC 7763 | 24.8 s wall | 25.3 / 24.3 % | 23.5 % (60 s ref.) |
+| 38698402544 (10-15) | e4462d1 | Xeon 6973P-C | 15.4 s wall | 16.3 / 15.0 % | 24.4 % (60 s ref.) |
+| 38865178559 (10-16) | 090d3b7 | EPYC 9V74 | 26.2 CPU s | 10.2 / 10.5 % | 12.5 / 12.9 % |
+| 38961332219 (10-16) | 090d3b7 | EPYC 7763 | 32.3 CPU s | 13.9 / 13.7 % | 13.9 / 13.7 % |
+| 38961335441 (10-16) | 090d3b7 | EPYC 7763 | 32.2 CPU s | 13.6 / 13.7 % | 13.7 / 13.7 % |
+| 38961339671 (10-16) | 090d3b7 | Xeon Platinum 8573C | 31.8 CPU s | 12.4 / 12.6 % | 12.6 / 12.8 % |
+
+The first four runs predate the CPU measurement of the catch-up; their reference values use its wall time
+times four threads busy 65 % of it, against the reference of those load generators (60 CPU seconds).
+
+The catch-up is fixed work only while the code doing it stays the same: OpenMLS through tavrn-crypto.
+0.4.0-rc.10 took tavrn-crypto 0.1.0 from crates.io, whose MLS client caches the groups it loaded instead of
+rebuilding them for every call; the catch-up became half as expensive (on the EPYC 7763 from about 60 to 32
+CPU seconds; on one local machine from 30.7 to 15.7 with the two load generators against the same node). The
+node became cheaper between the same two nightlies (0.4.0-rc.9, read buffer fix below). Scaled by a catch-up that had halved, the
+node's 43 % gain on the EPYC 7763 (24.5 % → 13.8 % measured) vanished: every scaled value stayed at 23–25 %.
+The reference is therefore tied to the crates it was measured with (`CALIBRATED_WITH` in
+`perf/loadgen/src/machine.rs`, their `Cargo.lock` checksums), and a unit test of the load generator fails when
+one of them changes. To measure the reference again, run the old and the new load generator against the same
+node on one machine (pinned, for example `taskset -c 0-3`, `--node-bin` of one build) and scale
+`REFERENCE_CATCH_UP_CPU_SECS` by the ratio of their `mls_catch_up_cpu_secs`; or run the Performance workflow
+before and after the change and compare runs on the EPYC 7763. Then update the checksums.
+
+The calibration holds for the default 200 clients only; at another scale the `_ref` values are missing (the
 report fails them) and only the measured shares can be compared between runs of the same parameters. A local
 machine scales differently from the runners (a virtualized Linux such as WSL pays more for the node's many
-small system calls), so compare local `_ref` values with local runs, not with the nightly.
+small system calls), so compare local `_ref` values with local runs, not with the nightly. The raw results
+also record the CPU topology (`machine.cpu`: model, logical CPUs, threads per core) and the load generator's
+own CPU in every measurement window (`loadgen_cpu_pct` in the details of a usage metric), for a later check
+of other calibrations against the runners.
 
-The budget is 20 % of one reference core at 20 messages per second. The node itself got cheaper at the same
-time: before every read, tungstenite zeroed the free part of a connection's 128 KiB read buffer, also for
-the reads that found nothing, and each event wakes every connection, which polls its socket. That zeroing
-was 39 % of the node's user CPU under this load; with a 4 KiB buffer (`ws::READ_BUFFER`) the plaintext load
-fell from 15.0 % to 10.1 % and the encrypted load from 13.2 % to 8.3 % (pinned to four CPUs; 19.6 % to
-11.4 % and 17.0 % to 9.4 % unpinned). On the reference machine that is about 16 % (from about 24 %). The
-budget leaves room for noise and catches a regression of about a quarter; the warning from 16 % shows a
-creep before.
+The budget is 17 % of one reference core at 20 messages per second. Before the read buffer fix the node
+took 23–25 % on the reference: before every read, tungstenite zeroed the free part of a connection's
+128 KiB read buffer, also for the reads that found nothing, and each event wakes every connection, which polls
+its socket. With a 4 KiB buffer (`ws::READ_BUFFER`) the runners give 12.5–13.9 % (mean 13.2 %) on the
+reference. The budget is about a quarter above that: 22 % above the highest runner value, 29 % above the
+mean; the warning from 13.6 % (80 %) shows a creep before.
+
+### Noisy runners
+
+The latency budgets (send p95 50 ms) measure the node and the runner's disk: PostgreSQL commits with `fsync`.
+On 2026-10-16 one nightly measured a send p95 of 115 ms (plaintext) and 61 ms (encrypted) while three runs of
+the same commit on the same day measured 10–12 ms; in that run the reads (list p95 9 ms) and the node's CPU
+(steady at 10 % second by second) were as always, only the writes were slow. A load scenario whose send p95
+is above 50 ms is therefore repeated once, right away, and the repetition is reported (the first attempt stays
+in the info as `<scenario>_first_attempt`). A slow node is slow twice; a stretch of slow disk flushes is not.
+For every attempt the info also lists the seconds in which sends took longer than 50 ms
+(`<scenario>_slow_sends_by_second`): a stall shows as many in a few seconds, a general slowness spread out.
 
 ## Reading the report
 
