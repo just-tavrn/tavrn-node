@@ -159,7 +159,7 @@ tarballs); adding the license texts under `/usr/share/doc/ffmpeg/` in the image 
 For development and CI, `just ffmpeg-install` and the CI download the BtbN "gpl" static build (GPL-3.0); it is
 only executed on developer and CI machines, never distributed, so this is fine for every package.
 
-**LiveKit server** (`livekit/livekit-server` v1.13.8, copied into the image): Apache-2.0, a separate
+**LiveKit server** (`livekit/livekit-server` v1.13.9, copied into the image): Apache-2.0, a separate
 process supervised by the node.
 
 ## 5. Compatibility verdict
