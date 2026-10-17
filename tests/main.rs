@@ -86,6 +86,7 @@ mod suite {
     mod reports_flow;
     mod reports_forward_flow;
     mod room_invites_flow;
+    mod room_legal_flow;
     mod room_profiles_flow;
     mod room_transfer_flow;
     mod rooms_flow;

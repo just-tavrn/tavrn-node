@@ -9,6 +9,13 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 First public release of the node and its container image.
 
+- **Room privacy notice and legal notice** (protocol PROTOCOL.md §6b): `PATCH /rooms/{room_id} { privacy_notice,
+  legal_notice }` (`manage_room`, up to 20,000 and 5,000 characters, `""` removes), room objects carry
+  `privacy_notice_updated_at` and `legal_notice_updated_at`, changes are audited as `room.legal` and sent as
+  `room.update`. New public route `GET /rooms/{room_id}/preview` (room, rules and documents before joining; public
+  rooms for everyone, rate-limited anonymously; other rooms for members and node admins); the invite preview carries
+  the documents too. Migration 0440. Tests now cover the rules requirement on every join route (personal
+  invitations and federated joins included); the node already enforced it.
 - **`tavrn-crypto` from crates.io** (0.1.0, the published crate) instead of a git revision; a git revision stays
   the way to build against unreleased crypto changes (README.md "Building").
 - **Message components** (protocol APPLICATIONS.md §5.10, capability `components.v1`): buttons and select menus in

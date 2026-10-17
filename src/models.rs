@@ -273,6 +273,11 @@ pub struct Room {
     pub age_gate: String,
     /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
     pub history_restore: String,
+    /// Time of the last change of the room's privacy notice, null while it has none (PROTOCOL.md §6b "Room privacy
+    /// notice and legal notice"; the text itself comes with `GET /rooms/{id}/preview` and the invite preview).
+    pub privacy_notice_updated_at: Option<String>,
+    /// Time of the last change of the room's legal notice, null while it has none.
+    pub legal_notice_updated_at: Option<String>,
 }
 
 impl Room {

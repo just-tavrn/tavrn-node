@@ -2111,6 +2111,23 @@ Web push payloads carry no content of encrypted conversations. Retention you con
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
+### Rooms' own privacy notice and legal notice
+
+Room managers (*Manage room*) can publish a privacy notice and a legal notice for their room (Room settings → Legal;
+protocol PROTOCOL.md §6b "Room privacy notice and legal notice"). Both are optional Markdown documents (up to 20,000
+and 5,000 characters), shown before joining (invite page, join dialogs of the invite list, Discover and the
+directory) and to members (room menu and Room settings → Legal), with the date of the last change. They inform; they
+never have to be accepted. Every change is audited as `room.legal`.
+
+What this means for you as the operator: you stay a separate controller for what the node does, with your own
+privacy policy (Admin → Legal); the room's documents link to it through the template and do not replace it. People
+who run rooms that are not purely private (public rooms, communities of a business or an association) may be
+controllers for their room jointly with you (CJEU C-210/16, the "fan page" ruling) and may need a legal notice of
+their own; the umbrella repository's guide
+[docs/room-legal.md](https://github.com/just-tavrn/tavrn/blob/main/docs/room-legal.md) explains this for them. You may
+want to say in your terms who is responsible for what in rooms and how requests about a room reach its managers.
+Nothing here is legal advice.
+
 ### Age gates
 
 Since `age.v1` (protocol PROTOCOL.md §5e) every registration asks for the **date of birth**: the password and passkey
@@ -2274,7 +2291,7 @@ birth. Some of the actions they record:
 
 | Audit log | Examples |
 |---|---|
-| Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
+| Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.legal`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
 | Node | `user.register`, `user.second_factor_enroll`, `user.recovery_code_used`, `admin.user_disable`, `admin.user_delete`, `admin.second_factor_reset`, `admin.date_of_birth`, `admin.ban`, `admin.federation_block`, `federation.block_auto`, `federation.user_deleted`, `app.create`, `app.token_create`, `webhook.create`, `entitlements.grant_create`, `legal.*`, `retention.messages`, `directory.reports_notice`, `report.forward`, `report.forwarded_in` |
 
 Moderation shortcuts of the reports inbox add the report they act on (`report_id`). The node keeps audit entries as
