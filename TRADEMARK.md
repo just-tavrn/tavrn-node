@@ -1,57 +1,61 @@
 # Trademark policy
 
-The name **tavrn** and the tavrn logo and icons are the project's marks. They are **not** licensed under the
-open-source licenses of the code (the `LICENSE` file of each repository): the code licenses give you the right to use, change and
-share the software, not the right to use our name or logo for your own version of it. This is how many
-open-source projects keep users from being confused about who made what they run. We want this policy to be
-generous towards people who run tavrn for themselves and their communities, and strict only where a name or
-logo could suggest an official offering.
+The tavrn project name, logo and icons identify the official project in the
+[just-tavrn organization](https://github.com/just-tavrn). They are excluded from the code and documentation
+licenses. This policy grants the permissions below for the project's brand artwork and name to the extent
+of the rights held by the project owner. It does not claim that a trademark has been registered.
 
-## What you may do without asking
+## Hosting and describing tavrn: no permission needed
 
-- **Run a node and keep the name and logo.** Build and run tavrn from our releases or source and leave the
-  logo, favicon and app icons as they are. Configuration, themes, your own room branding next to the logo,
-  translations and the usual operator settings do not count as modifications.
-- **Keep your own patches for your own node.** If you change the code for the node you run and do not
-  distribute the result and do not offer it as a service under our name, you may keep the name and logo.
-- **Name your node after the software.** A subdomain or path that contains the name to say what runs there is
-  fine: `tavrn.example.org`, `chat.example.org/tavrn`, "the tavrn node of the Example community".
-- **Say what you are.** Say that your node runs tavrn, that your software is compatible with tavrn, implements
-  the tavrn protocol or is based on tavrn, as long as the name of your own product is your own.
-- **Talk about the project.** Use the name and logo in articles, talks, tutorials, reviews, screenshots and
-  links to the project.
+Anyone, including a commercial provider, may run unmodified tavrn, charge for hosting, subscriptions and
+support, and advertise the software by its name. No partnership, fee or individual brand approval is required.
+Keep your own business name and clearly identify yourself as the service operator.
 
-## What needs our written permission
+Examples of permitted descriptions:
 
-- **Distributing modified versions under the name.** If you distribute a modified version of the node, the
-  web client or the apps (binaries, images, packages, a public download), give it a different name and remove
-  or replace the logo and icons (they live in the web client and app repositories). The same applies to versions that have been rebuilt
-  in substance even if you run them only yourself, for example with a different protocol, without the
-  end-to-end encryption, or with a different federation, because people who connect to them would expect
-  tavrn behaviour.
-- **Hosting as a business under the name.** Offering tavrn nodes as a service under the name "tavrn", a
-  confusingly similar name, or in a way that suggests an official offering needs permission. Hosting for
-  your own community, your company or your friends is not a business under the name.
-- **Domains and product names built on the name.** Domains where the name is the main part or that look
-  official (`tavrn-chat.example`, `tavrn.social`, `gettavrn.example`), product and company names containing
-  the name, and the logo as part of your own logo.
-- **Changing the marks.** Recolouring, redrawing, cropping or combining the logo with other marks, and
-  putting the logo on merchandise, documents or materials that are not about the project.
+- "Managed hosting for tavrn by ExampleHost".
+- "Rent a tavrn node from ExampleHost" or "ExampleHost offers tavrn hosting".
+- "ExampleHost — independent tavrn hosting provider".
+- "This node runs tavrn", "compatible with the tavrn protocol" or "based on tavrn".
+- `tavrn.examplehost.com` identifying the software hosted by ExampleHost.
 
-## Examples
+You may keep the original name, logo, favicon and app icons in an unmodified deployment, and use the
+unmodified logo next to a factual description of your tavrn offering. It must not become your own company
+or service logo, imply endorsement, or dominate your branding in a way that makes the offering look official.
+Where confusion is reasonably possible, state "Independently operated; not affiliated with the tavrn project."
+Configuration, themes, room branding and translations do not by themselves create a separately branded fork.
+You may discuss the project and use its unmodified logo in articles, reviews, tutorials and screenshots.
 
-| Allowed | Not allowed without permission |
-|---|---|
-| `tavrn.myclub.example` runs an unmodified node with the logo | `tavrn-hosting.example` sells nodes under the name |
-| A node with a custom theme, room icons and a German welcome text | A fork with a changed message format, still called tavrn |
-| A home-server operator who patched a bug locally and keeps the logo | A rebuilt web client published as "tavrn" with the icons |
-| "Example Chat, compatible with the tavrn protocol" | "tavrn Pro" as the name of a product |
-| A blog post with the logo reviewing the software | The logo recoloured as the logo of another project |
+## Modified versions and forks
 
-## Questions and reports
+You may make, host and distribute forks under the software licenses, including commercially and under your
+own name. Copyright notices, attribution and applicable source obligations must be preserved.
+Clearly disclose code modifications when describing a deployment as tavrn. Local operational or bug-fix
+patches may keep the name and logos if the deployment remains compatible and is clearly independently operated.
 
-Ask the maintainers if you are unsure; we are happy to allow reasonable uses and will answer in writing.
-Report uses that look official but are not to the project's security contact (see the
-[security policy](https://github.com/just-tavrn/.github/blob/main/SECURITY.md)). This policy
-may be refined once a legal entity holds the marks; the permissions above will not become narrower for
-existing uses.
+A separately marketed modified product, or a version that materially changes the protocol, federation or
+security properties, must use its own product name and replace the tavrn logo and icons. It may accurately
+say "based on tavrn". Do not present modified builds as official tavrn releases. Written permission is
+required to distribute a modified product under the tavrn product name and logos, except for the
+operational or bug-fix patches permitted above.
+
+## Uses requiring written permission
+
+- Naming your company or independent product "tavrn", "tavrn Pro" or a confusingly similar brand.
+- Claiming to be the official, approved or exclusive tavrn hoster or partner without authorization.
+- Domains that suggest the official project, such as `tavrn-hosting.example` or `gettavrn.example`, rather
+  than identifying tavrn as software offered by a separately named provider.
+- Altering the logo, incorporating it into your own mark or using it on unrelated merchandise.
+
+Describing yourself as a tavrn hosting provider is allowed; presenting "tavrn" as your business identity is not.
+This policy does not restrict rights that applicable law independently grants, including lawful descriptive use.
+
+## Project and company
+
+The official source, releases and project decisions are maintained in just-tavrn. A future hosting company
+established by the project owner may operate an official service, but independent providers retain the
+permissions above. Existing permitted uses will not become narrower through a later policy revision.
+
+For brand permission, contact the maintainers through the project's
+[discussions](https://github.com/just-tavrn/tavrn/discussions). Security vulnerabilities follow the
+[security policy](https://github.com/just-tavrn/.github/blob/main/SECURITY.md).
