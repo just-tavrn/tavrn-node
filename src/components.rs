@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use crate::{error::ApiError, validate::unknown_key};
 
 pub const CAPABILITY: &str = "components.v1";
+pub const MODAL_SELECT_CAPABILITY: &str = "components.modal_select.v1";
 pub const MAX_ROWS: usize = 5;
 pub const MAX_BUTTONS_PER_ROW: usize = 5;
 pub const MAX_OPTIONS: usize = 25;
@@ -37,14 +38,16 @@ pub const COMPONENT_VALUES_TYPE: &str = "component.values";
 pub const MODAL_VALUES_TYPE: &str = "modal.values";
 
 const BUTTON_STYLES: &[&str] = &["primary", "secondary", "success", "danger", "link"];
-const INPUT_STYLES: &[&str] = &["short", "paragraph"];
+const INPUT_STYLES: &[&str] = &["short", "paragraph", "select"];
 const ROW_KEYS: &[&str] = &["type", "components"];
 const BUTTON_KEYS: &[&str] = &["type", "style", "label", "emoji", "custom_id", "url", "disabled"];
 const SELECT_KEYS: &[&str] = &["type", "custom_id", "placeholder", "options", "min", "max", "disabled"];
 const OPTION_KEYS: &[&str] = &["label", "value", "description", "emoji", "default"];
+const MODAL_OPTION_KEYS: &[&str] = &["label", "value", "description", "emoji"];
 const MODAL_KEYS: &[&str] = &["custom_id", "title", "inputs"];
 const INPUT_KEYS: &[&str] =
     &["custom_id", "label", "style", "placeholder", "min_length", "max_length", "required", "value"];
+const MODAL_SELECT_KEYS: &[&str] = &["custom_id", "label", "style", "placeholder", "options", "required", "value"];
 
 // ---------------------------------------------------------------- errors
 
@@ -180,35 +183,7 @@ fn check_select(s: &Map<String, Value>, p: &str) -> Result<(), ApiError> {
     if !absent(s.get("placeholder")) && !text(s.get("placeholder"), 0, MAX_PLACEHOLDER) {
         return Err(invalid(format!("{p}.placeholder"), "placeholder: at most 150 characters"));
     }
-    let options = match s.get("options") {
-        Some(Value::Array(list)) if (1..=MAX_OPTIONS).contains(&list.len()) => list,
-        _ => return Err(invalid(format!("{p}.options"), "options: 1 to 25")),
-    };
-    let mut values: Vec<&str> = Vec::new();
-    for (i, o) in options.iter().enumerate() {
-        let q = format!("{p}.options[{i}]");
-        let o = o.as_object().ok_or_else(|| invalid(&q, "An option is an object"))?;
-        if let Some(k) = unknown_key(o, OPTION_KEYS) {
-            return Err(invalid(format!("{q}.{k}"), "Unknown field"));
-        }
-        if !text(o.get("label"), 1, MAX_OPTION_TEXT) {
-            return Err(invalid(format!("{q}.label"), "label: 1 to 100 characters"));
-        }
-        let value = o.get("value").filter(|v| text(Some(v), 1, MAX_OPTION_TEXT)).and_then(Value::as_str);
-        match value {
-            Some(v) if !values.contains(&v) => values.push(v),
-            _ => return Err(invalid(format!("{q}.value"), "value: 1 to 100 characters, unique")),
-        }
-        if !absent(o.get("description")) && !text(o.get("description"), 0, MAX_OPTION_TEXT) {
-            return Err(invalid(format!("{q}.description"), "description: at most 100 characters"));
-        }
-        if !opt_emoji(o.get("emoji")) {
-            return Err(invalid(format!("{q}.emoji"), "emoji: one Unicode emoji or :shortcode:"));
-        }
-        if !opt_bool(o.get("default")) {
-            return Err(invalid(format!("{q}.default"), "default: a boolean"));
-        }
-    }
+    let options = check_options(s, p, false)?;
     let n = options.len() as u64;
     let min = int_or(s.get("min"), 1, 0, MAX_OPTIONS as u64)
         .filter(|m| *m <= n)
@@ -220,6 +195,44 @@ fn check_select(s: &Map<String, Value>, p: &str) -> Result<(), ApiError> {
         return Err(invalid(format!("{p}.disabled"), "disabled: a boolean"));
     }
     Ok(())
+}
+
+/// Message and modal selects share option limits; only message options permit a default flag.
+fn check_options<'a>(s: &'a Map<String, Value>, p: &str, modal: bool) -> Result<&'a [Value], ApiError> {
+    let error = |path: String, detail: &str| {
+        if modal { modal_invalid(path, detail) } else { invalid(path, detail) }
+    };
+    let keys = if modal { MODAL_OPTION_KEYS } else { OPTION_KEYS };
+    let options = match s.get("options") {
+        Some(Value::Array(list)) if (1..=MAX_OPTIONS).contains(&list.len()) => list,
+        _ => return Err(error(format!("{p}.options"), "options: 1 to 25")),
+    };
+    let mut values: Vec<&str> = Vec::new();
+    for (i, o) in options.iter().enumerate() {
+        let q = format!("{p}.options[{i}]");
+        let o = o.as_object().ok_or_else(|| error(q.clone(), "An option is an object"))?;
+        if let Some(k) = unknown_key(o, keys) {
+            return Err(error(format!("{q}.{k}"), "Unknown field"));
+        }
+        if !text(o.get("label"), 1, MAX_OPTION_TEXT) {
+            return Err(error(format!("{q}.label"), "label: 1 to 100 characters"));
+        }
+        let value = o.get("value").filter(|v| text(Some(v), 1, MAX_OPTION_TEXT)).and_then(Value::as_str);
+        match value {
+            Some(v) if !values.contains(&v) => values.push(v),
+            _ => return Err(error(format!("{q}.value"), "value: 1 to 100 characters, unique")),
+        }
+        if !absent(o.get("description")) && !text(o.get("description"), 0, MAX_OPTION_TEXT) {
+            return Err(error(format!("{q}.description"), "description: at most 100 characters"));
+        }
+        if !opt_emoji(o.get("emoji")) {
+            return Err(error(format!("{q}.emoji"), "emoji: one Unicode emoji or :shortcode:"));
+        }
+        if !modal && !opt_bool(o.get("default")) {
+            return Err(error(format!("{q}.default"), "default: a boolean"));
+        }
+    }
+    Ok(options)
 }
 
 /// Checks the `components` value of a `text` content object (`400 message.components_invalid` with `meta.path`).
@@ -357,7 +370,8 @@ pub fn validate_modal(modal: &Value) -> Result<(), ApiError> {
     for (i, input) in inputs.iter().enumerate() {
         let p = format!("inputs[{i}]");
         let input = input.as_object().ok_or_else(|| modal_invalid(&p, "An input is an object"))?;
-        if let Some(k) = unknown_key(input, INPUT_KEYS) {
+        let select = input.get("style").and_then(Value::as_str) == Some("select");
+        if let Some(k) = unknown_key(input, if select { MODAL_SELECT_KEYS } else { INPUT_KEYS }) {
             return Err(modal_invalid(format!("{p}.{k}"), "Unknown field"));
         }
         let Some(id) = input.get("custom_id").and_then(Value::as_str).filter(|s| valid_custom_id(s)) else {
@@ -367,26 +381,42 @@ pub fn validate_modal(modal: &Value) -> Result<(), ApiError> {
             return Err(modal_invalid(format!("{p}.label"), "label: 1 to 45 characters"));
         }
         if !input.get("style").and_then(Value::as_str).is_some_and(|s| INPUT_STYLES.contains(&s)) {
-            return Err(modal_invalid(format!("{p}.style"), "style: short or paragraph"));
+            return Err(modal_invalid(format!("{p}.style"), "style: short, paragraph or select"));
         }
         if !absent(input.get("placeholder")) && !text(input.get("placeholder"), 0, MAX_INPUT_PLACEHOLDER) {
             return Err(modal_invalid(format!("{p}.placeholder"), "placeholder: at most 100 characters"));
         }
-        let min = int_or(input.get("min_length"), 0, 0, MAX_INPUT_LENGTH)
-            .ok_or_else(|| modal_invalid(format!("{p}.min_length"), "min_length: 0 to 4000"))?;
-        let max = int_or(input.get("max_length"), MAX_INPUT_LENGTH, 1, MAX_INPUT_LENGTH)
-            .filter(|m| *m >= min)
-            .ok_or_else(|| modal_invalid(format!("{p}.max_length"), "max_length: 1 to 4000, at least min_length"))?;
-        if !opt_bool(input.get("required")) {
-            return Err(modal_invalid(format!("{p}.required"), "required: a boolean"));
-        }
-        let value_ok = match input.get("value") {
-            None | Some(Value::Null) => true,
-            Some(Value::String(s)) => s.chars().count() as u64 <= max,
-            Some(_) => false,
-        };
-        if !value_ok {
-            return Err(modal_invalid(format!("{p}.value"), "value: at most max_length characters"));
+        if select {
+            let options = check_options(input, &p, true)?;
+            if !opt_bool(input.get("required")) {
+                return Err(modal_invalid(format!("{p}.required"), "required: a boolean"));
+            }
+            if !absent(input.get("value"))
+                && !input.get("value").and_then(Value::as_str).is_some_and(|value| {
+                    options.iter().any(|option| option.get("value").and_then(Value::as_str) == Some(value))
+                })
+            {
+                return Err(modal_invalid(format!("{p}.value"), "value: an option value of the select"));
+            }
+        } else {
+            let min = int_or(input.get("min_length"), 0, 0, MAX_INPUT_LENGTH)
+                .ok_or_else(|| modal_invalid(format!("{p}.min_length"), "min_length: 0 to 4000"))?;
+            let max = int_or(input.get("max_length"), MAX_INPUT_LENGTH, 1, MAX_INPUT_LENGTH)
+                .filter(|m| *m >= min)
+                .ok_or_else(|| {
+                    modal_invalid(format!("{p}.max_length"), "max_length: 1 to 4000, at least min_length")
+                })?;
+            if !opt_bool(input.get("required")) {
+                return Err(modal_invalid(format!("{p}.required"), "required: a boolean"));
+            }
+            let value_ok = match input.get("value") {
+                None | Some(Value::Null) => true,
+                Some(Value::String(s)) => s.chars().count() as u64 <= max,
+                Some(_) => false,
+            };
+            if !value_ok {
+                return Err(modal_invalid(format!("{p}.value"), "value: at most max_length characters"));
+            }
         }
         if ids.contains(&id) {
             return Err(modal_invalid(format!("{p}.custom_id"), "custom_id is unique within the modal"));
@@ -397,8 +427,8 @@ pub fn validate_modal(modal: &Value) -> Result<(), ApiError> {
 }
 
 /// A plaintext modal submit against the definition the node kept (`400 interaction.values_invalid` with
-/// `meta.path`): input `custom_id` → text, every required input filled, lengths within the limits. Returns the
-/// values as sent.
+/// `meta.path`): input `custom_id` → string, every required input filled, text lengths within the limits and select
+/// values matching an option exactly. Returns the values as sent.
 pub fn validate_modal_values(modal: &Value, values: Option<&Value>) -> Result<Value, ApiError> {
     let obj = values
         .and_then(Value::as_object)
@@ -417,6 +447,18 @@ pub fn validate_modal_values(modal: &Value, values: Option<&Value>) -> Result<Va
     for input in &inputs {
         let id = id_of(input);
         let text = obj.get(&id).and_then(Value::as_str).unwrap_or("");
+        if input.get("style").and_then(Value::as_str) == Some("select") {
+            if text.is_empty() {
+                if input.get("required").and_then(Value::as_bool).unwrap_or(true) {
+                    return Err(modal_values_invalid(format!("values.{id}"), "This input is required"));
+                }
+            } else if !input.get("options").and_then(Value::as_array).is_some_and(|options| {
+                options.iter().any(|option| option.get("value").and_then(Value::as_str) == Some(text))
+            }) {
+                return Err(modal_values_invalid(format!("values.{id}"), "An option value of the select"));
+            }
+            continue;
+        }
         let n = text.chars().count() as u64;
         // Whitespace only counts as empty: a required input needs real text (the clients check the same).
         if text.trim().is_empty() {
@@ -510,6 +552,111 @@ mod tests {
         assert_eq!(p(json!({ "name": "Al", "extra": "x" })).as_deref(), Some("values.extra"));
         assert_eq!(p(json!({ "name": 5 })).as_deref(), Some("values.name"));
         assert_eq!(validate_modal_values(&modal, Some(&json!({}))).unwrap_err().code(), "interaction.values_invalid");
+    }
+
+    fn select_modal() -> Value {
+        json!({ "custom_id": "raid:spec", "title": "Choose your specialization", "inputs": [
+            { "custom_id": "spec", "label": "Specialization", "style": "select", "placeholder": "Choose one",
+              "value": "protection", "options": [
+                { "label": "Protection", "value": "protection", "description": "Tank", "emoji": "🛡️" },
+                { "label": "Holy", "value": "holy", "emoji": ":healer:" } ] },
+            { "custom_id": "note", "label": "Note", "style": "short", "required": false } ] })
+    }
+
+    #[test]
+    fn modal_select_definitions_reuse_option_bounds() {
+        validate_modal(&select_modal()).unwrap();
+        let mut modal = select_modal();
+        modal["inputs"][0]["options"] = json!(
+            (0..MAX_OPTIONS)
+                .map(|i| json!({ "label": format!("Option {i}"), "value": i.to_string() }))
+                .collect::<Vec<_>>()
+        );
+        modal["inputs"][0]["value"] = json!("0");
+        validate_modal(&modal).unwrap();
+        modal["inputs"][0]["options"].as_array_mut().unwrap().push(json!({ "label": "Extra", "value": "extra" }));
+        assert_eq!(path(&validate_modal(&modal).unwrap_err()), "inputs[0].options");
+    }
+
+    #[test]
+    fn modal_select_definitions_refuse_malformed_fields() {
+        let input = select_modal()["inputs"][0].clone();
+        for (key, value, expected) in [
+            ("options", json!([]), "options"),
+            ("options", json!([null]), "options[0]"),
+            (
+                "options",
+                json!([{ "label": "A", "value": "same" }, { "label": "B", "value": "same" }]),
+                "options[1].value",
+            ),
+            ("options", json!([{ "label": "", "value": "x" }]), "options[0].label"),
+            ("options", json!([{ "label": "A".repeat(101), "value": "x" }]), "options[0].label"),
+            ("options", json!([{ "label": "A", "value": "" }]), "options[0].value"),
+            ("options", json!([{ "label": "A", "value": "x".repeat(101) }]), "options[0].value"),
+            (
+                "options",
+                json!([{ "label": "A", "value": "x", "description": "x".repeat(101) }]),
+                "options[0].description",
+            ),
+            ("options", json!([{ "label": "A", "value": "x", "emoji": "bad emoji" }]), "options[0].emoji"),
+            ("options", json!([{ "label": "A", "value": "x", "default": true }]), "options[0].default"),
+            ("options", json!([{ "label": "A", "value": "x", "default": null }]), "options[0].default"),
+            ("options", json!([{ "label": "A", "value": "x", "extra": 1 }]), "options[0].extra"),
+            ("value", json!("other"), "value"),
+            ("value", json!(""), "value"),
+            ("value", json!(["protection"]), "value"),
+            ("required", json!(1), "required"),
+            ("placeholder", json!("x".repeat(101)), "placeholder"),
+            ("min_length", json!(null), "min_length"),
+            ("max_length", json!(4000), "max_length"),
+            ("default", json!(true), "default"),
+            ("extra", json!(1), "extra"),
+        ] {
+            let mut modified = input.clone();
+            modified[key] = value;
+            let modal = json!({ "custom_id": "m", "title": "Choice", "inputs": [modified] });
+            let err = validate_modal(&modal).unwrap_err();
+            assert_eq!(err.code(), "interaction.modal_invalid");
+            assert_eq!(path(&err), format!("inputs[0].{expected}"), "{modal}");
+        }
+        // Text inputs retain their existing schema; adding select-only fields does not change them.
+        let mut modal = select_modal();
+        modal["inputs"][1]["options"] = json!([]);
+        assert_eq!(path(&validate_modal(&modal).unwrap_err()), "inputs[1].options");
+        modal = select_modal();
+        modal["inputs"][1]["custom_id"] = json!("spec");
+        assert_eq!(path(&validate_modal(&modal).unwrap_err()), "inputs[1].custom_id");
+    }
+
+    #[test]
+    fn modal_select_submits_require_an_exact_option_value() {
+        let mut modal = select_modal();
+        let good = json!({ "spec": "holy", "note": "late" });
+        assert_eq!(validate_modal_values(&modal, Some(&good)).unwrap(), good);
+        for values in [
+            json!({}),
+            json!({ "spec": "" }),
+            json!({ "spec": "unknown" }),
+            json!({ "spec": " holy " }),
+            json!({ "spec": ["holy"] }),
+        ] {
+            let err = validate_modal_values(&modal, Some(&values)).unwrap_err();
+            assert_eq!((err.code(), path(&err)), ("interaction.values_invalid", "values.spec".into()), "{values}");
+        }
+        modal["inputs"][0]["required"] = json!(false);
+        for values in [json!({}), json!({ "spec": "" }), json!({ "spec": "protection" })] {
+            assert_eq!(validate_modal_values(&modal, Some(&values)).unwrap(), values);
+        }
+        assert!(validate_modal_values(&modal, Some(&json!({ "spec": "unknown" }))).is_err());
+        assert!(validate_modal_values(&modal, Some(&json!({ "spec": "   " }))).is_err());
+        modal["inputs"][0]["options"] = json!([{ "label": "Opaque", "value": " " }]);
+        modal["inputs"][0]["value"] = json!(" ");
+        modal["inputs"][0]["required"] = json!(true);
+        validate_modal(&modal).unwrap();
+        assert!(
+            validate_modal_values(&modal, Some(&json!({ "spec": " " }))).is_ok(),
+            "option values are exact opaque strings"
+        );
     }
 
     #[test]

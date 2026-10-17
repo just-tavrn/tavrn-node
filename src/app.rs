@@ -74,7 +74,7 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     // Polls with vote records and the plaintext close time (PROTOCOL.md §7g).
     caps.push("polls.v1");
     // Buttons, select menus and modals of applications (APPLICATIONS.md §5.10).
-    caps.push(crate::components::CAPABILITY);
+    caps.extend([crate::components::CAPABILITY, crate::components::MODAL_SELECT_CAPABILITY]);
     // Threads, forum posts and announcement channels (PROTOCOL.md §7e).
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
