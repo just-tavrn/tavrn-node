@@ -195,8 +195,7 @@ async fn notice(
     content: serde_json::Value,
 ) -> Result<(), ApiError> {
     let kind = content.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
-    let message = crate::routes::messages::system_message(state, &channel.to_api(), author, &kind, content).await?;
-    store::messages::mark_notice(&state.db, &message.id).await?;
+    let message = crate::routes::messages::system_notice(state, &channel.to_api(), author, &kind, content).await?;
     state.hub.room(&room.id, "message.create", &message);
     Ok(())
 }

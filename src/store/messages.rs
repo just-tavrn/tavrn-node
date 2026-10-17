@@ -54,23 +54,28 @@ pub async fn insert_webhook(db: &Pool, m: NewMessage<'_>, webhook: WebhookAuthor
     by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
 }
 
-/// Marks a system message the node wrote into a channel as a security notice (`messages.notice`, APPLICATIONS.md §3.6):
-/// it never counts as unread, cannot be deleted and is skipped by purges and retention.
-pub async fn mark_notice(db: &Pool, id: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE messages SET notice = 1 WHERE id = $1").bind(id).execute(db).await?;
-    Ok(())
-}
-
 pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError> {
     insert_on(&mut *db.acquire().await?, &m).await?;
     by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
 }
 
+/// Inserts a system message the node writes into a channel as a security notice (`messages.notice`,
+/// APPLICATIONS.md §3.6) in the same statement, so it is never a normal message, not even for a moment: it never
+/// counts as unread, cannot be deleted and is skipped by purges and retention.
+pub async fn insert_notice(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError> {
+    insert_row(&mut *db.acquire().await?, &m, true).await?;
+    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+}
+
 /// [`insert`] on one connection (a transaction), without reading the row back.
 pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Result<(), ApiError> {
+    insert_row(conn, m, false).await
+}
+
+async fn insert_row(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>, notice: bool) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature, notice)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(m.id)
     .bind(m.conversation_id)
@@ -87,6 +92,7 @@ pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Re
     .bind(m.mentions_everyone as i64)
     .bind(now())
     .bind(m.signature)
+    .bind(notice as i64)
     .execute(&mut *conn)
     .await?;
     Ok(())

@@ -19,7 +19,7 @@ use common::{
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tavrn_crypto::MasterSecret;
-use tavrn_node::{hub::Event, permissions as p};
+use tavrn_node::{hub::Event, permissions as p, store, util};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -747,6 +747,8 @@ async fn entries_about_a_private_channel_go_into_that_channel_and_reach_only_its
     let notices = messages_of(&node, &erin.token, &council).await;
     assert_eq!(notices.len(), 1, "{notices:?}");
     let notice = &notices[0];
+    let row = store::messages::by_id(&node.state.db, notice["id"].as_str().unwrap()).await.unwrap().unwrap();
+    assert_eq!(row.notice, 1, "stored as a security notice");
     assert_eq!(
         (&notice["content"]["type"], &notice["content"]["channel"], &notice["content"]["by"], &notice["author"]),
         (&json!("system.bot_added"), &json!(council), &json!(b.address()), &json!(b.address()))
@@ -812,4 +814,37 @@ async fn entries_about_a_private_channel_go_into_that_channel_and_reach_only_its
         messages_of(&node, &dave.token, &welcome).await.iter().all(|m| !m["content"].to_string().contains(&council)),
         "the welcome channel names no private channel"
     );
+}
+
+/// A security notice is written as one: the row carries `notice` from its INSERT on, so a failure can never leave a
+/// normal (unread-counting, purgeable) message behind.
+#[tokio::test]
+async fn a_security_notice_is_stored_as_a_notice_by_its_insert() {
+    let node = test_node(D).await;
+    let alice = node.register("alice").await;
+    let room = node.create_room(&alice.token, "Room").await;
+    let general = TestNode::text_channel(&room);
+    let id = util::ulid();
+    let content = json!({ "type": "system.bot_added" }).to_string();
+    let row = store::messages::insert_notice(
+        &node.state.db,
+        store::messages::NewMessage {
+            id: &id,
+            conversation_id: &general,
+            author_id: &alice.user_id,
+            device_id: None,
+            encrypted: false,
+            format: 1,
+            epoch: None,
+            content: &content,
+            reply_to_id: None,
+            thread_id: None,
+            mentions: &[],
+            mentions_everyone: false,
+            signature: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((row.id.as_str(), row.notice), (id.as_str(), 1));
 }

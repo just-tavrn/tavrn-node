@@ -505,32 +505,56 @@ pub async fn system_message(
     channel: &Channel,
     actor: &UserRow,
     kind: &str,
+    data: Value,
+) -> Result<Message, ApiError> {
+    system_row(state, channel, actor, kind, data, false).await
+}
+
+/// [`system_message`] stored as a security notice in the channel (`messages.notice` set by the INSERT itself,
+/// APPLICATIONS.md §3.6): never unread, protected from deletion, purges and retention.
+pub async fn system_notice(
+    state: &AppState,
+    channel: &Channel,
+    actor: &UserRow,
+    kind: &str,
+    data: Value,
+) -> Result<Message, ApiError> {
+    system_row(state, channel, actor, kind, data, true).await
+}
+
+async fn system_row(
+    state: &AppState,
+    channel: &Channel,
+    actor: &UserRow,
+    kind: &str,
     mut data: Value,
+    notice: bool,
 ) -> Result<Message, ApiError> {
     if let Value::Object(obj) = &mut data {
         obj.insert("type".into(), Value::String(kind.into()));
     }
     let content = data.to_string();
     let id = util::ulid();
-    let row = store::messages::insert(
-        &state.db,
-        NewMessage {
-            id: &id,
-            conversation_id: &channel.id,
-            author_id: &actor.id,
-            device_id: None,
-            encrypted: false,
-            format: 1,
-            epoch: None,
-            content: &content,
-            reply_to_id: None,
-            thread_id: None,
-            mentions: &[],
-            mentions_everyone: false,
-            signature: None,
-        },
-    )
-    .await?;
+    let message = NewMessage {
+        id: &id,
+        conversation_id: &channel.id,
+        author_id: &actor.id,
+        device_id: None,
+        encrypted: false,
+        format: 1,
+        epoch: None,
+        content: &content,
+        reply_to_id: None,
+        thread_id: None,
+        mentions: &[],
+        mentions_everyone: false,
+        signature: None,
+    };
+    let row = if notice {
+        store::messages::insert_notice(&state.db, message).await?
+    } else {
+        store::messages::insert(&state.db, message).await?
+    };
     Ok(row.to_api())
 }
 
