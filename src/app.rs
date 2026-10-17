@@ -854,6 +854,7 @@ pub fn router(state: AppState) -> Router {
             "/rooms/{room_id}",
             get(routes::rooms::get_room).patch(routes::rooms::update_room).delete(routes::rooms::delete_room),
         )
+        .route("/rooms/{room_id}/preview", get(routes::rooms::preview_room))
         .route("/rooms/{room_id}/join", post(routes::rooms::join_room))
         .route("/rooms/{room_id}/leave", post(routes::rooms::leave_room))
         .route("/rooms/{room_id}/members", get(routes::rooms::list_members))

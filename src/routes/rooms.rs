@@ -25,6 +25,12 @@ use crate::{
 };
 
 const JOIN_MODES: &[&str] = &["public", "invite"];
+/// Longest room rules (characters).
+pub const RULES_MAX: usize = 10_000;
+/// Longest privacy notice of a room (characters, PROTOCOL.md §6b "Room privacy notice and legal notice").
+pub const PRIVACY_NOTICE_MAX: usize = 20_000;
+/// Longest legal notice of a room (characters).
+pub const LEGAL_NOTICE_MAX: usize = 5_000;
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateRoomRequest {
@@ -309,6 +315,13 @@ pub struct UpdateRoomRequest {
     /// History restore after a key reset (ENCRYPTION.md §7b): `request` (members may ask, default) or `off`.
     /// Owner or `manage_room`; never a bot.
     pub history_restore: Option<String>,
+    /// The room's privacy notice (Markdown subset like `rules`, at most 20,000 characters, `""` removes it; PROTOCOL.md
+    /// §6b "Room privacy notice and legal notice"). Information for members and people about to join, never a
+    /// condition of joining. Audited as `room.legal`.
+    pub privacy_notice: Option<String>,
+    /// The room's legal notice (who runs the room and how to reach them; Markdown subset, at most 5,000 characters,
+    /// `""` removes it). Audited as `room.legal`.
+    pub legal_notice: Option<String>,
 }
 
 /// Change room settings (`manage_room`).
@@ -329,7 +342,14 @@ pub async fn update_room(
         req.bots_in_encrypted_channels.as_deref().map(crate::bot_channels::validate_setting).transpose()?;
     let name = req.name.as_deref().map(|n| validate::name("name", n, 100)).transpose()?;
     let description = req.description.as_deref().map(|d| validate::text("description", d, 0, 1000)).transpose()?;
-    let rules = req.rules.as_deref().map(|r| validate::text("rules", r, 0, 10_000)).transpose()?;
+    let rules = req.rules.as_deref().map(|r| validate::text("rules", r, 0, RULES_MAX)).transpose()?;
+    let privacy_notice = req
+        .privacy_notice
+        .as_deref()
+        .map(|r| validate::text("privacy_notice", r, 0, PRIVACY_NOTICE_MAX))
+        .transpose()?;
+    let legal_notice =
+        req.legal_notice.as_deref().map(|r| validate::text("legal_notice", r, 0, LEGAL_NOTICE_MAX)).transpose()?;
     let join_mode = req.join_mode.as_deref().map(|j| validate::one_of("join_mode", j, JOIN_MODES)).transpose()?;
     let was_listed = access.room.is_discoverable();
     let public = join_mode.as_deref().unwrap_or(&access.room.join_mode) == "public";
@@ -385,6 +405,7 @@ pub async fn update_room(
         obj.insert("history_restore".into(), value.into());
     }
     store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "room.update", &room_id, "", meta).await?;
+    update_legal(&state, &room_id, &auth.user, privacy_notice.as_deref(), legal_notice.as_deref()).await?;
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     let listed = access.room.is_discoverable();
     if listed != was_listed {
@@ -425,6 +446,44 @@ pub async fn update_room(
     };
     state.hub.room(&room_id, "room.update", &access.room);
     Ok(Json(detail(&state, &access, &auth.user).await?))
+}
+
+/// Replaces the room's privacy notice and legal notice where they change (PROTOCOL.md §6b "Room privacy notice and
+/// legal notice"): each changed document gets the time of the change (null when removed), and one `room.legal` audit
+/// entry names what changed. The caller sends `room.update` with the new timestamps.
+async fn update_legal(
+    state: &AppState,
+    room_id: &str,
+    actor: &UserRow,
+    privacy_notice: Option<&str>,
+    legal_notice: Option<&str>,
+) -> Result<(), ApiError> {
+    if privacy_notice.is_none() && legal_notice.is_none() {
+        return Ok(());
+    }
+    let (old_privacy, old_legal) = store::rooms::room_legal(&state.db, room_id)
+        .await?
+        .ok_or_else(|| access::not_found("Room", "room.not_found"))?;
+    let at = now();
+    let mut meta = serde_json::Map::new();
+    for (doc, key, new, old) in [
+        (store::rooms::LegalDocument::PrivacyNotice, "privacy_notice", privacy_notice, old_privacy),
+        (store::rooms::LegalDocument::LegalNotice, "legal_notice", legal_notice, old_legal),
+    ] {
+        let Some(new) = new.filter(|n| *n != old) else { continue };
+        let updated_at = (!new.is_empty()).then_some(at.as_str());
+        store::rooms::set_legal_document(&state.db, room_id, doc, new, updated_at).await?;
+        let change = match (old.is_empty(), new.is_empty()) {
+            (_, true) => "removed",
+            (true, false) => "added",
+            (false, false) => "updated",
+        };
+        meta.insert(key.into(), change.into());
+    }
+    if !meta.is_empty() {
+        store::rooms::audit(&state.db, Some(room_id), Some(&actor.id), "room.legal", room_id, "", meta.into()).await?;
+    }
+    Ok(())
 }
 
 /// Sets the room's age gate (PROTOCOL.md §5e): audited, every channel changes its effective gate (`channel.update`),
@@ -609,11 +668,95 @@ pub async fn join_room(
     Ok(Json(join(&state, &auth.user, &room, body.map(|b| b.accept_rules).unwrap_or(false)).await?))
 }
 
+/// What a room shows before joining (PROTOCOL.md §6b "Room preview"): the public room, its rules and its legal
+/// documents. Empty strings mean none.
+#[derive(Serialize, ToSchema)]
+pub struct RoomPreview {
+    pub room: PublicRoom,
+    /// Markdown subset; joining needs `accept_rules: true` while it is not empty.
+    pub rules: String,
+    /// The room's privacy notice (Markdown subset), information only.
+    pub privacy_notice: String,
+    /// Time of the privacy notice's last change, null without one.
+    pub privacy_notice_updated_at: Option<String>,
+    /// The room's legal notice (Markdown subset), information only.
+    pub legal_notice: String,
+    /// Time of the legal notice's last change, null without one.
+    pub legal_notice_updated_at: Option<String>,
+}
+
+impl RoomPreview {
+    async fn of(state: &AppState, room: Room) -> Result<Self, ApiError> {
+        let (privacy_notice, legal_notice) = store::rooms::room_legal(&state.db, &room.id)
+            .await?
+            .ok_or_else(|| access::not_found("Room", "room.not_found"))?;
+        let member_count = store::rooms::member_count(&state.db, &room.id).await?;
+        Ok(Self {
+            rules: room.rules.clone(),
+            privacy_notice,
+            privacy_notice_updated_at: room.privacy_notice_updated_at.clone(),
+            legal_notice,
+            legal_notice_updated_at: room.legal_notice_updated_at.clone(),
+            room: PublicRoom::of(room, member_count),
+        })
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct InvitePreview {
     pub code: String,
-    pub room: PublicRoom,
-    pub rules: String,
+    #[serde(flatten)]
+    pub preview: RoomPreview,
+}
+
+/// Preview of a room before joining: its public data, rules, privacy notice and legal notice (PROTOCOL.md §6b "Room
+/// preview"). Public rooms answer everyone (the `Authorization` header is optional; anonymous callers are
+/// rate-limited per address); rooms with an age gate only an adult's session. Every other room answers only its
+/// members and node admins (`404 room.not_found` for everyone else, as for an unknown room); people with an invite
+/// use the invite preview. Remote users ask the hosting node with their federated session.
+#[utoipa::path(get, path = "/api/v1/rooms/{room_id}/preview", params(("room_id" = String, Path)), responses((status = 200, body = RoomPreview), (status = 404, body = ProblemDetails), (status = 429, body = ProblemDetails)))]
+pub async fn preview_room(
+    State(state): State<AppState>,
+    crate::auth::ClientIp(ip): crate::auth::ClientIp,
+    headers: axum::http::HeaderMap,
+    Path(room_id): Path<String>,
+) -> Result<Json<RoomPreview>, ApiError> {
+    let requester = match crate::auth::bearer(&headers) {
+        Some(token) => Some(crate::auth::authenticate(&state, token).await?),
+        None => None,
+    };
+    match &requester {
+        Some(auth) => {
+            if let Some(limiter) = &state.user_api_limiter {
+                limiter.check_all(&[format!("user:{}", auth.user.id)])?;
+            }
+        }
+        None => state.directory_limiter.check_all(&[format!("room-preview-ip:{ip}")])?,
+    }
+    let not_found = || access::not_found("Room", "room.not_found");
+    let room = store::rooms::room_by_id(&state.db, &room_id).await?.ok_or_else(not_found)?;
+    let insider = match &requester {
+        Some(auth) => {
+            auth.user.is_node_admin() || store::rooms::member(&state.db, &room.id, &auth.user.id).await?.is_some()
+        }
+        None => false,
+    };
+    if !insider {
+        if room.join_mode != "public" {
+            return Err(not_found());
+        }
+        // Gated rooms stay out of sight of minors and anonymous callers, as on Discover (PROTOCOL.md §5e).
+        if room.age_gate == crate::age::GATE_ADULTS {
+            let adult = match &requester {
+                Some(auth) => crate::age::is_adult(&state, &auth.user).await?,
+                None => false,
+            };
+            if !adult {
+                return Err(not_found());
+            }
+        }
+    }
+    Ok(Json(RoomPreview::of(&state, room).await?))
 }
 
 async fn valid_invite(state: &AppState, code: &str) -> Result<(Invite, Room), ApiError> {
@@ -628,18 +771,14 @@ async fn valid_invite(state: &AppState, code: &str) -> Result<(Invite, Room), Ap
     Ok((invite, room))
 }
 
-/// Preview of an invite (room name, rules), without joining.
+/// Preview of an invite (room, rules, privacy notice and legal notice), without joining.
 #[utoipa::path(get, path = "/api/v1/invites/{code}", params(("code" = String, Path)), responses((status = 200, body = InvitePreview), (status = 404, body = ProblemDetails)))]
 pub async fn get_invite(
     State(state): State<AppState>,
     Path(code): Path<String>,
 ) -> Result<Json<InvitePreview>, ApiError> {
     let (invite, room) = valid_invite(&state, &code).await?;
-    Ok(Json(InvitePreview {
-        code: invite.code,
-        rules: room.rules.clone(),
-        room: PublicRoom::of(room.clone(), store::rooms::member_count(&state.db, &room.id).await?),
-    }))
+    Ok(Json(InvitePreview { code: invite.code, preview: RoomPreview::of(&state, room).await? }))
 }
 
 /// Join by invite.

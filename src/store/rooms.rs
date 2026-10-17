@@ -9,7 +9,7 @@ use crate::{
     util::{now, ulid},
 };
 
-const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate, history_restore";
+const ROOM_COLS: &str = "id, name, description, rules, join_mode, owner_id, icon_blob_id, banner_blob_id, created_at, discoverable, icon_animated, no_bots, bots_in_encrypted_channels, attachment_retention_days, message_retention_days, age_gate, history_restore, privacy_notice_updated_at, legal_notice_updated_at";
 const ROLE_COLS: &str = "id, room_id, name, color, position, permissions, hoist, mentionable, is_everyone, upload_categories, application_id";
 const CHANNEL_COLS: &str = "c.id, c.room_id, c.category_id, c.kind, c.name, c.topic, c.status, c.position, c.slowmode_secs, c.bitrate_kbps, c.user_limit, v.encrypted, c.system_name, c.no_bots, CAST(CASE WHEN EXISTS (SELECT 1 FROM rooms nr WHERE nr.id = c.room_id AND nr.no_bots = 1) OR EXISTS (SELECT 1 FROM categories nc WHERE nc.id = c.category_id AND nc.no_bots = 1) THEN 1 ELSE 0 END AS BIGINT) AS inherited_no_bots, c.bots_allowed, COALESCE((SELECT br.bots_in_encrypted_channels FROM rooms br WHERE br.id = c.room_id), 'per_channel') AS bots_in_encrypted_channels, c.history_for_new_members, CAST(CASE WHEN EXISTS (SELECT 1 FROM webhooks wh WHERE wh.channel_id = c.id) THEN 1 ELSE 0 END AS BIGINT) AS has_webhooks, c.auto_archive_minutes, c.forum_tags, c.age_gate, COALESCE((SELECT ar.age_gate FROM rooms ar WHERE ar.id = c.room_id), 'none') AS room_age_gate";
 const OVERRIDE_COLS: &str =
@@ -209,6 +209,41 @@ pub async fn update_room(db: &Pool, id: &str, u: RoomUpdate<'_>) -> Result<(), A
     .bind(id)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// The two documents of a room's legal page (PROTOCOL.md §6b "Room privacy notice and legal notice").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegalDocument {
+    PrivacyNotice,
+    LegalNotice,
+}
+
+/// The privacy notice and the legal notice of a room (`''` = none), `None` for an unknown room.
+pub async fn room_legal(db: &Pool, id: &str) -> Result<Option<(String, String)>, ApiError> {
+    let row =
+        sqlx::query("SELECT privacy_notice, legal_notice FROM rooms WHERE id = $1").bind(id).fetch_optional(db).await?;
+    Ok(match row {
+        Some(r) => Some((r.try_get("privacy_notice")?, r.try_get("legal_notice")?)),
+        None => None,
+    })
+}
+
+/// Replaces one legal document of a room; `updated_at` is the time of the change (null when it is removed).
+pub async fn set_legal_document(
+    db: &Pool,
+    id: &str,
+    doc: LegalDocument,
+    text: &str,
+    updated_at: Option<&str>,
+) -> Result<(), ApiError> {
+    let sql = match doc {
+        LegalDocument::PrivacyNotice => {
+            "UPDATE rooms SET privacy_notice = $1, privacy_notice_updated_at = $2 WHERE id = $3"
+        }
+        LegalDocument::LegalNotice => "UPDATE rooms SET legal_notice = $1, legal_notice_updated_at = $2 WHERE id = $3",
+    };
+    sqlx::query(sql).bind(text).bind(updated_at).bind(id).execute(db).await?;
     Ok(())
 }
 
