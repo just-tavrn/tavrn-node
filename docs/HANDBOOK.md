@@ -1049,7 +1049,7 @@ the audit log records how many were kept.
 `TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
 sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
 together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
-again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
+again. Retention never deletes **pinned messages** (unpin a message to let it expire)
 and the entries of a room's **welcome channel** (the room's security log), together with the security notices in
 channels (see [Moderation and auto-moderation](#moderation-and-auto-moderation)). A room owner or a member with "Manage
 room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
