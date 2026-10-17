@@ -404,7 +404,22 @@ pub async fn update_room(
     if let (Some(value), Some(obj)) = (history_restore, meta.as_object_mut()) {
         obj.insert("history_restore".into(), value.into());
     }
-    store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "room.update", &room_id, "", meta).await?;
+    // A change of the documents alone is audited as `room.legal` only (update_legal), without an empty `room.update`.
+    let documents_only = (req.privacy_notice.is_some() || req.legal_notice.is_some())
+        && req.name.is_none()
+        && req.description.is_none()
+        && req.rules.is_none()
+        && req.join_mode.is_none()
+        && req.discoverable.is_none()
+        && req.no_bots.is_none()
+        && req.bots_in_encrypted_channels.is_none()
+        && req.attachment_retention_days.is_none()
+        && req.message_retention_days.is_none()
+        && req.age_gate.is_none()
+        && req.history_restore.is_none();
+    if !documents_only {
+        store::rooms::audit(&state.db, Some(&room_id), Some(&auth.user.id), "room.update", &room_id, "", meta).await?;
+    }
     update_legal(&state, &room_id, &auth.user, privacy_notice.as_deref(), legal_notice.as_deref()).await?;
     let access = access::room_access(&state, &room_id, &auth.user).await?;
     let listed = access.room.is_discoverable();

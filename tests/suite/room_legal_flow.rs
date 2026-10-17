@@ -198,6 +198,35 @@ async fn legal_documents_set_clear_limits_permission_audit_and_event() {
     assert_eq!(entries[0]["meta"], json!({ "privacy_notice": "removed" }));
 }
 
+/// A PATCH that changes only the documents writes only `room.legal`, no empty `room.update` audit entry; the
+/// `room.update` event is still sent (the timestamps changed). Other settings keep their `room.update` entry.
+#[tokio::test]
+async fn a_documents_only_change_is_audited_as_room_legal_alone() {
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let room_id = room_with(&node, &alice.token, json!({})).await;
+    let path = format!("/api/v1/rooms/{room_id}");
+    let count = |action: &'static str| {
+        let node = &node;
+        let token = alice.token.clone();
+        let path = format!("{path}/audit-log");
+        async move {
+            let (s, log) = node.get_auth(&path, &token).await;
+            assert_eq!(s, StatusCode::OK, "{log}");
+            log.as_array().unwrap().iter().filter(|e| e["action"] == action).count()
+        }
+    };
+    let updates = count("room.update").await;
+    let mut rx = node.state.hub.subscribe();
+    let (s, j) = node.patch(&path, &alice.token, json!({ "privacy_notice": "We store messages." })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| e.kind == "room.update"), "the event is sent");
+    assert_eq!((count("room.legal").await, count("room.update").await), (1, updates), "no empty room.update entry");
+    let (s, j) = node.patch(&path, &alice.token, json!({ "legal_notice": "Run by Alice", "description": "Hi" })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!((count("room.legal").await, count("room.update").await), (2, updates + 1));
+}
+
 /// The room preview: everyone for public rooms (anonymous too), members and node admins for every room, nobody
 /// else (404 as for an unknown room); the invite preview carries the same fields for whoever holds a valid code.
 #[tokio::test]
