@@ -370,10 +370,16 @@ async fn permission_matrix() {
     s.up(&s.alice.token, "inside.txt", Some(&id(&bob_folder)), "text/plain", b"x").await;
     let entry = |e: &Value| format!("{}/{}", s.base(), id(e));
 
-    // Not a member: nothing.
+    // Not a member: nothing, not even the single entry a file link names (PROTOCOL.md §7h).
     let (st, _) = s.node.get_auth(&s.base(), &stranger.token).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     assert_eq!(s.down(&stranger.token, &id(&alices), None).await.0, StatusCode::FORBIDDEN);
+    let (st, j) = s.node.get_auth(&entry(&alices), &stranger.token).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{j}");
+    assert!(j.get("entry").is_none(), "{j}");
+    // A member with view_channel gets the entry and its folder chain (a file link opens the folder at the file).
+    let (st, j) = s.node.get_auth(&entry(&alices), &carol.token).await;
+    assert_eq!((st, j["entry"]["name"].as_str()), (StatusCode::OK, Some("alice.txt")), "{j}");
 
     // attach_files: own entries only.
     let (st, j) = s.node.patch(&entry(&alices), &s.bob.token, json!({ "name": "mine.txt" })).await;
@@ -405,10 +411,13 @@ async fn permission_matrix() {
     let (_, info) = s.node.get_auth(&format!("{}/usage", s.base()), &carol.token).await;
     assert_eq!((info["can_manage"].as_bool(), info["can_configure"].as_bool()), (Some(true), Some(false)));
 
-    // Without view_channel: nothing at all.
+    // Without view_channel: nothing at all (also no single entry: a file chip says "File not available").
     s.member_override(&s.bob, 0, p::VIEW_CHANNEL).await;
     let (st, j) = s.node.get_auth(&s.base(), &s.bob.token).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{j}");
+    let (st, j) = s.node.get_auth(&entry(&alices), &s.bob.token).await;
+    assert_eq!((st, j["code"].as_str()), (StatusCode::FORBIDDEN, Some("channel.view_forbidden")), "{j}");
+    assert!(j.get("entry").is_none(), "{j}");
     assert_eq!(s.down(&s.bob.token, &id(&alices), None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(s.up(&s.bob.token, "x.txt", None, "text/plain", b"x").await.0, StatusCode::FORBIDDEN);
 

@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use crate::{db::Pool, error::ApiError, models::MessageRow, util::now};
 
-const COLS: &str = "m.id, m.conversation_id, m.author_id, u.username AS author_username, u.domain AS author_domain, u.kind AS author_kind, m.device_id, m.encrypted, m.format, m.epoch, m.content, m.content_size, m.reply_to_id, m.thread_id, m.mentions, m.mentions_everyone, m.created_at, m.edited_at, m.signature, m.webhook_id, m.webhook_name, m.interaction, m.poll_closes_at, u.deleted_at AS author_deleted_at";
+const COLS: &str = "m.id, m.conversation_id, m.author_id, u.username AS author_username, u.domain AS author_domain, u.kind AS author_kind, m.device_id, m.encrypted, m.format, m.epoch, m.content, m.content_size, m.reply_to_id, m.thread_id, m.mentions, m.mentions_everyone, m.created_at, m.edited_at, m.signature, m.webhook_id, m.webhook_name, m.interaction, m.poll_closes_at, m.notice, u.deleted_at AS author_deleted_at";
 
 pub struct NewMessage<'a> {
     pub id: &'a str,
@@ -59,11 +59,23 @@ pub async fn insert(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError
     by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
 }
 
+/// Inserts a system message the node writes into a channel as a security notice (`messages.notice`,
+/// APPLICATIONS.md §3.6) in the same statement, so it is never a normal message, not even for a moment: it never
+/// counts as unread, cannot be deleted and is skipped by purges and retention.
+pub async fn insert_notice(db: &Pool, m: NewMessage<'_>) -> Result<MessageRow, ApiError> {
+    insert_row(&mut *db.acquire().await?, &m, true).await?;
+    by_id(db, m.id).await?.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("message not found after INSERT")))
+}
+
 /// [`insert`] on one connection (a transaction), without reading the row back.
 pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Result<(), ApiError> {
+    insert_row(conn, m, false).await
+}
+
+async fn insert_row(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>, notice: bool) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        "INSERT INTO messages (id, conversation_id, author_id, device_id, encrypted, format, epoch, content, content_size, reply_to_id, thread_id, mentions, mentions_everyone, created_at, signature, notice)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(m.id)
     .bind(m.conversation_id)
@@ -80,6 +92,7 @@ pub async fn insert_on(conn: &mut sqlx::AnyConnection, m: &NewMessage<'_>) -> Re
     .bind(m.mentions_everyone as i64)
     .bind(now())
     .bind(m.signature)
+    .bind(notice as i64)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -402,7 +415,8 @@ pub(crate) fn last_ids_sql(n: usize) -> String {
 /// The unread counts (`unread`, `direct`, `everyone` per `conversation_id`) of `marked` conversations with a read
 /// marker and `unmarked` ones without. Parameters: `$1` user id, `$2` the user's mention pattern, then `roles` role
 /// mention patterns, the marked and the unmarked conversation ids and, with unmarked ones, last the join time for
-/// rooms (PostgreSQL refuses parameters a statement does not use). With a marker the count is driven from it, so only
+/// rooms (PostgreSQL refuses parameters a statement does not use). Security notices in channels (`m.notice`,
+/// APPLICATIONS.md §3.6) never count. With a marker the count is driven from it, so only
 /// the messages after the marker are read (`messages_conversation_main`, `id > marker`); without one it counts from
 /// the user's join (the conversation membership, else the join time).
 pub(crate) fn unread_counts_sql(roles: usize, marked: usize, unmarked: usize) -> String {
@@ -423,6 +437,7 @@ pub(crate) fn unread_counts_sql(roles: usize, marked: usize, unmarked: usize) ->
             "SELECT {counts} FROM read_markers r
              JOIN messages m ON m.conversation_id = r.conversation_id AND m.id > r.last_read_message_id
              WHERE r.user_id = $1 AND r.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
+               AND m.notice = 0
              GROUP BY m.conversation_id",
             super::placeholders(first, marked)
         ));
@@ -430,7 +445,7 @@ pub(crate) fn unread_counts_sql(roles: usize, marked: usize, unmarked: usize) ->
     if unmarked > 0 {
         parts.push(format!(
             "SELECT {counts} FROM messages m
-             WHERE m.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL
+             WHERE m.conversation_id IN ({}) AND m.author_id <> $1 AND m.thread_id IS NULL AND m.notice = 0
                AND m.created_at > COALESCE(
                      (SELECT cm.joined_at FROM conversation_members cm WHERE cm.conversation_id = m.conversation_id AND cm.user_id = $1),
                      ${})
@@ -577,9 +592,11 @@ pub fn purge_where(f: &PurgeFilter) -> (String, Vec<String>) {
         binds.push(t.clone());
         clauses.push(format!("created_at <= ${}", binds.len()));
     }
-    // The welcome channel's entries are never purged (MODERATION.md §3).
+    // The welcome channel's entries (MODERATION.md §3) and the security notices in channels (APPLICATIONS.md §3.6)
+    // are never purged.
     if !clauses.is_empty() {
         clauses.push("conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')".into());
+        clauses.push("notice = 0".into());
     }
     (clauses.join(" AND "), binds)
 }
@@ -631,8 +648,10 @@ pub async fn retention_candidates(
     Ok(sqlx::query_scalar(&sql).bind(cutoff).bind(limit).bind(room_id.unwrap_or("")).fetch_all(db).await?)
 }
 
-/// What message retention never deletes (on the row `m`): pinned messages and the welcome channel's entries.
+/// What message retention never deletes (on the row `m`): pinned messages, the welcome channel's entries and the
+/// security notices in channels (APPLICATIONS.md §3.6).
 const RETENTION_EXEMPT: &str = "m.conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')
+    AND m.notice = 0
     AND NOT EXISTS (SELECT 1 FROM pins p WHERE p.message_id = m.id)";
 
 /// Deletes the messages `ids` (from [`retention_candidates`]) unless they were pinned meanwhile; their attachments,
@@ -669,7 +688,7 @@ mod tests {
         assert_eq!(
             sql,
             "conversation_id IN ($1, $2) AND author_id = $3 AND created_at >= $4 \
-             AND conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system')"
+             AND conversation_id NOT IN (SELECT id FROM channels WHERE kind = 'system') AND notice = 0"
         );
         assert_eq!(binds, vec!["c1", "c2", "u1", "2026"]);
         assert_eq!(purge_where(&PurgeFilter::default()).0, "");

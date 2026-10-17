@@ -250,6 +250,49 @@ pub fn channel_perms_with(
     )
 }
 
+/// Is `channel` listed to a member holding only `@everyone` (`view_channel` without the age gate, as `GET
+/// /rooms/{id}` lists channels)? `overrides`: any superset of the channel's and its category's overrides. The single
+/// evaluation ([`channel_perms_of`]) for a plain member account without roles, member overrides or a timeout: whether a
+/// channel's name may appear where every member reads, e.g. the welcome channel (APPLICATIONS.md §3.6).
+pub fn everyone_views(everyone: &RoleRow, channel: &ChannelRow, overrides: &[OverrideRow]) -> bool {
+    let of = |target_type: &str, target_id: Option<&str>| -> Vec<permissions::Override> {
+        overrides
+            .iter()
+            .filter(|o| o.target_type == target_type && Some(o.target_id.as_str()) == target_id)
+            .map(|o| o.to_eval())
+            .collect()
+    };
+    let subject = Subject {
+        // No account has an empty id: no member override applies.
+        user_id: "",
+        is_owner: false,
+        is_node_admin: false,
+        everyone_role_id: &everyone.id,
+        everyone_permissions: everyone.perms(),
+        member_roles: &[],
+        timed_out: false,
+        kind: "user",
+        scopes: None,
+        adult: true,
+        moved_channel: None,
+    };
+    let perms = channel_perms_of(
+        &subject,
+        channel,
+        &of("category", channel.category_id.as_deref()),
+        &of("channel", Some(&channel.id)),
+    );
+    permissions::has(perms, permissions::VIEW_CHANNEL)
+}
+
+/// [`everyone_views`] from the database.
+pub async fn everyone_views_channel(state: &AppState, channel: &ChannelRow) -> Result<bool, ApiError> {
+    let roles = store::rooms::roles(&state.db, &channel.room_id).await?;
+    let Some(everyone) = roles.iter().find(|r| r.is_everyone != 0) else { return Ok(false) };
+    let overrides = store::rooms::overrides_of_channel(&state.db, channel).await?;
+    Ok(everyone_views(everyone, channel, &overrides))
+}
+
 /// What the evaluation of a channel needs of a member, borrowed (the visibility snapshot keeps it per member and
 /// evaluates every channel of a room with it).
 #[derive(Debug, Clone, Copy)]

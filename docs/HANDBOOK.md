@@ -1049,8 +1049,9 @@ the audit log records how many were kept.
 `TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
 sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
 together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
-again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
-and the entries of a room's **welcome channel** (the room's security log). A room owner or a member with "Manage
+again. Retention never deletes **pinned messages** (unpin a message to let it expire)
+and the entries of a room's **welcome channel** (the room's security log), together with the security notices in
+channels (see [Moderation and auto-moderation](#moderation-and-auto-moderation)). A room owner or a member with "Manage
 room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
 node's value); a longer room value has no effect, a room can only shorten. Each run that deleted something writes one
 entry `retention.messages` to the node's audit log (`deleted`, `node_days`, `rooms` with an own shorter value,
@@ -2110,6 +2111,23 @@ Web push payloads carry no content of encrypted conversations. Retention you con
 (`TAVRN_FEDERATION_REMOTE_USER_RETENTION_DAYS`), legal cases, deleted accounts, and your own log and backup
 rotation.
 
+### Rooms' own privacy notice and legal notice
+
+Room managers (*Manage room*) can publish a privacy notice and a legal notice for their room (Room settings → Legal;
+protocol PROTOCOL.md §6b "Room privacy notice and legal notice"). Both are optional Markdown documents (up to 20,000
+and 5,000 characters), shown before joining (invite page, join dialogs of the invite list, Discover and the
+directory) and to members (room menu and Room settings → Legal), with the date of the last change. They inform; they
+never have to be accepted. Every change is audited as `room.legal`.
+
+What this means for you as the operator: you stay a separate controller for what the node does, with your own
+privacy policy (Admin → Legal); the room's documents link to it through the template and do not replace it. People
+who run rooms that are not purely private (public rooms, communities of a business or an association) may be
+controllers for their room jointly with you (CJEU C-210/16, the "fan page" ruling) and may need a legal notice of
+their own; the umbrella repository's guide
+[docs/room-legal.md](https://github.com/just-tavrn/tavrn/blob/main/docs/room-legal.md) explains this for them. You may
+want to say in your terms who is responsible for what in rooms and how requests about a room reach its managers.
+Nothing here is legal advice.
+
 ### Age gates
 
 Since `age.v1` (protocol PROTOCOL.md §5e) every registration asks for the **date of birth**: the password and passkey
@@ -2257,7 +2275,10 @@ terms and domains were added and removed ("Auto-moderation node lists reloaded")
 at a path that does not exist yet: the paths themselves are read from the configuration at start. Matches are
 audited with the matched term, never the message text, and show up in the moderators' inbox.
 
-The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
+The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. It never names a
+channel that `@everyone` cannot view: when a bot joins or leaves the encryption group of such a channel, the entry is
+written into that channel as a **security notice** instead (visible to the channel's members only, never counted as
+unread, protected like the welcome channel's entries). Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
 
@@ -2270,7 +2291,7 @@ birth. Some of the actions they record:
 
 | Audit log | Examples |
 |---|---|
-| Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
+| Room | `member.kick`, `member.ban`, `member.unban`, `member.timeout`, `moderation.purge`, `voice.move`, `voice.mute`, `room.update`, `room.legal`, `room.transfer`, `room.age_gate`, `channel.age_gate`, `invite.direct`, `automod.spam`, `automod.content`, `files.delete`, `files.backend`, `history.restore_requested`, `history.restore_approved`, `history.restore_denied`, `role.override_restricted`, `role.everyone_restricted` |
 | Node | `user.register`, `user.second_factor_enroll`, `user.recovery_code_used`, `admin.user_disable`, `admin.user_delete`, `admin.second_factor_reset`, `admin.date_of_birth`, `admin.ban`, `admin.federation_block`, `federation.block_auto`, `federation.user_deleted`, `app.create`, `app.token_create`, `webhook.create`, `entitlements.grant_create`, `legal.*`, `retention.messages`, `directory.reports_notice`, `report.forward`, `report.forwarded_in` |
 
 Moderation shortcuts of the reports inbox add the report they act on (`report_id`). The node keeps audit entries as

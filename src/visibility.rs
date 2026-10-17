@@ -77,6 +77,8 @@ const COSMETIC_ROOM: &[&str] = &[
     "join_mode",
     "attachment_retention_days",
     "message_retention_days",
+    "privacy_notice_updated_at",
+    "legal_notice_updated_at",
 ];
 
 /// Do `new` and `old` (JSON objects) differ only in `cosmetic` keys?
