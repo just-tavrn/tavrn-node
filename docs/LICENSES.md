@@ -8,8 +8,9 @@ compatibility verdict. Audit date: 2026-10-06 (`cargo deny check licenses`, `car
 
 Everything in this repository (the node `tavrn-node`, the deployment files in `deploy/` and the performance
 tooling in `perf/`, including the load generator `perf/loadgen`) is **AGPL-3.0-only** ([LICENSE](../LICENSE)).
-The node is the piece a hosting company would run as a service: network use counts as distribution, so
-changes to a public node must be published.
+The node is the piece a hosting company would run as a service: AGPL section 13 requires a modified version to prominently offer its corresponding source to users
+interacting with it remotely over a network. This is a separate obligation from distribution and does not
+require an upstream pull request. Commercial hosting by independent providers is permitted.
 
 The other tavrn repositories carry their own licenses: the protocol ([tavrn-protocol](https://github.com/just-tavrn/tavrn-protocol),
 Apache-2.0 for schemas and test vectors, CC-BY-4.0 for the prose), the encryption core
