@@ -790,6 +790,9 @@ pub struct MessageRow {
     /// Plaintext close time of a poll (PROTOCOL.md §7g), UTC.
     #[sqlx(default)]
     pub poll_closes_at: Option<String>,
+    /// A security notice the node wrote into a channel (`messages.notice`, APPLICATIONS.md §3.6): not unread, protected.
+    #[sqlx(default)]
+    pub notice: i64,
 }
 
 impl MessageRow {

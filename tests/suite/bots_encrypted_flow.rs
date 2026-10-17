@@ -3,7 +3,8 @@
 //! Bots, permissions and end-to-end encryption (decided 2026-10-06): the `manage_applications` bit
 //! (install, uninstall, command settings, the startup fixup), the room setting `bots_in_encrypted_channels` with the
 //! channel setting `bots_allowed` (evaluation, MLS entitlement, `mls.remove_needed`, events, audit), and the
-//! security log entries `system.bot_added` / `system.bot_removed`.
+//! security log entries `system.bot_added` / `system.bot_removed` (in the welcome channel for channels `@everyone` can
+//! view, else as a security notice in the channel itself).
 
 use crate::common;
 
@@ -15,10 +16,12 @@ use common::{
     e2ee::{Dev, qualified, unb64},
     test_node,
 };
+use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tavrn_crypto::MasterSecret;
 use tavrn_node::{hub::Event, permissions as p};
 use tokio::sync::broadcast;
+use tokio_tungstenite::tungstenite::Message;
 
 const D: &str = "t.local";
 
@@ -604,4 +607,209 @@ async fn the_security_log_entry_follows_a_stored_commit_even_when_the_client_wen
     let (s, pending) =
         node.get_auth(&format!("/api/v1/conversations/{channel}/mls/pending-removals"), carol.token()).await;
     assert_eq!((s, &pending["items"]), (StatusCode::OK, &json!([])));
+}
+
+// ---------------------------------------------------------------- entries about private channels
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn serve(node: &TestNode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = node.router.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("ws://{addr}/api/v1/ws")
+}
+
+async fn hello(url: &str, token: &str) -> Socket {
+    let mut ws = tokio_tungstenite::connect_async(url).await.unwrap().0;
+    ws.send(Message::Text(json!({ "op": "hello", "token": token }).to_string().into())).await.unwrap();
+    let ready = frame(&mut ws).await;
+    assert_eq!(ready["op"], "ready", "{ready}");
+    ws
+}
+
+/// The next frame (raw JSON), skipping presence updates.
+async fn frame(ws: &mut Socket) -> Value {
+    loop {
+        let msg = common::within(Duration::from_secs(5), "the next frame", ws.next()).await.unwrap().unwrap();
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["type"] != "presence.update" {
+                return v;
+            }
+        }
+    }
+}
+
+/// Every frame up to and including the first that `last` accepts.
+async fn frames_until(ws: &mut Socket, last: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let mut seen = Vec::new();
+    loop {
+        let f = frame(ws).await;
+        let done = last(&f);
+        seen.push(f);
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// The messages of a conversation as `token` reads them (newest first).
+async fn messages_of(node: &TestNode, token: &str, conversation: &str) -> Vec<Value> {
+    let (s, msgs) = node.get_auth(&format!("/api/v1/conversations/{conversation}/messages"), token).await;
+    assert_eq!(s, StatusCode::OK, "{msgs}");
+    msgs.as_array().unwrap().clone()
+}
+
+async fn set_override(
+    node: &TestNode,
+    token: &str,
+    room_id: &str,
+    channel: &str,
+    subject: (&str, &str),
+    allow: u64,
+    deny: u64,
+) {
+    let (s, j) = node
+        .put(
+            &format!("/api/v1/rooms/{room_id}/overrides"),
+            token,
+            json!({ "target_type": "channel", "target_id": channel, "subject_type": subject.0, "subject_id": subject.1,
+                    "allow": allow.to_string(), "deny": deny.to_string() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+}
+
+#[tokio::test]
+async fn entries_about_a_private_channel_go_into_that_channel_and_reach_only_its_viewers() {
+    let node = test_node(D).await;
+    let alice = node.register("alice").await;
+    let mut carol = node.crypto_user("carol").await;
+    let dave = node.register("dave").await;
+    let erin = node.register("erin").await;
+    let b = bot(&node, &alice, "Reader").await;
+    let room = node.create_room(carol.token(), "Secret room").await;
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let general = TestNode::text_channel(&room);
+    let welcome = room["channels"].as_array().unwrap().iter().find(|c| c["kind"] == "system").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let everyone = room["roles"].as_array().unwrap().iter().find(|r| r["is_everyone"] == true).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    member(&node, &carol.session, &room_id, &dave).await;
+    member(&node, &carol.session, &room_id, &erin).await;
+    let channels = format!("/api/v1/rooms/{room_id}/channels");
+    let (s, j) = node.post(&channels, carol.token(), json!({ "kind": "text", "name": "council" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let council = j["id"].as_str().unwrap().to_string();
+    let (s, j) =
+        node.post(&channels, carol.token(), json!({ "kind": "text", "name": "lobby", "encrypted": false })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let lobby = j["id"].as_str().unwrap().to_string();
+    let (s, j) =
+        install(&node, carol.token(), &room_id, json!({ "application": b.reference(), "permissions": "0" })).await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    // The council: hidden from @everyone, open to erin and the bot (member overrides).
+    set_override(&node, carol.token(), &room_id, &council, ("role", &everyone), 0, p::VIEW_CHANNEL).await;
+    for user in [&erin.user_id, &b.user_id] {
+        set_override(&node, carol.token(), &room_id, &council, ("member", user), p::VIEW_CHANNEL, 0).await;
+    }
+    assert!(channel_of(&node, &dave.token, &room_id, &council).await.is_none(), "dave cannot view the council");
+    let master = MasterSecret::generate().unwrap();
+    node.put_identity(&b.session(), &master).await;
+    let mut bot_dev = node.attest(b.session(), master, 3).await;
+    let bot_identity = bot_dev.identity();
+    node.create_group(&mut carol, &general).await;
+    node.create_group(&mut carol, &council).await;
+    for c in [&general, &council] {
+        let (s, j) = patch_channel(&node, carol.token(), &room_id, c, json!({ "bots_allowed": true })).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+    }
+
+    // A channel @everyone can view: the entry goes into the welcome channel, nothing into the channel.
+    external_join(&node, &mut bot_dev, &general).await.unwrap();
+    let added = log(&node, carol.token(), &welcome, "system.bot_added").await;
+    assert_eq!((added.len(), &added[0]["channel"]), (1, &json!(general)));
+    assert!(messages_of(&node, carol.token(), &general).await.is_empty(), "no notice in a public channel");
+
+    // The council: the entry is a notice in the council itself, the welcome channel names nothing.
+    let url = serve(&node).await;
+    let mut dave_ws = hello(&url, &dave.token).await;
+    let mut erin_ws = hello(&url, &erin.token).await;
+    external_join(&node, &mut bot_dev, &council).await.unwrap();
+    let added = log(&node, carol.token(), &welcome, "system.bot_added").await;
+    assert_eq!(added.len(), 1, "still only the public channel's entry: {added:?}");
+    let notices = messages_of(&node, &erin.token, &council).await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let notice = &notices[0];
+    assert_eq!(
+        (&notice["content"]["type"], &notice["content"]["channel"], &notice["content"]["by"], &notice["author"]),
+        (&json!("system.bot_added"), &json!(council), &json!(b.address()), &json!(b.address()))
+    );
+    assert_eq!((notice["encrypted"].as_bool(), notice["device_id"].is_null()), (Some(false), true), "plaintext");
+    // Erin gets it live in the council.
+    let seen = frames_until(&mut erin_ws, |f| {
+        f["type"] == "message.create" && f["data"]["conversation_id"] == council.as_str()
+    })
+    .await;
+    assert_eq!(seen.last().unwrap()["data"]["content"]["type"], "system.bot_added");
+    // A notice never counts as unread: the council is erin's newest message, with nothing unread.
+    let (_, detail) = node.get_auth(&format!("/api/v1/rooms/{room_id}"), &erin.token).await;
+    let state =
+        detail["read_states"].as_array().unwrap().iter().find(|r| r["conversation_id"] == council.as_str()).unwrap();
+    assert_eq!(
+        (&state["last_message_id"], state["unread_count"].as_i64(), state["mention_count"].as_i64()),
+        (&notice["id"], Some(0), Some(0)),
+        "{state}"
+    );
+    // Nobody deletes it: neither the owner nor the bot it names; purges skip it.
+    let path = format!("/api/v1/conversations/{council}/messages/{}", notice["id"].as_str().unwrap());
+    for token in [carol.token(), b.secret.as_str()] {
+        let (s, j) = node.delete(&path, token).await;
+        assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "message.system_protected"), "{j}");
+    }
+    let purge = json!({ "channel_ids": [council], "author_id": b.user_id });
+    let (s, j) = node.post(&format!("/api/v1/rooms/{room_id}/moderation/purge"), carol.token(), purge).await;
+    assert_eq!((s, j["messages"].as_i64()), (StatusCode::OK, Some(0)), "a purge does not count the notice: {j}");
+
+    // Bot off in the council: the removal is a notice there too.
+    patch_channel(&node, carol.token(), &room_id, &council, json!({ "bots_allowed": false })).await;
+    remove_leaf(&node, &mut carol, &council, &bot_identity).await;
+    assert!(log(&node, carol.token(), &welcome, "system.bot_removed").await.is_empty());
+    let notices = messages_of(&node, &erin.token, &council).await;
+    assert_eq!(
+        (notices.len(), &notices[0]["content"]["type"], &notices[0]["content"]["reason"]),
+        (2, &json!("system.bot_removed"), &json!("bots_not_allowed"))
+    );
+    frames_until(&mut erin_ws, |f| {
+        f["type"] == "message.create" && f["data"]["content"]["type"] == "system.bot_removed"
+    })
+    .await;
+
+    // Dave saw none of it: no frame names the council (id or name) up to a marker in the lobby.
+    let (s, j) = node
+        .post(
+            &format!("/api/v1/rooms/{room_id}/channels/{lobby}/messages"),
+            carol.token(),
+            json!({ "content": { "type": "text", "body": "marker" } }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{j}");
+    let seen =
+        frames_until(&mut dave_ws, |f| f["type"] == "message.create" && f["data"]["content"]["body"] == "marker").await;
+    for f in &seen {
+        let raw = f.to_string();
+        assert!(!raw.contains(&council) && !raw.contains("council"), "dave learned of the council: {raw}");
+    }
+    let (s, _) = node.get_auth(&format!("/api/v1/conversations/{council}/messages"), &dave.token).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(
+        messages_of(&node, &dave.token, &welcome).await.iter().all(|m| !m["content"].to_string().contains(&council)),
+        "the welcome channel names no private channel"
+    );
 }

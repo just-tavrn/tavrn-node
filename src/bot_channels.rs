@@ -8,8 +8,9 @@
 //!   served to bots, the conversation member list for the roster check and the clients' ghost rule.
 //! - When a change closes a channel to bots, the bots' leaves are announced with `mls.remove_needed`; when it opens a
 //!   channel, `channel.update` tells the bot runtime to join.
-//! - Whenever a bot's leaf joins or leaves an encrypted channel's group, the welcome channel gets
-//!   `system.bot_added` / `system.bot_removed` (the commit decides, so the entry says what really happened).
+//! - Whenever a bot's leaf joins or leaves an encrypted channel's group, the security log gets
+//!   `system.bot_added` / `system.bot_removed` (the commit decides, so the entry says what really happened): the
+//!   welcome channel when `@everyone` can view the channel, else the channel itself (`welcome::bot_membership`).
 
 use std::collections::HashSet;
 

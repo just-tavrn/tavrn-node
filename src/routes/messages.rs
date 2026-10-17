@@ -1054,6 +1054,13 @@ async fn delete_in(state: &AppState, auth: &AuthUser, conv: &Conv, message_id: &
             detail: "Entries of the welcome channel cannot be deleted".into(),
         });
     }
+    // Nor the security notices in a channel, not even by the bot they name (APPLICATIONS.md §3.6).
+    if existing.notice != 0 {
+        return Err(ApiError::Forbidden {
+            code: "message.system_protected",
+            detail: "Security notices cannot be deleted".into(),
+        });
+    }
     let own = existing.author_id == auth.user.id;
     if !own {
         conv.require(p::MANAGE_MESSAGES, "message.delete_forbidden", "Manage messages")?;

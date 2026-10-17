@@ -2,7 +2,9 @@
 //! The welcome channel: a fixed system channel per room (`kind = "system"`,
 //! `system_name = "welcome"`) that is the room's security log. The node writes `system.join`, `system.leave`,
 //! `system.key_changed`, `system.bot_added`, `system.bot_removed`, `system.history_restored` and
-//! `system.history_restore_denied` entries; clients render them localized. Nobody can write there (reactions are allowed),
+//! `system.history_restore_denied` entries; clients render them localized. Only entries about members are written
+//! here unconditionally: an entry about a channel (`system.bot_*`) names the channel, so it comes here only when
+//! `@everyone` can view that channel and otherwise goes into the channel itself ([`bot_membership`]). Nobody can write there (reactions are allowed),
 //! nobody can hide it (`view_channel` is forced, `permissions::SYSTEM_CHANNEL_FORCED`), it is never encrypted and
 //! its whole history is readable for every member, including new ones.
 
@@ -141,8 +143,13 @@ pub enum BotChange<'a> {
 }
 
 /// `system.bot_added { bot, display_name, avatar, avatar_still, channel, channel_name, channel_system_name, by }` or
-/// `system.bot_removed { …, reason }` in the room's welcome channel, so every member sees who can read along in an encrypted channel.
-/// Failures are logged, never returned (the commit already happened).
+/// `system.bot_removed { …, reason }`, so every member who can read the channel sees who can read along
+/// (APPLICATIONS.md §3.6). The entry goes into the room's welcome channel only when `@everyone` can view the channel
+/// ([`access::everyone_views`]): the welcome channel is read by every member and its events reach every member, so
+/// an entry about any other channel would name it to members who cannot view it. Those entries go into the channel
+/// itself as a security notice (`messages.notice`: never unread, protected), which reaches exactly the channel's
+/// viewers. If the check fails, the channel is chosen (never the wider audience). Failures are logged, never
+/// returned (the commit already happened).
 pub async fn bot_membership(
     state: &AppState,
     room: &Room,
@@ -164,7 +171,32 @@ pub async fn bot_membership(
         BotChange::Added { by } => content["by"] = json!(by),
         BotChange::Removed { reason } => content["reason"] = json!(reason),
     }
-    if let Err(e) = write(state, room, bot, content).await {
+    let public = match crate::access::everyone_views_channel(state, channel).await {
+        Ok(public) => public,
+        Err(e) => {
+            tracing::warn!(error = %e, room = room.id, "channel audience not evaluated; the entry goes into the channel");
+            false
+        }
+    };
+    let written =
+        if public { write(state, room, bot, content).await } else { notice(state, room, bot, channel, content).await };
+    if let Err(e) = written {
         tracing::warn!(error = %e, room = room.id, "bot membership entry not written");
     }
+}
+
+/// A security notice in `channel` itself (APPLICATIONS.md §3.6): a plaintext system message marked `notice`, sent
+/// as `message.create` to the channel's viewers only (the hub filters room events by the channel they name).
+async fn notice(
+    state: &AppState,
+    room: &Room,
+    author: &UserRow,
+    channel: &crate::models::ChannelRow,
+    content: serde_json::Value,
+) -> Result<(), ApiError> {
+    let kind = content.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+    let message = crate::routes::messages::system_message(state, &channel.to_api(), author, &kind, content).await?;
+    store::messages::mark_notice(&state.db, &message.id).await?;
+    state.hub.room(&room.id, "message.create", &message);
+    Ok(())
 }
