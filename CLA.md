@@ -4,9 +4,8 @@ Version 2 — contributions under the existing project licenses.
 
 ## Scope and parties
 
-You are the person submitting a contribution. The project maintainer is the person operating
-GitHub account [babatonga](https://github.com/babatonga), identified with contact details in the
-[project imprint](https://tavrn.org/legal/imprint), on behalf of the tavrn project in the
+You are the person submitting a contribution. The project maintainer is the person identified with
+contact details in the [project imprint](https://tavrn.org/legal/imprint), acting on behalf of the tavrn project in the
 [just-tavrn organization](https://github.com/just-tavrn). A contribution is code, documentation or
 other material you intentionally submit for inclusion in one of its public repositories.
 Bug reports, questions and reviews do not require a signature unless they include material to be incorporated.
