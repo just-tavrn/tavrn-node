@@ -98,6 +98,8 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     ("GET", "/api/v1/users/{address}/profile", Always),
     ("GET", "/api/v1/rooms", Always),
     ("GET", "/api/v1/rooms/{room_id}", Always),
+    // public rooms and the bot's own rooms (PROTOCOL.md §6b "Room preview")
+    ("GET", "/api/v1/rooms/{room_id}/preview", Always),
     ("POST", "/api/v1/rooms/{room_id}/leave", Always),
     ("POST", "/api/v1/federation/token", Always),
     ("GET", "/api/v1/applications/me", Always),

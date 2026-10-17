@@ -730,6 +730,15 @@ pub async fn preview_room(
             if let Some(limiter) = &state.user_api_limiter {
                 limiter.check_all(&[format!("user:{}", auth.user.id)])?;
             }
+            // Bots through the fail-closed route table, as on every authenticated route (APPLICATIONS.md §2.5).
+            if auth.user.is_bot() {
+                let scopes = auth.app.as_ref().map(|a| a.scopes.as_slice()).unwrap_or_default();
+                crate::applications::check_route(
+                    scopes,
+                    &axum::http::Method::GET,
+                    Some("/api/v1/rooms/{room_id}/preview"),
+                )?;
+            }
         }
         None => state.directory_limiter.check_all(&[format!("room-preview-ip:{ip}")])?,
     }
