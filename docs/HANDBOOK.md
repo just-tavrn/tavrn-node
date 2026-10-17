@@ -1049,8 +1049,9 @@ the audit log records how many were kept.
 `TAVRN_RETENTION_DAYS` (default `0` = keep forever, at most 36500) deletes messages this many days after they were
 sent: the hourly housekeeping removes them from channels, DMs and group DMs hosted on the node, encrypted or not,
 together with their attachments (rows and files), reactions, pins and search entries; threads count their messages
-again. Two kinds of messages are never deleted by retention: **pinned messages** (unpin a message to let it expire)
-and the entries of a room's **welcome channel** (the room's security log). A room owner or a member with "Manage
+again. Retention never deletes **pinned messages** (unpin a message to let it expire)
+and the entries of a room's **welcome channel** (the room's security log), together with the security notices in
+channels (see [Moderation and auto-moderation](#moderation-and-auto-moderation)). A room owner or a member with "Manage
 room" can set a shorter retention for one room in the room settings (`message_retention_days`, 1–36500, `0` = the
 node's value); a longer room value has no effect, a room can only shorten. Each run that deleted something writes one
 entry `retention.messages` to the node's audit log (`deleted`, `node_days`, `rooms` with an own shorter value,
@@ -2257,7 +2258,10 @@ terms and domains were added and removed ("Auto-moderation node lists reloaded")
 at a path that does not exist yet: the paths themselves are read from the configuration at start. Matches are
 audited with the matched term, never the message text, and show up in the moderators' inbox.
 
-The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. Room ownership
+The welcome channel is the room's security log: its entries cannot be deleted or purged by anyone. It never names a
+channel that `@everyone` cannot view: when a bot joins or leaves the encryption group of such a channel, the entry is
+written into that channel as a **security notice** instead (visible to the channel's members only, never counted as
+unread, protected like the welcome channel's entries). Room ownership
 moves with room settings → Overview → "Transfer ownership" (the owner confirms with their password or passkey);
 accounts that own rooms must transfer or delete them before they can be deleted.
 
