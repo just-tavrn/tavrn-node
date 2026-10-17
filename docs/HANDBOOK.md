@@ -1882,7 +1882,9 @@ What the operator decides:
   marker `fixup.use_components`); it does not need *Send messages*, so announcement channels can carry sign-up
   buttons. In encrypted channels the values people send are end-to-end encrypted to the bot; the node sees which
   component of which message was used. Forms an application opens are kept with their interaction (15 minutes) and
-  never stored.
+  never stored. With `components.modal_select.v1`, those forms can include single-choice menus with up to 25
+  options alongside text inputs. Only the invoking user can submit them, once; the node validates plaintext choices
+  against the form, while the bot validates encrypted choices after decryption. An optional menu can be left empty.
 - **Files channels**: bots browse and download with the scope `messages:read` and create folders, upload and delete
   their own entries with `messages:write` (the channel's *Attach files*, upload categories and the bot account's
   upload size apply as for people; others' entries need *Manage files*, which only the scope `rooms:manage`

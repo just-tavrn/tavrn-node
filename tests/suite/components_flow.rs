@@ -244,6 +244,68 @@ fn note_modal() -> Value {
         { "custom_id": "name", "label": "Character", "style": "short", "min_length": 2 } ] })
 }
 
+fn spec_modal() -> Value {
+    json!({ "custom_id": "raid:spec", "title": "Your specialization", "inputs": [
+        { "custom_id": "spec", "label": "Specialization", "style": "select", "value": "protection", "options": [
+            { "label": "Protection", "value": "protection", "description": "Tank", "emoji": "🛡️" },
+            { "label": "Holy", "value": "holy" } ] },
+        { "custom_id": "backup", "label": "Backup", "style": "select", "required": false,
+          "options": [{ "label": "Holy", "value": "holy" }] } ] })
+}
+
+#[tokio::test]
+async fn modal_selects_validate_choices_and_keep_invoker_and_once_only_guards() {
+    let w = world().await;
+    let node = &w.node;
+    let (_, info) = node.get_auth("/api/v1/node", &w.bob.token).await;
+    assert!(info["capabilities"].as_array().unwrap().iter().any(|c| c == "components.modal_select.v1"));
+    let message = bot_card(&w).await;
+    let mut r = receiver(node, &w.bot);
+    let task = spawn_post(
+        node,
+        invoke_path(&w.channel, &message),
+        &w.bob.token,
+        json!({ "custom_id": "class", "values": ["tank"] }),
+    );
+    let parent = r.event("component.invoke").await["interaction_id"].as_str().unwrap().to_string();
+    let mut bad = spec_modal();
+    bad["inputs"][0]["options"][0]["default"] = json!(true);
+    let (s, j) = node.post(&callback(&parent), &w.bot.secret, json!({ "type": "modal", "modal": bad })).await;
+    assert_eq!(
+        (s, code(&j), path_of(&j)),
+        (StatusCode::BAD_REQUEST, "interaction.modal_invalid", "inputs[0].options[0].default")
+    );
+    let (s, j) = node.post(&callback(&parent), &w.bot.secret, json!({ "type": "modal", "modal": spec_modal() })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let (s, response) = task.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{response}");
+    assert_eq!(response["modal"], spec_modal());
+    let (s, j) = node.post(&submit(&parent), &w.carol.token, json!({ "values": { "spec": "holy" } })).await;
+    assert_eq!((s, code(&j)), (StatusCode::FORBIDDEN, "interaction.not_invoker"));
+    for (values, field) in [
+        (json!({}), "values.spec"),
+        (json!({ "spec": "" }), "values.spec"),
+        (json!({ "spec": "other-class" }), "values.spec"),
+        (json!({ "spec": ["holy"] }), "values.spec"),
+        (json!({ "spec": "holy", "backup": "protection" }), "values.backup"),
+        (json!({ "spec": "holy", "unknown": "holy" }), "values.unknown"),
+    ] {
+        let (s, j) = node.post(&submit(&parent), &w.bob.token, json!({ "values": values })).await;
+        assert_eq!((s, code(&j), path_of(&j)), (StatusCode::BAD_REQUEST, "interaction.values_invalid", field), "{j}");
+    }
+    let task = spawn_post(node, submit(&parent), &w.bob.token, json!({ "values": { "spec": "holy", "backup": "" } }));
+    let data = r.event("modal.submit").await;
+    assert_eq!(data["values"], json!({ "spec": "holy", "backup": "" }));
+    assert_eq!(data["modal_custom_id"], "raid:spec");
+    let id = data["interaction_id"].as_str().unwrap();
+    let (s, j) = node.post(&callback(id), &w.bot.secret,
+        json!({ "type": "reply", "ephemeral": true, "content": { "type": "text", "body": "Specialization saved" } })).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    assert_eq!(task.await.unwrap().1["ephemeral"]["content"]["body"], "Specialization saved");
+    let (s, j) = node.post(&submit(&parent), &w.bob.token, json!({ "values": { "spec": "holy" } })).await;
+    assert_eq!((s, code(&j)), (StatusCode::CONFLICT, "interaction.already_submitted"));
+}
+
 // ---------------------------------------------------------------- content (§5.10.1)
 
 #[tokio::test]
@@ -638,10 +700,10 @@ async fn modals_expire_with_their_interaction() {
     let mut r = receiver(node, &w.bot);
     let task = spawn_post(node, invoke_path(&w.channel, &message), &w.bob.token, json!({ "custom_id": "signup" }));
     let parent = r.event("component.invoke").await["interaction_id"].as_str().unwrap().to_string();
-    node.post(&callback(&parent), &w.bot.secret, json!({ "type": "modal", "modal": note_modal() })).await;
+    node.post(&callback(&parent), &w.bot.secret, json!({ "type": "modal", "modal": spec_modal() })).await;
     assert_eq!(task.await.unwrap().1["outcome"], "modal");
     clock.advance(chrono::Duration::minutes(16));
-    let (s, j) = node.post(&submit(&parent), &w.bob.token, json!({ "values": { "name": "Thrall" } })).await;
+    let (s, j) = node.post(&submit(&parent), &w.bob.token, json!({ "values": { "spec": "holy" } })).await;
     assert_eq!((s, code(&j)), (StatusCode::GONE, "interaction.expired"));
 }
 
@@ -721,17 +783,28 @@ async fn encrypted_conversations_pass_ciphertext_values() {
     assert_eq!((decoded["custom_id"].as_str(), decoded["values"].clone()), (Some("class"), json!(["tank"])));
     // The bot opens a modal; carol submits encrypted values.
     let parent = data["interaction_id"].as_str().unwrap().to_string();
-    let (s, j) = node.post(&callback(&parent), &b.secret, json!({ "type": "modal", "modal": note_modal() })).await;
+    let (s, j) = node.post(&callback(&parent), &b.secret, json!({ "type": "modal", "modal": spec_modal() })).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     assert_eq!(task.await.unwrap().1["outcome"], "modal");
-    let (s, j) = node.post(&submit(&parent), carol.token(), json!({ "values": { "name": "Thrall" } })).await;
+    let (s, j) = node.post(&submit(&parent), carol.token(), json!({ "values": { "spec": "holy" } })).await;
     assert_eq!((s, code(&j)), (StatusCode::BAD_REQUEST, "interaction.encryption_mismatch"));
-    let form = json!({ "type": "modal.values", "interaction": parent, "custom_id": "raid:note", "values": { "name": "Thrall" },
+    let form = json!({ "type": "modal.values", "interaction": parent, "custom_id": "raid:spec", "values": { "spec": "holy" },
                        "nonce": "AQAAAAAAAAAAAAAAAAAAAA", "issued_at": util::now() });
     let fct = carol.client.encrypt_content(&q, &form.to_string()).unwrap();
     let task = spawn_post(&node, submit(&parent), carol.token(), json!({ "values_ciphertext": fct, "epoch": vepoch }));
     let data = r.event("modal.submit").await;
     assert_eq!((data["values"].clone(), data["values_ciphertext"].as_str()), (Value::Null, Some(fct.as_str())));
+    let plain = bot_dev
+        .client
+        .decrypt_content(
+            &q,
+            &format!("carol@{D}"),
+            &carol.session.device_id,
+            data["values_ciphertext"].as_str().unwrap(),
+            Some(&carol.client.device().public_key()),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&plain).unwrap()["values"], json!({ "spec": "holy" }));
     let sub = data["interaction_id"].as_str().unwrap().to_string();
     // `update` in an encrypted conversation: the bot's ciphertext replaces the card (plaintext is a mismatch).
     let (s, j) = node.post(&callback(&sub), &b.secret, json!({ "type": "update", "content": card() })).await;
