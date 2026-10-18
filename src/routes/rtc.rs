@@ -366,12 +366,12 @@ async fn guarded_pump(
             }
         }
     }
-    let _ = client.close().await;
-    let _ = upstream.close(None).await;
     if active.is_some() || must_remove {
-        // Closing signaling alone leaves media alive during LiveKit's reconnect grace period.
+        // Revoke media before flushing closes: a backpressured signaling peer must not delay it.
         voice::remove_from_livekit(&state, &key, &identity).await;
     }
+    let _ = client.close().await;
+    let _ = upstream.close(None).await;
 }
 
 #[derive(Default)]
