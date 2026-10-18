@@ -1746,6 +1746,8 @@ async fn whisper_authorizations_require_permission_and_actual_received_publicati
     assert_eq!(v.node.post(&receive_path, &v.bob.token, json!({})).await.0, StatusCode::OK);
     let refreshed: Value = v.node.state.cluster.get_sealed(&record_key).await.unwrap().unwrap();
     assert_eq!(refreshed["deadline_ms"], original["deadline_ms"], "refresh cannot extend reply lifetime");
+    let removed = json!({"event":"track_unpublished","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.alice)},"track":{"sid":"TR_whisper","name":format!("whisper:{id}"),"source":"MICROPHONE","type":"AUDIO","encryption":"GCM"}});
+    assert_eq!(v.webhook(removed).await.0, StatusCode::OK);
     assert_eq!(v.node.delete(&v.path(&format!("whisper/{id}")), &v.alice.token).await.0, StatusCode::NO_CONTENT);
     assert_eq!(
         v.node.post(&receive_path, &v.bob.token, json!({})).await.0,
@@ -1868,6 +1870,12 @@ async fn whisper_proxy_owns_private_acls_and_preserves_outsider_camera_access() 
         matches!(proto::SignalRequest::decode(msg).unwrap().message,Some(proto::signal_request::Message::SubscriptionPermission(p)) if p.all_participants)
     );
     client.next().await.unwrap().unwrap();
+    // The permission guard must preserve extension fields on unrelated signaling messages.
+    let mut extended_ping =
+        proto::SignalRequest { message: Some(proto::signal_request::Message::Ping(123)) }.encode_to_vec();
+    extended_ping.extend_from_slice(&[0xc0, 0x3e, 0x07]); // unknown varint field 1000
+    client.send(Message::Binary(extended_ping.clone().into())).await.unwrap();
+    assert_eq!(upstream.next().await.unwrap().unwrap().into_data().as_ref(), extended_ping);
     // The fresh SFU connection establishes a new generation after the proxy invalidated the old one.
     tokio::time::sleep(Duration::from_millis(1)).await;
     v.connected(&v.alice).await;

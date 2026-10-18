@@ -273,8 +273,14 @@ async fn guarded_pump(
         tokio::select! {
             message = client.next() => {
                 let Some(Ok(mut message)) = message else { break };
+                match finished_whisper(&state, &mut active).await {
+                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(false) => {}
+                    Err(_) => { must_remove = true; break; }
+                }
                 if let ws::Message::Binary(bytes) = &message {
                     let Ok(mut request) = proto::SignalRequest::decode(bytes.clone()) else { break };
+                    let mut rewrite = false;
                     match &mut request.message {
                         Some(proto::signal_request::Message::AddTrack(track)) if track.name.starts_with("whisper") => {
                             let Some(id) = track.name.strip_prefix("whisper:") else { break };
@@ -294,6 +300,7 @@ async fn guarded_pump(
                                 Some(session)
                             } else { None };
                             request.message = Some(proto::signal_request::Message::SubscriptionPermission(acl.permissions(session.as_ref().map(|s| s.recipients.as_slice()))));
+                            rewrite = true;
                         }
                         Some(proto::signal_request::Message::SyncState(sync)) => {
                             if active.is_some() || sync.publish_tracks.iter().any(|p| p.track.as_ref().is_some_and(|t| t.name.starts_with("whisper"))) { must_remove = true; break; }
@@ -302,13 +309,19 @@ async fn guarded_pump(
                         Some(proto::signal_request::Message::AddTrack(track)) if active.as_ref().is_some_and(|(_, sid)| !sid.is_empty() && track.sid == *sid) => { break; }
                         _ => {}
                     }
-                    message = ws::Message::Binary(request.encode_to_vec().into());
+                    // Preserve extension fields on unrelated messages; prost drops unknown fields.
+                    if rewrite { message = ws::Message::Binary(request.encode_to_vec().into()); }
                 } else if matches!(message, ws::Message::Text(_)) { break; }
                 let closing = matches!(message, ws::Message::Close(_));
                 if upstream.send(to_tungstenite(message)).await.is_err() || closing { break; }
             }
             message = upstream.next() => {
                 let Some(Ok(message)) = message else { break };
+                match finished_whisper(&state, &mut active).await {
+                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(false) => {}
+                    Err(_) => { must_remove = true; break; }
+                }
                 if let tungstenite::Message::Binary(bytes) = &message
                     && let Ok(response) = proto::SignalResponse::decode(bytes.clone()) {
                         let mut changed = false;
@@ -332,6 +345,7 @@ async fn guarded_pump(
                                         let Some((id, sid)) = &mut active else { break };
                                         if track.name != format!("whisper:{id}") { break; }
                                         *sid = track.sid;
+                                        if voice::whisper::record_track(&state, id, sid).await.is_err() { must_remove = true; break; }
                                     } else { acl.ordinary.insert(track.sid); }
                                     changed = true;
                                 }
@@ -339,6 +353,8 @@ async fn guarded_pump(
                             Some(proto::signal_response::Message::TrackUnpublished(unpublished)) => {
                                 if active.as_ref().is_some_and(|(_, sid)| !sid.is_empty() && *sid == unpublished.track_sid) {
                                     // SFU confirmed removal. Only now may normal subscriptions resume.
+                                    if let Some((id, sid)) = &active
+                                        && voice::whisper::record_removal(&state, id, sid).await.is_err() { must_remove = true; break; }
                                     active = None;
                                 }
                                 acl.ordinary.remove(&unpublished.track_sid);
@@ -361,6 +377,11 @@ async fn guarded_pump(
                 if client.send(message).await.is_err() || closing { break; }
             }
             _ = interval.tick(), if active.is_some() => {
+                match finished_whisper(&state, &mut active).await {
+                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(false) => {}
+                    Err(_) => { must_remove = true; break; }
+                }
                 if let Some((id, _)) = &active
                     && voice::whisper::authorized(&state, &key, &identity, id).await.is_err() { break; }
             }
@@ -372,6 +393,17 @@ async fn guarded_pump(
     }
     let _ = client.close().await;
     let _ = upstream.close(None).await;
+}
+
+/// End confirmation is bound to the actual admitted SFU track, never just an absent grant.
+async fn finished_whisper(state: &AppState, active: &mut Option<(String, String)>) -> Result<bool, ApiError> {
+    let Some((id, sid)) = active else { return Ok(false) };
+    let Some(ended) = voice::whisper::ended(state, id).await? else { return Ok(false) };
+    if sid.is_empty() || ended.sid.as_ref() != Some(sid) {
+        return Err(voice::whisper::forbidden());
+    }
+    *active = None;
+    Ok(true)
 }
 
 #[derive(Default)]

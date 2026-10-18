@@ -1462,14 +1462,16 @@ pub async fn whisper_receive(
     Ok(Json(voice::whisper::receive(&state, &(room, channel), &recipient, &id).await?))
 }
 
+/// Unpublish locally, then await confirmation of the exact SFU track removal before restoring ordinary audio.
 #[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}", security(("bearer" = [])),
     params(("room_id" = String, Path), ("channel_id" = String, Path), ("id" = String, Path)),
-    responses((status = 204), (status = 403, body = ProblemDetails)))]
+    responses((status = 204), (status = 403, body = ProblemDetails), (status = 409, body = ProblemDetails)))]
 pub async fn whisper_end(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((room, channel, id)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    state.voice_limiter.check_all(&[format!("whisper-end:{}", auth.user.id)])?;
     let sender = voice::identity(&auth.user.address(), auth.public_device_id());
     voice::whisper::end(&state, &(room, channel), &sender, &id).await?;
     Ok(StatusCode::NO_CONTENT)

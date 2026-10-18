@@ -7,7 +7,10 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 ## Unreleased
 
-- Enforce voice whisper initiation permission (bit 41), authenticated bounded reply grants, and server-owned per-track SFU routing ACLs.
+- Enforce voice whisper initiation permission (bit 41), authenticated connection-bound replies, and server-owned
+  per-track SFU routing ACLs. Ordinary audio/camera remain public to authorized listeners; exact signed SFU track
+  removal is confirmed before restoring normal voice. Preserve unrelated protobuf extension fields and existing
+  long holds/reply-to-last behavior within the device connection.
 
 
 - **Whisper signaling** (protocol VOICE.md §4c): unmuted participants with `speak` may send encrypted

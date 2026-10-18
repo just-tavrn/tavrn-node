@@ -9,8 +9,10 @@ use utoipa::ToSchema;
 use super::state::ChannelKey;
 use crate::{access, app::AppState, cache, error::ApiError, permissions as p, store, util};
 
-pub const SESSION_SECS: u64 = 30;
-pub const REPLY_SECS: u64 = 120;
+// Authorization remains connection-scoped; continuous permission checks revoke it immediately.
+// The cache ceiling bounds abandoned state without imposing a short new push-to-whisper limit.
+pub const SESSION_SECS: u64 = 86_400;
+pub const REPLY_SECS: u64 = 86_400;
 
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct WhisperSession {
@@ -45,7 +47,7 @@ struct Receipt {
 pub struct WhisperReceipt {
     pub id: String,
     pub sender: String,
-    /// Active playback authorization expiry (30 seconds from start), never the reply deadline.
+    /// Active playback authorization expiry, separate from the latest-received reply deadline.
     pub expires_at: String,
     pub reply_expires_at: String,
 }
@@ -76,6 +78,13 @@ fn latest_key(key: &ChannelKey, identity: &str) -> String {
 fn receipt_key(key: &ChannelKey, identity: &str) -> String {
     format!("whisper:receipt:{}:{}:{identity}", key.0, key.1)
 }
+async fn clear_grant_metadata(state: &AppState, id: &str) -> Result<(), ApiError> {
+    for kind in ["published", "first-published", "track", "removed"] {
+        delete(state, &format!("whisper:{kind}:{id}")).await?;
+    }
+    Ok(())
+}
+
 async fn get<T: serde::de::DeserializeOwned>(state: &AppState, key: &str) -> Result<T, ApiError> {
     state.cluster.get_sealed(key).await.map_err(cache::unavailable)?.ok_or_else(forbidden)
 }
@@ -147,6 +156,10 @@ pub async fn webhook(state: &AppState, key: &ChannelKey, event: &livekit_protoco
                     }
                 }
             } else {
+                if let Err(error) = record_removal(state, id, &track.sid).await {
+                    tracing::warn!(%error, "Whisper removal state update failed");
+                    return;
+                }
                 delete(state, &marker).await
             }
         }
@@ -163,6 +176,14 @@ pub async fn invalidate_checked(state: &AppState, key: &ChannelKey, identity: &s
         connection.live = false;
         put(state, &name, &connection, 86400).await?;
     }
+    let previous: Option<String> =
+        state.cluster.get_sealed(&latest_key(key, identity)).await.map_err(cache::unavailable)?;
+    if let Some(previous) = previous {
+        delete(state, &format!("whisper:session:{previous}")).await?;
+        clear_grant_metadata(state, &previous).await?;
+    }
+    delete(state, &latest_key(key, identity)).await?;
+    delete(state, &receipt_key(key, identity)).await?;
     Ok(())
 }
 
@@ -257,6 +278,13 @@ pub async fn start(
         access_check(state, &key, recipient, false, false).await?;
         generations.push(generation(state, &key, recipient).await?);
     }
+    // Keep one authorization per sender instead of retaining superseded grants for the lease lifetime.
+    let previous: Option<String> =
+        state.cluster.get_sealed(&latest_key(&key, &sender)).await.map_err(cache::unavailable)?;
+    if let Some(previous) = previous {
+        delete(state, &format!("whisper:session:{previous}")).await?;
+        clear_grant_metadata(state, &previous).await?;
+    }
     let public = WhisperSession {
         id: util::ulid(),
         sender: sender.clone(),
@@ -281,7 +309,7 @@ pub async fn authorized(
     sender: &str,
     id: &str,
 ) -> Result<WhisperSession, ApiError> {
-    if !util::is_ulid(id) {
+    if !util::is_ulid(id) || ended(state, id).await?.is_some() {
         return Err(forbidden());
     }
     let stored: Stored = get(state, &format!("whisper:session:{id}")).await?;
@@ -344,12 +372,53 @@ pub async fn receive(
     })
 }
 
+/// A completed grant carries the exact SFU track whose removal was confirmed. None means
+/// cancellation before publication; an in-flight publication then has to fail closed.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Ended {
+    pub sid: Option<String>,
+}
+
+pub async fn ended(state: &AppState, id: &str) -> Result<Option<Ended>, ApiError> {
+    state.cluster.get_sealed(&format!("whisper:ended:{id}")).await.map_err(cache::unavailable)
+}
+
+pub async fn record_track(state: &AppState, id: &str, sid: &str) -> Result<(), ApiError> {
+    if sid.is_empty() {
+        return Err(forbidden());
+    }
+    put(state, &format!("whisper:track:{id}"), &sid, SESSION_SECS).await
+}
+
+pub async fn record_removal(state: &AppState, id: &str, sid: &str) -> Result<(), ApiError> {
+    put(state, &format!("whisper:removed:{id}"), &sid, SESSION_SECS).await
+}
+
 pub async fn end(state: &AppState, key: &ChannelKey, sender: &str, id: &str) -> Result<(), ApiError> {
     let stored: Stored = get(state, &format!("whisper:session:{id}")).await?;
     if stored.key != *key || stored.public.sender != sender {
         return Err(forbidden());
     }
-    delete(state, &format!("whisper:session:{id}")).await
+    let sid: Option<String> =
+        state.cluster.get_sealed(&format!("whisper:track:{id}")).await.map_err(cache::unavailable)?;
+    if let Some(sid) = &sid {
+        // Do not hold the lifecycle lock: the verified unpublication webhook needs it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let removed: Option<String> =
+                state.cluster.get_sealed(&format!("whisper:removed:{id}")).await.map_err(cache::unavailable)?;
+            if removed.as_ref() == Some(sid) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ApiError::conflict("voice.whisper_active", "The whisper track removal is not confirmed"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    put(state, &format!("whisper:ended:{id}"), &Ended { sid }, 60).await?;
+    delete(state, &format!("whisper:session:{id}")).await?;
+    clear_grant_metadata(state, id).await
 }
 
 /// Ignore delayed webhook lifecycle events from old SFU connections before changing voice state.
