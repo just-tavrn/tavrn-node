@@ -36,6 +36,8 @@
 //!   [`USE_COMPONENTS_MARKER`]; overrides are not touched: the bit is independent of writing), so everybody who could
 //!   use commands can use the buttons of their answers (APPLICATIONS.md §5.10). New rooms get it from
 //!   `DEFAULT_EVERYONE`.
+//! - `whisper` (bit 41) is granted once to existing roles holding `speak`, including `@everyone`.
+//!   Marker `fixup.whisper` prevents later owner changes from being overwritten; overrides stay independent.
 //! - Overrides carry channel-scoped bits only (`permissions::CHANNEL_SCOPED`, layered overrides of 2026-10-09):
 //!   other bits are removed from the `allow` and `deny` masks of every override, an override left with nothing at
 //!   all is deleted, and each change is audited in the room as `role.override_restricted`.
@@ -67,6 +69,8 @@ pub struct FixupReport {
     pub create_polls_grants: u64,
     /// Roles holding `send_messages` that got `use_components`.
     pub use_components_roles: u64,
+    /// Existing roles holding speak granted whisper initiation once.
+    pub whisper_roles: u64,
 }
 
 /// `node_settings` key: the one-time grant of the external emoji and sound bits has run.
@@ -171,6 +175,8 @@ pub async fn run(db: &Pool) -> anyhow::Result<FixupReport> {
         Everyone::Included,
     )
     .await?;
+    report.whisper_roles =
+        grant_to_roles(db, "fixup.whisper", Some(permissions::SPEAK), permissions::WHISPER, Everyone::Included).await?;
     if report != FixupReport::default() {
         tracing::info!(?report, "Data fixups applied");
     }

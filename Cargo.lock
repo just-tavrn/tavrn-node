@@ -4988,6 +4988,7 @@ dependencies = [
  "openssl",
  "p256 0.14.0",
  "prometheus",
+ "prost",
  "pulldown-cmark",
  "rand 0.10.3",
  "redis",

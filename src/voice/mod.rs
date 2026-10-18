@@ -10,6 +10,7 @@ pub mod livekit;
 pub mod moved;
 pub mod state;
 pub mod token;
+pub mod whisper;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -39,6 +40,8 @@ pub fn sweep_interval(grace: Duration) -> Duration {
 
 /// Voice runtime shared by all requests: LiveKit credentials and client, process status, participants.
 pub struct VoiceRuntime {
+    /// Serializes latest receipt/start decisions on the voice leader.
+    pub whisper_serial: tokio::sync::Mutex<()>,
     key: Option<ApiKey>,
     rooms: Option<RoomClient>,
     status: Mutex<LiveKitStatus>,
@@ -82,6 +85,7 @@ impl VoiceRuntime {
             RoomClient::with_api_key(&format!("http://127.0.0.1:{}", config.livekit_port), &key.key, &key.secret)
                 .with_request_timeout(Duration::from_secs(5));
         Ok(Self {
+            whisper_serial: tokio::sync::Mutex::new(()),
             key: Some(key),
             rooms: Some(rooms),
             status: Mutex::new(LiveKitStatus::Stopped),
@@ -96,6 +100,7 @@ impl VoiceRuntime {
 
     fn disabled() -> Self {
         Self {
+            whisper_serial: tokio::sync::Mutex::new(()),
             key: None,
             rooms: None,
             status: Mutex::new(LiveKitStatus::Disabled),
@@ -352,11 +357,20 @@ pub async fn handle_webhook(state: &AppState, event: proto::WebhookEvent) {
         return handle_call_webhook(state, &conversation_id, event).await;
     }
     let Some(key) = parse_room_name(&name) else { return };
+    // Lifecycle comparisons and generation writes must be atomic against concurrent webhook delivery.
+    let _whisper_order = state.voice.whisper_serial.lock().await;
     let now = Instant::now();
     let identity = event.participant.as_ref().map(|p| p.identity.clone()).unwrap_or_default();
+    if whisper::stale_connection_event(state, &key, &event).await {
+        return;
+    }
+    if event.event != "participant_joined" {
+        whisper::webhook(state, &key, &event).await;
+    }
     let changed = match event.event.as_str() {
         "participant_joined" => match who(state, &key.0, &identity).await {
             Some(who) if state.voice.participants().accepts(&key, &who) => {
+                whisper::webhook(state, &key, &event).await;
                 state.voice.participants().activate(&key, &who, now)
             }
             _ => {
@@ -529,6 +543,7 @@ pub fn spawn_reconciler(state: AppState) -> tokio::task::JoinHandle<()> {
 /// Tokens are not revoked: a token revocation would also hit a rejoin within the same second (token
 /// timestamps are seconds), and a member who lost access is refused by the `/rtc` proxy anyway.
 pub async fn remove_from_livekit(state: &AppState, key: &ChannelKey, identity: &str) {
+    whisper::invalidate(state, key, identity).await;
     let Some(rooms) = state.voice.rooms() else { return };
     let room = room_name(key);
     let screen = screen_owner(identity).is_none().then(|| screen_identity(identity));

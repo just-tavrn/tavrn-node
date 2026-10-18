@@ -57,6 +57,7 @@ perms! {
     VOICE_STATUS = 38, "voice_status";
     CREATE_POLLS = 39, "create_polls";
     USE_COMPONENTS = 40, "use_components";
+    WHISPER = 41, "whisper";
     ADMINISTRATOR = 62, "administrator";
 }
 
@@ -89,7 +90,8 @@ pub const DEFAULT_EVERYONE: Perms = VIEW_CHANNEL
     | USE_EXTERNAL_SOUNDS
     | READ_HISTORY
     | CREATE_POLLS
-    | USE_COMPONENTS;
+    | USE_COMPONENTS
+    | WHISPER;
 
 /// Management-class permissions that can never be granted to `@everyone`, neither on the role nor by
 /// an `allow` in a channel or category override (`role.everyone_restricted`, protocol/permissions.md).
@@ -147,7 +149,8 @@ pub const CHANNEL_SCOPED: Perms = VIEW_CHANNEL
     | MANAGE_THREADS
     | VOICE_STATUS
     | CREATE_POLLS
-    | USE_COMPONENTS;
+    | USE_COMPONENTS
+    | WHISPER;
 
 /// Permissions a member keeps while timed out.
 pub const TIMEOUT_KEEPS: Perms = VIEW_CHANNEL | READ_HISTORY;
@@ -211,7 +214,10 @@ pub const SCOPES: &[(&str, Perms)] = &[
             | MANAGE_APPLICATIONS
             | VOICE_STATUS,
     ),
-    ("voice", CONNECT | SPEAK | STREAM | USE_CAMERA | USE_SOUNDBOARD | USE_EXTERNAL_SOUNDS | PRIORITY_SPEAKER),
+    (
+        "voice",
+        CONNECT | SPEAK | STREAM | USE_CAMERA | USE_SOUNDBOARD | USE_EXTERNAL_SOUNDS | PRIORITY_SPEAKER | WHISPER,
+    ),
     ("whiteboard", USE_WHITEBOARD | MANAGE_WHITEBOARD),
     ("commands", 0),
     ("webhooks:manage", MANAGE_WEBHOOKS),
@@ -546,7 +552,7 @@ mod tests {
         }
         assert!(ALL <= i64::MAX as u64);
         assert_eq!(parse("abc"), None);
-        assert_eq!(parse(&(1u64 << 41).to_string()), None, "undefined bits are rejected");
+        assert_eq!(parse(&(1u64 << 42).to_string()), None, "undefined bits are rejected");
         assert_eq!(parse(&ALL.to_string()), Some(ALL));
     }
 
@@ -652,7 +658,7 @@ mod tests {
     #[test]
     fn channel_scoped_matches_the_protocol_table() {
         // The same value is pinned in the SDK (tavrn-js, sdk/test/permissions.test.ts).
-        assert_eq!(CHANNEL_SCOPED, 2_027_195_138_559);
+        assert_eq!(CHANNEL_SCOPED, 4_226_218_394_111);
         let doc = include_str!("../protocol/permissions.md");
         let section = doc.split("## Channel-scoped bits").nth(1).unwrap().split("\n## ").next().unwrap();
         let from_doc = section
@@ -668,7 +674,7 @@ mod tests {
         for room_level in [VIEW_AUDIT_LOG, MANAGE_EMOJIS, CHANGE_NICKNAME, MANAGE_NICKNAMES, MANAGE_APPLICATIONS] {
             assert_eq!(CHANNEL_SCOPED & room_level, 0, "{:?}", names(room_level));
         }
-        assert_eq!(names(CHANNEL_SCOPED).len(), 29);
+        assert_eq!(names(CHANNEL_SCOPED).len(), 30);
     }
 
     #[test]
@@ -677,7 +683,7 @@ mod tests {
         assert!(has(DEFAULT_EVERYONE, USE_COMPONENTS), "everybody may click buttons in new rooms");
         assert!(!has(EVERYONE_RESTRICTED, USE_COMPONENTS));
         assert!(has(CHANNEL_SCOPED, USE_COMPONENTS), "an override can take it away per channel");
-        assert_eq!(CHANNEL_SCOPED, 2_027_195_138_559);
+        assert_eq!(CHANNEL_SCOPED, 4_226_218_394_111);
         assert!(!has(scope_mask(&all_scopes()), USE_COMPONENTS), "bots never click");
         assert!(has(crate::access::DIRECT_PERMS, USE_COMPONENTS), "both members of a DM may click");
         assert_eq!(names(USE_COMPONENTS), vec!["use_components"]);

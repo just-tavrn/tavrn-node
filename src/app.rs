@@ -79,7 +79,7 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
         caps.push("voice");
-        caps.push("voice.whisper1");
+        caps.push("voice.whisper2");
         caps.push("soundboard");
         if config.screenshare_enabled {
             caps.push("screenshare");
@@ -993,6 +993,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/federation/peers/{domain}/unblock", post(routes::conformance::unblock_peer))
         // Voice (protocol/VOICE.md).
         .route("/rooms/{room_id}/voice", get(routes::voice::room_states))
+        .route("/rooms/{room_id}/channels/{channel_id}/voice/whisper", post(routes::voice::whisper_start))
+        .route(
+            "/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}",
+            axum::routing::delete(routes::voice::whisper_end),
+        )
+        .route(
+            "/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}/receive",
+            post(routes::voice::whisper_receive),
+        )
         .route("/rooms/{room_id}/channels/{channel_id}/voice/join", post(routes::voice::join))
         .route("/rooms/{room_id}/channels/{channel_id}/voice/leave", post(routes::voice::leave))
         .route(

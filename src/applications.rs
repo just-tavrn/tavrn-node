@@ -250,6 +250,9 @@ pub const APP_ROUTES: &[(&str, &str, Access)] = &[
     // voice
     ("GET", "/api/v1/rooms/{room_id}/voice", Scope("voice")),
     ("GET", "/api/v1/users/me/voice", Scope("voice")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper", Scope("voice")),
+    ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}/receive", Scope("voice")),
+    ("DELETE", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}", Scope("voice")),
     ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/join", Scope("voice")),
     ("POST", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/leave", Scope("voice")),
     ("PATCH", "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/state", Scope("voice")),
