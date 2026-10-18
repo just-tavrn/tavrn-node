@@ -79,6 +79,7 @@ pub fn capabilities(config: &Config) -> Vec<&'static str> {
     caps.extend(["threads", "forum", "announcement", "threads.client_ids"]);
     if config.voice_enabled {
         caps.push("voice");
+        caps.push("voice.whisper1");
         caps.push("soundboard");
         if config.screenshare_enabled {
             caps.push("screenshare");

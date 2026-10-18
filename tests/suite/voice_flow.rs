@@ -398,9 +398,16 @@ async fn node_policies_remove_sources_and_are_announced() {
     assert_eq!(wk["policies"]["screenshare"]["enabled"], false);
     assert_eq!(wk["policies"]["camera"], json!({ "enabled": false, "max_resolution": "720p", "max_fps": 30 }));
     let caps: Vec<&str> = wk["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
-    assert!(caps.contains(&"voice") && caps.contains(&"soundboard") && !caps.contains(&"screenshare"), "{caps:?}");
+    assert!(
+        caps.contains(&"voice")
+            && caps.contains(&"voice.whisper1")
+            && caps.contains(&"soundboard")
+            && !caps.contains(&"screenshare"),
+        "{caps:?}"
+    );
     let node = common::body_json(v.node.get("/api/v1/node").await).await;
     assert_eq!(node["voice"]["enabled"], true);
+    assert!(node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
     assert_eq!(node["voice"]["max_bitrate_kbps"], 48);
     assert_eq!(node["voice"]["camera"]["enabled"], false);
 
@@ -490,7 +497,9 @@ async fn voice_disabled_by_the_node_is_503() {
     let ready = v.node.get("/readyz").await;
     assert_eq!(ready.status(), StatusCode::OK, "LiveKit is not required without voice");
     let wk = common::body_json(v.node.get("/.well-known/tavrn").await).await;
-    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice"));
+    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice" || c == "voice.whisper1"));
+    let node = common::body_json(v.node.get("/api/v1/node").await).await;
+    assert!(!node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
     assert_eq!(wk["policies"]["voice_enabled"], false);
 }
 
