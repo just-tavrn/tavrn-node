@@ -153,7 +153,7 @@ async fn create_list_and_validate_applications() {
     assert_eq!((s, code(&j)), (StatusCode::CONFLICT, "app.username_taken"));
     for (body, expected) in [
         (json!({ "name": "Admin", "requested_permissions": p::ADMINISTRATOR.to_string() }), "app.permissions_invalid"),
-        (json!({ "name": "Bits", "requested_permissions": (1u64 << 41).to_string() }), "app.permissions_invalid"),
+        (json!({ "name": "Bits", "requested_permissions": (1u64 << 42).to_string() }), "app.permissions_invalid"),
         (json!({ "name": "Scopes", "scopes": ["messages:read", "root"] }), "app.scope_invalid"),
         (json!({ "name": "x" }), "validation.length"),
         (json!({ "name": "Name", "username": "Bad Name" }), "validation.username"),
