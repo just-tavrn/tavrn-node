@@ -27,8 +27,8 @@ pub struct Sources {
     pub camera: bool,
     /// `stream` and `TAVRN_SCREENSHARE_ENABLED` (screen video plus its audio).
     pub screen: bool,
-    /// `use_soundboard`: data messages (the `soundboard.play` signal, VOICE.md §8), end-to-end encrypted
-    /// by LiveKit like the media.
+    /// `speak` and not server-muted (whisper, VOICE.md §4c), or `use_soundboard` (§8): data
+    /// messages, end-to-end encrypted by LiveKit like the media.
     pub data: bool,
     /// `priority_speaker`: own attribute updates (the `priority` attribute, VOICE.md §7a). Receivers check
     /// the permission themselves; this only keeps clients without the bit from setting it at all.
@@ -53,7 +53,7 @@ impl Sources {
 }
 
 /// Grants for joining LiveKit room `room` with `sources`. Subscribing is always allowed (listening needs
-/// only `connect`); data messages only with `use_soundboard` and own metadata/attribute updates only with
+/// only `connect`); data messages with unmuted `speak` or `use_soundboard`, own metadata/attribute updates with
 /// `priority_speaker`; room administration, recording and hidden participants never.
 pub fn grants(room: &str, sources: Sources) -> VideoGrants {
     let names = sources.names();

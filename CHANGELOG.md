@@ -7,6 +7,10 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 ## Unreleased
 
+- **Whisper signaling** (protocol VOICE.md §4c): unmuted participants with `speak` may send encrypted
+  call-local data signals without `use_soundboard`. Nodes advertise `voice.whisper1` while voice is enabled. Server mute revokes this grant unless soundboard
+  permission independently allows data; ordinary microphone, camera and screen permissions stay scoped.
+
 First public release of the node and its container image.
 
 - **Room privacy notice and legal notice** (protocol PROTOCOL.md §6b): `PATCH /rooms/{room_id} { privacy_notice,

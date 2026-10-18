@@ -589,7 +589,7 @@ pub fn removal_pending(state: &AppState, key: &ChannelKey, identity: &str) -> bo
 }
 
 /// Grants or revokes the microphone of a connected participant (moderator mute) without a reconnect; data
-/// messages and own attribute updates stay as the token granted them (`token::grants`).
+/// messages follow unmuted `speak` or `use_soundboard`; own attributes follow `priority_speaker`.
 pub async fn update_permission(state: &AppState, key: &ChannelKey, identity: &str, sources: token::Sources) {
     let Some(rooms) = state.voice.rooms() else { return };
     let mut can_publish_sources = Vec::new();

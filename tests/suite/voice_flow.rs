@@ -289,7 +289,7 @@ async fn join_returns_a_token_with_exactly_the_allowed_grants() {
 }
 
 #[tokio::test]
-async fn attribute_updates_need_priority_speaker_and_data_needs_the_soundboard() {
+async fn attribute_updates_need_priority_speaker_and_data_needs_speak_or_soundboard() {
     let v = setup().await;
     // `priority_speaker` is off for @everyone by default: no own attribute updates.
     let (s, j) = v.join(&v.bob).await;
@@ -297,13 +297,49 @@ async fn attribute_updates_need_priority_speaker_and_data_needs_the_soundboard()
     let c = claims(&v.node, j["token"].as_str().unwrap());
     assert_eq!(c.video.can_update_own_metadata, Some(false), "a client without the bit cannot set `priority`");
     assert_eq!(c.video.can_publish_data, Some(true), "use_soundboard is on for @everyone");
-    // Granted in the channel: the token allows the `priority` attribute; without the soundboard no data.
+    // Speak alone grants whisper signals, independent of the soundboard permission.
     v.override_everyone(&v.voice_id, &[p::PRIORITY_SPEAKER], &[p::USE_SOUNDBOARD]).await;
     let (_, j) = v.join(&v.bob).await;
     let c = claims(&v.node, j["token"].as_str().unwrap());
     assert_eq!(c.video.can_update_own_metadata, Some(true));
-    assert_eq!(c.video.can_publish_data, Some(false));
+    assert_eq!(c.video.can_publish_data, Some(true), "speak allows whisper without use_soundboard");
     assert!(!c.video.room_admin && !c.video.hidden, "nothing else widens");
+}
+
+#[tokio::test]
+async fn whisper_data_grants_follow_speak_server_mute_and_soundboard_compatibility() {
+    let v = setup().await;
+    let mute = v.path("members/bob@t.local/mute");
+    // Check actual signed join tokens across the permission matrix; neither path widens media grants.
+    for speak in [false, true] {
+        for soundboard in [false, true] {
+            let mut denied = vec![p::STREAM, p::USE_CAMERA];
+            if !speak {
+                denied.push(p::SPEAK);
+            }
+            if !soundboard {
+                denied.push(p::USE_SOUNDBOARD);
+            }
+            v.override_everyone(&v.voice_id, &[], &denied).await;
+            for server_muted in [false, true, false] {
+                let (status, body) = v.node.post(&mute, &v.alice.token, json!({ "muted": server_muted })).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let (status, joined) = v.join(&v.bob).await;
+                assert_eq!(status, StatusCode::OK, "{joined}");
+                let c = claims(&v.node, joined["token"].as_str().unwrap());
+                let microphone = speak && !server_muted;
+                assert_eq!(
+                    c.video.can_publish_data,
+                    Some(microphone || soundboard),
+                    "speak={speak}, soundboard={soundboard}, server_muted={server_muted}"
+                );
+                assert_eq!(c.video.can_publish, Some(microphone));
+                assert_eq!(c.video.can_publish_sources, if microphone { vec!["microphone"] } else { vec![] });
+                assert_eq!(c.video.can_update_own_metadata, Some(false));
+                assert!(!c.video.room_admin && !c.video.hidden);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -362,9 +398,16 @@ async fn node_policies_remove_sources_and_are_announced() {
     assert_eq!(wk["policies"]["screenshare"]["enabled"], false);
     assert_eq!(wk["policies"]["camera"], json!({ "enabled": false, "max_resolution": "720p", "max_fps": 30 }));
     let caps: Vec<&str> = wk["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
-    assert!(caps.contains(&"voice") && caps.contains(&"soundboard") && !caps.contains(&"screenshare"), "{caps:?}");
+    assert!(
+        caps.contains(&"voice")
+            && caps.contains(&"voice.whisper1")
+            && caps.contains(&"soundboard")
+            && !caps.contains(&"screenshare"),
+        "{caps:?}"
+    );
     let node = common::body_json(v.node.get("/api/v1/node").await).await;
     assert_eq!(node["voice"]["enabled"], true);
+    assert!(node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
     assert_eq!(node["voice"]["max_bitrate_kbps"], 48);
     assert_eq!(node["voice"]["camera"]["enabled"], false);
 
@@ -454,7 +497,9 @@ async fn voice_disabled_by_the_node_is_503() {
     let ready = v.node.get("/readyz").await;
     assert_eq!(ready.status(), StatusCode::OK, "LiveKit is not required without voice");
     let wk = common::body_json(v.node.get("/.well-known/tavrn").await).await;
-    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice"));
+    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice" || c == "voice.whisper1"));
+    let node = common::body_json(v.node.get("/api/v1/node").await).await;
+    assert!(!node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
     assert_eq!(wk["policies"]["voice_enabled"], false);
 }
 
