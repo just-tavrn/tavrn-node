@@ -289,7 +289,7 @@ async fn join_returns_a_token_with_exactly_the_allowed_grants() {
 }
 
 #[tokio::test]
-async fn attribute_updates_need_priority_speaker_and_data_needs_the_soundboard() {
+async fn attribute_updates_need_priority_speaker_and_data_needs_speak_or_soundboard() {
     let v = setup().await;
     // `priority_speaker` is off for @everyone by default: no own attribute updates.
     let (s, j) = v.join(&v.bob).await;
@@ -297,13 +297,49 @@ async fn attribute_updates_need_priority_speaker_and_data_needs_the_soundboard()
     let c = claims(&v.node, j["token"].as_str().unwrap());
     assert_eq!(c.video.can_update_own_metadata, Some(false), "a client without the bit cannot set `priority`");
     assert_eq!(c.video.can_publish_data, Some(true), "use_soundboard is on for @everyone");
-    // Granted in the channel: the token allows the `priority` attribute; without the soundboard no data.
+    // Speak alone grants whisper signals, independent of the soundboard permission.
     v.override_everyone(&v.voice_id, &[p::PRIORITY_SPEAKER], &[p::USE_SOUNDBOARD]).await;
     let (_, j) = v.join(&v.bob).await;
     let c = claims(&v.node, j["token"].as_str().unwrap());
     assert_eq!(c.video.can_update_own_metadata, Some(true));
-    assert_eq!(c.video.can_publish_data, Some(false));
+    assert_eq!(c.video.can_publish_data, Some(true), "speak allows whisper without use_soundboard");
     assert!(!c.video.room_admin && !c.video.hidden, "nothing else widens");
+}
+
+#[tokio::test]
+async fn whisper_data_grants_follow_speak_server_mute_and_soundboard_compatibility() {
+    let v = setup().await;
+    let mute = v.path("members/bob@t.local/mute");
+    // Check actual signed join tokens across the permission matrix; neither path widens media grants.
+    for speak in [false, true] {
+        for soundboard in [false, true] {
+            let mut denied = vec![p::STREAM, p::USE_CAMERA];
+            if !speak {
+                denied.push(p::SPEAK);
+            }
+            if !soundboard {
+                denied.push(p::USE_SOUNDBOARD);
+            }
+            v.override_everyone(&v.voice_id, &[], &denied).await;
+            for server_muted in [false, true, false] {
+                let (status, body) = v.node.post(&mute, &v.alice.token, json!({ "muted": server_muted })).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let (status, joined) = v.join(&v.bob).await;
+                assert_eq!(status, StatusCode::OK, "{joined}");
+                let c = claims(&v.node, joined["token"].as_str().unwrap());
+                let microphone = speak && !server_muted;
+                assert_eq!(
+                    c.video.can_publish_data,
+                    Some(microphone || soundboard),
+                    "speak={speak}, soundboard={soundboard}, server_muted={server_muted}"
+                );
+                assert_eq!(c.video.can_publish, Some(microphone));
+                assert_eq!(c.video.can_publish_sources, if microphone { vec!["microphone"] } else { vec![] });
+                assert_eq!(c.video.can_update_own_metadata, Some(false));
+                assert!(!c.video.room_admin && !c.video.hidden);
+            }
+        }
+    }
 }
 
 #[tokio::test]

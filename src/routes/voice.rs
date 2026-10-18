@@ -87,7 +87,7 @@ fn sources(state: &AppState, vc: &VoiceChannel, server_muted: bool) -> Sources {
         microphone: vc.has(p::SPEAK) && !server_muted,
         camera: c.camera_enabled && vc.has(p::USE_CAMERA),
         screen: c.screenshare_enabled && vc.has(p::STREAM),
-        data: vc.has(p::USE_SOUNDBOARD),
+        data: (vc.has(p::SPEAK) && !server_muted) || vc.has(p::USE_SOUNDBOARD),
         priority: vc.has(p::PRIORITY_SPEAKER),
     }
 }
