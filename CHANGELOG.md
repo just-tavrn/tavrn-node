@@ -7,6 +7,9 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 ## Unreleased
 
+- Enforce voice whisper initiation permission (bit 41), authenticated bounded reply grants, and server-owned per-track SFU routing ACLs.
+
+
 - **Whisper signaling** (protocol VOICE.md §4c): unmuted participants with `speak` may send encrypted
   call-local data signals without `use_soundboard`. Nodes advertise `voice.whisper1` while voice is enabled. Server mute revokes this grant unless soundboard
   permission independently allows data; ordinary microphone, camera and screen permissions stay scoped.

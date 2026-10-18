@@ -343,6 +343,7 @@ pub async fn leave(
     let key = (room_id, channel_id);
     let device = voice::identity(&auth.user.address(), auth.public_device_id());
     let identity = if req.role == VoiceRole::Screen { voice::screen_identity(&device) } else { device };
+    voice::whisper::invalidate(&state, &key, &identity).await;
     let visible = state.voice.participants().remove(&key, &identity);
     // LiveKit's removal runs after the answer; a rejoin of this device waits for it (`voice::removal_settled`).
     voice::remove_from_livekit_later(&state, &key, &identity);
@@ -1421,4 +1422,55 @@ mod tests {
         assert_eq!(percent_decode("plain"), None);
         assert_eq!(percent_decode("bad%zz"), None);
     }
+}
+
+/// Either initiate to explicit devices or reply to the last server-confirmed received session.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WhisperRequest {
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    pub reply_to: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path)), request_body = WhisperRequest,
+    responses((status = 200, body = voice::whisper::WhisperSession), (status = 403, body = ProblemDetails)))]
+pub async fn whisper_start(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(key): Path<(String, String)>,
+    ApiJson(req): ApiJson<WhisperRequest>,
+) -> Result<Json<voice::whisper::WhisperSession>, ApiError> {
+    require_enabled(&state)?;
+    state.voice_limiter.check_all(&[format!("whisper:{}", auth.user.id)])?;
+    let sender = voice::identity(&auth.user.address(), auth.public_device_id());
+    Ok(Json(voice::whisper::start(&state, key, sender, req.recipients, req.reply_to).await?))
+}
+
+#[utoipa::path(post, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}/receive", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), ("id" = String, Path)),
+    responses((status = 200, body = voice::whisper::WhisperReceipt), (status = 403, body = ProblemDetails)))]
+pub async fn whisper_receive(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room, channel, id)): Path<(String, String, String)>,
+) -> Result<Json<voice::whisper::WhisperReceipt>, ApiError> {
+    require_enabled(&state)?;
+    state.voice_limiter.check_all(&[format!("whisper-receive:{}", auth.user.id)])?;
+    let recipient = voice::identity(&auth.user.address(), auth.public_device_id());
+    Ok(Json(voice::whisper::receive(&state, &(room, channel), &recipient, &id).await?))
+}
+
+#[utoipa::path(delete, path = "/api/v1/rooms/{room_id}/channels/{channel_id}/voice/whisper/{id}", security(("bearer" = [])),
+    params(("room_id" = String, Path), ("channel_id" = String, Path), ("id" = String, Path)),
+    responses((status = 204), (status = 403, body = ProblemDetails)))]
+pub async fn whisper_end(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((room, channel, id)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let sender = voice::identity(&auth.user.address(), auth.public_device_id());
+    voice::whisper::end(&state, &(room, channel), &sender, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

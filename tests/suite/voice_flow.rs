@@ -88,7 +88,7 @@ impl Voice {
 
     /// LiveKit reports `s` as connected.
     async fn connected(&self, s: &Session) {
-        let ev = json!({ "event": "participant_joined", "room": { "name": self.room_name() }, "participant": { "identity": self.identity(s), "state": "ACTIVE" } });
+        let ev = json!({ "event": "participant_joined", "room": { "name": self.room_name() }, "participant": { "identity": self.identity(s), "sid":tavrn_node::util::ulid(), "joined_at_ms":tavrn_node::cache::now_ms(), "state": "ACTIVE" } });
         let (st, j) = self.webhook(ev).await;
         assert_eq!(st, StatusCode::OK, "{j}");
     }
@@ -400,14 +400,14 @@ async fn node_policies_remove_sources_and_are_announced() {
     let caps: Vec<&str> = wk["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
     assert!(
         caps.contains(&"voice")
-            && caps.contains(&"voice.whisper1")
+            && caps.contains(&"voice.whisper2")
             && caps.contains(&"soundboard")
             && !caps.contains(&"screenshare"),
         "{caps:?}"
     );
     let node = common::body_json(v.node.get("/api/v1/node").await).await;
     assert_eq!(node["voice"]["enabled"], true);
-    assert!(node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
+    assert!(node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper2")));
     assert_eq!(node["voice"]["max_bitrate_kbps"], 48);
     assert_eq!(node["voice"]["camera"]["enabled"], false);
 
@@ -497,9 +497,9 @@ async fn voice_disabled_by_the_node_is_503() {
     let ready = v.node.get("/readyz").await;
     assert_eq!(ready.status(), StatusCode::OK, "LiveKit is not required without voice");
     let wk = common::body_json(v.node.get("/.well-known/tavrn").await).await;
-    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice" || c == "voice.whisper1"));
+    assert!(!wk["capabilities"].as_array().unwrap().iter().any(|c| c == "voice" || c == "voice.whisper2"));
     let node = common::body_json(v.node.get("/api/v1/node").await).await;
-    assert!(!node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper1")));
+    assert!(!node["capabilities"].as_array().unwrap().contains(&json!("voice.whisper2")));
     assert_eq!(wk["policies"]["voice_enabled"], false);
 }
 
@@ -1709,4 +1709,447 @@ async fn an_unreachable_livekit_is_logged_without_the_token() {
     let log = capture.text();
     assert!(log.contains("LiveKit unreachable"), "{log}");
     assert!(!log.contains(&token), "{log}");
+}
+
+#[tokio::test]
+async fn whisper_authorizations_require_permission_and_actual_received_publication() {
+    let v = setup().await;
+    for s in [&v.alice, &v.bob] {
+        assert_eq!(v.join(s).await.0, StatusCode::OK);
+        v.connected(s).await;
+    }
+    v.override_everyone(&v.voice_id, &[], &[p::WHISPER]).await;
+    let (status, _) = v.node.post(&v.path("whisper"), &v.bob.token, json!({"recipients":[v.identity(&v.alice)]})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "initiation denied by channel override");
+    let (status, _) = v.node.post(&v.path("whisper"), &v.bob.token, json!({"reply_to":tavrn_node::util::ulid()})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "forged reply id grants nothing");
+    // The owner may initiate; Bob cannot create a receipt until LiveKit confirms a real track.
+    let (status, session) =
+        v.node.post(&v.path("whisper"), &v.alice.token, json!({"recipients":[v.identity(&v.bob)]})).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let id = session["id"].as_str().unwrap();
+    let receive_path = v.path(&format!("whisper/{id}/receive"));
+    assert_eq!(v.node.post(&receive_path, &v.bob.token, json!({})).await.0, StatusCode::FORBIDDEN);
+    let event = json!({"event":"track_published","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.alice)},"track":{"sid":"TR_whisper","name":format!("whisper:{id}"),"source":"MICROPHONE","type":"AUDIO","encryption":"GCM"}});
+    assert_eq!(v.webhook(event).await.0, StatusCode::OK);
+    let (status, receipt) = v.node.post(&receive_path, &v.bob.token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert!(receipt.get("recipients").is_none(), "recipient privacy");
+    assert_eq!(receipt["expires_at"], session["expires_at"], "playback deadline is not the reply deadline");
+    assert_eq!(
+        v.node.post(&receive_path, &v.alice.token, json!({})).await.0,
+        StatusCode::FORBIDDEN,
+        "unselected device cannot mint receipt"
+    );
+    let record_key = format!("whisper:receipt:{}:{}:{}", v.room_id, v.voice_id, v.identity(&v.bob));
+    let original: Value = v.node.state.cluster.get_sealed(&record_key).await.unwrap().unwrap();
+    assert_eq!(v.node.post(&receive_path, &v.bob.token, json!({})).await.0, StatusCode::OK);
+    let refreshed: Value = v.node.state.cluster.get_sealed(&record_key).await.unwrap().unwrap();
+    assert_eq!(refreshed["deadline_ms"], original["deadline_ms"], "refresh cannot extend reply lifetime");
+    assert_eq!(v.node.delete(&v.path(&format!("whisper/{id}")), &v.alice.token).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        v.node.post(&receive_path, &v.bob.token, json!({})).await.0,
+        StatusCode::FORBIDDEN,
+        "ended grant cannot mint a new receipt"
+    );
+    let (status, reply) = v.node.post(&v.path("whisper"), &v.bob.token, json!({"reply_to":id})).await;
+    assert_eq!(status, StatusCode::OK, "actual reply allowed without initiation bit: {reply}");
+    assert_eq!(reply["recipients"], json!([v.identity(&v.alice)]));
+    assert_eq!(
+        v.node
+            .post(&v.path("whisper"), &v.bob.token, json!({"reply_to":id,"recipients":[v.identity(&v.alice)]}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "reply cannot select arbitrary targets"
+    );
+    let mut expired = original.clone();
+    expired["deadline_ms"] = json!(1);
+    v.node.state.cluster.put_sealed(&record_key, &expired, Duration::from_secs(120)).await.unwrap();
+    assert_eq!(
+        v.node.post(&v.path("whisper"), &v.bob.token, json!({"reply_to":id})).await.0,
+        StatusCode::FORBIDDEN,
+        "absolute receipt deadline applies despite cache lifetime"
+    );
+    v.node.state.cluster.put_sealed(&record_key, &original, Duration::from_secs(120)).await.unwrap();
+    // Revocation of speak still applies to replies and existing SFU authorization.
+    v.override_everyone(&v.voice_id, &[], &[p::WHISPER, p::SPEAK]).await;
+    assert_eq!(v.node.post(&v.path("whisper"), &v.bob.token, json!({"reply_to":id})).await.0, StatusCode::FORBIDDEN);
+    assert!(
+        voice::whisper::authorized(
+            &v.node.state,
+            &(v.room_id.clone(), v.voice_id.clone()),
+            &v.identity(&v.bob),
+            reply["id"].as_str().unwrap()
+        )
+        .await
+        .is_err()
+    );
+    v.override_everyone(&v.voice_id, &[], &[p::WHISPER]).await;
+    // Reconnecting the recipient invalidates its receipt, even with the same device identity.
+    v.webhook(
+        json!({"event":"participant_left","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob)}}),
+    )
+    .await;
+    v.connected(&v.bob).await;
+    assert_eq!(
+        v.node.post(&v.path("whisper"), &v.bob.token, json!({"reply_to":id})).await.0,
+        StatusCode::FORBIDDEN,
+        "stale connection receipt denied"
+    );
+    let wrong_channel = format!("/api/v1/rooms/{}/channels/{}/voice/whisper/{id}/receive", v.room_id, v.text_id);
+    assert_eq!(
+        v.node.post(&wrong_channel, &v.bob.token, json!({})).await.0,
+        StatusCode::FORBIDDEN,
+        "channel isolation"
+    );
+}
+
+/// Real node WebSocket proxy with a controlled SFU peer: proves the wire ACL transformation,
+/// including the renamed ordinary-microphone bypass and a camera published during whisper.
+#[tokio::test]
+async fn whisper_proxy_owns_private_acls_and_preserves_outsider_camera_access() {
+    use livekit_protocol as proto;
+    use prost::Message as _;
+    let sfu = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sfu_port = sfu.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_port = listener.local_addr().unwrap().port();
+    let v = setup_with(|c| c.livekit_port = sfu_port).await;
+    let (status, join) = v.join(&v.alice).await;
+    assert_eq!(status, StatusCode::OK);
+    v.connected(&v.alice).await;
+    v.join(&v.bob).await;
+    v.connected(&v.bob).await;
+    let router = v.node.router.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = sfu.accept().await.unwrap();
+        tx.send(tokio_tungstenite::accept_async(stream).await.unwrap()).ok();
+    });
+    let (mut client, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{node_port}/rtc?access_token={}",
+        join["token"].as_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    let mut upstream = rx.await.unwrap();
+    let bob = v.identity(&v.bob);
+    upstream
+        .send(Message::Binary(
+            proto::SignalResponse {
+                message: Some(proto::signal_response::Message::Join(proto::JoinResponse {
+                    participant: Some(proto::ParticipantInfo {
+                        identity: v.identity(&v.alice),
+                        tracks: vec![proto::TrackInfo {
+                            sid: "TR_main".into(),
+                            name: "microphone".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    other_participants: vec![
+                        proto::ParticipantInfo { identity: bob.clone(), ..Default::default() },
+                        proto::ParticipantInfo { identity: "carol/DEVICE".into(), ..Default::default() },
+                    ],
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let msg = upstream.next().await.unwrap().unwrap().into_data();
+    assert!(
+        matches!(proto::SignalRequest::decode(msg).unwrap().message,Some(proto::signal_request::Message::SubscriptionPermission(p)) if p.all_participants)
+    );
+    client.next().await.unwrap().unwrap();
+    // The fresh SFU connection establishes a new generation after the proxy invalidated the old one.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    v.connected(&v.alice).await;
+    // A hostile client cannot privately target its normal/renamed microphone.
+    client
+        .send(Message::Binary(
+            proto::SignalRequest {
+                message: Some(proto::signal_request::Message::SubscriptionPermission(proto::SubscriptionPermission {
+                    all_participants: false,
+                    track_permissions: vec![proto::TrackPermission {
+                        participant_identity: bob.clone(),
+                        all_tracks: true,
+                        ..Default::default()
+                    }],
+                })),
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let msg = upstream.next().await.unwrap().unwrap().into_data();
+    assert!(
+        matches!(proto::SignalRequest::decode(msg).unwrap().message,Some(proto::signal_request::Message::SubscriptionPermission(p)) if p.all_participants)
+    );
+    let (status, session) = v.node.post(&v.path("whisper"), &v.alice.token, json!({"recipients":[bob]})).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let name = format!("whisper:{}", session["id"].as_str().unwrap());
+    client
+        .send(Message::Binary(
+            proto::SignalRequest {
+                message: Some(proto::signal_request::Message::AddTrack(proto::AddTrackRequest {
+                    cid: "whisper-client".into(),
+                    name: name.clone(),
+                    source: proto::TrackSource::Microphone as i32,
+                    encryption: proto::encryption::Type::Gcm as i32,
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let msg = upstream.next().await.unwrap().unwrap().into_data();
+    let Some(proto::signal_request::Message::SubscriptionPermission(permission)) =
+        proto::SignalRequest::decode(msg).unwrap().message
+    else {
+        panic!("ACL must precede publication")
+    };
+    let outsider = permission.track_permissions.iter().find(|p| p.participant_identity == "carol/DEVICE").unwrap();
+    assert!(!outsider.all_tracks);
+    assert_eq!(outsider.track_sids, vec!["TR_main"]);
+    let msg = upstream.next().await.unwrap().unwrap().into_data();
+    assert!(matches!(
+        proto::SignalRequest::decode(msg).unwrap().message,
+        Some(proto::signal_request::Message::AddTrack(_))
+    ));
+    for (sid, track_name) in [("TR_whisper", name.as_str()), ("TR_camera", "camera")] {
+        upstream
+            .send(Message::Binary(
+                proto::SignalResponse {
+                    message: Some(proto::signal_response::Message::TrackPublished(proto::TrackPublishedResponse {
+                        cid: "test".into(),
+                        track: Some(proto::TrackInfo {
+                            sid: sid.into(),
+                            name: track_name.into(),
+                            ..Default::default()
+                        }),
+                    })),
+                }
+                .encode_to_vec()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let msg = upstream.next().await.unwrap().unwrap().into_data();
+        let Some(proto::signal_request::Message::SubscriptionPermission(permission)) =
+            proto::SignalRequest::decode(msg).unwrap().message
+        else {
+            panic!("expected updated ACL")
+        };
+        let outsider = permission.track_permissions.iter().find(|p| p.participant_identity == "carol/DEVICE").unwrap();
+        assert!(!outsider.all_tracks);
+        assert!(!outsider.track_sids.contains(&"TR_whisper".into()));
+        if sid == "TR_camera" {
+            assert!(outsider.track_sids.contains(&"TR_camera".into()));
+        }
+        client.next().await.unwrap().unwrap();
+    }
+    // Current permission revocation closes media signaling; removing the publisher follows.
+    v.override_everyone(&v.voice_id, &[], &[p::WHISPER]).await; // owner bypasses overrides
+    v.node
+        .state
+        .cluster
+        .cache()
+        .delete(&v.node.state.cluster.key(&format!("whisper:session:{}", session["id"].as_str().unwrap())))
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(3), client.next()).await.unwrap();
+    assert!(closed.is_none() || matches!(closed, Some(Ok(Message::Close(_)))));
+}
+
+#[tokio::test]
+async fn whisper_recipient_revocation_expiry_and_reordered_connection_events_fail_closed() {
+    let v = setup().await;
+    for s in [&v.alice, &v.bob] {
+        v.join(s).await;
+        v.connected(s).await;
+    }
+    let key = (v.room_id.clone(), v.voice_id.clone());
+    let connection_key =
+        v.node.state.cluster.key(&format!("whisper:connection:{}:{}:{}", v.room_id, v.voice_id, v.identity(&v.bob)));
+    let connection: Value = v
+        .node
+        .state
+        .cluster
+        .get_sealed(&format!("whisper:connection:{}:{}:{}", v.room_id, v.voice_id, v.identity(&v.bob)))
+        .await
+        .unwrap()
+        .unwrap();
+    // A new SFU connection supersedes the previous one. Delayed old departures and joins are ignored.
+    let timestamp = connection["joined_ms"].as_i64().unwrap() + 1;
+    let new_sid = tavrn_node::util::ulid();
+    v.webhook(json!({"event":"participant_joined","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob),"sid":new_sid,"joined_at_ms":timestamp}})).await;
+    v.webhook(json!({"event":"participant_left","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob),"sid":connection["sid"]}})).await;
+    v.webhook(json!({"event":"participant_joined","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob),"sid":connection["sid"],"joined_at_ms":connection["joined_ms"]}})).await;
+    let (status, session) =
+        v.node.post(&v.path("whisper"), &v.alice.token, json!({"recipients":[v.identity(&v.bob)]})).await;
+    assert_eq!(status, StatusCode::OK, "new connection survives delayed events: {session}");
+    let id = session["id"].as_str().unwrap();
+    assert!(
+        voice::whisper::authorized(&v.node.state, &(v.room_id.clone(), v.text_id.clone()), &v.identity(&v.alice), id)
+            .await
+            .is_err(),
+        "live session cannot cross channels"
+    );
+    assert!(
+        voice::whisper::authorized(
+            &v.node.state,
+            &(tavrn_node::util::ulid(), v.voice_id.clone()),
+            &v.identity(&v.alice),
+            id
+        )
+        .await
+        .is_err(),
+        "live session cannot cross rooms"
+    );
+    // Receiving does not require speak or whisper; loss of channel access does revoke it immediately.
+    v.override_everyone(&v.voice_id, &[], &[p::SPEAK, p::WHISPER]).await;
+    assert!(voice::whisper::authorized(&v.node.state, &key, &v.identity(&v.alice), id).await.is_ok());
+    v.override_everyone(&v.voice_id, &[], &[p::CONNECT]).await;
+    assert!(voice::whisper::authorized(&v.node.state, &key, &v.identity(&v.alice), id).await.is_err());
+    v.override_everyone(&v.voice_id, &[], &[]).await;
+    v.join(&v.bob).await;
+    v.connected(&v.bob).await;
+    let connection: Value = v
+        .node
+        .state
+        .cluster
+        .get_sealed(&format!("whisper:connection:{}:{}:{}", v.room_id, v.voice_id, v.identity(&v.bob)))
+        .await
+        .unwrap()
+        .unwrap();
+    let new_sid = connection["sid"].as_str().unwrap();
+    let timestamp = connection["joined_ms"].as_i64().unwrap();
+    let (status, session) =
+        v.node.post(&v.path("whisper"), &v.alice.token, json!({"recipients":[v.identity(&v.bob)]})).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let id = session["id"].as_str().unwrap();
+    assert!(voice::whisper::authorized(&v.node.state, &key, &v.identity(&v.alice), id).await.is_ok());
+    // Actual TTL expiration in the shared cache, without waiting 30 seconds.
+    let session_key = format!("whisper:session:{id}");
+    let stored: Value = v.node.state.cluster.get_sealed(&session_key).await.unwrap().unwrap();
+    v.node.state.cluster.put_sealed(&session_key, &stored, Duration::from_millis(1)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(voice::whisper::authorized(&v.node.state, &key, &v.identity(&v.alice), id).await.is_err());
+    assert_eq!(
+        v.node.post(&v.path(&format!("whisper/{id}/receive")), &v.bob.token, json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // A departure leaves a tombstone, so a duplicate delayed join cannot resurrect old reply rights.
+    v.webhook(json!({"event":"participant_left","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob),"sid":new_sid}})).await;
+    v.webhook(json!({"event":"participant_joined","room":{"name":v.room_name()},"participant":{"identity":v.identity(&v.bob),"sid":new_sid,"joined_at_ms":timestamp}})).await;
+    assert_eq!(
+        v.node.post(&v.path("whisper"), &v.alice.token, json!({"recipients":[v.identity(&v.bob)]})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(v.node.state.cluster.cache().get(&connection_key).await.unwrap().is_some(), "bounded tombstone remains");
+}
+
+#[tokio::test]
+async fn whisper_permission_migration_runs_once_and_preserves_later_owner_changes() {
+    let v = setup().await;
+    sqlx::query("UPDATE roles SET permissions = permissions - $1 WHERE (permissions & $1) <> 0")
+        .bind(p::WHISPER as i64)
+        .execute(&v.node.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM node_settings WHERE key = 'fixup.whisper'").execute(&v.node.state.db).await.unwrap();
+    let report = tavrn_node::fixups::run(&v.node.state.db).await.unwrap();
+    assert_eq!(report.whisper_roles, 1, "existing everyone with SPEAK receives independent initiation bit");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roles WHERE (permissions & $1) <> 0")
+        .bind(p::WHISPER as i64)
+        .fetch_one(&v.node.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    sqlx::query("UPDATE roles SET permissions = permissions - $1 WHERE (permissions & $1) <> 0")
+        .bind(p::WHISPER as i64)
+        .execute(&v.node.state.db)
+        .await
+        .unwrap();
+    assert_eq!(tavrn_node::fixups::run(&v.node.state.db).await.unwrap().whisper_roles, 0);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roles WHERE (permissions & $1) <> 0")
+        .bind(p::WHISPER as i64)
+        .fetch_one(&v.node.state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "restart cannot restore permission deliberately removed by owner");
+}
+
+#[tokio::test]
+async fn whisper_proxy_removes_a_resumed_track_instead_of_only_closing_signaling() {
+    use livekit_protocol as proto;
+    use prost::Message as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sfu = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sfu_port = sfu.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_port = listener.local_addr().unwrap().port();
+    let v = setup_with(|c| c.livekit_port = sfu_port).await;
+    let (_, join) = v.join(&v.alice).await;
+    let router = v.node.router.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    let (socket_tx, socket_rx) = tokio::sync::oneshot::channel();
+    let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = sfu.accept().await.unwrap();
+        socket_tx.send(tokio_tungstenite::accept_async(stream).await.unwrap()).ok();
+        // Removing the SFU participant is essential: closing signaling alone preserves reconnect media.
+        let (mut stream, _) = sfu.accept().await.unwrap();
+        let mut bytes = [0u8; 8192];
+        let n = stream.read(&mut bytes).await.unwrap();
+        removed_tx.send(String::from_utf8_lossy(&bytes[..n]).into_owned()).ok();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+    });
+    let (mut client, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{node_port}/rtc?access_token={}",
+        join["token"].as_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    let mut upstream = socket_rx.await.unwrap();
+    upstream
+        .send(Message::Binary(
+            proto::SignalResponse {
+                message: Some(proto::signal_response::Message::Join(proto::JoinResponse {
+                    participant: Some(proto::ParticipantInfo {
+                        identity: v.identity(&v.alice),
+                        tracks: vec![proto::TrackInfo {
+                            sid: "TR_stale".into(),
+                            name: format!("whisper:{}", tavrn_node::util::ulid()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(3), client.next()).await.unwrap();
+    assert!(closed.is_none() || matches!(closed, Some(Ok(Message::Close(_)))));
+    let request = tokio::time::timeout(Duration::from_secs(3), removed_rx).await.unwrap().unwrap();
+    assert!(
+        request.starts_with("POST /twirp/livekit.RoomService/RemoveParticipant "),
+        "resumed media must be removed from SFU"
+    );
 }

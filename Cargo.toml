@@ -105,6 +105,7 @@ tokio-tungstenite = "0.30"
 # LiveKit tokens, webhook verification and the room service (voice); HTTP to 127.0.0.1 only, no TLS.
 livekit-api = { version = "0.8", default-features = false, features = ["services", "webhooks", "access-token"] }
 livekit-protocol = "0.8"
+prost = "0.14"
 # Single sign-on (APPLICATIONS.md §8): JWK parsing and RS256/PS256/ES256/EdDSA verification of the identity
 # provider's ID tokens. Only the RustCrypto verifiers are used, called explicitly (never jsonwebtoken's
 # process-global provider, which livekit-token installs HMAC-only). The small OIDC code flow itself is
