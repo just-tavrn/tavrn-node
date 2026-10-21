@@ -7,6 +7,10 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 ## Unreleased
 
+- A whisper whose authorization fails mid-hold (a recipient left, was moved or lost access; revocation, expiry) is
+  hidden from every listener at once; the publisher has five seconds to unpublish it before it is removed from
+  LiveKit. Previously the sender was removed immediately and dropped out of voice whenever a recipient left
+  (tavrn-node#113).
 - Enforce voice whisper initiation permission (bit 41), authenticated connection-bound replies, and server-owned
   per-track SFU routing ACLs. Ordinary audio/camera remain public to authorized listeners; exact signed SFU track
   removal is confirmed before restoring normal voice. Preserve unrelated protobuf extension fields and existing
