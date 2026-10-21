@@ -1976,7 +1976,8 @@ async fn whisper_proxy_owns_private_acls_and_preserves_outsider_camera_access() 
         .delete(&v.node.state.cluster.key(&format!("whisper:session:{}", session["id"].as_str().unwrap())))
         .await
         .unwrap();
-    let msg = tokio::time::timeout(Duration::from_secs(3), upstream.next()).await.unwrap().unwrap().unwrap().into_data();
+    let msg =
+        tokio::time::timeout(Duration::from_secs(3), upstream.next()).await.unwrap().unwrap().unwrap().into_data();
     let Some(proto::signal_request::Message::SubscriptionPermission(revoked)) =
         proto::SignalRequest::decode(msg).unwrap().message
     else {
