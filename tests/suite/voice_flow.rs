@@ -1966,7 +1966,8 @@ async fn whisper_proxy_owns_private_acls_and_preserves_outsider_camera_access() 
         }
         client.next().await.unwrap().unwrap();
     }
-    // Current permission revocation closes media signaling; removing the publisher follows.
+    // Current permission revocation hides the whisper from everyone at once (ordinary tracks stay public) and
+    // leaves the publisher a grace period to unpublish; keeping the track published removes the publisher.
     v.override_everyone(&v.voice_id, &[], &[p::WHISPER]).await; // owner bypasses overrides
     v.node
         .state
@@ -1975,7 +1976,24 @@ async fn whisper_proxy_owns_private_acls_and_preserves_outsider_camera_access() 
         .delete(&v.node.state.cluster.key(&format!("whisper:session:{}", session["id"].as_str().unwrap())))
         .await
         .unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(3), client.next()).await.unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(3), upstream.next()).await.unwrap().unwrap().unwrap().into_data();
+    let Some(proto::signal_request::Message::SubscriptionPermission(revoked)) =
+        proto::SignalRequest::decode(msg).unwrap().message
+    else {
+        panic!("revocation must restrict subscriptions before anything else")
+    };
+    assert!(!revoked.all_participants);
+    assert!(!revoked.track_permissions.is_empty());
+    for permission in &revoked.track_permissions {
+        assert!(!permission.all_tracks, "{}", permission.participant_identity);
+        assert!(!permission.track_sids.contains(&"TR_whisper".into()), "{}", permission.participant_identity);
+        assert!(permission.track_sids.contains(&"TR_main".into()), "{}", permission.participant_identity);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), client.next()).await.is_err(),
+        "the publisher keeps its signaling during the grace period"
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(6), client.next()).await.unwrap();
     assert!(closed.is_none() || matches!(closed, Some(Ok(Message::Close(_)))));
 }
 

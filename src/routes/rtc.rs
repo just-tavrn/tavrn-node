@@ -266,6 +266,10 @@ async fn guarded_pump(
     identity: String,
 ) {
     let mut active: Option<(String, String)> = None; // authorization id, track SID (empty until acknowledged)
+    // An active whisper whose authorization failed (a recipient left, was moved or lost access): the SFU
+    // hides the whisper track from everyone at once, and the publisher gets a short grace period to
+    // unpublish it itself before the whole participant is removed (VOICE.md §4d).
+    let mut revoked: Option<tokio::time::Instant> = None;
     let mut must_remove = false;
     let mut acl = WhisperAcl::default();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -274,7 +278,7 @@ async fn guarded_pump(
             message = client.next() => {
                 let Some(Ok(mut message)) = message else { break };
                 match finished_whisper(&state, &mut active).await {
-                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(true) => { revoked = None; if upstream.send(acl.frame(None)).await.is_err() { break; } }
                     Ok(false) => {}
                     Err(_) => { must_remove = true; break; }
                 }
@@ -295,11 +299,8 @@ async fn guarded_pump(
                         Some(proto::signal_request::Message::SubscriptionPermission(_)) => {
                             // Ordinary tracks are public to every permitted listener. A renamed mic
                             // plus a private client ACL can never bypass initiation authorization.
-                            let session = if let Some((id, _)) = &active {
-                                let Ok(session) = voice::whisper::authorized(&state, &key, &identity, id).await else { break };
-                                Some(session)
-                            } else { None };
-                            request.message = Some(proto::signal_request::Message::SubscriptionPermission(acl.permissions(session.as_ref().map(|s| s.recipients.as_slice()))));
+                            let recipients = current_recipients(&state, &key, &identity, &active, &mut revoked).await;
+                            request.message = Some(proto::signal_request::Message::SubscriptionPermission(acl.permissions(recipients.as_deref())));
                             rewrite = true;
                         }
                         Some(proto::signal_request::Message::SyncState(sync)) => {
@@ -318,7 +319,7 @@ async fn guarded_pump(
             message = upstream.next() => {
                 let Some(Ok(message)) = message else { break };
                 match finished_whisper(&state, &mut active).await {
-                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(true) => { revoked = None; if upstream.send(acl.frame(None)).await.is_err() { break; } }
                     Ok(false) => {}
                     Err(_) => { must_remove = true; break; }
                 }
@@ -363,13 +364,10 @@ async fn guarded_pump(
                             _ => {}
                         }
                         if changed {
-                            let session = if let Some((id, _)) = &active {
-                                let Ok(session) = voice::whisper::authorized(&state, &key, &identity, id).await else { break };
-                                Some(session)
-                            } else { None };
+                            let recipients = current_recipients(&state, &key, &identity, &active, &mut revoked).await;
                             // A new ordinary camera/microphone is granted to outsiders by SID before
                             // forwarding publication ACK; unknown/new whisper SIDs stay deny-default.
-                            if upstream.send(acl.frame(session.as_ref().map(|s| s.recipients.as_slice()))).await.is_err() { break; }
+                            if upstream.send(acl.frame(recipients.as_deref())).await.is_err() { break; }
                         }
                 }
                 let Some(message) = to_axum(message) else { continue };
@@ -378,12 +376,19 @@ async fn guarded_pump(
             }
             _ = interval.tick(), if active.is_some() => {
                 match finished_whisper(&state, &mut active).await {
-                    Ok(true) => { if upstream.send(acl.frame(None)).await.is_err() { break; } }
+                    Ok(true) => { revoked = None; if upstream.send(acl.frame(None)).await.is_err() { break; } }
                     Ok(false) => {}
                     Err(_) => { must_remove = true; break; }
                 }
-                if let Some((id, _)) = &active
-                    && voice::whisper::authorized(&state, &key, &identity, id).await.is_err() { break; }
+                if let Some((id, _)) = &active && voice::whisper::authorized(&state, &key, &identity, id).await.is_err() {
+                    match revoked {
+                        // First failure: nobody may subscribe to the whisper track from now on.
+                        None => { revoked = Some(tokio::time::Instant::now()); if upstream.send(acl.frame(Some(&[]))).await.is_err() { break; } }
+                        // The publisher did not unpublish within the grace period: remove it.
+                        Some(since) if since.elapsed() >= REVOKE_GRACE => break,
+                        Some(_) => {}
+                    }
+                } else { revoked = None; }
             }
         }
     }
@@ -393,6 +398,31 @@ async fn guarded_pump(
     }
     let _ = client.close().await;
     let _ = upstream.close(None).await;
+}
+
+/// How long a publisher may keep a revoked whisper track published before the participant is removed.
+const REVOKE_GRACE: Duration = Duration::from_secs(5);
+
+/// The recipients the SFU may still route the active whisper to: the authorized set, or nobody once the
+/// authorization failed (`revoked` starts the grace period; `None` without an active whisper).
+async fn current_recipients(
+    state: &AppState,
+    key: &voice::state::ChannelKey,
+    identity: &str,
+    active: &Option<(String, String)>,
+    revoked: &mut Option<tokio::time::Instant>,
+) -> Option<Vec<String>> {
+    let (id, _) = active.as_ref()?;
+    match voice::whisper::authorized(state, key, identity, id).await {
+        Ok(session) => {
+            *revoked = None;
+            Some(session.recipients)
+        }
+        Err(_) => {
+            revoked.get_or_insert_with(tokio::time::Instant::now);
+            Some(Vec::new())
+        }
+    }
 }
 
 /// End confirmation is bound to the actual admitted SFU track, never just an absent grant.
@@ -475,5 +505,18 @@ mod whisper_acl_tests {
         acl.participants.insert("dave".into());
         let permission = acl.permissions(Some(&recipients));
         assert!(!permission.track_permissions.iter().find(|p| p.participant_identity == "dave").unwrap().all_tracks);
+    }
+    #[test]
+    fn revoked_whisper_keeps_ordinary_tracks_public_and_hides_the_whisper_from_everyone() {
+        let mut acl = WhisperAcl::default();
+        acl.participants.extend(["bob".into(), "carol".into()]);
+        acl.ordinary.insert("TR_microphone".into());
+        let permission = acl.permissions(Some(&[]));
+        assert!(!permission.all_participants);
+        assert_eq!(permission.track_permissions.len(), 2);
+        for p in &permission.track_permissions {
+            assert!(!p.all_tracks);
+            assert_eq!(p.track_sids, vec!["TR_microphone"]);
+        }
     }
 }
