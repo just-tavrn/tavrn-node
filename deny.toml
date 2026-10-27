@@ -57,10 +57,17 @@ ignore = [
     # proc-macro-error2 is unmaintained: a build-time macro crate via tavrn-crypto -> openmls_rust_crypto ->
     # hpke-rs -> libcrux, not part of the binary's runtime code.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate deep in the OpenMLS stack" },
+    # Owner-approved temporary exception, tracked in https://github.com/just-tavrn/tavrn-crypto/issues/24.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only: elliptic-curve 0.13 <- p256/p384/k256/ecdsa 0.13 <- openmls_rust_crypto 0.6 / hpke-rs-rust-crypto 0.7, and jsonwebtoken 11 (verify only); tavrn uses only MLS suite 0x0001 (X25519/Ed25519), NIST curves only verify public data; tracking https://github.com/just-tavrn/tavrn-crypto/issues/24; expires 2026-12-26" },
 ]
 
 [bans]
 multiple-versions = "warn"
+# The advisory ignore above matches RUSTSEC-2026-0387 for every version; it is meant for crypto-bigint 0.5.5
+# only, so the affected 0.7 releases stay banned.
+deny = [
+    { crate = "crypto-bigint:>=0.6.0, <0.7.6", reason = "RUSTSEC-2026-0387: affected versions; the advisory ignore (tavrn-crypto#24) is meant for 0.5.5 only" },
+]
 
 [sources]
 unknown-registry = "deny"
