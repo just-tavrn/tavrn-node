@@ -103,7 +103,9 @@ zeroize = { version = "1", features = ["serde"] }
 # side on tungstenite 0.29, so both are in the tree until axum moves; the two never exchange types (rtc.rs converts).
 tokio-tungstenite = "0.30"
 # LiveKit tokens, webhook verification and the room service (voice); HTTP to 127.0.0.1 only, no TLS.
-livekit-api = { version = "0.8", default-features = false, features = ["services", "webhooks", "access-token"] }
+# livekit-api 0.8.2 does not build against livekit-protocol >= 0.8.1 (new SipInboundTrunkInfo field), so the two
+# move together. livekit-api 0.9 brings reqwest 0.13 next to the node's 0.12; they share hyper and rustls.
+livekit-api = { version = "0.9", default-features = false, features = ["services", "webhooks", "access-token"] }
 livekit-protocol = "0.8"
 prost = "0.14"
 # Single sign-on (APPLICATIONS.md §8): JWK parsing and RS256/PS256/ES256/EdDSA verification of the identity
