@@ -29,3 +29,6 @@ jobs:
           allow-licenses: >-
             MIT, MIT-0, 0BSD, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC,
             MPL-2.0, Zlib, Unicode-3.0, Unicode-DFS-2016, CC0-1.0, BSL-1.0, Unlicense, CDLA-Permissive-2.0
+          # Swatinem/rust-cache (LGPL-3.0) only runs in CI (perf.yml) and is never part of the node or its image; the
+          # action compares type and name of these package URLs, not the version, so every release of it is excepted.
+          allow-dependencies-licenses: pkg:githubactions/Swatinem/rust-cache
