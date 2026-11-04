@@ -68,7 +68,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 # Legal pages: the admin's Markdown is rendered once at publish time; raw HTML is escaped.
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 # Decodes animated WebP uploads for the media pipeline (ffmpeg cannot decode them); pure Rust, small.
 image-webp = "0.2"
 serde.workspace = true
