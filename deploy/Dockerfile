@@ -31,7 +31,7 @@ ARG TAVRN_WEB_SOURCE=git
 
 # ---- Web client from the tavrn-web repository ------------------------------------
 # The bundle is the same for every architecture: built once, on the build machine.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web-git
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
