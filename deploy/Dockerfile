@@ -31,7 +31,7 @@ ARG TAVRN_WEB_SOURCE=git
 
 # ---- Web client from the tavrn-web repository ------------------------------------
 # The bundle is the same for every architecture: built once, on the build machine.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS web-git
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -158,7 +158,7 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
 # (`just ffmpeg-install` and ci.yml take BtbN's dated build of that release); bump them together.
 # Runs on the build machine; for another target architecture libwebp and ffmpeg are cross-compiled with Debian's
 # cross gcc against the target's zlib (dpkg multiarch), and the result is checked with `file` instead of being run.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS ffmpeg
 ARG BUILDARCH
 ARG TARGETARCH
 ARG FFMPEG_VERSION=8.1.3
@@ -226,7 +226,7 @@ FROM livekit/livekit-server:v1.13.9@sha256:d0c04791bf63ca8dcea123571827d56ba9504
 
 # ---- Runtime image ---------------------------------------------------------
 # The only stage of the target architecture that runs commands (emulated in a cross build): keep it small.
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data tavrn && mkdir -p /data && chown tavrn:tavrn /data
