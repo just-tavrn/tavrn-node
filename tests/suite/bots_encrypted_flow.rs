@@ -525,13 +525,12 @@ async fn command_approval_state_is_for_local_node_admins_only() {
 /// Sends a commit and drops the request once the node stored it (the client went away: a tab closed or navigated right
 /// after committing, as the e2e test does after switching bots off). "Stored" is seen as the commit's `mls.commit`
 /// event: the request future is polled by hand, and between polls the hub is read (the database stays untouched, the
-/// paused request may hold the test pool's connection). Returns false when the request had finished first.
-async fn post_commit_and_disconnect(
-    node: &TestNode,
-    token: &str,
-    channel: &str,
-    out: &tavrn_crypto::CommitOutput,
-) -> bool {
+/// paused request may hold the test pool's connection).
+///
+/// The node runs what follows the store as a task of its own, which the runtime may drive to its end (and so finish
+/// the request) before this test looks at the hub again: then the finished answer is dropped unread. Were that work
+/// part of the request again, it would advance only while the request is polled here, and the drop always came first.
+async fn post_commit_and_disconnect(node: &TestNode, token: &str, channel: &str, out: &tavrn_crypto::CommitOutput) {
     use axum::body::Body;
     use axum::http::{Method, Request, header};
     use std::{future::Future, task::Poll};
@@ -548,15 +547,14 @@ async fn post_commit_and_disconnect(
     let mut call = Box::pin(node.router.clone().oneshot(request));
     for _ in 0..1_000_000 {
         let done = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx).is_ready())).await;
-        if done {
-            return false;
-        }
+        // The hub before the result: the event may have come out together with the end of the request.
         while let Ok(ev) = rx.try_recv() {
             if ev.kind == "mls.commit" && ev.data["conversation_id"] == channel {
                 drop(call);
-                return true;
+                return;
             }
         }
+        assert!(!done, "the request ended without storing the commit");
         tokio::task::yield_now().await;
     }
     unreachable!("the commit was never stored")
@@ -590,10 +588,7 @@ async fn the_security_log_entry_follows_a_stored_commit_even_when_the_client_wen
     patch_channel(&node, carol.token(), &room_id, &channel, json!({ "bots_allowed": false })).await;
     node.catch_up(&mut carol, &channel).await;
     let out = carol.client.remove_members(&qualified(&channel), std::slice::from_ref(&bot_identity)).unwrap();
-    assert!(
-        post_commit_and_disconnect(&node, carol.token(), &channel, &out).await,
-        "the request was cut after the store"
-    );
+    post_commit_and_disconnect(&node, carol.token(), &channel, &out).await;
     // What follows the stored commit still happens: the security log entry and the cleared pending removal.
     let mut removed = Vec::new();
     for _ in 0..50 {
