@@ -135,8 +135,9 @@ jobs:
             --notes-file "$notes" --generate-notes --verify-tag "${prerelease[@]}"
 
   # Production rollout is GitOps in the private just-tavrn/tavrn-internal: prod/node.version selects the release
-  # (NODE_TAG + NODE_DIGEST), and merging the change to its main deploys app.tavrn.org (deploy-prod.yml there; the
-  # server deploys only a digest whose build provenance attestation names this workflow and a v* tag). This job
+  # (NODE_TAG + NODE_DIGEST). After a merge to its main the production server (app.tavrn.org) picks up the new
+  # selection within minutes on its own (pull; it deploys only a digest whose build provenance attestation names this
+  # workflow and a v* tag) and reports the result as the commit status prod/deploy. This job
   # opens that pull request, never merges it, and only for an attested release: a skipped attestation (private
   # repository) gives no pull request. The cross-repository work uses a token limited to tavrn-internal (contents and
   # pull requests write): the GitHub App vars.TAVRN_INTERNAL_APP_ID + secrets.TAVRN_INTERNAL_APP_KEY if configured,
@@ -267,7 +268,7 @@ jobs:
             echo "gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node@${DIGEST} --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml --source-ref refs/tags/${tag}"
             echo '```'
             echo
-            echo "**Merging deploys to app.tavrn.org.** Opened by the release workflow of ${GITHUB_REPOSITORY}; it is never merged automatically."
+            echo "**Merging deploys to app.tavrn.org** within a few minutes; see the \`prod/deploy\` commit status. Opened by the release workflow of ${GITHUB_REPOSITORY}; it is never merged automatically."
           } > "$body"
           title="prod: deploy tavrn-node ${tag}"
           pr="$(gh pr list --repo "$INTERNAL_REPO" --head "$branch" --base "$base" --state open --json number --jq '.[0].number // empty')"

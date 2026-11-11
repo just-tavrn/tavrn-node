@@ -79,8 +79,10 @@ request (just-tavrn/.github `docs/GITHUB.md` "Reusable workflows in release path
 ## Production version pull request
 
 Production (app.tavrn.org) is rolled out through the private repository `just-tavrn/tavrn-internal`:
-`prod/node.version` there selects the release, and merging a change to its `main` deploys it. The deploy accepts only
-a digest whose build provenance attestation names this repository, `.github/workflows/release.yml` and a `v*` tag.
+`prod/node.version` there selects the release. After a merge to its `main`, the production server picks up the new
+selection within minutes on its own (pull, not push) and reports the result as the commit status `prod/deploy`. It
+deploys only a digest whose build provenance attestation names this repository, `.github/workflows/release.yml` and a
+`v*` tag.
 
 After the GitHub release of a tag, the job `prod-version-pr` of `release.yml` prepares that change:
 
@@ -92,7 +94,7 @@ After the GitHub release of a tag, the job `prod-version-pr` of `release.yml` pr
 - it sets `NODE_TAG=<tag>` and `NODE_DIGEST=<manifest list digest>` in `prod/node.version` (comments are kept) on the
   branch `prod/node-<version>`, committed as `github-actions[bot]`, and opens the pull request
   "prod: deploy tavrn-node <tag>" against `main` with the digest, the links to the release run and the GitHub
-  release and the `gh attestation verify` command. It never merges: merging deploys;
+  release and the `gh attestation verify` command. It never merges: merging deploys (within minutes, see the `prod/deploy` commit status);
 - running it again is safe: an existing branch gets a new commit on top (never rewritten) only when its file differs,
   an open pull request of the branch is updated, and when `main` already selects this tag and digest nothing happens.
 
