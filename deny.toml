@@ -50,10 +50,12 @@ allow = ["CDLA-Permissive-2.0"]
 yanked = "deny"
 # Accepted until upstream moves (docs/LICENSES.md, section 2). Review on every dependency update.
 ignore = [
-    # rsa 0.9 (Marvin timing attack) via jsonwebtoken and livekit-api: no fixed version exists. The node uses
-    # RSA only to verify ID-token signatures of SSO providers with their public keys; the timing side channel
-    # concerns private-key operations, which never happen here.
-    { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification with public keys only; no fix upstream" },
+    # rsa (Marvin timing attack), fixed in 0.10.0 but not yet reachable: rsa 0.9.10 via jsonwebtoken 11 (no
+    # jsonwebtoken release on rsa 0.10), and rsa 0.10.0-rc.19 via crypto-glue 0.2.2 <- webauthn-rs 0.6 (the
+    # advisory counts the pre-releases as affected; crypto-glue requests rsa's `sha2` feature, which 0.10.0
+    # dropped). The node uses RSA only to verify signatures with public keys: SSO ID tokens and RS256 passkey
+    # assertions. The timing side channel concerns private-key operations, which never happen here.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 (jsonwebtoken 11) and 0.10.0-rc.19 (crypto-glue <- webauthn-rs 0.6) used for signature verification with public keys only; the fixed rsa 0.10.0 is not reachable from either yet" },
     # proc-macro-error2 is unmaintained: a build-time macro crate via tavrn-crypto -> openmls_rust_crypto ->
     # hpke-rs -> libcrux, not part of the binary's runtime code.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate deep in the OpenMLS stack" },

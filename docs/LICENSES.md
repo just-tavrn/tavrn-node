@@ -51,9 +51,10 @@ Crate-specific exceptions in `deny.toml`:
 Audit result: `cargo deny check licenses`: **licenses ok**.
 
 Advisories: `cargo deny check advisories` reports two advisories that predate this audit; both are accepted
-as `ignore` entries in `deny.toml` until upstream moves: RUSTSEC-2023-0071 (`rsa` 0.9, Marvin timing attack, via `jsonwebtoken`
-and `livekit-api`; no fixed version exists; the node uses RSA only to verify ID-token signatures of SSO
-providers with public keys, where the timing side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
+as `ignore` entries in `deny.toml` until upstream moves: RUSTSEC-2023-0071 (`rsa`, Marvin timing attack: 0.9.10 via `jsonwebtoken`
+and 0.10.0-rc.19 via `crypto-glue` ← `webauthn-rs` 0.6; the fixed 0.10.0 is reachable from neither yet; the node
+uses RSA only to verify signatures with public keys, SSO ID tokens and RS256 passkey assertions, where the timing
+side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
 `openmls_rust_crypto` → `hpke-rs` → `libcrux`). Temporary, owner-approved exceptions carry an expiry date in
 their `deny.toml` reason; among them RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1 via `sqlx-sqlite` 0.8.6, SQLite before
 3.54 can return uninitialized memory for a crafted database/`-wal` pair; SQLite is only the `--dev` and test
