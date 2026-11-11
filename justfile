@@ -61,7 +61,7 @@ test-pg: protocol
 # Start the PostgreSQL and Valkey test containers of `just test-pg` (throwaway data: fsync off)
 test-services:
     docker start tavrn-test-pg 2>/dev/null || docker run -d --name tavrn-test-pg --shm-size=1g -e POSTGRES_USER=tavrn -e POSTGRES_PASSWORD=tavrn -e POSTGRES_DB=tavrn_test -p 55432:5432 postgres:17-alpine -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=600
-    docker start tavrn-test-valkey 2>/dev/null || docker run -d --name tavrn-test-valkey -p 56379:6379 valkey/valkey:8
+    docker start tavrn-test-valkey 2>/dev/null || docker run -d --name tavrn-test-valkey -p 56379:6379 valkey/valkey:9
 
 # Drop the throwaway per-test databases (t_*) left behind by earlier runs (run only when no tests are running)
 test-pg-clean:
