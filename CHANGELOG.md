@@ -7,6 +7,25 @@ tags `vX.Y.Z` of this repository; the image tags follow them (`X.Y.Z`, `X.Y`, `l
 
 ## Unreleased
 
+- **Security fixes** (0.4.0-rc.15):
+  - **Encryption:** tavrn-crypto 0.1.1 with OpenMLS 0.9.2. Removed members can no longer reappear after an external
+    commit regrows the ratchet tree ([GHSA-94v4-rg25-x625](https://github.com/openmls/openmls/security/advisories/GHSA-94v4-rg25-x625)),
+    and a rejected message no longer advances the sender's ratchet
+    ([GHSA-p276-g3f3-wwgh](https://github.com/openmls/openmls/security/advisories/GHSA-p276-g3f3-wwgh)). It also
+    includes ctutils 0.4.8 ([RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385)).
+  - **Runtime:** tokio 1.54 ([RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)) and
+    crypto-bigint 0.7.10 for web push (RUSTSEC-2026-0387; crypto-bigint 0.5.5 stays excepted until 2026-12-26,
+    [tavrn-crypto#24](https://github.com/just-tavrn/tavrn-crypto/issues/24)).
+  - **Legal pages:** pulldown-cmark 0.13.6 ([RUSTSEC-2026-0414](https://rustsec.org/advisories/RUSTSEC-2026-0414),
+    [RUSTSEC-2026-0433](https://rustsec.org/advisories/RUSTSEC-2026-0433)).
+  - **The image ships the web client 0.4.0-rc.15** with the same OpenMLS fixes.
+- **Passkeys:** webauthn-rs 0.6.2. Verification uses RustCrypto, and the node no longer links OpenSSL. Passkeys
+  stored by earlier versions (ES256, RS256) keep working.
+- **Temporary RustSec exceptions with an expiry:**
+  - RUSTSEC-2026-0459: libsqlite3-sys via sqlx; SQLite backs only `--dev` and the tests. Expires 2027-02-11 (#127).
+  - RUSTSEC-2023-0071: rsa, used only to verify signatures with public keys. Expires 2027-02-11 (#128).
+- **Image build:** the ffmpeg and libwebp downloads retry transient failures. The checksum check is unchanged.
+
 - A whisper whose authorization fails mid-hold (a recipient left, was moved or lost access; revocation, expiry) is
   hidden from every listener at once; the publisher has five seconds to unpublish it before it is removed from
   LiveKit. Previously the sender was removed immediately and dropped out of voice whenever a recipient left
