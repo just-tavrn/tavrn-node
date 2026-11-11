@@ -8,7 +8,7 @@ what is configured in the repository and what has to be set by hand.
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `ci.yml` | push to `main`, pull requests, by hand | the organization's `rust-ci.yml` (`cargo deny` bans, licenses and sources, `cargo fmt`, `cargo clippy` of the node and the load generator, `cargo test` on PostgreSQL with livekit-server, ffmpeg and a Valkey for the cluster tests, incl. the protocol test vectors and the comparison with `protocol/openapi.json`, then `cargo test` again on SQLite); SPDX headers, `scripts/check-tool-pins.sh`, `scripts/publish-check.sh`, the perf report tests, the shared scripts against their source; a newer push cancels the run of a pull request, never one on `main`; on pushes to `main` (and manual runs on `main`) the image is built on `ubuntu-latest` (never on the self-hosted runners) and published as `ghcr.io/just-tavrn/tavrn-node:edge` (what tavrn-web's end-to-end suite pulls by default); the web client inside it is the current commit of tavrn-web `main` (or `vars.TAVRN_WEB_REF`), resolved before the build so the build cache never serves a stale bundle |
-| `release.yml` | tag `v*.*.*` | checks the tag against `Cargo.toml` and that `TAVRN_WEB_REF` is a tavrn-web release tag (a branch fails the release), builds the image GitHub-hosted and without any cache from that tag's commit (the organization's `docker-publish.yml`, pinned by commit: BuildKit's SLSA provenance and SBOM) and pushes `ghcr.io/just-tavrn/tavrn-node:<version>`, `:<major>.<minor>`, `:latest` and `:sha-…`, records GitHub's build provenance attestation of the digest, then creates the GitHub release with the digest |
+| `release.yml` | tag `v*.*.*` | checks the tag against `Cargo.toml` and that `TAVRN_WEB_REF` is a tavrn-web release tag (a branch fails the release), builds the image GitHub-hosted and without any cache from that tag's commit (the organization's `docker-publish.yml`, pinned by commit: BuildKit's SLSA provenance and SBOM) and pushes `ghcr.io/just-tavrn/tavrn-node:<version>`, `:<major>.<minor>`, `:latest` and `:sha-…`, records GitHub's build provenance attestation of the digest, then creates the GitHub release with the digest; for an attested release it opens the production version pull request in `just-tavrn/tavrn-internal` ("Production version pull request") |
 | `advisories.yml` | daily, pull requests that change `Cargo.lock` or `deny.toml`, by hand | the organization's `rust-advisories.yml`: `cargo deny check advisories`; a scheduled failure opens the issue "RustSec advisories" |
 | `perf.yml` | nightly, by hand | release builds, the load generator against a release node with PostgreSQL, the budget report (`perf/README.md`) |
 | `gitleaks.yml` | push to `main`, pull requests, by hand | the organization's `gitleaks.yml`: secret scan of the full history (`.gitleaks.toml`) |
@@ -30,6 +30,9 @@ Every job carries `if: ${{ vars.CI_ENABLED == 'true' }}`.
 | `PUBLISH_CHECK_PRIVATE` | secret | Comma-separated private domains, hosts and addresses that `scripts/publish-check.sh` refuses (the same strings as the owner's local `.publish-check.private`). |
 | Dependabot secrets | secret (Dependabot) | Dependabot pull requests run with Dependabot's own secret store: add `TAVRN_READ_PAT` and `PUBLISH_CHECK_PRIVATE` again under Settings → Secrets and variables → Dependabot (or as organization Dependabot secrets), otherwise their CI fails at the private git dependencies, and the hygiene check skips its private-pattern step with a warning (the workflow sets `PUBLISH_CHECK_ALLOW_UNCONFIGURED=1` for Dependabot's pull requests only; the push to `main` runs the full check). |
 | `CLA_PAT` | organization secret | the CLA bot's token (`contents: write` on `just-tavrn/cla-signatures`). Organization secrets do not reach private repositories on the free plan: until the repository is public, add it as a repository secret as well. |
+| `TAVRN_INTERNAL_APP_ID` | variable | Optional, preferred: client ID (or numeric App ID) of a GitHub App installed on `just-tavrn/tavrn-internal` only, with repository permissions Contents: read and write and Pull requests: read and write. Used with `TAVRN_INTERNAL_APP_KEY` by `release.yml` for the production version pull request. |
+| `TAVRN_INTERNAL_APP_KEY` | secret | The private key (PEM) of that GitHub App. |
+| `TAVRN_INTERNAL_PR_TOKEN` | secret | Fallback when the App is not configured: fine-grained PAT, resource owner `just-tavrn`, repository access only `tavrn-internal`, Contents: read and write, Pull requests: read and write (Metadata: read is implied). Without the App and this token, releases go on and print a notice instead of the pull request. |
 
 The image is pushed with the job's `GITHUB_TOKEN` (`packages: write`); no registry secret is needed. After the
 first push, set the package `tavrn-node` (organization → Packages) to inherit access from this repository,
@@ -72,6 +75,31 @@ ghcr.io/just-tavrn/tavrn-node:<version>@sha256:…`) to run exactly what you ver
 
 `release.yml` calls the organization's `docker-publish.yml` by commit, not `@main`; bumping it is a reviewed pull
 request (just-tavrn/.github `docs/GITHUB.md` "Reusable workflows in release paths").
+
+## Production version pull request
+
+Production (app.tavrn.org) is rolled out through the private repository `just-tavrn/tavrn-internal`:
+`prod/node.version` there selects the release, and merging a change to its `main` deploys it. The deploy accepts only
+a digest whose build provenance attestation names this repository, `.github/workflows/release.yml` and a `v*` tag.
+
+After the GitHub release of a tag, the job `prod-version-pr` of `release.yml` prepares that change:
+
+- it runs only when the attestation job succeeded (no pull request while attestations are skipped);
+- it takes a token for `tavrn-internal` from the GitHub App (`TAVRN_INTERNAL_APP_ID` + `TAVRN_INTERNAL_APP_KEY`,
+  a short-lived installation token limited to that repository, revoked at the end of the job) or, without it, from
+  `TAVRN_INTERNAL_PR_TOKEN`; the job's own `GITHUB_TOKEN` stays `contents: read`. With neither, the job prints a
+  notice and succeeds;
+- it sets `NODE_TAG=<tag>` and `NODE_DIGEST=<manifest list digest>` in `prod/node.version` (comments are kept) on the
+  branch `prod/node-<version>`, committed as `github-actions[bot]`, and opens the pull request
+  "prod: deploy tavrn-node <tag>" against `main` with the digest, the links to the release run and the GitHub
+  release and the `gh attestation verify` command. It never merges: merging deploys;
+- running it again is safe: an existing branch gets a new commit on top (never rewritten) only when its file differs,
+  an open pull request of the branch is updated, and when `main` already selects this tag and digest nothing happens.
+
+The token is never written to disk or a URL: git reads it from the environment through a credential helper, and the
+clone lives in a temporary directory of the job. A configured App or token that fails (expired, missing permission)
+turns this job red after the release was created; the release itself is complete, and the pull request can be
+opened by hand or by re-running the job.
 
 ## Settings applied through the API
 

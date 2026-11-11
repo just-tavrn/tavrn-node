@@ -133,3 +133,148 @@ jobs:
           [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
             --notes-file "$notes" --generate-notes --verify-tag "${prerelease[@]}"
+
+  # Production rollout is GitOps in the private just-tavrn/tavrn-internal: prod/node.version selects the release
+  # (NODE_TAG + NODE_DIGEST), and merging the change to its main deploys app.tavrn.org (deploy-prod.yml there; the
+  # server deploys only a digest whose build provenance attestation names this workflow and a v* tag). This job
+  # opens that pull request, never merges it, and only for an attested release: a skipped attestation (private
+  # repository) gives no pull request. The cross-repository work uses a token limited to tavrn-internal (contents and
+  # pull requests write): the GitHub App vars.TAVRN_INTERNAL_APP_ID + secrets.TAVRN_INTERNAL_APP_KEY if configured,
+  # otherwise secrets.TAVRN_INTERNAL_PR_TOKEN. Without either, a notice and no pull request; the release stays green.
+  # Idempotent: an existing branch prod/node-<version> and its open pull request are updated, and nothing happens
+  # when tavrn-internal's main already selects this tag and digest (docs/GITHUB.md "Production version pull request").
+  prod-version-pr:
+    name: Production version pull request
+    needs: [image, attest, release]
+    if: ${{ vars.CI_ENABLED == 'true' && startsWith(github.ref, 'refs/tags/v') && needs.image.result == 'success' && needs.attest.result == 'success' && needs.release.result == 'success' && needs.image.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      USE_APP: ${{ vars.TAVRN_INTERNAL_APP_ID != '' && secrets.TAVRN_INTERNAL_APP_KEY != '' }}
+    steps:
+      - name: Token of the tavrn-internal GitHub App
+        id: app
+        if: ${{ env.USE_APP == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # The App's client ID (or its numeric App ID; the action accepts both).
+          client-id: ${{ vars.TAVRN_INTERNAL_APP_ID }}
+          private-key: ${{ secrets.TAVRN_INTERNAL_APP_KEY }}
+          owner: just-tavrn
+          repositories: tavrn-internal
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open or update the pull request in tavrn-internal
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.TAVRN_INTERNAL_PR_TOKEN }}
+          TOKEN_SOURCE: ${{ steps.app.outputs.token && 'GitHub App' || 'TAVRN_INTERNAL_PR_TOKEN' }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          INTERNAL_REPO: just-tavrn/tavrn-internal
+          INTERNAL_URL: https://github.com/just-tavrn/tavrn-internal.git
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice title=No production version pull request::Neither the GitHub App (vars.TAVRN_INTERNAL_APP_ID + secrets.TAVRN_INTERNAL_APP_KEY) nor secrets.TAVRN_INTERNAL_PR_TOKEN is configured, so no pull request for prod/node.version in ${INTERNAL_REPO} was opened. Open it by hand (NODE_TAG=${GITHUB_REF_NAME}, NODE_DIGEST=${DIGEST}) or configure a token (docs/GITHUB.md)."
+            exit 0
+          fi
+          tag="$GITHUB_REF_NAME"
+          if ! [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "::error::tag $tag is not a release version prod/node.version accepts"; exit 1
+          fi
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::image digest '$DIGEST' is not sha256:<64 hex>"; exit 1
+          fi
+          version="${tag#v}"
+          branch="prod/node-${version}"
+          file="prod/node.version"
+          echo "Using the token of: $TOKEN_SOURCE"
+
+          # git authenticates through a credential helper that reads GH_TOKEN from the environment: the token is
+          # never on a command line, in a URL or in a config file, and the clone is deleted at the end.
+          export GIT_CONFIG_COUNT=2 GIT_TERMINAL_PROMPT=0
+          export GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
+          export GIT_CONFIG_KEY_1=credential.helper
+          # shellcheck disable=SC2016 # expanded by git's shell when the helper runs, not here
+          export GIT_CONFIG_VALUE_1='!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          git clone --quiet --no-tags "$INTERNAL_URL" "$work/repo"
+          cd "$work/repo"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          base="$(git symbolic-ref --short refs/remotes/origin/HEAD)"
+          base="${base#origin/}"
+
+          # The selection in a file: NODE_TAG and NODE_DIGEST of its non-comment lines.
+          selected() { if [ -f "$2" ]; then sed -n "s/^$1=//p" "$2" | tail -n 1; fi; }
+          if [ "$(selected NODE_TAG "$file")" = "$tag" ] && [ "$(selected NODE_DIGEST "$file")" = "$DIGEST" ]; then
+            echo "::notice title=No production version pull request::${INTERNAL_REPO} ${base} already selects ${tag} (${DIGEST})."
+            exit 0
+          fi
+          main_tag="$(selected NODE_TAG "$file")"
+
+          # Continue an existing branch (never rewritten), otherwise start from the default branch.
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+            git fetch --quiet origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            git switch --quiet -c "$branch" "origin/$branch"
+          else
+            git switch --quiet -c "$branch"
+          fi
+
+          # Replace the two selection lines and keep every comment; a missing file gets just the two lines.
+          new="$(mktemp)"
+          if [ -f "$file" ]; then
+            awk -v t="$tag" -v d="$DIGEST" '
+              /^NODE_TAG=/ { if (!st) print "NODE_TAG=" t; st = 1; next }
+              /^NODE_DIGEST=/ { if (!sd) print "NODE_DIGEST=" d; sd = 1; next }
+              { print }
+              END { if (!st) print "NODE_TAG=" t; if (!sd) print "NODE_DIGEST=" d }
+            ' "$file" > "$new"
+          else
+            mkdir -p "$(dirname "$file")"
+            printf 'NODE_TAG=%s\nNODE_DIGEST=%s\n' "$tag" "$DIGEST" > "$new"
+          fi
+          if [ "$(grep -cvE '^[[:space:]]*(#|$)' "$new")" != 2 ]; then
+            echo "::error::${file} would not have exactly the two lines NODE_TAG and NODE_DIGEST; fix it in ${INTERNAL_REPO} by hand"
+            exit 1
+          fi
+          mv "$new" "$file"
+          git add "$file"
+          if git diff --cached --quiet; then
+            echo "Branch $branch already selects ${tag} (${DIGEST})."
+          else
+            git commit --quiet -m "prod: deploy tavrn-node ${tag}" \
+              -m "NODE_TAG=${tag}" -m "NODE_DIGEST=${DIGEST}" \
+              -m "Release run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            git push --quiet origin "HEAD:refs/heads/$branch"
+            echo "Pushed $branch."
+          fi
+
+          body="$(mktemp)"
+          {
+            echo "Selects the tavrn-node release \`${tag}\` for production."
+            echo
+            echo "- Tag: \`${tag}\`"
+            echo "- Image: \`ghcr.io/just-tavrn/tavrn-node@${DIGEST}\` (manifest list for linux/amd64 and linux/arm64)"
+            echo "- Release run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- GitHub release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
+            if [ -n "$main_tag" ]; then echo "- Currently selected on \`${base}\`: \`${main_tag}\`"; fi
+            echo
+            echo "Verify the build provenance:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://ghcr.io/just-tavrn/tavrn-node@${DIGEST} --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml --source-ref refs/tags/${tag}"
+            echo '```'
+            echo
+            echo "**Merging deploys to app.tavrn.org.** Opened by the release workflow of ${GITHUB_REPOSITORY}; it is never merged automatically."
+          } > "$body"
+          title="prod: deploy tavrn-node ${tag}"
+          pr="$(gh pr list --repo "$INTERNAL_REPO" --head "$branch" --base "$base" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --repo "$INTERNAL_REPO" --title "$title" --body-file "$body" >/dev/null
+            echo "Updated ${INTERNAL_REPO}#${pr}."
+          else
+            url="$(gh pr create --repo "$INTERNAL_REPO" --base "$base" --head "$branch" --title "$title" --body-file "$body")"
+            echo "Opened $url"
+          fi
