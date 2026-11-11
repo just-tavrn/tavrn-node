@@ -87,24 +87,57 @@ impl Authenticator {
     }
 }
 
-/// A synced P-256 passkey (backup eligible and backed up) with a fixed private key, signing assertions by hand: it
-/// plays the authenticator of a credential that an older node stored, whose `Passkey` JSON a test inserts directly.
+/// A synced passkey (backup eligible and backed up) with a known private key that signs assertions by hand: it plays
+/// the authenticator of a credential an older node stored, whose `Passkey` JSON a test inserts directly.
 pub struct FixedKey {
-    signing: p256::ecdsa::SigningKey,
+    signer: FixedSigner,
     pub cred_id: Vec<u8>,
     counter: u32,
 }
 
+enum FixedSigner {
+    /// ES256 (COSE -7).
+    P256(p256::ecdsa::SigningKey),
+    /// RS256 (COSE -257, RSASSA-PKCS1-v1_5 with SHA-256), e.g. Windows Hello.
+    Rsa(openssl::pkey::PKey<openssl::pkey::Private>),
+}
+
 impl FixedKey {
-    pub fn new(scalar: [u8; 32], cred_id: &[u8]) -> Self {
+    /// An ES256 key from its private scalar.
+    pub fn p256(scalar: [u8; 32], cred_id: &[u8]) -> Self {
         let secret = p256::SecretKey::from_slice(&scalar).unwrap();
-        Self { signing: p256::ecdsa::SigningKey::from(secret), cred_id: cred_id.to_vec(), counter: 0 }
+        Self::with(FixedSigner::P256(p256::ecdsa::SigningKey::from(secret)), cred_id)
+    }
+
+    /// An RS256 key from its PKCS#8 DER (base64).
+    pub fn rsa(pkcs8_base64: &str, cred_id: &[u8]) -> Self {
+        use base64::Engine;
+        let der = base64::engine::general_purpose::STANDARD.decode(pkcs8_base64).unwrap();
+        Self::with(FixedSigner::Rsa(openssl::pkey::PKey::private_key_from_pkcs8(&der).unwrap()), cred_id)
+    }
+
+    fn with(signer: FixedSigner, cred_id: &[u8]) -> Self {
+        Self { signer, cred_id: cred_id.to_vec(), counter: 0 }
+    }
+
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        match &self.signer {
+            FixedSigner::P256(key) => {
+                use p256::ecdsa::{Signature, signature::Signer};
+                let signature: Signature = key.sign(data);
+                signature.to_der().as_bytes().to_vec()
+            }
+            FixedSigner::Rsa(key) => {
+                let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), key).unwrap();
+                signer.update(data).unwrap();
+                signer.sign_to_vec().unwrap()
+            }
+        }
     }
 
     /// `navigator.credentials.get()` with the node's `options` on [`ORIGIN`]: user presence and verification, the
     /// next signature counter, and `user_handle` for a discoverable login.
     pub fn authenticate(&mut self, options: &Value, user_handle: Option<&[u8]>) -> Value {
-        use p256::ecdsa::{Signature, signature::Signer};
         use sha2::{Digest, Sha256};
         let b64 = tavrn_crypto::util::b64url_encode;
         let pk = &options["publicKey"];
@@ -118,12 +151,12 @@ impl FixedKey {
         .unwrap();
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&Sha256::digest(&client_data));
-        let signature: Signature = self.signing.sign(&signed);
+        let signature = self.sign(&signed);
         json!({
             "id": b64(&self.cred_id), "rawId": b64(&self.cred_id), "type": "public-key",
             "response": {
                 "authenticatorData": b64(&auth_data), "clientDataJSON": b64(&client_data),
-                "signature": b64(signature.to_der().as_bytes()), "userHandle": user_handle.map(b64),
+                "signature": b64(&signature), "userHandle": user_handle.map(b64),
             },
             "clientExtensionResults": {},
         })

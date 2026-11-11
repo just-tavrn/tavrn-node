@@ -32,3 +32,7 @@ regexes = ['''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyfWPiYE''']
 description = "The example Sec-WebSocket-Key of RFC 6455 section 1.3 (raw handshake test in tests/suite/ws_flow.rs)"
 regexTarget = "secret"
 regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+
+[[allowlists]]
+description = "Throwaway RSA-2048 key of the WebAuthn RS256 compatibility test (tests/suite/second_factor_flow.rs); it protects nothing"
+regexes = ['''AoIBAQDh2yc/inqEQo0GqaSajNaM35kj''']

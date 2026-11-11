@@ -812,10 +812,14 @@ async fn passkeys_of_an_app_origin_count_only_where_the_node_accepts_it() {
     assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("webauthn.registration_failed")), "{j}");
 }
 
-/// A passkey as tavrn-node up to 0.4.0-rc.14 stored it: `serde_json::to_string(&Passkey)` of webauthn-rs 0.5.5's
-/// `finish_passkey_registration`, fed a "none" attestation (UP, UV, BE, BS) of the P-256 key of [`legacy_key`] for
-/// the relying party `t.local` (generated once with webauthn-rs 0.5.5; the JSON is kept verbatim).
-const PASSKEY_WEBAUTHN_RS_0_5: &str = concat!(
+// Passkeys as tavrn-node up to 0.4.0-rc.14 stored them: `serde_json::to_string(&Passkey)` of webauthn-rs 0.5.5's
+// `finish_passkey_registration`, fed a "none" attestation (UP, UV, BE, BS) for the relying party `t.local` (generated
+// once with webauthn-rs 0.5.5; the JSON is kept verbatim). With the builder defaults the node uses (`build_webauthn`),
+// 0.5.5 registers exactly ES256 and RS256 (`COSEAlgorithm::secure_algs`; the builder has no setter for it), so both
+// are covered.
+
+/// ES256: the P-256 key of [`es256_key`].
+const ES256_PASSKEY_0_5: &str = concat!(
     r#"{"cred":{"cred_id":"wMHCw8TFxsfIycrLzM3Ozw","cred":{"type_":"ES256","key":{"EC_EC2":{"curve":"SECP25"#,
     r#"6R1","x":"TGM247iz3ncbYTocehc0g0zWnBpPX_7LJAxjvA3bFXQ","y":"9olsXRTKROADd5HCMAMzJZpxuQHlJYV10QfluKxI"#,
     r#"tCQ"}}},"counter":0,"transports":null,"user_verified":true,"backup_eligible":true,"backup_state":tru"#,
@@ -824,26 +828,73 @@ const PASSKEY_WEBAUTHN_RS_0_5: &str = concat!(
     r#"ne"},"attestation_format":"none"}}"#,
 );
 
-/// The authenticator of [`PASSKEY_WEBAUTHN_RS_0_5`]: private scalar 0x11..=0x30, credential id 0xc0..=0xcf.
-fn legacy_key() -> FixedKey {
-    FixedKey::new(std::array::from_fn(|i| 0x11 + i as u8), &std::array::from_fn::<u8, 16, _>(|i| 0xc0 + i as u8))
+/// The authenticator of [`ES256_PASSKEY_0_5`]: private scalar 0x11..=0x30, credential id 0xc0..=0xcf.
+fn es256_key() -> FixedKey {
+    FixedKey::p256(std::array::from_fn(|i| 0x11 + i as u8), &std::array::from_fn::<u8, 16, _>(|i| 0xc0 + i as u8))
+}
+
+/// RS256 (Windows Hello registers RSA-2048 keys): the key of [`rs256_key`].
+const RS256_PASSKEY_0_5: &str = concat!(
+    r#"{"cred":{"cred_id":"0NHS09TV1tfY2drb3N3e3w","cred":{"type_":"RS256","key":{"RSA":{"n":"4dsnP4p6hEKNB"#,
+    r#"qmkmozWjN-ZI-Jnapv7n_CppUuNf5KhJwRdeNBCuITXVLVcUsJSNtQMxIypve22zB4-jAoV2TbxqrSDRoMNkhOEEoH_8qeiQyJE3"#,
+    r#"zWKWZwnXjJ4LY8wf-yLHLQR6jNIkTa7rJNlpxIQMx1hB12tTBtuxV4HdU9p2jUHSpbnPYa_JsfPXR2Mwf1O_dGpVHBVmpvXk5ocq"#,
+    r#"Abs_gV-IjqQ7mqRWqPvh02wiDqpb0ethnACSHU9V4Or_PBYNR1TYl9f0KNDrKiSzyZcwQFngKfc8SzdZzQvxLpW7gnKoQQq6xtFN"#,
+    r#"85dgky1PwOQCCaNWkHqVyIAE3mh-w","e":[1,0,1]}}},"counter":0,"transports":null,"user_verified":true,"ba"#,
+    r#"ckup_eligible":true,"backup_state":true,"registration_policy":"required","extensions":{"cred_protect"#,
+    r#"":"Ignored","hmac_create_secret":"NotRequested","appid":"NotRequested","cred_props":"Ignored"},"atte"#,
+    r#"station":{"data":"None","metadata":"None"},"attestation_format":"none"}}"#,
+);
+
+/// Throwaway RSA-2048 test key (PKCS#8 DER, base64) of [`RS256_PASSKEY_0_5`]; it protects nothing.
+const RS256_TEST_PKCS8: &str = concat!(
+    r#"MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDh2yc/inqEQo0GqaSajNaM35kj4mdqm/uf8KmlS41/kqEnBF14"#,
+    r#"0EK4hNdUtVxSwlI21AzEjKm97bbMHj6MChXZNvGqtINGgw2SE4QSgf/yp6JDIkTfNYpZnCdeMngtjzB/7IsctBHqM0iRNrusk2Wn"#,
+    r#"EhAzHWEHXa1MG27FXgd1T2naNQdKluc9hr8mx89dHYzB/U790alUcFWam9eTmhyoBuz+BX4iOpDuapFao++HTbCIOqlvR62GcAJI"#,
+    r#"dT1Xg6v88Fg1HVNiX1/Qo0OsqJLPJlzBAWeAp9zxLN1nNC/EulbuCcqhBCrrG0U3zl2CTLU/A5AIJo1aQepXIgATeaH7AgMBAAEC"#,
+    r#"ggEAEtlk6acneXFKbsNqsuFNKJ2inL2Q7vNMqTj/F4X6Larxmx2ApYwP/XFMvUuThG6mSOAinqa0pd64ckmV478Vuracraf6CsD2"#,
+    r#"OXo6fAbwcvJtlte90rkXrknbeT+SCw9Xt11o8MDQe/DCvifIuurkQXC+/F0X03MMev0RHhSuX6pUXj0GM4OqqgKssbxkqASc9vsv"#,
+    r#"W+66iBEMEBh3p7whY+pewbilWxNyiR1LkK6ljeJ6qeHqiDx53CPK4QlbuSFcui+AZfODoNSdpBU6b+1z+Q+62yrYOibfG/c82ggE"#,
+    r#"dm4EFS4NibBnKGU2fDMhv+7w8BLgUTnvA8zVjG/ImBqkSQKBgQD31NwZOBGHKRlX/6mDqxgvKX/qgazou/POe0dTrUJMUJkCZbPT"#,
+    r#"aETrqA0f9YfsV7TMZd/+b4mAhyl638ITrePyiBJn5w2WPEP52mzJh0P3YHqtbyWxtOVoadfi57QrBu/rbTQ+3IBUVc5/+IEzGQZ+"#,
+    r#"MI/5bLrmQDQATuq1QlWDMwKBgQDpTN7XiK+5ufv2H3YtWLRS03sDT+6fv4SkdmLTaXovrmGBR4nCVELwWOJiWSQNRVwozbobfNov"#,
+    r#"HxKHFt+jhRytVO9qm88G97Y7CEMjDtyMtiHlDoUUOacz1A1yEn9RFTM3PH4UozdLuOC0DO8LDH9wsjUh0uVnmY7qdsz5JcDmGQKB"#,
+    r#"gQDnCaFGQWbVwhLGXqkA/nfFP8LoM4umS9G2JGcSMusjid+axIUoCIR3zGqv6I2WXw1Fn5N59zEQiPC6g+7BudJPP1spUdTwwa39"#,
+    r#"NwtDtL4/18mF9aAGUsWq2UFRXwAvPIBd0ahrEdTwyi2AT4Lix+mtqkgOFrcF/8R6pRdZc0WU0QKBgQDLmNsMS2vXcFhTZQdz8WqE"#,
+    r#"sawzqsj7Pl7aS7pY9z67Z7oN4Ul2fqRgLaF65IIS1snjjg3xORcLcllv7OVERcFN/sZlSg307a5pe/9jE/AjGDsiM3atvNaO42rM"#,
+    r#"dxoGv7KPbMo25m02NuRaHMNr5/87cTnvB6ZNr/PJ591fPLRH2QKBgQDhQ+iR1VjsK2Q0cirdUnPmOOGbj4eZ937ZBZIn/oyRJz1B"#,
+    r#"NwKA6HdH1eloMIbMvrkwaMh3qTiX5+Gko8Fb3dFVunTq92kPdXJgexu0C63vsN+0H2ESV0pEVmD2EmqCPFu0CoUqR1ZQVCUdBVlu"#,
+    r#"A7hKcXNFMYZJaqpvnfjWfAvCJw=="#,
+);
+
+/// The authenticator of [`RS256_PASSKEY_0_5`]: credential id 0xd0..=0xdf.
+fn rs256_key() -> FixedKey {
+    FixedKey::rsa(RS256_TEST_PKCS8, &std::array::from_fn::<u8, 16, _>(|i| 0xd0 + i as u8))
 }
 
 #[tokio::test]
-async fn passkeys_stored_by_webauthn_rs_0_5_keep_working() {
+async fn es256_passkeys_stored_by_webauthn_rs_0_5_keep_working() {
+    passkey_stored_by_webauthn_rs_0_5_keeps_working(ES256_PASSKEY_0_5, es256_key(), "ES256").await;
+}
+
+#[tokio::test]
+async fn rs256_passkeys_stored_by_webauthn_rs_0_5_keep_working() {
+    passkey_stored_by_webauthn_rs_0_5_keeps_working(RS256_PASSKEY_0_5, rs256_key(), "RS256").await;
+}
+
+async fn passkey_stored_by_webauthn_rs_0_5_keeps_working(stored_json: &str, mut key: FixedKey, alg: &str) {
     use tavrn_node::{
         second_factor::MAX_CREDENTIALS,
         store::factors::{self, InsertCredential, NewCredential},
     };
     let node = test_node("t.local").await;
     let alice = node.register("alice").await;
-    let mut key = legacy_key();
+    assert_eq!(serde_json::from_str::<Value>(stored_json).unwrap()["cred"]["cred"]["type_"], alg);
     let cred_id = tavrn_crypto::util::b64url_encode(&key.cred_id);
     let row = NewCredential {
         credential_id: &cred_id,
         user_id: &alice.user_id,
         name: "Old phone",
-        passkey: PASSKEY_WEBAUTHN_RS_0_5,
+        passkey: stored_json,
         prf_supported: false,
     };
     let stored = factors::insert_credential(&node.state.db, row, MAX_CREDENTIALS).await.unwrap();
