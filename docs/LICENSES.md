@@ -50,11 +50,23 @@ Crate-specific exceptions in `deny.toml`:
 
 Audit result: `cargo deny check licenses`: **licenses ok**.
 
-Advisories: `cargo deny check advisories` reports two advisories that predate this audit; both are accepted
-as `ignore` entries in `deny.toml` until upstream moves: RUSTSEC-2023-0071 (`rsa` 0.9, Marvin timing attack, via `jsonwebtoken`
-and `livekit-api`; no fixed version exists; the node uses RSA only to verify ID-token signatures of SSO
-providers with public keys, where the timing side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
-`openmls_rust_crypto` → `hpke-rs` → `libcrux`).
+Advisories: `cargo deny check advisories` reports advisories that are accepted as `ignore` entries in
+`deny.toml`. Permanent until upstream moves: RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time
+macro crate via `openmls_rust_crypto` → `hpke-rs` → `libcrux`). Temporary, owner-approved exceptions carry an
+expiry date in their `deny.toml` reason, after which the Advisories check fails:
+
+- RUSTSEC-2023-0071 (`rsa`, Marvin timing attack; owner-approved 2026-11-11, tracking
+  [tavrn-node#128](https://github.com/just-tavrn/tavrn-node/issues/128), expires 2027-02-11): 0.9.10 via
+  `jsonwebtoken` 11 and 0.10.0-rc.19 via `crypto-glue` ← `webauthn-rs` 0.6; the fixed 0.10.0 is reachable from
+  neither yet. The node uses RSA only to verify signatures with public keys (SSO ID tokens, RS256 passkey
+  assertions), where the timing side channel on private-key operations does not apply. cargo-deny cannot scope
+  an advisory ignore to one crate version, so the entry covers both paths and expires as a whole.
+- RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5, tracking
+  [tavrn-crypto#24](https://github.com/just-tavrn/tavrn-crypto/issues/24), expires 2026-12-26).
+- RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1 via `sqlx-sqlite` 0.8.6, SQLite before 3.54 can return uninitialized
+  memory for a crafted database/`-wal` pair; SQLite is only the `--dev` and test database, production refuses it;
+  tracking [tavrn-node#127](https://github.com/just-tavrn/tavrn-node/issues/127), until an `sqlx` release allows
+  `libsqlite3-sys` 0.39, expires 2027-02-11).
 
 `cargo audit` scans every entry of `Cargo.lock` rather than the build graph and additionally reports
 RUSTSEC-2026-0330 and RUSTSEC-2026-0331 (`libcrux-kem` 0.0.9). That crate is a lockfile entry only and is never
@@ -87,10 +99,9 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `lettre` | 0.11.23 | MIT | runtime |
 | `livekit-api` | 0.8.2 | Apache-2.0 | runtime |
 | `livekit-protocol` | 0.8.0 | Apache-2.0 | runtime |
-| `log` | 0.4.34 | MIT OR Apache-2.0 | runtime |
+| `log` | 0.4.35 | MIT OR Apache-2.0 | runtime |
 | `mime_guess` | 2.0.5 | MIT | runtime |
 | `nix` | 0.31.3 | MIT | runtime (unix) |
-| `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | runtime |
 | `rand` | 0.10.3 | MIT OR Apache-2.0 | runtime |
 | `reqwest` | 0.12.28 | MIT OR Apache-2.0 | runtime |
 | `rust-embed` | 8.13.0 | MIT | runtime |
@@ -99,7 +110,7 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `sha2` | 0.11.0 | MIT OR Apache-2.0 | runtime |
 | `sqlx` | 0.8.6 | MIT OR Apache-2.0 | runtime |
 | `subtle` | 2.6.1 | BSD-3-Clause | runtime |
-| `tavrn-crypto` | 0.1.0 | MPL-2.0 | runtime ([crates.io](https://crates.io/crates/tavrn-crypto), [tavrn-crypto](https://github.com/just-tavrn/tavrn-crypto)) |
+| `tavrn-crypto` | 0.1.1 | MPL-2.0 | runtime ([crates.io](https://crates.io/crates/tavrn-crypto), [tavrn-crypto](https://github.com/just-tavrn/tavrn-crypto)) |
 | `thiserror` | 2.0.21 | MIT OR Apache-2.0 | runtime |
 | `tokio` | 1.53.2 | MIT | runtime |
 | `tokio-tungstenite` | 0.29.0 | MIT | runtime |
@@ -110,12 +121,13 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `ulid` | 3.0.0 | MIT | runtime |
 | `unicode-normalization` | 0.1.25 | MIT OR Apache-2.0 | runtime |
 | `utoipa` | 5.5.0 | MIT OR Apache-2.0 | runtime |
-| `webauthn-rs` | 0.5.5 | MPL-2.0 | runtime |
+| `webauthn-rs` | 0.6.2 | MPL-2.0 | runtime |
 | `zeroize` | 1.9.1 | Apache-2.0 OR MIT | runtime |
 | `http-body-util` | 0.1.5 | MIT | dev |
+| `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | dev |
 | `tempfile` | 3.27.0 | MIT OR Apache-2.0 | dev |
 | `tower` | 0.5.3 | MIT | dev |
-| `webauthn-authenticator-rs` | 0.5.5 | MPL-2.0 | dev |
+| `webauthn-authenticator-rs` | 0.6.2 | MPL-2.0 | dev |
 
 Notable transitive licenses of `tavrn-crypto` (210 crates): `hpke-rs`, `hpke-rs-crypto`,
 `hpke-rs-libcrux`, `hpke-rs-rust-crypto` (MPL-2.0, via OpenMLS), `bitcoin_hashes`, `hex-conservative`

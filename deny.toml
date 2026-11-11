@@ -50,15 +50,26 @@ allow = ["CDLA-Permissive-2.0"]
 yanked = "deny"
 # Accepted until upstream moves (docs/LICENSES.md, section 2). Review on every dependency update.
 ignore = [
-    # rsa 0.9 (Marvin timing attack) via jsonwebtoken and livekit-api: no fixed version exists. The node uses
-    # RSA only to verify ID-token signatures of SSO providers with their public keys; the timing side channel
-    # concerns private-key operations, which never happen here.
-    { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification with public keys only; no fix upstream" },
+    # Owner-approved temporary exception (2026-11-11), tracked in https://github.com/just-tavrn/tavrn-node/issues/128.
+    # rsa (Marvin timing attack) is fixed in 0.10.0, which neither path reaches yet: rsa 0.9.10 via jsonwebtoken 11
+    # (no jsonwebtoken release on rsa 0.10), and rsa 0.10.0-rc.19 via crypto-glue 0.2.2 <- webauthn-rs 0.6 (the
+    # advisory counts the pre-releases as affected; crypto-glue requests rsa's `sha2` feature, which 0.10.0
+    # dropped). cargo-deny cannot scope an advisory ignore to one crate version, so the one entry covers both and
+    # expires as a whole. The node uses RSA only to verify signatures with public keys (SSO ID tokens, RS256
+    # passkey assertions); the timing side channel concerns private-key operations, which never happen here.
+    { id = "RUSTSEC-2023-0071", reason = "owner-approved 2026-11-11: rsa 0.9.10 via jsonwebtoken 11 and rsa 0.10.0-rc.19 via crypto-glue 0.2.2 <- webauthn-rs 0.6, both used only to verify signatures with public keys (SSO ID tokens, RS256 passkey assertions); the fixed rsa 0.10.0 is not reachable from either yet; tracking https://github.com/just-tavrn/tavrn-node/issues/128; expires 2027-02-11" },
     # proc-macro-error2 is unmaintained: a build-time macro crate via tavrn-crypto -> openmls_rust_crypto ->
     # hpke-rs -> libcrux, not part of the binary's runtime code.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate deep in the OpenMLS stack" },
     # Owner-approved temporary exception, tracked in https://github.com/just-tavrn/tavrn-crypto/issues/24.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only: elliptic-curve 0.13 <- p256/p384/k256/ecdsa 0.13 <- openmls_rust_crypto 0.6 / hpke-rs-rust-crypto 0.7, and jsonwebtoken 11 (verify only); tavrn uses only MLS suite 0x0001 (X25519/Ed25519), NIST curves only verify public data; tracking https://github.com/just-tavrn/tavrn-crypto/issues/24; expires 2026-12-26" },
+    # Owner-approved temporary exception (2026-11-11), tracked in https://github.com/just-tavrn/tavrn-node/issues/127.
+    # The bundled SQLite (< 3.54) of libsqlite3-sys 0.30.1 via sqlx-sqlite 0.8.6 can return uninitialized page-cache
+    # memory when it opens a crafted database/-wal pair. The fix (libsqlite3-sys >= 0.39) needs an sqlx release beyond
+    # 0.9.0, which caps it at < 0.38.
+    # SQLite only backs `--dev` and the tests: Config::validate refuses a sqlite: URL without --dev, production
+    # (deploy/docker-compose.yml) runs PostgreSQL, and the node opens only files it created itself.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 via sqlx-sqlite 0.8.6: SQLite is only the --dev and test database (Config::validate refuses sqlite: outside --dev; production is PostgreSQL) and opens only files the node created; no sqlx release allows libsqlite3-sys >= 0.39 yet (sqlx 0.9.0: < 0.38); tracking https://github.com/just-tavrn/tavrn-node/issues/127; expires 2027-02-11" },
 ]
 
 [bans]

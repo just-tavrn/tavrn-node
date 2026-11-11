@@ -17,7 +17,7 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tavrn-crypto = "0.1.0"
+tavrn-crypto = "0.1.1"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
@@ -91,11 +91,10 @@ tavrn-crypto.workspace = true
 # utoipa stays on 5: 6 omits the (required) empty response descriptions and reorders `oneOf` with null, which
 # changes protocol/openapi.json, the protocol's source of truth.
 utoipa = { version = "5", features = ["axum_extras"] }
-# Second factor: TOTP (RFC 6238) and WebAuthn. webauthn-rs needs OpenSSL; it is
-# vendored (built from source) so neither developers nor the image need system OpenSSL headers.
+# Second factor: TOTP (RFC 6238) and WebAuthn. webauthn-rs 0.6 verifies with the RustCrypto stack (crypto-glue)
+# instead of OpenSSL and reads the passkeys 0.5 stored (tests/suite/second_factor_flow.rs).
 totp-rs = { version = "6", features = ["otpauth"] }
-webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
-openssl = { version = "0.10", features = ["vendored"] }
+webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 aes-gcm = "0.11"
 hkdf = "0.13"
 zeroize = { version = "1", features = ["serde"] }
@@ -136,7 +135,10 @@ http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 # Software passkey that plays the browser/authenticator in the WebAuthn tests.
-webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "0.6.2", features = ["softpasskey"] }
+# Test keys and certificates (ID tokens of the SSO tests, TLS of the federation client tests); vendored (built from
+# source) so developers need no system OpenSSL headers. The node itself does not link OpenSSL.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [lints]
 workspace = true

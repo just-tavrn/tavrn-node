@@ -31,7 +31,7 @@ ARG TAVRN_WEB_SOURCE=git
 
 # ---- Web client from the tavrn-web repository ------------------------------------
 # The bundle is the same for every architecture: built once, on the build machine.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS web-git
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -88,8 +88,8 @@ COPY perf/loadgen perf/loadgen
 RUN cargo chef prepare --recipe-path recipe.json
 
 # For another target architecture the server stage installs Debian's cross gcc and the Rust target and writes
-# /cross.env (cargo's target, linker and the C compiler of the -sys crates: ring, the bundled SQLite, the vendored
-# OpenSSL); for the host's own architecture there is no /cross.env and cargo builds natively.
+# /cross.env (cargo's target, linker and the C compiler of the -sys crates: ring, the bundled SQLite); for the host's
+# own architecture there is no /cross.env and cargo builds natively.
 FROM chef AS server
 ARG BUILDARCH
 ARG TARGETARCH
@@ -158,7 +158,7 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
 # (`just ffmpeg-install` and ci.yml take BtbN's dated build of that release); bump them together.
 # Runs on the build machine; for another target architecture libwebp and ffmpeg are cross-compiled with Debian's
 # cross gcc against the target's zlib (dpkg multiarch), and the result is checked with `file` instead of being run.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS ffmpeg
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS ffmpeg
 ARG BUILDARCH
 ARG TARGETARCH
 ARG FFMPEG_VERSION=8.1.3
@@ -188,14 +188,17 @@ RUN set -eu; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+# Downloads retry transient network and TLS failures (curl exit 35 from ffmpeg.org broke the main build of
+# 2026-11-04, run 41788031952); the SHA-256 check after each download stays the only trust anchor.
+ARG CURL_RETRY="--retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30"
 RUN set -eu; CROSS=; WEBP_CROSS=; . /cross.env; \
-    curl -fsSLo webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}.tar.gz" \
+    curl -fsSL $CURL_RETRY -o webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}.tar.gz" \
     && echo "${LIBWEBP_SHA256}  webp.tar.gz" | sha256sum -c - \
     && tar xzf webp.tar.gz && cd "libwebp-${LIBWEBP_VERSION}" \
     && ./configure $WEBP_CROSS --prefix=/opt/deps --disable-shared --enable-static --disable-png --disable-jpeg --disable-tiff --disable-gif --disable-wic --disable-gl --disable-sdl \
     && make -j"$(nproc)" && make install
 RUN set -eu; CROSS=; FFMPEG_CROSS=; ELF_MACHINE=; . /cross.env; \
-    curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+    curl -fsSL $CURL_RETRY -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
     && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
     && tar xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
     && PKG_CONFIG_PATH=/opt/deps/lib/pkgconfig ./configure $FFMPEG_CROSS --prefix=/opt/ffmpeg \
@@ -226,7 +229,7 @@ FROM livekit/livekit-server:v1.13.9@sha256:d0c04791bf63ca8dcea123571827d56ba9504
 
 # ---- Runtime image ---------------------------------------------------------
 # The only stage of the target architecture that runs commands (emulated in a cross build): keep it small.
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data tavrn && mkdir -p /data && chown tavrn:tavrn /data

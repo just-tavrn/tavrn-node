@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use utoipa::ToSchema;
 use webauthn_rs::prelude::{
-    DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyAuthentication, PasskeyRegistration,
-    PublicKeyCredential, RegisterPublicKeyCredential, WebauthnError,
+    DiscoverableAuthentication, Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, WebauthnError,
 };
 
 use crate::{
@@ -556,14 +556,16 @@ pub async fn webauthn_login_finish(
             state.login_limiter.check_all(&[format!("ip:{ip}")]).await?;
             let failed = || ApiError::Unauthorized { code: "auth.invalid_credentials" };
             let ceremony: DiscoverableAuthentication = serde_json::from_str(&challenge.state).map_err(internal)?;
-            let (handle, _) = state.webauthn.identify_discoverable_authentication(&credential).map_err(|_| failed())?;
+            let (handle, cred_id) =
+                state.webauthn.identify_discoverable_authentication(&credential).map_err(|_| failed())?;
             let user = store::users::by_id(&state.db, &sf::user_id_from_handle(handle))
                 .await?
                 .filter(|u| u.domain == state.config.domain && u.kind == "user")
                 .ok_or_else(failed)?;
+            // Only a credential of the user the handle names: another account's key never matches.
             let creds = passkeys(&store::factors::credentials(&state.db, &user.id).await?)?;
-            let keys: Vec<DiscoverableKey> = creds.iter().map(DiscoverableKey::from).collect();
-            let result = state.webauthn.finish_discoverable_authentication(&credential, ceremony, &keys);
+            let passkey = creds.iter().find(|p| p.cred_id().as_slice() == cred_id).ok_or_else(failed)?;
+            let result = state.webauthn.finish_discoverable_authentication_v2(&credential, ceremony, passkey);
             let result = assertion_result(&state, &user, result, failed).await?;
             // Passkeys count as two factors only with user verification (PIN, biometrics).
             if !result.user_verified() {
