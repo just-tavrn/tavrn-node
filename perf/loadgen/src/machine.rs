@@ -27,13 +27,15 @@ pub const CALIBRATED_CLIENTS: usize = 200;
 /// tavrn-crypto update (60 CPU seconds with the uncached groups), so the scaled values of older runs stay comparable.
 /// openmls 0.9.2 (security fixes) kept the cost: against the same node on one machine (pinned to four CPUs, four runs
 /// each, alternating) the catch-up took 60.1-62.4 CPU seconds with 0.9.1 and 58.4-62.8 with 0.9.2 (2026-10-27), a
-/// ratio of 0.98 within the spread of the runs, so the reference stays.
+/// ratio of 0.98 within the spread of the runs, so the reference stays. tavrn-crypto 0.1.1 kept it as well: measured the
+/// same way (2026-11-11, Intel Xeon Skylake VM, the same node binary) 59.9-61.6 CPU seconds with 0.1.0 (four runs) and
+/// 59.2-62.0 with 0.1.1 (five runs), a ratio of the means of 0.99.
 pub const REFERENCE_CATCH_UP_CPU_SECS: f64 = 32.25;
 
 /// The crates that do the catch-up's work, with the `Cargo.lock` checksums the reference was measured with. A new
 /// version (or a git source instead of the registry) can change the work; then measure the reference again.
 pub const CALIBRATED_WITH: [(&str, &str); 3] = [
-    ("tavrn-crypto", "ff97c66ebb266d2f06a72251e470a384ae132a737e0030e57bf85df210d9c86f"),
+    ("tavrn-crypto", "0c07c7ba8ea1873f422687d794e980c2c8e901a4b1915bab8bba3dc5d7bf8536"),
     ("openmls", "ce4173f914cbc2dd28d9499f19e92f3e1bfebd9eea1607889924a77ca63d3ffc"),
     ("openmls_rust_crypto", "36bf3fe824ead6e81d22f49a9cd7feffca3494979fac14c1248e19516e3625f1"),
 ];
