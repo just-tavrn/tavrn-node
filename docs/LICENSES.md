@@ -54,7 +54,10 @@ Advisories: `cargo deny check advisories` reports two advisories that predate th
 as `ignore` entries in `deny.toml` until upstream moves: RUSTSEC-2023-0071 (`rsa` 0.9, Marvin timing attack, via `jsonwebtoken`
 and `livekit-api`; no fixed version exists; the node uses RSA only to verify ID-token signatures of SSO
 providers with public keys, where the timing side channel on private-key operations does not apply) and RUSTSEC-2026-0173 (`proc-macro-error2` unmaintained, a build-time macro crate via
-`openmls_rust_crypto` → `hpke-rs` → `libcrux`).
+`openmls_rust_crypto` → `hpke-rs` → `libcrux`). Temporary, owner-approved exceptions carry an expiry date in
+their `deny.toml` reason; among them RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1 via `sqlx-sqlite` 0.8.6, SQLite before
+3.54 can return uninitialized memory for a crafted database/`-wal` pair; SQLite is only the `--dev` and test
+database, production refuses it; until an `sqlx` release allows `libsqlite3-sys` 0.39, expires 2027-02-11).
 
 `cargo audit` scans every entry of `Cargo.lock` rather than the build graph and additionally reports
 RUSTSEC-2026-0330 and RUSTSEC-2026-0331 (`libcrux-kem` 0.0.9). That crate is a lockfile entry only and is never
