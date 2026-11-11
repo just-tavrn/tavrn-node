@@ -87,6 +87,49 @@ impl Authenticator {
     }
 }
 
+/// A synced P-256 passkey (backup eligible and backed up) with a fixed private key, signing assertions by hand: it
+/// plays the authenticator of a credential that an older node stored, whose `Passkey` JSON a test inserts directly.
+pub struct FixedKey {
+    signing: p256::ecdsa::SigningKey,
+    pub cred_id: Vec<u8>,
+    counter: u32,
+}
+
+impl FixedKey {
+    pub fn new(scalar: [u8; 32], cred_id: &[u8]) -> Self {
+        let secret = p256::SecretKey::from_slice(&scalar).unwrap();
+        Self { signing: p256::ecdsa::SigningKey::from(secret), cred_id: cred_id.to_vec(), counter: 0 }
+    }
+
+    /// `navigator.credentials.get()` with the node's `options` on [`ORIGIN`]: user presence and verification, the
+    /// next signature counter, and `user_handle` for a discoverable login.
+    pub fn authenticate(&mut self, options: &Value, user_handle: Option<&[u8]>) -> Value {
+        use p256::ecdsa::{Signature, signature::Signer};
+        use sha2::{Digest, Sha256};
+        let b64 = tavrn_crypto::util::b64url_encode;
+        let pk = &options["publicKey"];
+        self.counter += 1;
+        let mut auth_data = Sha256::digest(pk["rpId"].as_str().unwrap().as_bytes()).to_vec();
+        auth_data.push(0x01 | 0x04 | 0x08 | 0x10); // UP, UV, BE, BS
+        auth_data.extend_from_slice(&self.counter.to_be_bytes());
+        let client_data = serde_json::to_vec(&json!({
+            "type": "webauthn.get", "challenge": pk["challenge"], "origin": ORIGIN, "crossOrigin": false,
+        }))
+        .unwrap();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data));
+        let signature: Signature = self.signing.sign(&signed);
+        json!({
+            "id": b64(&self.cred_id), "rawId": b64(&self.cred_id), "type": "public-key",
+            "response": {
+                "authenticatorData": b64(&auth_data), "clientDataJSON": b64(&client_data),
+                "signature": b64(signature.to_der().as_bytes()), "userHandle": user_handle.map(b64),
+            },
+            "clientExtensionResults": {},
+        })
+    }
+}
+
 /// WebAuthn user handle of a user id (the ULID's 16 bytes).
 pub fn user_handle(user_id: &str) -> Vec<u8> {
     ulid::Ulid::from_string(user_id).unwrap().to_bytes().to_vec()

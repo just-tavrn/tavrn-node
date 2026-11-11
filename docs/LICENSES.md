@@ -90,10 +90,9 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `lettre` | 0.11.23 | MIT | runtime |
 | `livekit-api` | 0.8.2 | Apache-2.0 | runtime |
 | `livekit-protocol` | 0.8.0 | Apache-2.0 | runtime |
-| `log` | 0.4.34 | MIT OR Apache-2.0 | runtime |
+| `log` | 0.4.35 | MIT OR Apache-2.0 | runtime |
 | `mime_guess` | 2.0.5 | MIT | runtime |
 | `nix` | 0.31.3 | MIT | runtime (unix) |
-| `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | runtime |
 | `rand` | 0.10.3 | MIT OR Apache-2.0 | runtime |
 | `reqwest` | 0.12.28 | MIT OR Apache-2.0 | runtime |
 | `rust-embed` | 8.13.0 | MIT | runtime |
@@ -113,12 +112,13 @@ Cargo records in the lockfile, but nothing enables it (`cargo tree --target all 
 | `ulid` | 3.0.0 | MIT | runtime |
 | `unicode-normalization` | 0.1.25 | MIT OR Apache-2.0 | runtime |
 | `utoipa` | 5.5.0 | MIT OR Apache-2.0 | runtime |
-| `webauthn-rs` | 0.5.5 | MPL-2.0 | runtime |
+| `webauthn-rs` | 0.6.2 | MPL-2.0 | runtime |
 | `zeroize` | 1.9.1 | Apache-2.0 OR MIT | runtime |
 | `http-body-util` | 0.1.5 | MIT | dev |
+| `openssl` (vendored: `openssl-src`, OpenSSL 3, Apache-2.0) | 0.10.81 | Apache-2.0 | dev |
 | `tempfile` | 3.27.0 | MIT OR Apache-2.0 | dev |
 | `tower` | 0.5.3 | MIT | dev |
-| `webauthn-authenticator-rs` | 0.5.5 | MPL-2.0 | dev |
+| `webauthn-authenticator-rs` | 0.6.2 | MPL-2.0 | dev |
 
 Notable transitive licenses of `tavrn-crypto` (210 crates): `hpke-rs`, `hpke-rs-crypto`,
 `hpke-rs-libcrux`, `hpke-rs-rust-crypto` (MPL-2.0, via OpenMLS), `bitcoin_hashes`, `hex-conservative`

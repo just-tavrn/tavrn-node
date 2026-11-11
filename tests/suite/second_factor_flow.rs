@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use axum::http::{Method, StatusCode};
 use common::{
     TestNode, now_secs, password, test_node, test_node_with, totp_code,
-    webauthn::{APP_ORIGIN, Authenticator, ORIGIN, user_handle},
+    webauthn::{APP_ORIGIN, Authenticator, FixedKey, ORIGIN, user_handle},
 };
 use serde_json::{Value, json};
 use tavrn_node::cache::limiter::SharedLimiter;
@@ -810,4 +810,74 @@ async fn passkeys_of_an_app_origin_count_only_where_the_node_accepts_it() {
     let mut stranger = Authenticator::with_origin(other);
     let (s, j) = node.try_add_passkey(&bob.token, &mut stranger, "Other app", |_| {}).await;
     assert_eq!((s, j["code"].as_str()), (StatusCode::BAD_REQUEST, Some("webauthn.registration_failed")), "{j}");
+}
+
+/// A passkey as tavrn-node up to 0.4.0-rc.14 stored it: `serde_json::to_string(&Passkey)` of webauthn-rs 0.5.5's
+/// `finish_passkey_registration`, fed a "none" attestation (UP, UV, BE, BS) of the P-256 key of [`legacy_key`] for
+/// the relying party `t.local` (generated once with webauthn-rs 0.5.5; the JSON is kept verbatim).
+const PASSKEY_WEBAUTHN_RS_0_5: &str = concat!(
+    r#"{"cred":{"cred_id":"wMHCw8TFxsfIycrLzM3Ozw","cred":{"type_":"ES256","key":{"EC_EC2":{"curve":"SECP25"#,
+    r#"6R1","x":"TGM247iz3ncbYTocehc0g0zWnBpPX_7LJAxjvA3bFXQ","y":"9olsXRTKROADd5HCMAMzJZpxuQHlJYV10QfluKxI"#,
+    r#"tCQ"}}},"counter":0,"transports":null,"user_verified":true,"backup_eligible":true,"backup_state":tru"#,
+    r#"e,"registration_policy":"required","extensions":{"cred_protect":"Ignored","hmac_create_secret":"NotR"#,
+    r#"equested","appid":"NotRequested","cred_props":"Ignored"},"attestation":{"data":"None","metadata":"No"#,
+    r#"ne"},"attestation_format":"none"}}"#,
+);
+
+/// The authenticator of [`PASSKEY_WEBAUTHN_RS_0_5`]: private scalar 0x11..=0x30, credential id 0xc0..=0xcf.
+fn legacy_key() -> FixedKey {
+    FixedKey::new(std::array::from_fn(|i| 0x11 + i as u8), &std::array::from_fn::<u8, 16, _>(|i| 0xc0 + i as u8))
+}
+
+#[tokio::test]
+async fn passkeys_stored_by_webauthn_rs_0_5_keep_working() {
+    use tavrn_node::{
+        second_factor::MAX_CREDENTIALS,
+        store::factors::{self, InsertCredential, NewCredential},
+    };
+    let node = test_node("t.local").await;
+    let alice = node.register("alice").await;
+    let mut key = legacy_key();
+    let cred_id = tavrn_crypto::util::b64url_encode(&key.cred_id);
+    let row = NewCredential {
+        credential_id: &cred_id,
+        user_id: &alice.user_id,
+        name: "Old phone",
+        passkey: PASSKEY_WEBAUTHN_RS_0_5,
+        prf_supported: false,
+    };
+    let stored = factors::insert_credential(&node.state.db, row, MAX_CREDENTIALS).await.unwrap();
+    assert!(matches!(stored, InsertCredential::Inserted));
+
+    // Second factor, twice: the first use rewrites the row in the current format, the second reads that back.
+    for counter in 1..=2 {
+        let pre = node.login_preauth("alice", &password("alice")).await;
+        let body = json!({ "preauth_token": preauth(&pre) });
+        let (s, start) = node.req(Method::POST, "/api/v1/auth/webauthn/login/start", None, Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{start}");
+        assert_eq!(start["options"]["publicKey"]["allowCredentials"][0]["id"], cred_id.as_str(), "{start}");
+        let assertion = key.authenticate(&start["options"], None);
+        let finish =
+            json!({ "challenge_id": start["challenge_id"], "response": assertion, "preauth_token": preauth(&pre) });
+        let (s, ok) = node.req(Method::POST, "/api/v1/auth/webauthn/login/finish", None, Some(finish)).await;
+        assert_eq!(s, StatusCode::OK, "{ok}");
+        assert_eq!(ok["status"], "ok");
+        let row = factors::credential(&node.state.db, &alice.user_id, &cred_id).await.unwrap().unwrap();
+        let passkey: Value = serde_json::from_str(&row.passkey).unwrap();
+        assert_eq!(passkey["cred"]["counter"], counter, "{passkey}");
+    }
+
+    // Passkey-only login with the same credential.
+    let start = discoverable_start(&node).await;
+    let assertion = key.authenticate(&start["options"], Some(&user_handle(&alice.user_id)));
+    let (s, ok) = discoverable_finish(&node, start, assertion).await;
+    assert_eq!(s, StatusCode::OK, "{ok}");
+    assert_eq!(ok["user"]["address"], "alice@t.local");
+
+    // Excluded from a new registration, listed with its name.
+    let (s, start) = node.post("/api/v1/auth/webauthn/register/start", &alice.token, json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{start}");
+    assert_eq!(start["options"]["publicKey"]["excludeCredentials"][0]["id"], cred_id.as_str(), "{start}");
+    let (_, list) = node.get_auth("/api/v1/auth/webauthn/credentials", &alice.token).await;
+    assert_eq!(list[0]["name"], "Old phone", "{list}");
 }
