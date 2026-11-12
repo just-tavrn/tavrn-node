@@ -31,7 +31,7 @@ ARG TAVRN_WEB_SOURCE=git
 
 # ---- Web client from the tavrn-web repository ------------------------------------
 # The bundle is the same for every architecture: built once, on the build machine.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS web-git
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -71,7 +71,7 @@ FROM web-${TAVRN_WEB_SOURCE} AS web
 # BuildKit cache mounts. The dependency layer holds the compiled crates and the crates.io sources, never a token: the
 # private git dependency is fetched into a cache mount (the token reaches git only through GIT_CONFIG_* variables of
 # the RUN), so no layer carries its checkout.
-FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS chef
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS chef
 WORKDIR /src
 # cargo fetches the private git dependency tavrn-crypto (and its protocol submodule) with the git CLI.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
@@ -158,7 +158,7 @@ RUN --mount=type=secret,id=read_token --mount=type=secret,id=TAVRN_WEB_TOKEN \
 # (`just ffmpeg-install` and ci.yml take BtbN's dated build of that release); bump them together.
 # Runs on the build machine; for another target architecture libwebp and ffmpeg are cross-compiled with Debian's
 # cross gcc against the target's zlib (dpkg multiarch), and the result is checked with `file` instead of being run.
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS ffmpeg
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS ffmpeg
 ARG BUILDARCH
 ARG TARGETARCH
 ARG FFMPEG_VERSION=8.1.3
@@ -229,7 +229,7 @@ FROM livekit/livekit-server:v1.13.9@sha256:d0c04791bf63ca8dcea123571827d56ba9504
 
 # ---- Runtime image ---------------------------------------------------------
 # The only stage of the target architecture that runs commands (emulated in a cross build): keep it small.
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /data tavrn && mkdir -p /data && chown tavrn:tavrn /data
