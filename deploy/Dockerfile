@@ -31,7 +31,7 @@ ARG TAVRN_WEB_SOURCE=git
 
 # ---- Web client from the tavrn-web repository ------------------------------------
 # The bundle is the same for every architecture: built once, on the build machine.
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS web-git
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS web-git
 RUN apk add --no-cache git
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
 RUN corepack enable
@@ -71,7 +71,7 @@ FROM web-${TAVRN_WEB_SOURCE} AS web
 # BuildKit cache mounts. The dependency layer holds the compiled crates and the crates.io sources, never a token: the
 # private git dependency is fetched into a cache mount (the token reaches git only through GIT_CONFIG_* variables of
 # the RUN), so no layer carries its checkout.
-FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS chef
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS chef
 WORKDIR /src
 # cargo fetches the private git dependency tavrn-crypto (and its protocol submodule) with the git CLI.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
